@@ -73,6 +73,18 @@ fn valid_id(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
 }
 
+/// Stable native identity: prose changes do not create a new decision.
+fn id_for(task: &str, kind: &str, generation: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let bytes = serde_json::to_vec(&("task-inquiry-v3", task, kind, generation))
+        .expect("string tuple serialization cannot fail");
+    let digest: String = Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("task-v3-{digest}")
+}
+
 fn same_repository(left: &Path, right: &Path) -> bool {
     left == right
         || std::fs::canonicalize(left)
@@ -128,7 +140,8 @@ impl Outbox {
     }
 
     /// File a free-text task inquiry directly, without a Question envelope.
-    /// The producer occurrence and unchanged inquiry content form its restart key.
+    /// Task, producer and execution generation form its restart key; prose does not.
+    /// Reopening the same occurrence preserves its original content and lifecycle.
     pub fn file(
         &self,
         task: &crate::queue::Task,
@@ -137,81 +150,48 @@ impl Outbox {
         summary: &str,
         detail: &str,
     ) -> Result<Inquiry> {
-        use sha2::{Digest, Sha256};
         ensure!(!summary.trim().is_empty(), "inquiry summary is empty");
         ensure!(
             run.as_ref().is_none_or(|run| task.runs.contains(run)),
             "inquiry run is not owned by its task"
         );
-        let bytes = if task.passes.is_empty() && task.operator_decided_at.is_none() {
-            // Preserve the retained implementation's initial-generation keys.
-            serde_json::to_vec(&(
-                "task-inquiry-v1",
-                &task.id,
-                &task.repo,
-                &run,
-                &source,
-                summary,
-                detail,
-            ))?
-        } else {
-            // Identical wording in a later execution pass or after an owner
-            // transition is a new inquiry, not a replay of resolved history.
-            serde_json::to_vec(&(
-                "task-inquiry-v2",
-                task.passes.len(),
-                &task.operator_decided_at,
-                &task.id,
-                &task.repo,
-                &run,
-                &source,
-                summary,
-                detail,
-            ))?
-        };
-        let digest: String = Sha256::digest(bytes)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
-        let mut id = format!("task-{digest}");
         let occurrence = serde_json::to_string(&(task.passes.len(), &task.operator_decided_at))?;
+        let generation = serde_json::to_string(&(&task.repo, &run, &occurrence))?;
+        let mut id = id_for(&task.id, &source, &generation);
         let clean = |s: &str| {
             crate::prompt::defuse(&crate::scrub::scrub(s, &crate::scrub::Identity::current()))
         };
         let display = format!("{}\n\n{}", clean(summary), clean(detail));
-        // A retained v1 inquiry has no occurrence metadata. Adopt its active
-        // intent once rather than redelivering it merely because of upgrade.
-        // Known different generations still get independent pending records.
-        let legacy = serde_json::to_vec(&(
-            "task-inquiry-v1",
-            &task.id,
-            &task.repo,
-            &run,
-            &source,
-            summary,
-            detail,
-        ))?;
-        let legacy_digest: String = Sha256::digest(legacy)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
-        let legacy_id = format!("task-{legacy_digest}");
-        if legacy_id != id && self.path(&legacy_id)?.exists() {
-            let saved = self.get(&legacy_id)?;
-            if saved.task == task.id
-                && saved.run == run
-                && saved.repo == task.repo
-                && saved.source == source
-                && saved.display == display
-                && saved
-                    .occurrence
-                    .as_ref()
-                    .is_none_or(|prior| prior == &occurrence)
-                && saved.decision.as_ref().is_some_and(|decision| {
-                    decision.status != crate::task_decision::Status::Resolved
+        // Adopt retained content-derived IDs without rewriting transcript links
+        // or effect receipts. Unknown generations can only carry forward active,
+        // unchanged intent; known generations also retain resolved history.
+        if !self.path(&id)?.exists() {
+            let retained: Vec<_> = self
+                .list()?
+                .into_iter()
+                .filter(|saved| {
+                    saved.id.starts_with("task-")
+                        && saved.task == task.id
+                        && saved.run == run
+                        && saved.repo == task.repo
+                        && saved.source == source
+                        && match &saved.occurrence {
+                            Some(prior) => prior == &occurrence,
+                            None => {
+                                saved.display == display
+                                    && saved.decision.as_ref().is_some_and(|d| {
+                                        d.status != crate::task_decision::Status::Resolved
+                                    })
+                            }
+                        }
                 })
-            {
-                id = legacy_id;
+                .collect();
+            ensure!(
+                retained.len() <= 1,
+                "multiple inquiries claim the same producer generation"
+            );
+            if let Some(saved) = retained.first() {
+                id = saved.id.clone();
             }
         }
         let text = format!(
@@ -280,12 +260,8 @@ impl Outbox {
                     && saved.key == inquiry.key,
                 "inquiry identity was reused for a different target"
             );
-            if inquiry.id.starts_with("task-") {
-                ensure!(
-                    saved.text == inquiry.text && saved.display == inquiry.display,
-                    "inquiry key collision: content differs"
-                );
-            }
+            // The original prose and decision lifecycle survive a producer replay.
+            // Identity is ownership plus occurrence, never the rephrased body.
             if let Some(occurrence) = &inquiry.occurrence {
                 ensure!(
                     saved
@@ -595,5 +571,147 @@ impl Outbox {
             }
         }
         failed.map_or(Ok(()), Err)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        queue::{Source, Task},
+        task_decision::Status,
+    };
+
+    fn task() -> Task {
+        Task::new(
+            "work".into(),
+            "work".into(),
+            PathBuf::from("/repo"),
+            Source::Human,
+        )
+    }
+
+    #[test]
+    fn identity_uses_task_kind_and_generation_with_unambiguous_boundaries() {
+        assert_eq!(id_for("t", "k", "g"), id_for("t", "k", "g"));
+        assert_ne!(id_for("t", "k", "g"), id_for("u", "k", "g"));
+        assert_ne!(id_for("t", "k", "g"), id_for("t", "l", "g"));
+        assert_ne!(id_for("t", "k", "g"), id_for("t", "k", "h"));
+        assert_ne!(id_for("ab", "c", "d"), id_for("a", "bc", "d"));
+    }
+
+    #[test]
+    fn rewording_after_restart_preserves_content_receipts_and_all_decision_states() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut task = task();
+        task.runs = vec!["run-a".into(), "run-b".into()];
+        let outbox = Outbox::at(dir.path());
+        let first = outbox
+            .file(
+                &task,
+                Some("run-a".into()),
+                "implement".into(),
+                "Original",
+                "Original detail",
+            )
+            .unwrap();
+        for status in [
+            Status::AwaitingOwner,
+            Status::Queued,
+            Status::InProgress,
+            Status::RetryNeeded,
+            Status::Resolved,
+        ] {
+            let mut saved = outbox.get(&first.id).unwrap();
+            saved.delivered_to = Some("chat-a".into());
+            let decision = saved.decision.as_mut().unwrap();
+            decision.status = status;
+            decision.request =
+                (status != Status::AwaitingOwner).then(|| "durable owner request".into());
+            decision.error = (status == Status::RetryNeeded).then(|| "uncertain effect".into());
+            outbox.save(&saved).unwrap();
+            let replay = Outbox::at(dir.path())
+                .file(
+                    &task,
+                    Some("run-a".into()),
+                    "implement".into(),
+                    "Reworded",
+                    "Changed detail",
+                )
+                .unwrap();
+            assert_eq!(replay, saved);
+        }
+        let other_kind = outbox
+            .file(
+                &task,
+                Some("run-a".into()),
+                "review".into(),
+                "Original",
+                "Original detail",
+            )
+            .unwrap();
+        let other_run = outbox
+            .file(
+                &task,
+                Some("run-b".into()),
+                "implement".into(),
+                "Original",
+                "Original detail",
+            )
+            .unwrap();
+        assert_ne!(first.id, other_kind.id);
+        assert_ne!(first.id, other_run.id);
+        task.hold_manual(Some("new owner generation".into()));
+        let next = outbox
+            .file(
+                &task,
+                Some("run-a".into()),
+                "implement".into(),
+                "Original",
+                "Original detail",
+            )
+            .unwrap();
+        assert_ne!(first.id, next.id);
+        assert_eq!(next.decision.unwrap().status, Status::AwaitingOwner);
+        assert_eq!(outbox.list().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn retained_content_ids_keep_links_and_lifecycle_when_reworded() {
+        let dir = tempfile::tempdir().unwrap();
+        let task = task();
+        let outbox = Outbox::at(dir.path());
+        let mut retained = outbox
+            .file(
+                &task,
+                None,
+                "implement".into(),
+                "Original",
+                "Original detail",
+            )
+            .unwrap();
+        std::fs::remove_file(outbox.path(&retained.id).unwrap()).unwrap();
+        // Both retained native formats used this namespace and content hashes.
+        retained.id = "task-retained-content-hash".into();
+        retained.key = format!("inquiry:{}", retained.id);
+        retained.delivered_to = Some("retained-chat".into());
+        retained
+            .decision
+            .as_mut()
+            .unwrap()
+            .settle("owner settled this occurrence")
+            .unwrap();
+        outbox.save(&retained).unwrap();
+        let replay = Outbox::at(dir.path())
+            .file(
+                &task,
+                None,
+                "implement".into(),
+                "Reworded",
+                "Changed detail",
+            )
+            .unwrap();
+        assert_eq!(replay, retained);
+        assert_eq!(outbox.list().unwrap().len(), 1);
     }
 }

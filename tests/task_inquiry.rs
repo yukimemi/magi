@@ -251,6 +251,9 @@ async fn pending_decision_failure_supersession_and_scope_are_durable() {
     queue.put(&mut task).unwrap();
     let outbox = Outbox::at(&home);
     let first = outbox.file(&task, None, "implement".into(), "Old inquiry", "Old context").unwrap();
+    // A new owner transition creates a new occurrence, independently of prose.
+    task.hold_manual(Some("owner replaced the old request".into()));
+    queue.put(&mut task).unwrap();
     let next = outbox.file(&task, None, "implement".into(), "New inquiry", "New context").unwrap();
     for id in [&first.id, &next.id] { outbox.deliver(&queue, &talks, id).unwrap(); }
     assert!(outbox.settle(&first.id, "foreign-chat", "superseded", Some(&next.id)).is_err());
