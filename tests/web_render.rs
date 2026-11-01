@@ -19,7 +19,7 @@
 mod cdp;
 #[path = "web_render/diag.rs"]
 mod diag;
-// This binary uses the home lock and the fixture, not the `e2e!` wrapper.
+// Config-dependent scenes use `e2e!` to isolate their machine layer.
 #[allow(unused_macros, unused_imports)]
 mod common;
 
@@ -4559,7 +4559,7 @@ async fn question_identity_disclosure_copy_and_live_updates() {
     }
 }
 
-#[tokio::test]
+common::e2e! {
 async fn queue_compact_controls_and_edit_save_fit_and_preserve_drafts() {
     let Some(chrome) = cdp::find_chrome() else {
         assert!(std::env::var_os("CI").is_none(), "Chrome required in CI");
@@ -4713,6 +4713,7 @@ async fn queue_compact_controls_and_edit_save_fit_and_preserve_drafts() {
         browser.close_page(&page).await;
     }
 }
+}
 
 #[tokio::test]
 async fn magi_icon_settings_preview_save_reload_and_reset_on_phone() {
@@ -4794,7 +4795,7 @@ async fn magi_icon_settings_preview_save_reload_and_reset_on_phone() {
     browser.close_page(&page).await;
 }
 
-#[tokio::test]
+common::e2e! {
 async fn avatar_settings_preview_isolation_reload_and_reset_on_phone() {
     let Some(chrome) = cdp::find_chrome() else {
         assert!(std::env::var_os("CI").is_none(), "Chrome required in CI");
@@ -4803,6 +4804,9 @@ async fn avatar_settings_preview_isolation_reload_and_reset_on_phone() {
     };
     let guard = common::home_lock().await;
     let fx = common::fixture(guard, common::Judges::Unanimous, false);
+    // Avatar requests resolve settings repeatedly; use the fixture roster
+    // instead of probing the host's installed agents and repository roots.
+    publish_fixture_roster(&fx).await;
     let home = fx.tmp.path().join("magi-home");
     let base = serve(
         &home,
@@ -4897,6 +4901,7 @@ async fn avatar_settings_preview_isolation_reload_and_reset_on_phone() {
     browser.wait_for(&page, "document.querySelector('.avatar-settings').textContent.includes('Built-in avatar restored.')", timeout).await.unwrap();
     assert!(!home.join("avatars/operator.data").exists());
     browser.close_page(&page).await;
+}
 }
 
 #[tokio::test]

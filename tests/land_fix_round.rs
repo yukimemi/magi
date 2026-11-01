@@ -130,3 +130,204 @@ async fn land_rescue_waits_for_the_real_repository_lock() {
     drop(external);
 }
 }
+
+#[cfg(unix)]
+fn install_resume_forge(root: &Path, branch: &str) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let bin = root.join("resume-forge");
+    std::fs::create_dir(&bin).unwrap();
+    let script = bin.join("gh");
+    std::fs::write(&script, r#"#!/bin/sh
+sha=$(git ls-remote --refs origin "refs/heads/$LAND_TEST_BRANCH" | cut -f1)
+case "$1 $2" in
+ 'pr view') printf '{"url":"https://github.com/example/repo/pull/1","number":1,"state":"OPEN","title":"feat: existing work","reviews":[],"comments":[],"mergeStateStatus":"CLEAN","headRefOid":"%s","baseRefName":"main","autoMergeRequest":null,"headRefName":"%s","isCrossRepository":false}\n' "$sha" "$LAND_TEST_BRANCH" ;;
+ 'api graphql') printf '{"data":{"repository":{"pullRequest":{"commits":{"nodes":[{"commit":{"oid":"%s","statusCheckRollup":{"contexts":{"pageInfo":{"hasNextPage":false},"nodes":[{"__typename":"CheckRun","name":"ci","status":"COMPLETED","conclusion":"SUCCESS"}]}}}}]}}}}}\n' "$sha" ;;
+ 'api repos/{owner}/{repo}/pulls/1/comments') echo '[]' ;;
+ 'pr merge') case "$*" in *--disable-auto*) exit 0 ;; *) exit 99 ;; esac ;;
+ *) exit 98 ;;
+esac
+"#).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut paths = vec![bin];
+    paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+    // SAFETY: this e2e scene runs in its own child, between graph executions.
+    unsafe {
+        std::env::set_var("PATH", std::env::join_paths(paths).unwrap());
+        std::env::set_var("LAND_TEST_BRANCH", branch);
+    }
+}
+
+#[cfg(unix)]
+async fn unavailable_landing_fix_is_refunded_and_retryable(authentication: bool) {
+    let home = common::home_lock().await;
+    let mut fx = fixture(home, Judges::Unanimous, false);
+    fx.config.graph.implementers = 1;
+    let mut runner = Runner::start(
+        &fx.repo,
+        "create note.txt".into(),
+        fx.config.clone(),
+        magi::run::Origin::operator(),
+    )
+    .await
+    .unwrap();
+    runner.execute().await.unwrap();
+    let mut state = runner.state;
+    let winner = state.winner().cloned().unwrap();
+    let remote = state.config.merge.remote.clone();
+    git(&winner.worktree, &["push", "-q", &remote, &winner.branch]);
+    state.config.roles.fixer = Some(magi::config::AgentChoice::Chain(vec![
+        "beta".to_owned(),
+        "gamma".to_owned(),
+    ]));
+    let outage_script = fx.tmp.path().join("landing-outage.sh");
+    // Command wrappers use the observed single-object error format. The
+    // fixture's normal landing reply runs before its quota/auth knobs.
+    let line = if authentication {
+        r#"{"is_error":true,"terminal_reason":"api_error","result":"Failed to authenticate: OAuth session expired and could not be refreshed"}"#
+    } else {
+        r#"{"is_error":true,"terminal_reason":"api_error","result":"You've hit your session limit"}"#
+    };
+    std::fs::write(
+        &outage_script,
+        format!("echo partial >> partial-land.txt\necho changed >> note.txt\ncat <<'EVENTS'\n{line}\nEVENTS\nexit 1\n"),
+    )
+    .unwrap();
+    for agent in &mut state.config.agents {
+        agent.command = vec!["sh".into(), outage_script.to_string_lossy().into_owned()];
+    }
+    let pr = PrState {
+        url: "https://github.com/example/repo/pull/1".into(),
+        number: 1,
+        state: PrLifecycle::Open,
+        checks: Checks::Red,
+        failing: vec!["check".into()],
+        review_comments: Vec::new(),
+        blocking: Blocking::Yes,
+    };
+    state.pr = Some(magi::run::PrRecord {
+        url: pr.url.clone(),
+        number: 1,
+        state: "open".into(),
+        checks: "red".into(),
+        round: 0,
+        rounds: 1,
+        red_at_merge: Vec::new(),
+    });
+    assert_eq!(
+        fix_round(&mut state, &pr, 1, 1, "check failed", "")
+            .await
+            .unwrap(),
+        Fixed::Deferred
+    );
+    assert_eq!(state.status, magi::run::RunStatus::Blocked);
+    assert_eq!(
+        state.quota.len(),
+        1,
+        "only the exhausted chain's final loss"
+    );
+    assert_eq!(state.quota[0].agent, "gamma");
+    assert_eq!(state.quota[0].node, "land");
+    assert_eq!(state.handovers.len(), 1);
+    let cause = if authentication {
+        magi::agent::QuotaCause::Authentication
+    } else {
+        magi::agent::QuotaCause::UsageLimit
+    };
+    assert_eq!(state.quota[0].cause, cause);
+    let saved = magi::run::RunState::load(&state.id).unwrap();
+    assert_eq!(saved.resource_block.as_ref().unwrap().node, "land");
+    assert_eq!(saved.pr.as_ref().unwrap().round, 0);
+    let queue = magi::queue::Queue::open();
+    let mut task = magi::queue::Task::new(
+        "fix check".into(),
+        "fix check".into(),
+        fx.repo.clone(),
+        magi::queue::Source::Human,
+    );
+    task.start(state.id.clone());
+    queue.put(&mut task).unwrap();
+    magi::daemon::finish_attempt(2, &queue, &mut task, &state, &[], Ok(()));
+    assert_eq!(task.attempts, 0, "an open PR must not suppress the refund");
+    if authentication {
+        assert_eq!(task.status, magi::queue::TaskStatus::Held);
+        assert_eq!(task.hold_source, Some(magi::queue::HoldSource::Machine));
+        assert!(task.hold_reason.as_ref().unwrap().contains("gamma"));
+        assert!(
+            task.hold_reason
+                .as_ref()
+                .unwrap()
+                .contains("re-authenticate")
+        );
+    }
+    let saved_head = git(&winner.worktree, &["rev-parse", "HEAD"]);
+    assert_eq!(git(&winner.worktree, &["status", "--porcelain"]), "");
+    assert!(git(&winner.worktree, &["show", "HEAD:partial-land.txt"]).contains("partial"));
+    assert!(git(&winner.worktree, &["show", "HEAD:note.txt"]).contains("changed"));
+    assert_ne!(
+        saved_head,
+        git(
+            &winner.worktree,
+            &["rev-parse", &format!("{remote}/{}", winner.branch)]
+        ),
+        "deferred work must remain local until resume gates it"
+    );
+    state.config.agents = fx.config.agents.clone();
+    state.config.graph.land = true;
+    state.config.graph.land_approval = true;
+    state.config.merge.mode = magi::config::MergeMode::Pr;
+    state.merge = Some(magi::run::MergeOutcome {
+        mode: magi::config::MergeMode::Pr,
+        ok: true,
+        detail: pr.url.clone(),
+        empty: false,
+    });
+    state.pr_pushed_head = Some(git(
+        &winner.worktree,
+        &["rev-parse", &format!("{remote}/{}", winner.branch)],
+    ));
+    install_resume_forge(fx.tmp.path(), &winner.branch);
+    state.save().unwrap();
+    // Exercise execute_graph -> resume_landing_head -> restore_landing_worktree,
+    // rather than clearing the resource block and calling the fixer directly.
+    let mut resumed = Runner::resume(&state.id).unwrap();
+    resumed.execute().await.unwrap();
+    assert!(resumed.state.resource_block.is_none());
+    assert!(!resumed.state.land_sync_pending);
+    assert!(
+        resumed.state.parked,
+        "resume must reach fresh owner approval: {:?}",
+        resumed.state.events
+    );
+    assert_eq!(
+        resumed.state.gate_head.as_deref(),
+        Some(saved_head.as_str())
+    );
+    assert_eq!(
+        resumed.state.pr_pushed_head.as_deref(),
+        Some(saved_head.as_str())
+    );
+    assert_eq!(git(&winner.worktree, &["status", "--porcelain"]), "");
+    assert!(resumed.state.land_approval.is_some());
+    // Recovery still leaves the fixer callable with the original round budget.
+    let mut state = resumed.state;
+    state.parked = false;
+    state.land_approval = None;
+    let retried = fix_round(&mut state, &pr, 1, 1, "check failed", "")
+        .await
+        .unwrap();
+    assert!(matches!(retried, Fixed::Committed { .. }), "{retried:?}");
+}
+
+common::e2e! {
+#[cfg(unix)]
+async fn landing_authentication_outage_refunds_the_attempt_and_retries_the_fix() {
+    unavailable_landing_fix_is_refunded_and_retryable(true).await;
+}
+}
+
+common::e2e! {
+#[cfg(unix)]
+async fn landing_usage_outage_refunds_the_attempt_and_retries_the_fix() {
+    unavailable_landing_fix_is_refunded_and_retryable(false).await;
+}
+}

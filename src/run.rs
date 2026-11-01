@@ -722,6 +722,12 @@ pub struct VoteRecord {
 /// whose panel collapsed does not masquerade as a healthy one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuotaLoss {
+    /// Machine-side cause; legacy losses are usage limits.
+    #[serde(default)]
+    pub cause: crate::agent::QuotaCause,
+    /// Agent that needs recovery (empty in legacy records).
+    #[serde(default)]
+    pub agent: String,
     /// Seat key, e.g. `judge-1` or `review-2`.
     pub seat: String,
     /// Node that was running, e.g. `judge`, `vote`, `review`.
@@ -731,6 +737,20 @@ pub struct QuotaLoss {
     /// Reset hint if the CLI printed one, free text.
     #[serde(default)]
     pub reset: Option<String>,
+}
+
+impl QuotaLoss {
+    /// Preserve the cause and agent alongside the seat at every loss site.
+    pub fn from_report(seat: String, node: &str, quota: Option<&crate::agent::Quota>) -> Self {
+        Self {
+            seat,
+            node: node.to_owned(),
+            at: Timestamp::now(),
+            reset: quota.and_then(|q| q.reset.clone()),
+            cause: quota.map(|q| q.cause).unwrap_or_default(),
+            agent: quota.map(|q| q.agent.clone()).unwrap_or_default(),
+        }
+    }
 }
 
 /// A seat handed from one roster agent to the next after the first failed it
@@ -937,6 +957,10 @@ pub struct GateFixRecord {
 /// round back.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RebaseFixRecord {
+    /// A machine outage deferred this call without spending a conflict round.
+    /// The record retains the original index baseline for safe resumption.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outage: Option<crate::agent::QuotaCause>,
     /// Agent asked to resolve the conflict.
     pub agent: String,
     /// Paths git reported unmerged when the round started.
@@ -4417,6 +4441,26 @@ mod tests {
         for (name, body) in names {
             assert_eq!(read_artifact(&state, &name).unwrap(), body);
         }
+    }
+
+    #[test]
+    fn quota_loss_from_report_preserves_machine_failure_details() {
+        let report = crate::agent::Quota {
+            reset: Some("in 1h".into()),
+            cause: crate::agent::QuotaCause::Authentication,
+            agent: "alpha".into(),
+        };
+        let loss = QuotaLoss::from_report("advisor-1".into(), "advise", Some(&report));
+        assert_eq!(loss.seat, "advisor-1");
+        assert_eq!(loss.node, "advise");
+        assert_eq!(loss.reset, report.reset);
+        assert_eq!(loss.cause, report.cause);
+        assert_eq!(loss.agent, report.agent);
+
+        let absent = QuotaLoss::from_report("advisor-2".into(), "advise", None);
+        assert_eq!(absent.reset, None);
+        assert_eq!(absent.cause, crate::agent::QuotaCause::UsageLimit);
+        assert!(absent.agent.is_empty());
     }
 
     fn pass_state() -> RunState {

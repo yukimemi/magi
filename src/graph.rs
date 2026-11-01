@@ -2615,6 +2615,45 @@ impl Runner {
             self.resume_unconfirmed_commands(&mut results, &sent, &prompts, &run_id)
                 .await;
         }
+        // Do not finalize failed candidates when the entire wave needs machine
+        // recovery: leaving them pending resumes this node with its work intact.
+        if !results.is_empty()
+            && results
+                .iter()
+                .all(|(_, _, out)| matches!(out, AgentOutcome::Quota(_)))
+        {
+            let losses: Vec<_> = results
+                .iter()
+                .map(|(_, seat, out)| {
+                    let AgentOutcome::Quota(o) = out else {
+                        unreachable!()
+                    };
+                    QuotaLoss::from_report(seat.key.clone(), "implement", o.quota.as_ref())
+                })
+                .collect();
+            self.state.quota.extend(losses.clone());
+            for (_, seat, _) in results {
+                self.state.seats.insert(seat.key.clone(), seat);
+            }
+            for &i in &todo {
+                let label = self.state.candidates[i].label;
+                self.state.interrupted_implementations.insert(label);
+                self.state
+                    .candidate_preservation
+                    .insert(label, "machine outage awaiting persistence".into());
+            }
+            // Preserve partial edits too, while keeping every interrupted seat
+            // pending even when its tree already contains an inherited patch.
+            block_machine_outage(&mut self.state, "implement", &losses);
+            self.state.save()?;
+            self.persist_candidates().await?;
+            for &i in &todo {
+                self.state
+                    .interrupted_implementations
+                    .insert(self.state.candidates[i].label);
+            }
+            return self.stop_for_resource();
+        }
         let resource_blocked = self.state.resource_block.is_some() || wave_blocked(&results);
 
         let selected_failed = self.state.config.graph.selected_implementer.is_some()
@@ -2685,12 +2724,11 @@ impl Runner {
                     )
                 }
                 AgentOutcome::Quota(o) => {
-                    self.state.quota.push(QuotaLoss {
-                        seat: seat_key,
-                        node: "implement".to_owned(),
-                        at: Timestamp::now(),
-                        reset: o.quota.as_ref().and_then(|q| q.reset.clone()),
-                    });
+                    self.state.quota.push(QuotaLoss::from_report(
+                        seat_key,
+                        "implement",
+                        o.quota.as_ref(),
+                    ));
                     (
                         String::new(),
                         o.duration_ms,
@@ -3384,12 +3422,9 @@ impl Runner {
                 }
                 AgentOutcome::Quota(o) => {
                     cumulative_wait_ms += o.duration_ms;
-                    self.state.quota.push(QuotaLoss {
-                        seat: seat.key.clone(),
-                        node: "fix".to_owned(),
-                        at: Timestamp::now(),
-                        reset: o.quota.as_ref().and_then(|q| q.reset.clone()),
-                    });
+                    let loss = QuotaLoss::from_report(seat.key.clone(), "fix", o.quota.as_ref());
+                    block_machine_outage(&mut self.state, "fix", std::slice::from_ref(&loss));
+                    self.state.quota.push(loss);
                     self.state.event(
                         "fix",
                         format!(
@@ -3674,7 +3709,9 @@ impl Runner {
         // while `self` is mutably borrowed by the node's own bookkeeping.
         let run_id = self.state.id.clone();
         let prompts = self.state.config.prompts.clone();
-        if !self.state.deliberation.is_empty() || self.state.tally.is_some() {
+        let rounds = self.state.config.graph.deliberate_rounds;
+        // Resume unfinished rounds after an outage, but never reopen a tally.
+        if self.state.deliberation.len() >= rounds || self.state.tally.is_some() {
             return Ok(());
         }
         let tops: Vec<char> = self
@@ -3683,7 +3720,6 @@ impl Runner {
             .iter()
             .filter_map(|j| j.ranking.first().copied())
             .collect();
-        let rounds = self.state.config.graph.deliberate_rounds;
         if tops.len() < 2 || tops.iter().all(|t| *t == tops[0]) || rounds == 0 {
             if tops.len() >= 2 && tops.iter().all(|t| *t == tops[0]) {
                 self.state.event(
@@ -3716,8 +3752,10 @@ impl Runner {
         // Judges argue in sequence so that a turn can answer the one before it;
         // that is the difference between deliberation and three parallel
         // monologues.
-        for round in 1..=rounds {
+        for round in self.state.deliberation.len() + 1..=rounds {
             let mut turns: Vec<DeliberationTurn> = Vec::new();
+            let mut round_losses = Vec::new();
+            let mut asked = 0;
             for (j, spec) in self.roles.judges.clone().into_iter().enumerate() {
                 if self.state.judgements[j].failed.is_some() {
                     continue;
@@ -3769,6 +3807,7 @@ impl Runner {
                 // handed to the next roster agent, which gets the full
                 // context. An empty answer is a turn, not a failure.
                 let mut losses = Vec::new();
+                asked += 1;
                 let mut results = ask_wave_with::<String>(
                     vec![job],
                     Arc::clone(&self.sem),
@@ -3782,6 +3821,10 @@ impl Runner {
                     },
                 )
                 .await;
+                if self.state.resource_block.is_some() {
+                    return self.stop_for_resource();
+                }
+                round_losses.extend(losses.iter().cloned());
                 self.state.quota.extend(losses);
                 let (updated, res, _) = results.pop().expect("one job in, one result out");
                 seat = updated;
@@ -3816,6 +3859,10 @@ impl Runner {
                     body: blind::sanitize_prose(&body, &self.state.config.blind),
                     tentative,
                 });
+            }
+            if asked > 0 && turns.is_empty() && round_losses.len() == asked {
+                block_machine_outage(&mut self.state, "deliberate", &round_losses);
+                return self.stop_for_resource();
             }
             self.state
                 .deliberation
@@ -4618,12 +4665,11 @@ impl Runner {
             AgentOutcome::Ok(_) => {}
             AgentOutcome::Dropped(_) => why = Some("the CLI dropped the stream".to_owned()),
             AgentOutcome::Quota(o) => {
-                self.state.quota.push(QuotaLoss {
-                    seat: seat.key.clone(),
-                    node: "graft".to_owned(),
-                    at: Timestamp::now(),
-                    reset: o.quota.as_ref().and_then(|q| q.reset.clone()),
-                });
+                self.state.quota.push(QuotaLoss::from_report(
+                    seat.key.clone(),
+                    "graft",
+                    o.quota.as_ref(),
+                ));
                 why = Some("rate limited (quota)".to_owned());
             }
             AgentOutcome::Failed(e) | AgentOutcome::ResourceBlocked(e) => {
@@ -5594,6 +5640,10 @@ impl Runner {
             return Err(e);
         }
 
+        // This explicit operator request retries availability independently
+        // of execute(); the previous call has already saved and cleaned up.
+        self.state.resource_block = None;
+
         let run_id = self.state.id.clone();
         let prompts = self.state.config.prompts.clone();
         let language = self.state.config.graph.language.clone();
@@ -5698,12 +5748,11 @@ impl Runner {
                 fix.failed = Some(format!("the CLI dropped the stream ({why})"));
             }
             AgentOutcome::Quota(o) => {
-                self.state.quota.push(QuotaLoss {
-                    seat: final_seat.key.clone(),
-                    node: "fix".to_owned(),
-                    at: Timestamp::now(),
-                    reset: o.quota.as_ref().and_then(|q| q.reset.clone()),
-                });
+                self.state.quota.push(QuotaLoss::from_report(
+                    final_seat.key.clone(),
+                    "fix",
+                    o.quota.as_ref(),
+                ));
                 fix.failed = Some("rate limited (quota); fixer could not run".to_owned());
             }
             AgentOutcome::Failed(e) => fix.failed = Some(e),
@@ -5711,6 +5760,8 @@ impl Runner {
                 fix.failed = Some(format!("the fixer was not started: {e}"));
             }
         }
+        // Even a deferred call must rescue edits, release the worktree and
+        // finalize its record below so an explicit `magi fix` can retry.
         if fix.continuation.is_none() {
             fix.continuation = Some(ContinuationRecord::not_needed());
         }
@@ -5787,6 +5838,9 @@ impl Runner {
         // Saved again now that the fixer's own outcome is final, on top of
         // the save right after the request was first pushed above.
         self.state.save()?;
+        if self.state.resource_block.is_some() {
+            return self.stop_for_resource();
+        }
 
         if committed {
             self.state.event(
@@ -5986,7 +6040,28 @@ impl Runner {
             last = Some((job, seat, out));
             break;
         }
-        last.expect("the fixer chain always has an entry")
+        let (job, seat, out) = last.expect("the fixer chain always has an entry");
+        if let AgentOutcome::Quota(output) = &out
+            && node != "graft"
+        {
+            // Graft is best effort: its caller records the loss and restores
+            // the pre-graft tree, then proceeds to review and gate.
+            // Every fallback was tried. Machine outages cannot be repaired by
+            // spending a fix round; use each caller's resumable resource path.
+            let loss = QuotaLoss::from_report(seat.key.clone(), node, output.quota.as_ref());
+            block_machine_outage(&mut self.state, node, std::slice::from_ref(&loss));
+            self.state.quota.push(loss);
+            self.state.seats.insert(seat.key.clone(), seat.clone());
+            self.state.status = RunStatus::Blocked;
+            return (
+                job,
+                seat,
+                AgentOutcome::ResourceBlocked(
+                    "fixer unavailable; restore agent availability and resume".into(),
+                ),
+            );
+        }
+        (job, seat, out)
     }
 
     /// The one repair a verification-only failure earns (see
@@ -6098,12 +6173,11 @@ impl Runner {
         let failed = match &out {
             AgentOutcome::Ok(_) | AgentOutcome::ResourceBlocked(_) => None,
             AgentOutcome::Quota(o) => {
-                self.state.quota.push(QuotaLoss {
-                    seat: seat.key.clone(),
-                    node: "fix".to_owned(),
-                    at: Timestamp::now(),
-                    reset: o.quota.as_ref().and_then(|q| q.reset.clone()),
-                });
+                self.state.quota.push(QuotaLoss::from_report(
+                    seat.key.clone(),
+                    "fix",
+                    o.quota.as_ref(),
+                ));
                 Some("rate limited (quota); the fixer could not run".to_owned())
             }
             AgentOutcome::Dropped(_) => Some("the CLI dropped the stream".to_owned()),
@@ -7094,15 +7168,18 @@ impl Runner {
                 fix.failed = Some(format!("the CLI dropped the stream ({why})"));
             }
             AgentOutcome::Quota(o) => {
-                self.state.quota.push(QuotaLoss {
-                    seat: final_seat.key.clone(),
-                    node: "fix".to_owned(),
-                    at: Timestamp::now(),
-                    reset: o.quota.as_ref().and_then(|q| q.reset.clone()),
-                });
+                self.state.quota.push(QuotaLoss::from_report(
+                    final_seat.key.clone(),
+                    "fix",
+                    o.quota.as_ref(),
+                ));
                 fix.failed = Some("rate limited (quota); fixer could not run".to_owned());
             }
             AgentOutcome::Failed(e) | AgentOutcome::ResourceBlocked(e) => fix.failed = Some(e),
+        }
+        if self.state.resource_block.is_some() {
+            self.state.seats.insert(final_seat.key.clone(), final_seat);
+            return Ok(FixStep::Resource);
         }
         fix.continuation = Some(continuation);
         self.state.seats.insert(final_seat.key.clone(), final_seat);
@@ -7707,12 +7784,11 @@ impl Runner {
                 record.error = Some("the CLI dropped the stream".to_owned());
             }
             AgentOutcome::Quota(o) => {
-                self.state.quota.push(QuotaLoss {
-                    seat: seat.key.clone(),
-                    node: "gate-fix".to_owned(),
-                    at: Timestamp::now(),
-                    reset: o.quota.as_ref().and_then(|q| q.reset.clone()),
-                });
+                self.state.quota.push(QuotaLoss::from_report(
+                    seat.key.clone(),
+                    "gate-fix",
+                    o.quota.as_ref(),
+                ));
                 record.error = Some("rate limited (quota); fixer could not run".to_owned());
             }
             AgentOutcome::Failed(e) | AgentOutcome::ResourceBlocked(e) => record.error = Some(e),
@@ -8913,6 +8989,9 @@ impl Runner {
                         continue;
                     }
                 }
+                Ok(_) if self.state.resource_block.is_some() => {
+                    return self.stop_for_resource();
+                }
                 Ok(pr) if self.state.parked => {
                     // `land` already saved the parked marker; nothing here
                     // overrides `status` back to a terminal value while an
@@ -9036,6 +9115,21 @@ impl Runner {
             let result = land::fix_round(&mut self.state, &pr, i + 1, budget, &reason, "").await;
             match result {
                 Ok(land::Fixed::Committed { .. } | land::Fixed::Declined) => {}
+                Ok(land::Fixed::Deferred) => {
+                    // An unavailable fixer did not spend this repair request.
+                    // Restore partial fallback work before retrying it, as for
+                    // an interrupted repair, without closing the request.
+                    let worktree = self
+                        .state
+                        .winner()
+                        .context("repair has no winning branch")?
+                        .worktree
+                        .clone();
+                    self.graft_restore(&worktree, &request.head).await?;
+                    self.state.merge_repairs[i].phase = Phase::Requested;
+                    self.stop_for_resource()?;
+                    return Ok(false);
+                }
                 Ok(land::Fixed::Failed(why)) => {
                     self.hold_merge_repair(
                         i,
@@ -9974,8 +10068,8 @@ async fn wave(
                 .err()
                 .is_some_and(|error| error.is::<agent::ExecutionInterrupted>());
             let out = match out {
-                Ok(o) if o.usable() => AgentOutcome::Ok(o),
                 Ok(o) if o.quota_exhausted() => AgentOutcome::Quota(o),
+                Ok(o) if o.usable() => AgentOutcome::Ok(o),
                 // Billed work the CLI failed to hand over is not an ordinary
                 // failure, but its text is the CLI's raw error JSON, not an
                 // answer — `Dropped` keeps it out of `Ok` so a caller cannot
@@ -10404,7 +10498,7 @@ where
             .cloned()
         };
     let mut fresh: Vec<Option<String>> = vec![None; n];
-    let mut last_quota: Vec<Option<Option<String>>> = vec![None; n];
+    let mut last_quota: Vec<Option<agent::Quota>> = vec![None; n];
     let mut pending: Vec<usize> = (0..n).collect();
 
     // Per seat the work is bounded by `roster.len().max(1) * (1 + retries)`
@@ -10553,7 +10647,7 @@ where
             let parsed = match out {
                 AgentOutcome::Ok(o) => parse(&o.text).map(|v| (v, o)),
                 AgentOutcome::Quota(o) => {
-                    last_quota[i] = Some(o.quota.as_ref().and_then(|q| q.reset.clone()));
+                    last_quota[i] = o.quota.clone();
                     Err(anyhow::anyhow!("rate limited (quota); not retrying now"))
                 }
                 // Not a parseable answer: the nudge loop re-asks it, which is
@@ -10573,6 +10667,13 @@ where
             };
             let quota = class == Some(FailClass::Quota);
             let failed = parsed.is_err();
+            if !failed && matches!(ctx.node, "judge" | "vote") {
+                // A validated answer restores this seat's quorum presence,
+                // including on the normal path after an all-seat block.
+                state
+                    .quota
+                    .retain(|loss| loss.seat != originals[i].seat.key);
+            }
             done[i] = Some(parsed);
             if carry && !failed {
                 let h = state
@@ -10605,14 +10706,25 @@ where
     // One loss per seat whose chain ended on a quota: the intermediate ones
     // were absorbed by a handover and are not losses.
     for (i, q) in last_quota.into_iter().enumerate() {
-        if let Some(reset) = q {
-            losses.push(QuotaLoss {
-                seat: originals[i].seat.key.clone(),
-                node: ctx.node.to_owned(),
-                at: Timestamp::now(),
-                reset,
-            });
+        if let Some(quota) = q {
+            losses.push(QuotaLoss::from_report(
+                originals[i].seat.key.clone(),
+                ctx.node,
+                Some(&quota),
+            ));
         }
+    }
+
+    // A stalled quorum already has its own recovery checkpoint. Refresh
+    // its missing seats before deciding whether it can resume.
+    if state.status != RunStatus::Stalled
+        && ctx.node != "deliberate"
+        && n > 0
+        && losses.len() == n
+        && done.iter().all(|r| r.as_ref().is_some_and(Result::is_err))
+    {
+        block_machine_outage(state, ctx.node, losses);
+        state.quota.append(losses);
     }
 
     seats
@@ -10627,6 +10739,41 @@ where
             )
         })
         .collect()
+}
+
+/// A node with no available agent has no task verdict. Preserve the node
+/// checkpoint and record why a subsequent explicit resume is needed.
+pub(crate) fn block_machine_outage(state: &mut RunState, node: &str, losses: &[QuotaLoss]) {
+    let mut auth: Vec<_> = losses
+        .iter()
+        .filter(|loss| loss.cause == agent::QuotaCause::Authentication)
+        .map(|loss| loss.agent.clone())
+        .collect();
+    auth.sort();
+    auth.dedup();
+    let (kind, detail) = if auth.is_empty() {
+        (
+            "agent usage limit",
+            "All seats reached their agent usage limits; resume after usage is available"
+                .to_owned(),
+        )
+    } else {
+        (
+            "agent authentication",
+            format!(
+                "Agents {} cannot authenticate; re-authenticate these agents, then resume the held task",
+                auth.join(", ")
+            ),
+        )
+    };
+    state.resource_block = Some(crate::run::ResourceBlock {
+        node: node.to_owned(),
+        kind: kind.to_owned(),
+        cause: crate::run::ResourceBlockCause::Other,
+        detail: detail.clone(),
+        at: Timestamp::now(),
+    });
+    state.event(node, detail);
 }
 
 /// Did the wave end without asking any agent (see [`block_wave`])?
@@ -13632,14 +13779,23 @@ mod tests {
 
     #[cfg(unix)]
     async fn registered_runner(root: &Path) -> Runner {
+        repository_runner(root, crate::config::test_coordination()).await
+    }
+
+    async fn repository_runner(
+        root: &Path,
+        coordination: Option<crate::config::Coordination>,
+    ) -> Runner {
         ask_test_home();
         let repo = root.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         init_repo(&repo);
-        std::fs::write(repo.join(".git/updater.contract"), "test-protocol-v1\n").unwrap();
+        if coordination.is_some() {
+            std::fs::write(repo.join(".git/updater.contract"), "test-protocol-v1\n").unwrap();
+        }
         let mut runner = runner_at(RunStatus::Prep);
         runner.state.repo = repo.clone();
-        runner.state.config.coordination = crate::config::test_coordination();
+        runner.state.config.coordination = coordination;
         runner.state.base_commit = git::rev_parse(&repo, "HEAD").await.unwrap();
         runner.state.config.graph.worktree_root = Some(root.join("wt"));
         runner.state.config.graph.advise = false;
@@ -13647,6 +13803,112 @@ mod tests {
         runner.roles.judges = vec![spec("judge")];
         runner.prep().await.unwrap();
         runner
+    }
+
+    const AUTH_OUTAGE: &str = r#"{"is_error":true,"terminal_reason":"api_error","result":"Failed to authenticate: OAuth session expired and could not be refreshed"}"#;
+
+    #[tokio::test]
+    async fn all_unauthenticated_wave_stops_the_node_without_nudges() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut runner = repository_runner(tmp.path(), None).await;
+        let prompts = runner.state.config.prompts.clone();
+        let run = runner.state.id.clone();
+        let ctx = WaveCtx {
+            carry_seats: false,
+            pauses: None,
+            run: &run,
+            node: "advise",
+            prompts: &prompts,
+            cache: None,
+            round: None,
+        };
+        let jobs: Vec<_> = ["alpha", "beta"]
+            .into_iter()
+            .map(|id| SeatJob {
+                spec: scripted(id, AUTH_OUTAGE),
+                seat: SeatState::new(id, id, 7),
+                prompt: "propose".into(),
+                cwd: runner.state.candidates[0].worktree.clone(),
+                timeout: Duration::from_secs(10),
+                allow_write: false,
+                sessions: false,
+                artifacts: agent::artifacts_dir(&runner.state.dir()),
+                stem: id.into(),
+                handover: None,
+            })
+            .collect();
+        let mut losses = Vec::new();
+        let results = ask_wave_with(
+            jobs.clone(),
+            runner.sem.clone(),
+            2,
+            &[],
+            &ctx,
+            &mut losses,
+            &mut runner.state,
+            &|_: &str| Ok(()),
+        )
+        .await;
+        assert!(
+            results
+                .iter()
+                .all(|(seat, result, nudges)| seat.turns == 1 && result.is_err() && *nudges == 0)
+        );
+        assert_eq!(runner.state.quota.len(), 2);
+        assert!(
+            runner
+                .state
+                .quota
+                .iter()
+                .all(|q| q.cause == agent::QuotaCause::Authentication && !q.agent.is_empty())
+        );
+        assert!(!runner.state.advise_attempted);
+        runner.stop_for_resource().unwrap();
+        assert_eq!(runner.state.status, RunStatus::Blocked);
+        assert_eq!(runner.state.resource_block.as_ref().unwrap().node, "advise");
+        assert_eq!(
+            runner.state.resource_block.as_ref().unwrap().kind,
+            "agent authentication"
+        );
+        // A machine loss followed by an ordinary failure is not evidence
+        // that the whole node was unavailable, and must not earn a refund.
+        runner.state.resource_block = None;
+        runner.state.quota.clear();
+        let mut mixed = jobs;
+        mixed[1].spec.command = vec!["false".into()];
+        let results = ask_wave_with(
+            mixed,
+            runner.sem.clone(),
+            0,
+            &[],
+            &ctx,
+            &mut losses,
+            &mut runner.state,
+            &|_: &str| Ok(()),
+        )
+        .await;
+        assert!(results.iter().all(|(_, res, _)| res.is_err()));
+        assert!(runner.state.resource_block.is_none());
+        assert_eq!(losses.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_implementation_keeps_its_candidate_pending() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut runner = repository_runner(tmp.path(), None).await;
+        let implementer = scripted("implement", AUTH_OUTAGE);
+        runner.roles.implementers = vec![implementer.clone()];
+        runner.state.config.agents = vec![implementer];
+        runner.implement().await.unwrap();
+        assert_eq!(runner.state.status, RunStatus::Blocked);
+        assert_eq!(runner.state.quota.len(), 1);
+        assert_eq!(
+            runner.state.quota[0].cause,
+            agent::QuotaCause::Authentication
+        );
+        let candidate = &runner.state.candidates[0];
+        assert!(candidate.failed.is_none() && !candidate.empty && candidate.commits == 0);
+        assert_eq!(runner.state.seats["impl-A"].turns, 1);
     }
 
     #[tokio::test]

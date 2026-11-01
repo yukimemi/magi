@@ -167,3 +167,40 @@ async fn binary_changes_do_not_prevent_grafting_or_review() {
     assert!(graft_events(state).contains(&"applied: changed lines unavailable"));
 }
 }
+
+async fn unavailable_graft_agents_proceed(failure: &str) {
+    let home = common::home_lock().await;
+    let mut fx = fixture(home, Judges::Unanimous, false);
+    with_env(&mut fx, &[("MOCK_STRENGTHS", "1"), (failure, "graft")]);
+    let runner = run(&fx).await;
+    let state = &runner.state;
+    assert!(matches!(
+        state.graft.as_ref().unwrap().outcome,
+        GraftOutcome::RolledBack(_)
+    ));
+    assert!(state.resource_block.is_none());
+    assert_eq!(
+        state
+            .quota
+            .iter()
+            .filter(|loss| loss.node == "graft")
+            .count(),
+        1
+    );
+    assert!(!state.reviews.is_empty());
+    assert!(!state.gate.is_empty());
+    assert_eq!(state.status, RunStatus::Ready);
+    assert!(!winner_has(state, "grafted.txt"));
+}
+
+common::e2e! {
+async fn quota_limited_graft_agents_do_not_block_review_or_gate() {
+    unavailable_graft_agents_proceed("MOCK_QUOTA_SEAT").await;
+}
+}
+
+common::e2e! {
+async fn unauthenticated_graft_agents_do_not_block_review_or_gate() {
+    unavailable_graft_agents_proceed("MOCK_AUTH_SEAT").await;
+}
+}

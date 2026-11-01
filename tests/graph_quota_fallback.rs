@@ -63,23 +63,14 @@ common::e2e! {
 async fn a_seat_that_exhausts_the_whole_roster_records_exactly_one_quota_loss() {
     let _home = common::home_lock().await;
     // Every agent in the roster is rate-limited on this seat: the fallback
-    // chain runs out and today's behaviour applies unchanged.
+    // chain runs out and the node must wait for machine recovery.
     let fx = fixture_with_quota_on_agents(_home, &["alpha", "beta", "gamma"], &["impl-A"]);
     let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
-    // An ordinary all-empty implement round: `after_implement` still fails
-    // the run outright (see `after_implement_still_fails_an_ordinary_all_empty_run`),
-    // exactly as it does today with no fallback in the picture at all — the
-    // fallback chain running out changes nothing about that.
-    let err = runner
-        .execute()
-        .await
-        .expect_err("no candidate produced a change");
-    assert!(
-        err.to_string().contains("no candidate produced a change"),
-        "{err}"
-    );
+    runner.execute().await.expect("machine outage stops resumably");
+    assert_eq!(runner.state.status, magi::run::RunStatus::Blocked);
+    assert_eq!(runner.state.resource_block.as_ref().unwrap().kind, "agent usage limit");
     let state = &runner.state;
 
     // Exactly one loss, not one per fallback attempt: every intermediate
@@ -104,19 +95,12 @@ async fn a_seat_that_exhausts_the_whole_roster_records_exactly_one_quota_loss() 
         "{events:?}"
     );
 
-    // Left as the ordinary quota loss it always was, once nothing else in
-    // the roster is left to try.
-    let a = state
-        .candidates
-        .iter()
-        .find(|c| c.label == 'A')
-        .expect("candidate A");
-    assert!(a.empty, "{a:?}");
+    // The pending candidate can be retried after machine recovery.
+    let a = state.candidates.iter().find(|c| c.label == 'A').expect("candidate A");
+    assert!(!a.empty, "{a:?}");
     assert_eq!(a.commits, 0, "{a:?}");
-    assert_eq!(
-        a.failed.as_deref(),
-        Some("rate limited (quota); produced no change")
-    );
+    assert!(a.failed.is_none());
+    assert!(state.interrupted_implementations.contains(&'A'));
     // Nobody actually answered — every fallback also quota'd out — so the
     // candidate must keep the agent it was assigned at creation, not the
     // last one the fallback happened to try. Crediting `gamma` here would
@@ -124,6 +108,16 @@ async fn a_seat_that_exhausts_the_whole_roster_records_exactly_one_quota_loss() 
     // keyed on `Candidate::agent`, and unfairly count the loss against
     // `gamma` alone.
     assert_eq!(a.agent, "alpha", "{a:?}");
+    let id = state.id.clone();
+    drop(runner);
+    let mut saved = magi::run::RunState::load(&id).unwrap();
+    for agent in &mut saved.config.agents { agent.env.remove("MOCK_QUOTA_SEAT"); }
+    saved.save().unwrap();
+    let mut resumed = Runner::resume(&id).unwrap();
+    resumed.execute().await.expect("resume after quota reset");
+    assert_eq!(resumed.state.status, magi::run::RunStatus::Ready);
+    assert!(resumed.state.interrupted_implementations.is_empty());
+
 }
 }
 
@@ -272,7 +266,8 @@ async fn replacement_implementer_pin_refuses_quota_fallback_and_holds_task() {
     fx.config.graph.selected_implementer = Some("alpha".into());
     let mut runner = Runner::start(&fx.repo, "create note.txt".into(), fx.config.clone(), magi::run::Origin::operator()).await.unwrap();
     let result = runner.execute().await;
-    assert!(result.is_err());
+    assert!(result.is_ok());
+    assert_eq!(runner.state.status, magi::run::RunStatus::Blocked);
     assert_eq!(runner.state.candidates.len(), 1);
     assert_eq!(runner.state.candidates[0].agent, "alpha");
     assert!(runner.state.handovers.is_empty(), "configured beta/gamma must not substitute for the pin");
@@ -287,7 +282,8 @@ async fn replacement_implementer_pin_refuses_quota_fallback_and_holds_task() {
     queue.put(&mut task).unwrap();
     magi::daemon::finish_attempt(3, &queue, &mut task, &runner.state, &[], result);
     assert_eq!(task.status, magi::queue::TaskStatus::Held);
-    assert!(task.operator_held());
+    assert!(!task.operator_held());
+    assert_eq!(task.attempts, 0);
     assert!(task.hold_reason.as_ref().unwrap().contains("alpha"));
     assert!(task.hold_reason.as_ref().unwrap().contains("No other implementer"));
 }
@@ -327,7 +323,7 @@ async fn selected_implementer_quota_cannot_publish_a_seeded_partial_patch() {
     replacement.state.sources = magi::refs::Sources::resolve(
         &fx.repo, &fx.config.merge.remote, None, &[head],
     ).await.unwrap();
-    assert!(replacement.execute().await.is_err());
+    replacement.execute().await.expect("machine outage stops resumably");
     assert_eq!(replacement.state.status, magi::run::RunStatus::Blocked);
     assert!(replacement.state.candidates[0].commits > 0, "the inherited patch alone cannot stand in for the selected implementer");
     assert_eq!(replacement.state.quota.len(), 1);

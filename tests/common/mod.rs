@@ -265,6 +265,10 @@ fi
 # `git rebase --skip` once, on the first stop only, then resolves as usual. Both count their calls in
 # `rebase-fix.log` in the run's artifacts directory.
 if has "Your rebase stopped on a conflict"; then
+  if [ -n "$MOCK_REBASE_AUTH" ]; then
+    printf '%s\n' '{"is_error":true,"terminal_reason":"api_error","result":"Failed to authenticate: OAuth session expired and could not be refreshed"}'
+    exit 1
+  fi
   echo "$seat" >> "$artifacts/rebase-fix.log"
   if [ -n "$MOCK_REBASE_FIX_NOOP" ]; then
     printf '{"addressed":[],"rejected":[],"notes":"changed nothing"}\n'
@@ -403,6 +407,13 @@ fi
 # fall through to the implementation branch below, so a seat that had just been
 # rate limited answered a retry with a SUMMARY block claiming it created
 # note.txt — which looks like success, and hid the very retry this forbids.
+# Authentication outages use the same node/seat filters as quota, but need
+# explicit operator recovery rather than a timed reset.
+if [ -n "$MOCK_AUTH_SEAT" ] && { case ",$MOCK_AUTH_SEAT," in *",$seat,"*) true ;; *) false ;; esac; } && only; then
+  printf '%s\n' '{"is_error":true,"terminal_reason":"api_error","result":"Failed to authenticate: OAuth session expired and could not be refreshed"}'
+  exit 1
+fi
+
 if [ -n "$MOCK_QUOTA_SEAT" ] && { case ",$MOCK_QUOTA_SEAT," in *",$seat,"*) true ;; *) false ;; esac; } && only; then
   printf '{"is_error":true,"terminal_reason":"api_error","result":"You'\''ve hit your session limit","session_id":"quota-test"}\n'
   exit 1
@@ -544,6 +555,10 @@ fi
 # never recovers, for exhaustion coverage; every other matching seat recovers
 # on this, its first resumed call.
 if has "the report this step requires"; then
+  if [ -n "$MOCK_CONTINUATION_AUTH" ]; then
+    printf '%s\n' '{"is_error":true,"terminal_reason":"api_error","result":"Failed to authenticate: OAuth session expired and could not be refreshed"}'
+    exit 1
+  fi
   if [ -n "$MOCK_FIX_ALWAYS_INCOMPLETE_SEAT" ] && { case ",$MOCK_FIX_ALWAYS_INCOMPLETE_SEAT," in *",$seat,"*) true ;; *) false ;; esac; }; then
     printf "Still waiting on the background test run; I will report back once it finishes.\n"
     exit 0
@@ -622,6 +637,9 @@ if has "Your patch was reviewed"; then
   # resume, `MOCK_FIX_INCOMPLETE_SEAT` does.
   if { [ -n "$MOCK_FIX_INCOMPLETE_SEAT" ] && { case ",$MOCK_FIX_INCOMPLETE_SEAT," in *",$seat,"*) true ;; *) false ;; esac; }; } \
     || { [ -n "$MOCK_FIX_ALWAYS_INCOMPLETE_SEAT" ] && { case ",$MOCK_FIX_ALWAYS_INCOMPLETE_SEAT," in *",$seat,"*) true ;; *) false ;; esac; }; }; then
+    if [ -n "$MOCK_FIX_UNCOMMITTED" ]; then
+      echo "work before report loss" > retained-fix.txt
+    fi
     printf "I'll pause here until the background test run reports back. I will continue once it completes.\n"
     exit 0
   fi

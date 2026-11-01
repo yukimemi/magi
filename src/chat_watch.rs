@@ -328,6 +328,30 @@ fn kill_group(pid: u32) {
 #[cfg(not(unix))]
 fn kill_group(_pid: u32) {}
 
+// The internal wrapper has a separate, bounded launch phase. Its process
+// startup and identity checks must not consume the watched command's budget.
+fn watch_timeout(
+    startup_deadline: Instant,
+    execution_deadline: &mut Option<Instant>,
+    executing: bool,
+    timeout: u64,
+    now: Instant,
+) -> Option<String> {
+    if executing && execution_deadline.is_none() {
+        *execution_deadline = Some(now + Duration::from_secs(timeout));
+    }
+    match *execution_deadline {
+        Some(deadline) if now >= deadline => Some(format!(
+            "timed out after {timeout} second{}",
+            if timeout == 1 { "" } else { "s" }
+        )),
+        None if now >= startup_deadline => {
+            Some("startup failed: watch wrapper did not start the command".to_owned())
+        }
+        _ => None,
+    }
+}
+
 /// Internal supervisor entry point. The per-job OS lock is a durable lease:
 /// released on process death, without age-based guesses or restarting the job.
 pub fn supervise(home: &Path, id: &str) -> Result<()> {
@@ -404,7 +428,8 @@ pub fn supervise(home: &Path, id: &str) -> Result<()> {
         tail.clone(),
         stopped.clone(),
     );
-    let deadline = Instant::now() + Duration::from_secs(job.timeout);
+    let startup_deadline = Instant::now() + Duration::from_secs(10);
+    let mut execution_deadline = None;
     let outcome = loop {
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -423,14 +448,19 @@ pub fn supervise(home: &Path, id: &str) -> Result<()> {
                 );
             }
             Err(e) => break format!("result unknown: {e}"),
-            Ok(None) if Instant::now() >= deadline => {
-                break format!(
-                    "timed out after {} second{}",
+            Ok(None) => {
+                let executing = execution_deadline.is_some() || dir.join("executing").is_file();
+                if let Some(result) = watch_timeout(
+                    startup_deadline,
+                    &mut execution_deadline,
+                    executing,
                     job.timeout,
-                    if job.timeout == 1 { "" } else { "s" }
-                );
+                    Instant::now(),
+                ) {
+                    break result;
+                }
+                std::thread::sleep(Duration::from_millis(20));
             }
-            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
         }
     };
     kill_group(child.id());
@@ -568,6 +598,9 @@ pub fn execute(home: &Path, id: &str) -> Result<()> {
                 .env_remove("MAGI_RUN")
                 .env_remove("MAGI_NODE");
             command.quiet();
+            // Signal only after authorization and command construction. The
+            // supervisor starts the command timeout at this execution boundary.
+            std::fs::write(dir.join("executing"), b"ready")?;
             #[cfg(unix)]
             let error = command.exec();
             #[cfg(windows)]
@@ -822,6 +855,50 @@ mod tests {
         fn read_available(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
             self.read(bytes)
         }
+    }
+
+    #[test]
+    fn wrapper_startup_does_not_spend_the_command_timeout() {
+        let start = Instant::now();
+        let startup = start + Duration::from_secs(10);
+        let mut execution = None;
+        let ready = start + Duration::from_secs(9);
+        assert_eq!(
+            watch_timeout(startup, &mut execution, false, 1, ready),
+            None
+        );
+        assert_eq!(watch_timeout(startup, &mut execution, true, 1, ready), None);
+        assert_eq!(
+            watch_timeout(
+                startup,
+                &mut execution,
+                true,
+                1,
+                ready + Duration::from_millis(999)
+            ),
+            None
+        );
+        assert_eq!(
+            watch_timeout(
+                startup,
+                &mut execution,
+                false,
+                1,
+                ready + Duration::from_secs(1)
+            ),
+            Some("timed out after 1 second".into())
+        );
+    }
+
+    #[test]
+    fn an_unstarted_wrapper_has_a_bounded_startup_failure() {
+        let deadline = Instant::now();
+        let mut execution = None;
+        assert_eq!(
+            watch_timeout(deadline, &mut execution, false, 1, deadline),
+            Some("startup failed: watch wrapper did not start the command".into())
+        );
+        assert!(execution.is_none());
     }
 
     #[test]

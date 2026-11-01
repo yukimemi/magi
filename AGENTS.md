@@ -663,7 +663,7 @@ docs, and each is asserted in `src/agent.rs` tests:
 
 | CLI | open | resume | trap |
 |---|---|---|---|
-| `claude` | `--session-id <uuid>` | `--resume <uuid>` | the uuid must be RFC 4122 v4 or the CLI rejects it (`src/rng.rs` mints it) |
+| `claude` | `--session-id <uuid>` | `--resume <uuid>` | the uuid must be RFC 4122 v4 or the CLI rejects it (`src/rng.rs` mints it); an expired OAuth session requires re-authentication before resuming |
 | `opencode` | `--format json` → `sessionID` | `-s <id>` | nothing to resume until a turn reported an id |
 | `agy` | `--output-format json` → `conversation_id` | `--conversation <id>` | print mode defaults to a **5 minute** timeout; `--print-timeout` must track the node budget. `--disable-slash-commands` silently disables `--mode`, so magi never passes it |
 | `codex` | `exec --json` → `thread.started.thread_id` | `exec … resume <id>` | `resume` is a **subcommand** and rejects every `exec` option that follows it (`unexpected argument '--sandbox'`), so magi emits all options first and the subcommand last. The prompt goes on stdin, which codex reads only when the prompt argument is `-`. The answer is the **last** `item.completed` whose item is an `agent_message`: earlier ones narrate the tool loop |
@@ -1019,11 +1019,49 @@ upstream CRLF, not drift worth committing — normalise back to LF and
 
 ### Rate limits, and what a collapsed panel means
 
-- **Quota is detected, not guessed.** `agent::claude_quota` keys on the *only*
-  observed shape (a JSON object with `is_error: true` and a `result` mentioning
-  `session limit`) and treats everything else — other CLIs, unknown output — as
-  an ordinary failure. `AgentOutcome::Quota` is distinct from `Failed`, and a
-  quota'd seat is **not** re-asked, because a retry now fails the same way.
+- **Machine failures are detected, not guessed.** Claude usage detection accepts
+  `is_error: true` with a `session limit` result, or the structured
+  `429` / `usage_limit_reached` pair. Codex requires a top-level `error` event
+  starting with the observed `You've hit your usage limit. Visit
+  https://chatgpt.com/settings/usage to purchase more credits` message **and** a
+  `turn.failed` event in the same invocation; `try again at ` supplies the reset
+  hint to the existing dated parser. agy's structured quota shapes remain
+  supported. Assistant text quoting errors is never evidence.
+- **Authentication is a machine failure too.** Claude must report
+  `is_error: true`, `terminal_reason: "api_error"`, and a result starting with
+  `Failed to authenticate:` containing `OAuth session expired and could not be
+  refreshed`. Unknown errors, including unobserved Codex/agy authentication
+  shapes, remain ordinary failures. `Quota::cause` and `QuotaLoss::cause`
+  distinguish authentication from usage limits (serde defaults preserve older
+  records); losses also retain the agent id. Both use `AgentOutcome::Quota`,
+  so neither is immediately re-asked and both can hand over to another agent.
+  Authentication raises a notice keyed by agent id asking to re-authenticate.
+  A fixer chain ending in a usage limit or authentication failure uses its
+  caller's resource deferral path, including the independent landing fixer
+  chain: it records the final agent/cause and defers without handing off the
+  PR or spending a fix round. Partial edits are rescued to a local commit
+  under repository coordination before deferral; normal resume gates that
+  commit before publishing it. Resume retries its checks/comments; an explicit
+  merge-repair request remains pending after restoring partial fixer work.
+  This excludes best-effort graft, which records
+  the loss, restores its tree and proceeds to review and gate. The same applies
+  to missing-report continuations: gate and review fix rounds remain unspent
+  until recovery. Operator fixes rescue edits, release their worktree and save
+  an unreported outcome before deferring; retry explicitly with `magi fix`
+  after recovery (`--allow-stale` if the saved work moved the branch).
+- **A node with no available agents stops resumably.** When every final seat
+  of an advisor, implementation or shared structured wave ends on quota/auth,
+  record a `ResourceBlock` and stop `Blocked` before completing the node.
+  Pending candidates stay pending; successful earlier work stays intact.
+  Settlement and orphan recovery refund the attempt. Usage stops retain the
+  existing cooldown policy (a pinned implementer remains held); authentication
+  stops use a machine `Held` reason
+  and require re-authentication followed by explicit release/resume, never a
+  cooldown-triggered second empty attempt. Historical losses alone must not
+  turn a later ordinary failure into a refundable machine outage.
+  Sequential deliberation aggregates all turns in a round before declaring
+  an outage; one unavailable seat does not block healthy peers. Interrupted
+  rounds remain pending, while completed rounds survive resumption.
 - **A verdict needs a quorum.** `tally()` counts a judge as present unless a
   `QuotaLoss` names that seat; a strict majority (`judges/2 + 1`) is required,
   or the run becomes `Stalled`. `Stalled` is a terminal-but-suspect status: it
@@ -1038,7 +1076,10 @@ upstream CRLF, not drift worth committing — normalise back to LF and
   the seats recorded in `RunState::quota` for the judge/vote nodes (never a
   healthy seat), and if the re-tally restores the quorum the run picks up and
   finishes; for a seat that ranks again its `QuotaLoss` is dropped so `tally`
-  counts it present. If the quota is still out, the seat fails again, the run
+  counts it present. Successful validated judge/vote answers also clear the
+  seat's previous losses on the normal path after an all-seat `Blocked` wave;
+  the first healthy resume must restore quorum without another stall.
+  If the quota is still out, the seat fails again, the run
   stays `Stalled` and the marker is persisted (the normal end-of-execute save
   sits below the `Stalled` return), so it stays resumable for a later retry.
 
@@ -1145,10 +1186,10 @@ whole of a run).
 - `Task::fail` decides whether an attempt was the last one, with no disk in
   the way, so the retry policy is asserted directly.
 
-**A quota stall is refunded, and only a quota stall.** `Task::stall`
-decrements `attempts`. A rate limit is a property of the machine, not of the
-task, and a quota window closing overnight must not leave a backlog of `held`
-tasks that were never actually judged. Do not "simplify" this into `fail`.
+**A quota stall or recorded machine resource stop is refunded.** `Task::stall`
+decrements `attempts`. A rate limit or authentication outage is a property of
+the machine, not of the task, and a quota window closing overnight must not
+leave a backlog of `held` tasks that were never actually judged. Do not "simplify" this into `fail`.
 
 But the refund is keyed on `Verdict::quota_hit`, not on the `Stalled` status,
 and that distinction is load-bearing. A quorum can collapse for a reason that
@@ -1334,7 +1375,11 @@ resolves it and runs `git rebase --continue`. magi never resolves a conflict
 itself. The budget is `graph.review_rounds`, counted in
 `RunState::rebase_fixes` and saved *before* each call (so a park or crash
 cannot hand a round back), shared by both callers, and touching neither the
-task's attempts nor land's own rebase budget. A round is judged by what git
+task's attempts nor land's own rebase budget. An observed machine outage
+retains the scratch rebase and its original index baseline, records
+`RebaseFixRecord::outage`, and stops with a resource block instead of a
+permanent conflict. Such records do not spend the conflict-round budget.
+A round is judged by what git
 says - rebase no longer in progress, nothing unmerged, no markers left in a
 path that conflicted, the base an ancestor of the result - never by the
 fixer's report. `git::rebase_start` records HEAD after each pick with
