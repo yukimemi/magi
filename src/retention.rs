@@ -199,7 +199,7 @@ async fn cargo_target(worktree: &Path) -> Result<PathBuf> {
     }
     let tag = std::fs::read_to_string(target.join("CACHEDIR.TAG"))?;
     ensure!(
-        tag.starts_with("Signature: 8a477f597d28d172789f06886806bc55d"),
+        tag.starts_with("Signature: 8a477f597d28d172789f06886806bc55"),
         "unknown Cargo cache tag"
     );
     let info: serde_json::Value =
@@ -1298,7 +1298,7 @@ mod tests {
             std::fs::write(target.join("debug/.cargo-lock"), "").unwrap();
             std::fs::write(
                 target.join("CACHEDIR.TAG"),
-                "Signature: 8a477f597d28d172789f06886806bc55d\n",
+                "Signature: 8a477f597d28d172789f06886806bc55\n",
             )
             .unwrap();
             std::fs::write(
@@ -1323,6 +1323,88 @@ mod tests {
                 .unwrap();
             task
         }
+    }
+
+    #[tokio::test]
+    async fn sweep_reclaims_real_cargo_outputs_and_preserves_source_and_unknown_files() {
+        let f = Fx::new().await;
+        let state = f.run("ca00", true).await;
+        let wt = &state.candidates[0].worktree;
+        let source = "fn main() { println!(\"retained fixture\"); }\n";
+        std::fs::create_dir(wt.join("src")).unwrap();
+        std::fs::write(wt.join("src/main.rs"), source).unwrap();
+        std::fs::write(
+            wt.join("Cargo.toml"),
+            "[package]\nname = \"retained-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[workspace]\n",
+        )
+        .unwrap();
+        let mut cargo = std::process::Command::new("cargo");
+        cargo.env_clear();
+        for key in ["PATH", "HOME", "RUSTUP_HOME"] {
+            if let Some(value) = std::env::var_os(key) {
+                cargo.env(key, value);
+            }
+        }
+        let build = cargo
+            .current_dir(wt)
+            .env("RUSTUP_TOOLCHAIN", "stable")
+            .env("CARGO_HOME", f._temp.path().join("cargo-home"))
+            .env("CARGO_INCREMENTAL", "0")
+            .args([
+                "build",
+                "--offline",
+                "--release",
+                "--jobs",
+                "1",
+                "--target-dir",
+            ])
+            .arg(wt.join("target"))
+            .output()
+            .unwrap();
+        assert!(
+            build.status.success(),
+            "{}",
+            String::from_utf8_lossy(&build.stderr)
+        );
+        git::git(wt, &["add", "Cargo.toml", "Cargo.lock", "src"])
+            .await
+            .unwrap();
+        git::git(wt, &["commit", "-m", "real Cargo fixture"])
+            .await
+            .unwrap();
+        let artifact = wt.join("target/release/retained-fixture");
+        assert!(artifact.is_file());
+        let unknown = wt.join("target/release/operator-note");
+        std::fs::write(&unknown, "keep this note\n").unwrap();
+
+        let out = sweep(&f.home, &Fx::disk(), Fx::now()).await;
+        assert!(out.freed_bytes > 0, "{out:?}");
+        assert!(!artifact.exists(), "{out:?}");
+        assert_eq!(
+            std::fs::read_to_string(wt.join("src/main.rs")).unwrap(),
+            source
+        );
+        assert_eq!(
+            std::fs::read_to_string(&unknown).unwrap(),
+            "keep this note\n"
+        );
+        assert_eq!(std::fs::read_to_string(wt.join("source")).unwrap(), "ca00");
+        let ledger: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                f.home
+                    .join("runs")
+                    .join(&state.id)
+                    .join("build-outputs.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            ledger["files"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!(artifact))
+        );
     }
 
     #[tokio::test]

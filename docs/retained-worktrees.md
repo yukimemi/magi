@@ -25,7 +25,8 @@ ineligible targets do not consume the first-deletion exception. Low free space
 permits reclamation below the cap, but does not override grace or ownership.
 
 Only plain, canonical, registered worktrees are eligible. A legacy `target` must
-be ignored, contain no tracked files, carry Cargo's cache tag and rustc identity,
+be ignored, contain no tracked files, carry Cargo's standard
+[cache directory tag signature](https://bford.info/cachedir/) and rustc identity,
 and contain only recognized Cargo root entries (`debug`, `release`, the tag and
 identity). These checks do not authorize recursive deletion. Cleanup removes only
 regular artifact files declared as outputs in rustc dep-info (`.d`) records in
@@ -220,6 +221,13 @@ distinct runs, three candidate-bearing runs, and 106 occurrences of the same
 referenced-commit cherry-pick failure. The two old useful candidates and the
 later candidate all remain recovery evidence. A completed task label does not
 authorize discarding that work. No local historical run was changed.
+
+The real-Cargo retention regression builds a dependency-free temporary crate offline
+with stable Cargo, an isolated Cargo home and an explicit temporary target directory.
+It passes Cargo's unchanged cache identity and dep-info through the production sweep,
+checking artifact reclamation and its ledger while preserving source and an unknown
+profile file. Synthetic fixtures continue to cover the other safety protections
+and the oversized-target budget exception.
 
 Focused regression verification:
 
