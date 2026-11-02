@@ -617,16 +617,19 @@ async fn execute_decision(
             .map(|_| ())
             .map_err(|e| anyhow::Error::new(BeforeEffect(e)))
             .and_then(|()| -> Result<String> {
-                ensure!(
+                let pinned =
                     crate::resume::pin_queued(queue, run, None, Some(id)).map_err(|error| {
-                        if error.is::<crate::resume::ClaimContended>() {
+                        if error.is::<crate::resume::BeforeQueueWrite>() {
                             anyhow::Error::new(BeforeEffect(error))
                         } else {
                             error
                         }
-                    })?,
-                    "no queued task owns this run"
-                );
+                    })?;
+                if !pinned {
+                    return Err(anyhow::Error::new(BeforeEffect(anyhow::anyhow!(
+                        "no queued task owns this run"
+                    ))));
+                }
                 Ok(format!(
                     "resume queued for {run}; execution start remains unconfirmed"
                 ))

@@ -2740,6 +2740,7 @@ async fn ask_cmd(args: AskArgs) -> Result<()> {
         }
         None => {
             let mut q = ask::Question::new(run, node, seat, summary, detail, choices);
+            q.legacy_foreground = true;
             q.actions = actions;
             // Recorded once, here, so a later `magi ask --wait` enforces the
             // deadline this call actually asked with, not whatever `--timeout`

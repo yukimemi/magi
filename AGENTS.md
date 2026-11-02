@@ -3607,3 +3607,13 @@ effect; accepted uncertain requests still require reconciliation. Resume queue
 claim contention is pre-effect and retryable; a queue persistence failure remains
 uncertain. Dismissal's durable run checkpoint confirms its effect even when the
 owning task is Done or has a later attempt and intentionally receives no marker.
+
+run 付きの非タスク問い合わせにも legacy foreground 経路がある。
+`Question::legacy_foreground` は CLI がタスク所有を見つけられなかった時点の来歴である。
+過去分は確認できる foreground 来歴を使い、queue にタスクがないことだけで
+移行対象から除外しない。破損した無関係な inquiry は新規作成を止めず、
+一覧の未読込件数と警告に残す。同一 ID の破損は上書きしない。
+`resume::pin_queued` の書込み前の拒否は取消・再試行可能にする一方、
+queue 書込み失敗の結果は不確実として保持する。
+撤回は対応する質問・対象の閉鎖確認と実行終了の永続記録で解決する。
+watch の既報の起動待ちタイムアウトと再現検証の限界は README の検証記録を参照する。

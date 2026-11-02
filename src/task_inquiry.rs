@@ -186,7 +186,8 @@ impl Outbox {
         // unchanged intent; known generations also retain resolved history.
         if !self.path(&id)?.exists() {
             let retained: Vec<_> = self
-                .list()?
+                .list_readable()?
+                .0
                 .into_iter()
                 .filter(|saved| {
                     saved.id.starts_with("task-")

@@ -90,8 +90,8 @@ pub(crate) async fn start(home: &Path, id: String) -> Result<()> {
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("resume task claim was not acquired: {0:#}")]
-pub(crate) struct ClaimContended(pub anyhow::Error);
+#[error("resume did not reach its queue write: {0:#}")]
+pub(crate) struct BeforeQueueWrite(pub anyhow::Error);
 
 /// Hand a resumable run back to the queue task that owns it, pinned to that
 /// exact run, so the loop's ordinary start logic resumes it under the graph's
@@ -109,7 +109,7 @@ pub(crate) fn pin_queued(
     applied: Option<&str>,
 ) -> Result<bool> {
     use crate::queue::TaskStatus;
-    crate::task_reassign::ensure_current(queue, run)?;
+    crate::task_reassign::ensure_current(queue, run).map_err(BeforeQueueWrite)?;
     let Some(listed) = queue
         .list()
         .into_iter()
@@ -117,20 +117,24 @@ pub(crate) fn pin_queued(
     else {
         return Ok(false);
     };
-    let _claim = queue.claim(&listed.id).map_err(ClaimContended)?;
-    let mut task = queue.get(&listed.id)?;
-    ensure!(
-        task.execution_runs().last().map(String::as_str) == Some(run)
-            && !matches!(task.status, TaskStatus::Running | TaskStatus::Done),
-        "run queue owner changed"
-    );
-    ensure!(
-        match decided_before {
-            Some(answered) => task.operator_decided_at.is_none_or(|at| at <= answered),
-            None => true,
-        },
-        "resume was superseded by a newer operator decision"
-    );
+    let _claim = queue.claim(&listed.id).map_err(BeforeQueueWrite)?;
+    let mut task = queue.get(&listed.id).map_err(BeforeQueueWrite)?;
+    let preflight = || -> Result<()> {
+        ensure!(
+            task.execution_runs().last().map(String::as_str) == Some(run)
+                && !matches!(task.status, TaskStatus::Running | TaskStatus::Done),
+            "run queue owner changed"
+        );
+        ensure!(
+            match decided_before {
+                Some(answered) => task.operator_decided_at.is_none_or(|at| at <= answered),
+                None => true,
+            },
+            "resume was superseded by a newer operator decision"
+        );
+        Ok(())
+    };
+    preflight().map_err(BeforeQueueWrite)?;
     if applied.is_none()
         && task.status == TaskStatus::Queued
         && task

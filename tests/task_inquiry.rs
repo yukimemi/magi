@@ -907,11 +907,18 @@ common::e2e! {
 async fn foreground_non_task_questions_remain_answerable_after_migration_and_restart() {
     use magi::ask::{Answer, Question, Questions};
     let fx = common::fixture(common::home_lock().await, common::Judges::Unanimous, false);
+    for kind in ["empty", "run-operator", "old-agent"] {
     for old_boundary in ["new", "pending", "completed"] {
-        let home = fx.tmp.path().join(format!("foreground-{old_boundary}"));
+        let home = fx.tmp.path().join(format!("foreground-{kind}-{old_boundary}"));
         let queue = Queue::at(home.join("queue")); let talks = Talks::at(home.join("talks"));
         let questions = Questions::at(home.join("questions"));
         let mut q = Question::new(String::new(), "ask".into(), "operator".into(), "Standalone question".into(), "Foreground wait must receive the reply".into(), vec![]);
+        if kind == "run-operator" { q.run = "legacy-run-without-owner".into(); }
+        if kind == "old-agent" {
+            let mut run = magi::run::RunState::new(fx.repo.clone(), "main".into(), "base".into(), "legacy work".into(), fx.config.clone());
+            run.reserve_under(&home).unwrap(); run.origin = Some(magi::run::Origin::operator()); run.save_under(&home).unwrap();
+            q.run = run.id; q.node = "implement".into(); q.seat = "impl-A".into(); q.cwd = Some(fx.repo.to_string_lossy().into_owned());
+        }
         questions.put(&mut q).unwrap();
         if old_boundary != "new" {
             let dir = home.join("notifications/task-chat-migration-v1"); std::fs::create_dir_all(&dir).unwrap();
@@ -926,5 +933,103 @@ async fn foreground_non_task_questions_remain_answerable_after_migration_and_res
             assert!(Outbox::at(&home).list().unwrap().is_empty());
         }
     }
+    }
+}
+}
+
+common::e2e! {
+async fn rejected_resume_preconditions_remain_unstarted_and_explicitly_cancellable() {
+    use magi::{chat_control::{self, Operation}, run::{RunState, RunStatus}, task_decision::Status};
+    let fx = common::fixture(common::home_lock().await, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("resume-preconditions");
+    let queue = Queue::at(home.join("queue")); let talks = Talks::at(home.join("talks"));
+    let chat = talk::begin(&talks, &fx.config, fx.repo.clone(), Some("alpha")).unwrap();
+    for rejection in ["older", "done", "running"] {
+        let mut state = RunState::new(fx.repo.clone(), "main".into(), "base".into(), "work".into(), fx.config.clone());
+        state.reserve_under(&home).unwrap(); state.status = RunStatus::Blocked; state.driver_exited = true; state.save_under(&home).unwrap();
+        let mut task = Task::new("work".into(), "work".into(), fx.repo.clone(), Source::Human);
+        task.chat = Some(chat.id.clone()); task.runs.push(state.id.clone());
+        match rejection {
+            "older" => task.runs.push("newer-run".into()),
+            "done" => task.status = magi::queue::TaskStatus::Done,
+            "running" => task.status = magi::queue::TaskStatus::Running,
+            _ => unreachable!(),
+        }
+        queue.put(&mut task).unwrap();
+        let outbox = Outbox::at(&home);
+        let q = outbox.file(&task, Some(state.id.clone()), "owner".into(), "Resume request", rejection).unwrap();
+        outbox.deliver(&queue, &talks, &q.id).unwrap();
+        let before = std::fs::read(queue.path_of(&task.id)).unwrap();
+        for _ in 0..2 {
+            assert!(chat_control::dispatch(&queue, &home, &talks, &chat.id, Operation::ForDecision { inquiry: q.id.clone(), command: Box::new(Operation::Resume { run: state.id.clone() }) }).await.is_err());
+            chat_control::reconcile_decisions(&queue, &home).unwrap();
+            let failed = Outbox::at(&home).get(&q.id).unwrap().decision.unwrap();
+            assert_eq!(failed.status, Status::RetryNeeded); assert!(failed.retry_safe);
+            assert_eq!(std::fs::read(queue.path_of(&task.id)).unwrap(), before);
+        }
+        chat_control::dispatch(&queue, &home, &talks, &chat.id, Operation::SettleDecision { inquiry: q.id.clone(), reason: "Owner cancels the rejected resume".into(), replacement: None }).await.unwrap();
+        assert_eq!(outbox.get(&q.id).unwrap().decision.unwrap().status, Status::Resolved);
+        assert_eq!(std::fs::read(queue.path_of(&task.id)).unwrap(), before);
+        assert!(magi::run::RunState::load_under(&state.id, &home).unwrap().decision_starts.is_empty());
+    }
+    assert!(magi::worker::active(&home).unwrap().is_empty());
+}
+}
+
+common::e2e! {
+async fn task_scoped_cli_ask_survives_unrelated_corruption_without_overwriting_it() {
+    let fx = common::fixture(common::home_lock().await, common::Judges::Unanimous, false);
+    publish_config(&fx);
+    let home = fx.tmp.path().join("file-around-corruption");
+    let queue = Queue::at(home.join("queue"));
+    let mut task = Task::new("work".into(), "work".into(), fx.repo.clone(), Source::Human);
+    task.runs.push("run-a".into()); queue.put(&mut task).unwrap();
+    let dir = home.join("notifications/task-inquiries"); std::fs::create_dir_all(&dir).unwrap();
+    let corrupt = dir.join("unrelated.json"); std::fs::write(&corrupt, "{truncated").unwrap();
+    for _ in 0..2 {
+        let output = common::magi_cli(&home).current_dir(&fx.repo)
+            .env("MAGI_RUN", "run-a").env("MAGI_NODE", "implement").env("MAGI_SEAT", "impl-A")
+            .args(["ask", "--summary", "New request", "--detail", "Unrelated corruption must stay isolated", "--request", "stable-request"]).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let (items, unreadable) = Outbox::at(&home).list_readable().unwrap();
+        assert_eq!(items.len(), 1); assert_eq!(unreadable, 1);
+        assert_eq!(items[0].task, task.id); assert!(items[0].decision.as_ref().unwrap().request.is_none());
+        assert_eq!(std::fs::read_to_string(&corrupt).unwrap(), "{truncated");
+    }
+}
+}
+
+common::e2e! {
+async fn real_foreground_ask_with_a_run_survives_migration_and_receives_a_fresh_reply() {
+    use magi::ask::{Answer, Questions};
+    let fx = common::fixture(common::home_lock().await, common::Judges::Unanimous, false);
+    publish_config(&fx);
+    let home = fx.tmp.path().join("run-foreground");
+    let queue = Queue::at(home.join("queue")); let talks = Talks::at(home.join("talks"));
+    let questions = Questions::at(home.join("questions"));
+    let mut child = common::magi_cli(&home).current_dir(&fx.repo)
+        .env("MAGI_RUN", "run-without-a-task").env("MAGI_NODE", "implement").env("MAGI_SEAT", "impl-A")
+        .args(["ask", "--summary", "Foreground request", "--detail", "No task owns this run", "--timeout", "15"])
+        .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let q = loop {
+        if let Some(q) = questions.list().pop() { break q; }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill(); let output = child.wait_with_output().unwrap();
+            panic!("foreground inquiry not filed: {}", String::from_utf8_lossy(&output.stderr));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    // Finish/reap the child before making assertions, including failure paths.
+    magi::task_chat::sweep(&queue, &talks, &questions, &home);
+    let answer = questions.update(&q.id, |q| q.answer(Answer::Text("Fresh foreground reply".into())));
+    if answer.is_err() { let _ = child.kill(); }
+    let output = child.wait_with_output().unwrap();
+    answer.unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Fresh foreground reply"));
+    assert!(q.legacy_foreground); assert_eq!(q.run, "run-without-a-task");
+    assert!(Outbox::at(&home).list().unwrap().is_empty()); assert!(queue.list().is_empty());
+    assert_eq!(Questions::at(home.join("questions")).get(&q.id).unwrap().resolution().as_deref(), Some("Fresh foreground reply"));
 }
 }

@@ -1710,3 +1710,32 @@ Fresh chat commands bind their exact response generation before it is exposed
 to consumers, avoiding a crash window that could consume an older title or
 answer. Legacy workers cannot resume imported sources. The original source
 files remain available to the passive history decoder.
+
+
+判断待ち基盤の追加検証（2026-11-02）:
+`watch_supervisor_loss_is_reported_without_reexecuting_the_command` の既報の失敗は、
+watch 登録後、コマンドが `starts` を作成するまでの5秒待ちで発生しており、
+SIGKILL 後の効果再実行や判断待ちへの投影まで到達していない。
+第1修正ラウンドでは実際の CLI・supervisor・コマンドを使う同テストが2回とも通過した。
+その時点の `src/chat_watch.rs` と `tests/chat_notify.rs` は、固定された基点
+`4eda9559dff7c6a9fac29100d549d8e22bddcea2` との差分がないことを確認した。
+したがって今回導入した判断状態の変更による回帰を示す証拠は得られていないが、
+既報のタイムアウトの根本原因は未特定であり、修正済みとは扱わない。
+再発時の診断用に、同じ5秒制限の失敗メッセージへ永続ジョブと
+`armed` / `executing` / `spawn-error` の状態を追加した。
+本番の wrapper 起動猶予は10秒で、登録成功はコマンドの最初の書込み完了を保証しない。
+この差から起動遅延は調査候補になるが、既報の実測原因だとは断定できない。
+テストの時間制限、強制終了、通知内容と一度だけの実行の検証は維持している。
+第2修正ラウンドでも、`RUSTUP_TOOLCHAIN=stable cargo test --locked --test chat_notify
+watch_supervisor_loss_is_reported_without_reexecuting_the_command -- --nocapture`
+を3回実行してすべて通過し、既報の失敗は再現しなかった。
+第1修正時点と基点の同一性は `git diff 4eda9559dff7c6a9fac29100d549d8e22bddcea2
+f93acf27 -- src/chat_watch.rs tests/chat_notify.rs` が空であることから再確認できる。
+全対象テストと最終ゲートは親実行で確認する。
+
+run を持つ従来型問い合わせも維持対象となる。新規 CLI 問い合わせは
+所有タスクがないため foreground 経路を選んだことを `legacy_foreground` に保存する。
+過去分は operator 由来、またはタスクを持たない run と保存済みの作業ディレクトリから
+来歴を確認し、タスク不在だけでは非タスク扱いにしない。
+撤回の解決には対応する質問・対象の閉鎖確認と `Superseded` の永続記録が必要で、
+回答の受付や閉鎖失敗では解決しない。無関係な破損項目は報告を続けながら新規作成から隔離する。

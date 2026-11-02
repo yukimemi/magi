@@ -51,6 +51,9 @@ pub(crate) fn routes(q: &Question, home: &Path) -> bool {
     if q.routed_task.is_some() {
         return true;
     }
+    if standalone_inquiry(home, q) {
+        return false;
+    }
     if !q.status.open() || !chat_routable(q) {
         return false;
     }
@@ -252,10 +255,37 @@ pub(crate) fn migration_sources(home: &Path) -> Result<Option<std::collections::
 
 /// A foreground ask without run/task attribution retains legacy ownership.
 /// Release-watch inquiries may have an empty run but still belong to a task.
-pub(crate) fn standalone_inquiry(q: &Question) -> bool {
-    q.run.is_empty()
-        && q.routed_task.is_none()
-        && !(q.node == crate::bump::NOTICE_NODE && q.seat == "release-watch")
+pub(crate) fn standalone_inquiry(home: &Path, q: &Question) -> bool {
+    if q.routed_task.is_some() || (q.node == crate::bump::NOTICE_NODE && q.seat == "release-watch")
+    {
+        return false;
+    }
+    if q.legacy_foreground || q.run.is_empty() {
+        return true;
+    }
+    // Older foreground asks have no explicit route marker. Recognize only
+    // positive legacy provenance, never infer it from a missing task alone.
+    if Queue::at(home.join("queue"))
+        .list()
+        .iter()
+        .any(|task| task.id == q.run || task.runs.contains(&q.run))
+    {
+        return false;
+    }
+    let run = crate::run::RunState::load_under(&q.run, home).ok();
+    if run
+        .as_ref()
+        .and_then(|run| run.origin.as_ref())
+        .is_some_and(|origin| origin.task.is_some())
+    {
+        return false;
+    }
+    (q.node == "ask" && q.seat == "operator")
+        || (q.cwd.is_some()
+            && run
+                .as_ref()
+                .and_then(|run| run.origin.as_ref())
+                .is_some_and(|origin| origin.task.is_none()))
 }
 
 pub(crate) fn migrated_source(home: &Path, id: &str) -> bool {
@@ -263,7 +293,7 @@ pub(crate) fn migrated_source(home: &Path, id: &str) -> bool {
     // decoding the entire history on each scheduler lap.
     if Questions::at(home.join("questions"))
         .read_history(id)
-        .is_ok_and(|q| standalone_inquiry(&q))
+        .is_ok_and(|q| standalone_inquiry(home, &q))
     {
         return false;
     }
@@ -465,7 +495,7 @@ fn migrate_batch(
     for id in batch {
         let result = (|| -> Result<()> {
             let q = questions.read_history(&id)?;
-            if standalone_inquiry(&q) {
+            if standalone_inquiry(home, &q) {
                 if let Some(sources) = &mut migration.sources {
                     sources.remove(&id);
                 }
@@ -686,10 +716,12 @@ pub fn sweep(queue: &Queue, talks: &Talks, questions: &Questions, home: &Path) {
             }
         }
     }
-    for q in all
-        .into_iter()
-        .filter(|q| q.status.open() && chat_routable(q) && !deferred.contains(&q.id))
-    {
+    for q in all.into_iter().filter(|q| {
+        q.status.open()
+            && chat_routable(q)
+            && !standalone_inquiry(home, q)
+            && !deferred.contains(&q.id)
+    }) {
         // The pre-migration scan may have projected a not-yet-imported source
         // as open. Recheck the native result before scheduling delivery: the
         // batch may just have classified it as passive completed history.
@@ -787,6 +819,32 @@ fn effect_receipt(
     task: Option<&str>,
 ) -> Result<Option<String>> {
     if q.resolution().is_none() {
+        return Ok(None);
+    }
+
+    if q.node == crate::land::APPROVAL_NODE
+        && q.resolution().as_deref() == Some(crate::merge_decision::WITHDRAW)
+    {
+        let run = crate::run::RunState::load_under(&q.run, home)?;
+        if let Some(receipt) = &run.merge_decision
+            && receipt.question == q.id
+            && receipt.choice == crate::merge_decision::WITHDRAW
+            && receipt.closed
+            && run.status == crate::run::RunStatus::Superseded
+            && run.pr.as_ref().is_some_and(|pr| {
+                pr.url == receipt.target.pr && pr.state.eq_ignore_ascii_case("closed")
+            })
+            && q.merge_target
+                .as_ref()
+                .is_none_or(|target| target == &receipt.target)
+        {
+            return Ok(Some(format!(
+                "run {}: withdrawal {} confirmed PR closure and retired execution",
+                q.run, q.id
+            )));
+        }
+        // Resume is only this legacy choice's transport. Its execution-start
+        // marker cannot confirm closure or complete a withdrawal decision.
         return Ok(None);
     }
 

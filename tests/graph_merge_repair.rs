@@ -777,7 +777,16 @@ async fn decision_cli_hold_survives_head_change_and_daemon_settles_manual_hold()
 common::e2e! {
 async fn decision_cli_withdraw_closes_and_terminates_only_after_confirmation() {
     let (fx, mut runner, question) = held_pr_choice(false, false, magi::merge_decision::WITHDRAW).await;
-    let task = decision_owner(&mut runner, &fx).await;
+    let mut task = decision_owner(&mut runner, &fx).await;
+    let home = magi::run::home();
+    let queue = magi::queue::Queue::open();
+    let talks = magi::talk::Talks::open();
+    let chat = magi::talk::begin(&talks, &fx.config, fx.repo.clone(), Some("alpha")).unwrap();
+    task.chat = Some(chat.id.clone()); queue.put(&mut task).unwrap();
+    magi::task_chat::sweep(&queue, &talks, &Questions::open(), &home);
+    magi::chat_control::decide(&talks, &home, &chat.id, &question, magi::merge_decision::WITHDRAW).unwrap();
+    let outbox = magi::task_inquiry::Outbox::at(&home);
+    assert_eq!(outbox.get(&question).unwrap().decision.unwrap().status, magi::task_decision::Status::Queued);
     serve_decision(&fx, &runner.state).await;
     let disk = RunState::load(&runner.state.id).unwrap();
     let owner = magi::queue::Queue::open().get(&task.id).unwrap();
@@ -788,13 +797,26 @@ async fn decision_cli_withdraw_closes_and_terminates_only_after_confirmation() {
     assert!(Runner::resume(&disk.id).is_err(), "retired execution must never resume");
     assert_eq!(owner.instruction, task.instruction);
     assert_eq!(owner.runs, task.runs);
+    let calls = std::fs::read(fx.tmp.path().join("forge/calls")).unwrap();
+    for _ in 0..2 {
+        magi::task_chat::sweep(&queue, &talks, &Questions::open(), &home);
+        magi::chat_control::reconcile_decisions(&queue, &home).unwrap();
+        let projected = magi::task_inquiry::Outbox::at(&home).get(&question).unwrap().decision.unwrap();
+        assert_eq!(projected.status, magi::task_decision::Status::Resolved, "{projected:?}; receipt={:?}; source={:?}", disk.merge_decision, Questions::open().get(&question).unwrap());
+        assert_eq!(std::fs::read(fx.tmp.path().join("forge/calls")).unwrap(), calls, "receipt reconciliation must not close again");
+    }
 }
 }
 
 common::e2e! {
 async fn decision_withdraw_failure_holds_without_terminating_or_repairing() {
-    let (fx, mut runner, _) = held_pr_choice(false, false, magi::merge_decision::WITHDRAW).await;
-    let task = decision_owner(&mut runner, &fx).await;
+    let (fx, mut runner, question) = held_pr_choice(false, false, magi::merge_decision::WITHDRAW).await;
+    let mut task = decision_owner(&mut runner, &fx).await;
+    let home = magi::run::home(); let queue = magi::queue::Queue::open(); let talks = magi::talk::Talks::open();
+    let chat = magi::talk::begin(&talks, &fx.config, fx.repo.clone(), Some("alpha")).unwrap();
+    task.chat = Some(chat.id.clone()); queue.put(&mut task).unwrap();
+    magi::task_chat::sweep(&queue, &talks, &Questions::open(), &home);
+    magi::chat_control::decide(&talks, &home, &chat.id, &question, magi::merge_decision::WITHDRAW).unwrap();
     std::fs::write(fx.tmp.path().join("forge/refuse-close"), "").unwrap();
     serve_decision(&fx, &runner.state).await;
     let disk = RunState::load(&runner.state.id).unwrap();
@@ -804,6 +826,10 @@ async fn decision_withdraw_failure_holds_without_terminating_or_repairing() {
     assert!(!disk.merge_decision.as_ref().unwrap().closed);
     assert_eq!(disk.pr.as_ref().unwrap().state, "open");
     assert!(!fx.tmp.path().join("forge/fixes").exists());
+    for _ in 0..2 {
+        magi::task_chat::sweep(&queue, &talks, &Questions::open(), &home);
+        assert_eq!(magi::task_inquiry::Outbox::at(&home).get(&question).unwrap().decision.unwrap().status, magi::task_decision::Status::Queued, "unconfirmed closure must remain pending");
+    }
 }
 }
 

@@ -601,6 +601,10 @@ pub struct Question {
     /// Task decision outbox; retained until task-chat delivery is durable.
     #[serde(default)]
     pub routed_task: Option<String>,
+    /// `ask_cmd` chose the legacy foreground path because no task owned it.
+    /// Persist this provenance: a nonempty run alone is not task ownership.
+    #[serde(default)]
+    pub legacy_foreground: bool,
     /// Set after delivery; merge consent remains in this record.
     #[serde(default)]
     pub routed_chat: Option<String>,
@@ -764,6 +768,7 @@ impl Question {
             choices,
             merge_target: None,
             routed_task: None,
+            legacy_foreground: false,
             routed_chat: None,
             publication_title: None,
             actions: std::collections::BTreeMap::new(),
@@ -1580,7 +1585,7 @@ impl Questions {
     fn consumption_view_in(&self, mut q: Question, migrated: bool) -> Question {
         if let Some(home) = self.root.parent()
             && migrated
-            && !crate::task_chat::standalone_inquiry(&q)
+            && !crate::task_chat::standalone_inquiry(home, &q)
             && crate::task_chat::source_reply_needs_confirmation(home, &q)
         {
             let saved = q.resolution().unwrap_or_default();

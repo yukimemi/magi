@@ -898,7 +898,22 @@ async fn watch_supervisor_loss_is_reported_without_reexecuting_the_command() {
     );
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while !w.tmp.path().join("starts").exists() {
-        assert!(std::time::Instant::now() < deadline);
+        assert!(
+            std::time::Instant::now() < deadline,
+            "watch registered but command did not create its start marker within 5s; durable job and launch gates: {:?}",
+            watch_records(&w)
+                .into_iter()
+                .map(|(path, job)| {
+                    let dir = path.parent().unwrap();
+                    (
+                        job,
+                        dir.join("armed").exists(),
+                        dir.join("executing").exists(),
+                        std::fs::read_to_string(dir.join("spawn-error")).ok(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        );
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     let (_, record) = watch_records(&w).pop().expect("record");
