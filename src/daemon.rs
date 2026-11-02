@@ -4349,12 +4349,20 @@ async fn attempt(
                 .unwrap_or_default();
             inputs.push_str(&format!(";review:{branch}:{source}"));
         }
-        if let Some(reason) = task.recovery_exhausted(
-            &head,
-            &inputs,
-            task.attempt_limit
-                .map_or(opts.max_attempts, std::num::NonZeroUsize::get),
-        ) {
+        if let Some(reason) = task
+            .recovery_exhausted(
+                &head,
+                &inputs,
+                task.attempt_limit
+                    .map_or(opts.max_attempts, std::num::NonZeroUsize::get),
+            )
+            .filter(|_| {
+                !task.repair_grants.last().is_some_and(|receipt| {
+                    RunState::load(&receipt.request.run)
+                        .is_ok_and(|run| crate::repair_budget::pending(task, &run))
+                })
+            })
+        {
             task.hold_unrequested_retry(Some(reason));
             record(queue, task);
             return Vec::new();
@@ -4450,7 +4458,13 @@ async fn attempt(
             })
         })
         .and_then(|pin| pin.pinned_run.clone());
-    let starter = if let Some(owner) = &public_owner {
+    let granted_run = task.repair_grants.last().and_then(|receipt| {
+        let state = RunState::load(&receipt.request.run).ok()?;
+        crate::repair_budget::pending(task, &state).then(|| receipt.request.run.clone())
+    });
+    let starter = if let Some(run) = granted_run {
+        Starter::Resume(run)
+    } else if let Some(owner) = &public_owner {
         Starter::Resume(owner.id.clone())
     } else if let Some(run) = stop_pin {
         // Stop actions resume their exact owner even after seat-count edits;

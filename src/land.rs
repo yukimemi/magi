@@ -667,7 +667,7 @@ pub fn approval_reasons(state: &RunState) -> Vec<ApprovalReason> {
     if state.land_approval.is_some() {
         reasons.push(ApprovalReason::ExistingDecision);
     }
-    if !state.merge_repairs.is_empty() {
+    if !state.merge_repairs.is_empty() || !state.repair_grants.is_empty() {
         reasons.push(ApprovalReason::AfterRepair);
     }
     reasons
@@ -1753,6 +1753,10 @@ async fn approval_gate(
             .find(|q| q.id == a.question)
             .filter(|q| {
                 q.status != ask::QuestionStatus::Abandoned
+                    && state
+                        .repair_grants
+                        .last()
+                        .is_none_or(|g| q.asked_at > g.receipt.at)
                     && (a.head.eq_ignore_ascii_case(head)
                         || q.resolution()
                             .as_deref()

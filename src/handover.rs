@@ -538,6 +538,18 @@ pub(crate) fn resume_refusal_under(state: &RunState, home: Option<&Path>) -> Opt
     }
     let review = crate::graph::review_conclusion(&state.reviews, state.config.graph.review_rounds);
     let allowed = resume_checkpoint(state)
+        || state
+            .repair_grants
+            .last()
+            .is_some_and(|g| g.phase != crate::repair_budget::Phase::Complete)
+        || home.is_some_and(|home| {
+            state
+                .origin
+                .as_ref()
+                .and_then(|o| o.task.as_ref())
+                .and_then(|id| crate::queue::Queue::at(home.join("queue")).get(id).ok())
+                .is_some_and(|task| crate::repair_budget::pending(&task, state))
+        })
         || home.is_some_and(|home| has_resume_checkpoint(state, home))
         || ((state.config.graph.review_rounds == 0
             || state.reviews.iter().any(|round| round.clean))

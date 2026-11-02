@@ -688,6 +688,11 @@ enum TalkCmd {
 /// Direct control of this chat's own tasks and runs (standing chat seat only).
 #[derive(Debug, Subcommand)]
 enum ControlCmd {
+    /// Grant bounded repair budget on the owner's explicit request.
+    GrantRepair {
+        #[command(flatten)]
+        request: magi::repair_budget::Request,
+    },
     /// Merge a PR at the head read from the forge when the owner asks.
     MergePr {
         repo: String,
@@ -771,6 +776,11 @@ enum ControlCmd {
 /// Operations on the queue.
 #[derive(Debug, Subcommand)]
 enum TaskCmd {
+    /// Grant 1..=3 additional repairs and queue the exact stopped run (not merge approval).
+    GrantRepair {
+        #[command(flatten)]
+        request: magi::repair_budget::Request,
+    },
     /// Resume, hold, release, retry, rerun checks, decide or abandon tasks
     /// and runs. Only the standing chat seat (`MAGI_NODE=chat`, `MAGI_RUN` =
     /// an open conversation) may use it.
@@ -3418,6 +3428,23 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
             Ok(())
         }
 
+        TaskCmd::GrantRepair { request } => {
+            if std::env::var("MAGI_NODE").as_deref() == Ok("chat") {
+                println!(
+                    "{}",
+                    control_from_chat(magi::chat_control::Operation::GrantRepair { request })
+                        .await?
+                );
+            } else {
+                magi::repair_budget::authorize_terminal()?;
+                // Run-state admission is large; do not embed it in every task
+                // command's future, including simple queue-only operations.
+                let receipt =
+                    Box::pin(magi::repair_budget::grant(&q, &magi::run::home(), request)).await?;
+                println!("{}", serde_json::to_string_pretty(&receipt)?);
+            }
+            Ok(())
+        }
         TaskCmd::Control { op } => {
             let home = magi::run::home();
             let talks = magi::talk::Talks::open();
@@ -3429,6 +3456,7 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
             let talk_id = talk.id.as_str();
             use magi::chat_control as cc;
             let operation = match op {
+                ControlCmd::GrantRepair { request } => cc::Operation::GrantRepair { request },
                 ControlCmd::MergePr {
                     repo,
                     number,
@@ -4551,7 +4579,9 @@ async fn resume_run(id: &str, dry_run: bool, recover_base: bool) -> Result<()> {
         task.short(),
         task.short()
     );
-    task.release_operator("cli-run-resume", None);
+    if !magi::repair_budget::queue_resumption(&queue, &mut task, &run_id)? {
+        task.release_operator("cli-run-resume", None);
+    }
     task.resume_override = Some(queue::OperatorResume {
         question_id: String::new(),
         at: jiff::Timestamp::now(),
@@ -7540,6 +7570,25 @@ command = ['sh', '-c', 'cat >/dev/null; printf "%s" "{\"duplicate\":true,\"reaso
             q.get(&id).unwrap().instruction,
             "old instruction",
             "a refused edit must not touch the stored task"
+        );
+    }
+
+    #[test]
+    fn task_command_future_fits_the_default_thread_stack() {
+        // A caller can retain several command futures (as the claimed-task
+        // test below does). Admission of a stopped run must not inflate each
+        // queue operation until their combined frames overflow a 2 MiB stack.
+        let command = task_cmd_on(
+            TaskCmd::Hold {
+                id: "fixture".into(),
+                reason: Vec::new(),
+            },
+            Queue::at(PathBuf::from("unused-queue")),
+        );
+        let bytes = std::mem::size_of_val(&command);
+        assert!(
+            bytes < 64 * 1024,
+            "task command future occupies {bytes} bytes"
         );
     }
 
