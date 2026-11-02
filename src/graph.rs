@@ -7791,6 +7791,20 @@ impl Runner {
                 return Ok(());
             }
             last.e2e_deferred = false;
+            // A complete panel may have been saved as unclean solely because
+            // verification could not run. Refresh that verdict with the new
+            // outcomes before a granted repair consumes the round's result.
+            // Incomplete panels retain their original policy/quota decision.
+            if last.answered == last.expected {
+                last.clean = round_is_clean(
+                    last.blocking,
+                    last.e2e.iter().all(CommandOutcome::ok),
+                    last.answered,
+                    last.expected,
+                    0,
+                    self.state.config.graph.incomplete_review,
+                );
+            }
         }
         let last = &self.state.reviews[round_idx];
         let open: usize = last.reviews.iter().map(|r| r.findings.len()).sum();

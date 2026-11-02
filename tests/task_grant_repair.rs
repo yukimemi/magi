@@ -450,3 +450,100 @@ async fn review_grant_cannot_bypass_an_unresolved_fixer_continuation() {
     assert!(resumed.state.merge.is_none());
 }
 }
+
+common::e2e! {
+async fn granted_confirmation_review_recovers_cleanliness_after_unresolved_e2e_on_restart() {
+    for deferred in [false, true] {
+    let (_fx, _task, mut runner, request) = stopped(false).await;
+    runner.state.config.verify.e2e = vec!["test -f gatefix.txt".into()];
+    runner.state.save().unwrap();
+    accepted(&request);
+    let receipt = Queue::open().get(&request.task).unwrap().repair_grants[0].clone();
+    let worktree = runner.state.winner().unwrap().worktree.clone();
+    std::fs::write(worktree.join("gatefix.txt"), "retained fixer output\n").unwrap();
+    assert!(magi::git::git_raw(&worktree, &["add", "gatefix.txt"]).await.unwrap().ok());
+    assert!(magi::git::git_raw(&worktree, &["commit", "-m", "repair gate fixture"]).await.unwrap().ok());
+    let head = magi::git::rev_parse(&worktree, "HEAD").await.unwrap();
+    let review_start = runner.state.reviews.len();
+    let mut round = runner.state.reviews.last().unwrap().clone();
+    round.round += 1;
+    round.head = head.clone();
+    round.verified_head = Some(head.clone());
+    round.clean = false;
+    round.e2e = vec![magi::run::CommandOutcome {
+        command: "test -f gatefix.txt".into(), code: None,
+        output_tail: "shared build cache is busy".into(), duration_ms: 0,
+        resource_blocked: true,
+    }];
+    if deferred {
+        round.e2e.clear();
+        round.e2e_deferred = true;
+        round.verified_head = None;
+    }
+    assert_eq!(round.answered, round.expected);
+    assert_eq!(round.blocking, 0);
+    runner.state.reviews.push(round);
+    runner.state.repair_grants.push(magi::repair_budget::Applied {
+        receipt, spent: 1, phase: Phase::Reviewing, review_start,
+        head: head.clone(), succeeded: false,
+    });
+    runner.state.status = RunStatus::Reviewing;
+    runner.state.save().unwrap();
+    drop(runner);
+
+    let mut resumed = Runner::resume(&request.run).unwrap();
+    resumed.execute().await.unwrap();
+    let last = resumed.state.reviews.last().unwrap();
+    assert!(last.clean, "successful catch-up must refresh the saved verdict");
+    assert_eq!(last.verified_head.as_ref(), Some(&head));
+    assert_eq!(last.e2e_status(), magi::run::E2eStatus::Passed);
+    assert_eq!(resumed.state.reviews.len(), review_start + 1, "reuse the answered panel");
+    assert!(resumed.state.repair_grants[0].succeeded);
+    assert_eq!(resumed.state.repair_grants[0].spent, 1);
+    assert_eq!(resumed.state.gate_head.as_ref(), Some(&head));
+    assert!(resumed.state.gate_allows_progress());
+    let mut again = Runner::resume(&request.run).unwrap();
+    again.execute().await.unwrap();
+    assert!(again.state.repair_grants[0].succeeded);
+    assert_eq!(again.state.repair_grants[0].spent, 1);
+    }
+}
+}
+
+#[cfg(unix)]
+common::e2e! {
+async fn retained_reviewer_descendant_refuses_grant_and_resume_without_mutation() {
+    use std::os::fd::AsRawFd;
+    let (_fx, _task, runner, request) = stopped(false).await;
+    // This seat is intentionally absent from candidates, just like the
+    // detached confirmation-review trees retained by the graph.
+    let review = runner.state.worktree_root().join("review-retained");
+    assert!(magi::git::git_raw(&runner.state.repo, &["worktree", "add", "--detach", review.to_str().unwrap(), &request.head]).await.unwrap().ok());
+    let dir = magi::git::git_raw(&review, &["rev-parse", "--absolute-git-dir"]).await.unwrap().stdout;
+    let lock_path = std::path::Path::new(dir.trim()).join("magi-output.lock");
+    let take = || {
+        let lease = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false)
+            .open(&lock_path).unwrap();
+        // SAFETY: the descriptor remains owned until the guard is dropped.
+        assert_eq!(unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) }, 0);
+        lease
+    };
+    let lease = take();
+    refused(&request, "descendant still owns");
+    drop(lease);
+    accepted(&request);
+    let lease = take();
+    let before = RunState::load(&request.run).unwrap();
+    let mut resumed = Runner::resume(&request.run).unwrap();
+    let error = resumed.execute().await.unwrap_err();
+    assert!(error.to_string().contains("descendant still owns"), "{error:#}");
+    let mut after = RunState::load(&request.run).unwrap();
+    // Driver cleanup may refresh the timestamp while releasing admission.
+    after.updated_at = before.updated_at;
+    assert_eq!(serde_json::to_value(after).unwrap(), serde_json::to_value(before).unwrap());
+    drop(lease);
+    let mut resumed = Runner::resume(&request.run).unwrap();
+    resumed.execute().await.unwrap();
+    assert!(resumed.state.repair_grants[0].succeeded);
+}
+}

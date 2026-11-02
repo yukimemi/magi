@@ -377,12 +377,32 @@ pub async fn grant(queue: &Queue, home: &Path, mut request: Request) -> Result<R
 }
 
 fn output_leases(state: &RunState) -> Result<Vec<crate::retention::OutputLease>> {
-    state
+    let mut paths: std::collections::BTreeSet<_> = state
         .candidates
         .iter()
         .filter(|c| c.worktree.exists())
-        .map(|c| {
-            crate::retention::OutputLease::take(&c.worktree, true)
+        .map(|c| c.worktree.clone())
+        .collect();
+    // Reviewers and other retained seats are reset on reuse too. A stopped
+    // driver does not imply their tool descendants have released the tree.
+    match std::fs::read_dir(state.worktree_root()) {
+        Ok(entries) => {
+            for entry in entries {
+                let path = entry?.path();
+                if path.join(".git").is_file() {
+                    paths.insert(path);
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).context("repair grant refused: cannot inspect seat worktrees");
+        }
+    }
+    paths
+        .into_iter()
+        .map(|path| {
+            crate::retention::OutputLease::take(&path, true)
                 .context("repair grant refused: seat or descendant still owns the worktree")
         })
         .collect()
