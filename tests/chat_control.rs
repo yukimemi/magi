@@ -653,7 +653,7 @@ esac
         )
         .unwrap();
     outbox.deliver(&f.queue(), &f.talks, &inquiry.id).unwrap();
-    let routed = || {
+    let routed = |request: &str| {
         common::magi_cli(f.tmp.path())
             .args([
                 "task",
@@ -663,7 +663,7 @@ esac
                 "rerun-checks",
                 &f.run.id,
                 "--request",
-                "preflight",
+                request,
                 "--head",
                 "current",
                 "--workflow",
@@ -679,9 +679,20 @@ esac
             .output()
             .unwrap()
     };
+    let awaiting = outbox.get(&inquiry.id).unwrap().decision.unwrap();
+    assert!(refused(routed("bad/id")).contains("safe filename"));
+    assert_eq!(outbox.get(&inquiry.id).unwrap().decision.unwrap(), awaiting);
+    // A missing PR is also a correctable pre-acceptance read failure.
+    let mut without_pr = RunState::load_under(&f.run.id, f.tmp.path()).unwrap();
+    let recorded_pr = without_pr.pr.take();
+    without_pr.save_under(f.tmp.path()).unwrap();
+    assert!(refused(routed("preflight")).contains("no pull request"));
+    assert_eq!(outbox.get(&inquiry.id).unwrap().decision.unwrap(), awaiting);
+    without_pr.pr = recorded_pr;
+    without_pr.save_under(f.tmp.path()).unwrap();
     let snapshot = std::fs::read(f.tmp.path().join("snapshot.json")).unwrap();
     std::fs::remove_file(f.tmp.path().join("snapshot.json")).unwrap();
-    refused(routed());
+    refused(routed("preflight"));
     let decision = outbox.get(&inquiry.id).unwrap().decision.unwrap();
     assert_eq!(decision.status, magi::task_decision::Status::RetryNeeded);
     assert!(decision.retry_safe);
@@ -698,8 +709,8 @@ esac
         "42\n42\n"
     );
     std::fs::write(f.tmp.path().join("snapshot.json"), snapshot).unwrap();
-    passed(routed());
-    passed(routed());
+    passed(routed("preflight"));
+    passed(routed("preflight"));
     assert_eq!(
         outbox.get(&inquiry.id).unwrap().decision.unwrap().status,
         magi::task_decision::Status::Resolved

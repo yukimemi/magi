@@ -584,6 +584,11 @@ async fn execute_decision(
             "decision {id} is already resolved; inspect its outcome history"
         ));
     }
+    if let Operation::RerunChecks { run, request, .. } = &command {
+        // Reject correctable input before binding the decision to this exact
+        // command. Execution revalidates these reads before taking its lock.
+        rerun_preflight(queue, home, run, request)?;
+    }
     if decision.request.is_none() && decision.status == Status::RetryNeeded {
         if let Ok(source) = crate::ask::Questions::at(home.join("questions")).get(id) {
             ensure!(
@@ -1367,6 +1372,24 @@ pub fn resume(queue: &Queue, home: &Path, run: &str) -> Result<Task> {
     queue.get(&task.id)
 }
 
+// These reads and input checks cannot start an effect. Keep them shared by
+// decision acceptance and execution so invalid input never pins a new request.
+fn rerun_preflight(
+    queue: &Queue,
+    home: &Path,
+    run: &str,
+    request: &str,
+) -> Result<crate::run::RunState> {
+    run_task(queue, run)?;
+    let state = crate::run::RunState::load_under(run, home)?;
+    ensure!(state.pr.is_some(), "the run recorded no pull request");
+    ensure!(
+        crate::ask::valid_asset_name(request),
+        "request must be a safe filename of at most 64 bytes"
+    );
+    Ok(state)
+}
+
 /// チャットのリクエスト単位で受付記録を残し、共通遷移でチェックを再実行する。
 pub async fn rerun_checks(
     queue: &Queue,
@@ -1377,17 +1400,7 @@ pub async fn rerun_checks(
     head: &str,
     workflows: &[String],
 ) -> Result<Vec<String>> {
-    run_task(queue, run)?;
-    let state = crate::run::RunState::load_under(run, home)?;
-    let pr = &state
-        .pr
-        .as_ref()
-        .context("the run recorded no pull request")?
-        .url;
-    ensure!(
-        crate::ask::valid_asset_name(request),
-        "request must be a safe filename of at most 64 bytes"
-    );
+    let state = rerun_preflight(queue, home, run, request).map_err(BeforeEffect)?;
     let dir = home.join("chat-controls").join(talk);
     std::fs::create_dir_all(&dir)?;
     let lock = std::fs::OpenOptions::new()
@@ -1397,6 +1410,11 @@ pub async fn rerun_checks(
         .open(dir.join(format!("{request}.lock")))?;
     crate::pr_head::try_lock_file(&lock)?;
     let path = dir.join(format!("{request}.json"));
+    let pr = &state
+        .pr
+        .as_ref()
+        .context("the run recorded no pull request")?
+        .url;
     let action = serde_json::json!({
         "run": run, "repo": state.repo, "pr": pr, "head": head, "runs": workflows
     });
