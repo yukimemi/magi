@@ -568,3 +568,50 @@ async fn separate_cli_asks_create_separate_decisions_and_request_ids_deduplicate
     assert!(!home.join("questions").exists());
 }
 }
+
+common::e2e! {
+async fn routed_triage_discard_has_a_durable_receipt_without_a_live_task() {
+    use magi::task_decision::Status;
+    use magi::task_inquiry::Outbox;
+    let fx = common::fixture(common::home_lock().await, common::Judges::Unanimous, false);
+    for node in [magi::triage::NODE, magi::triage::DEPS_NODE] {
+        let home = fx.tmp.path().join(node);
+        let queue = Queue::at(home.join("queue"));
+        let questions = Questions::at(home.join("questions"));
+        let talks = Talks::at(home.join("talks"));
+        let chat = talk::begin(&talks, &fx.config, fx.repo.clone(), Some("alpha")).unwrap();
+        let mut task = task(&fx.repo, Source::Human);
+        task.hold_machine(Some("gate failed".into()));
+        task.origin_chat = Some(chat.id.clone());
+        queue.put(&mut task).unwrap();
+        let choices = if node == magi::triage::NODE {
+            vec!["resume", "keep held", "discard"]
+        } else {
+            vec!["resume", "discard", "detach"]
+        };
+        let mut q = Question::new(task.id.clone(), node.into(), "triage".into(),
+            "Inspect held task".into(), String::new(), choices.into_iter().map(str::to_owned).collect());
+        questions.put(&mut q).unwrap();
+        magi::task_chat::sweep(&queue, &talks, &questions, &home);
+        magi::chat_control::decide(&talks, &home, &chat.id, &q.id, "discard").unwrap();
+        magi::task_chat::sweep(&queue, &talks, &questions, &home);
+        assert_eq!(Outbox::at(&home).get(&q.id).unwrap().decision.unwrap().status, Status::Queued);
+        // A failed receipt destination cannot delete the task or resolve it.
+        let receipts = queue.root().join("triage-discard");
+        std::fs::write(&receipts, "unavailable").unwrap();
+        assert!(magi::triage::apply_answers(&queue, &questions).is_empty());
+        assert!(queue.get(&task.id).is_ok());
+        magi::task_chat::sweep(&queue, &talks, &questions, &home);
+        assert_ne!(Outbox::at(&home).get(&q.id).unwrap().decision.unwrap().status, Status::Resolved);
+        std::fs::remove_file(&receipts).unwrap();
+        assert_eq!(magi::triage::apply_answers(&queue, &questions), [task.id.clone()]);
+        assert!(queue.get(&task.id).is_err());
+        for _ in 0..2 {
+            let queue = Queue::at(home.join("queue"));
+            magi::task_chat::sweep(&queue, &talks, &questions, &home);
+            assert_eq!(Outbox::at(&home).get(&q.id).unwrap().decision.unwrap().status, Status::Resolved);
+            assert!(magi::triage::apply_answers(&queue, &questions).is_empty());
+        }
+    }
+}
+}

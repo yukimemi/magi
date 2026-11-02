@@ -890,6 +890,26 @@ fn effect_receipt(
         return Ok(None);
     }
 
+    if crate::release_watch::quiet_effect_applied(home, q)? {
+        return Ok(Some(format!(
+            "release watch {}: owner choice applied",
+            q.id
+        )));
+    }
+    if matches!(
+        q.node.as_str(),
+        crate::triage::NODE | crate::triage::DEPS_NODE
+    ) && let Some(id) = task
+        .filter(|id| !id.is_empty())
+        .or_else(|| (!q.run.is_empty()).then_some(q.run.as_str()))
+        && queue.triage_discard_applied(id, &q.id)?
+    {
+        return Ok(Some(format!(
+            "task {id}: triage discard {} committed",
+            q.id
+        )));
+    }
+
     let task = task
         .filter(|id| !id.is_empty())
         .map(|id| queue.get(id))
@@ -1606,6 +1626,74 @@ mod tests {
                 check(Status::Resolved);
             }
             check(Status::Resolved);
+        }
+    }
+
+    #[test]
+    fn quiet_release_receipts_resolve_pending_decisions_after_restart() {
+        use crate::{
+            task_decision::{Decision, Status},
+            task_inquiry::Outbox,
+        };
+        for choice in [crate::release_watch::HOLD, crate::release_watch::LEAVE_IT] {
+            let dir = tempfile::tempdir().unwrap();
+            let home = dir.path();
+            let queue = Queue::at(home.join("queue"));
+            let mut task = Task::new(
+                "release".into(),
+                "release".into(),
+                home.into(),
+                crate::queue::Source::Human,
+            );
+            queue.put(&mut task).unwrap();
+            let mut q = Question::new(
+                "run".into(),
+                crate::bump::NOTICE_NODE.into(),
+                "release-watch".into(),
+                "release stalled".into(),
+                String::new(),
+                vec![choice.into()],
+            );
+            q.answer(Answer::Choice(choice.into())).unwrap();
+            let mut record = history_record(&q, Some(&task));
+            let mut decision = Decision::awaiting(q.summary.clone());
+            decision.accept(&format!("decision: {choice}")).unwrap();
+            record.decision = Some(decision);
+            record.archived = false;
+            Outbox::at(home).enqueue(record).unwrap();
+            sync_effect_receipt(home, &queue, &q);
+            assert_eq!(
+                Outbox::at(home)
+                    .get(&q.id)
+                    .unwrap()
+                    .decision
+                    .unwrap()
+                    .status,
+                Status::Queued
+            );
+            let receipts = home.join("release-watch-receipts");
+            std::fs::create_dir_all(&receipts).unwrap();
+            let st = crate::release_watch::WatchState {
+                applied: vec![q.id.clone()],
+                ..Default::default()
+            };
+            std::fs::write(
+                receipts.join(format!("{}.json", q.id)),
+                serde_json::to_vec(&st).unwrap(),
+            )
+            .unwrap();
+            for _ in 0..2 {
+                sync_effect_receipt(home, &Queue::at(home.join("queue")), &q);
+                assert_eq!(
+                    Outbox::at(home)
+                        .get(&q.id)
+                        .unwrap()
+                        .decision
+                        .unwrap()
+                        .status,
+                    Status::Resolved
+                );
+            }
         }
     }
 

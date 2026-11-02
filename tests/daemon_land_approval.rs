@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use std::collections::BTreeMap;
 
 use common::{Judges, fixture, home_lock};
-use magi::ask::{self, Answer};
+use magi::ask;
 use magi::config::MergeMode;
 use magi::daemon::{self, Opts};
 use magi::land::APPROVAL_NODE;
@@ -398,14 +398,9 @@ async fn once_the_approval_answers_the_daemon_resumes_the_run_on_its_own(gh) {
     let run = parked_run(&fx.repo, &run_config);
     let store = ask::Questions::open();
     let mut question = approval_question(&run.id);
-    // The owner taps "merge" - the only interaction the operator's side of
-    // this loop requires. Nothing here calls `magi task release`.
-    question
-        .answer(Answer::Choice("merge".to_owned()))
-        .expect("record the approval");
-    store
-        .put(&mut question)
-        .expect("file the answered question");
+    question.merge_target = Some(magi::merge_decision::Target {
+        pr: PR_URL.into(), head: "deadbeef".into(), language: "en".into(),
+    });
 
     let mut task = Task::new(
         "landing task".to_owned(),
@@ -416,6 +411,18 @@ async fn once_the_approval_answers_the_daemon_resumes_the_run_on_its_own(gh) {
     task.status = TaskStatus::Failed;
     task.runs.push(run.id.clone());
     queue.put(&mut task).expect("file the task");
+    // A directly saved historical reply must stay quarantined during migration.
+    // Exercise the supported live owner route: deliver the open inquiry, then
+    // accept a fresh chat decision with its exact source generation.
+    let talks = magi::talk::Talks::open();
+    let chat = magi::talk::begin(&talks, &config, fx.repo.clone(), Some("alpha")).unwrap();
+    task.origin_chat = Some(chat.id.clone());
+    queue.put(&mut task).unwrap();
+    store.put(&mut question).unwrap();
+    let home = store.root().parent().unwrap();
+    magi::task_chat::sweep(&queue, &talks, &store, home);
+    magi::chat_control::decide(&talks, home, &chat.id, &question.id, "merge").unwrap();
+    assert_eq!(store.get(&question.id).unwrap().resolution().as_deref(), Some("merge"));
 
     let opts = Opts {
         repo: fx.repo.clone(),

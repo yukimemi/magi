@@ -1685,6 +1685,9 @@ Pending decisions list. Requests with accepted or uncertain effects still requir
 receipt reconciliation. A successful obsolete-approval dismissal is confirmed by
 its durable run checkpoint, including when its task is already done or has moved
 to another attempt; it does not require changing that task's later outcome.
+release-watch の hold / leave it は、監視終了後にも残す適用済み問い合わせ ID で
+照合する。triage の破棄は削除対象のタスクを問い合わせ専用の受領記録へ原子的に
+移すため、タスク削除後も再起動時の照合証拠を失わず、その判断を解決できる。
 
 Existing task-scoped source inquiries are imported under their original delivery
 keys, including saved replies without confirmed effects. A saved reply is

@@ -3636,3 +3636,9 @@ Resume に完了受領記録を付けない。状態フラグだけを後から�
 run 保存を試みた後の失敗は引き続き不確実として扱う。
 相談テストではタスク所有の質問と実在する run の関連を維持し、本番の task chat
 配送経路で実行不変を確認する。非タスク相談も実在する独立 run を使って維持する。
+
+release-watch の hold / leave it は `WatchState::applied` と、watch 削除前に保存する
+`release-watch-receipts/<inquiry>.json` で照合する。rerun の transport 用記録を
+外部実行の成功証拠にしない。triage / triage-deps の discard は queue の task
+本体を `triage-discard/<inquiry>.json` に原子的に移す。受領記録は task 削除と
+同じ操作で成立し、単に task が見つからないことは成功証拠にしない。

@@ -2928,13 +2928,53 @@ impl Queue {
     /// from, passed in rather than reopened here so a test queue at an
     /// explicit root never reads the operator's real questions directory.
     pub fn remove(&self, id: &str, in_flight: bool, questions: &Questions) -> Result<Removal> {
+        self.remove_with_receipt(id, in_flight, questions, None)
+    }
+
+    /// Atomically retain the deleted task as the receipt for this triage inquiry.
+    pub(crate) fn discard_triage(
+        &self,
+        id: &str,
+        questions: &Questions,
+        inquiry: &str,
+    ) -> Result<Removal> {
+        self.remove_with_receipt(id, false, questions, Some(inquiry))
+    }
+
+    pub(crate) fn triage_discard_applied(&self, id: &str, inquiry: &str) -> Result<bool> {
+        let path = self
+            .root
+            .join("triage-discard")
+            .join(format!("{inquiry}.json"));
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e.into()),
+        };
+        let receipt: Task = serde_json::from_slice(&bytes)?;
+        Ok(receipt.id == id && !self.path_of(id).exists())
+    }
+
+    fn remove_with_receipt(
+        &self,
+        id: &str,
+        in_flight: bool,
+        questions: &Questions,
+        inquiry: Option<&str>,
+    ) -> Result<Removal> {
         let resolved = self.resolve_id(id)?;
         if in_flight {
             bail!("task {resolved} is being run by a live daemon right now");
         }
+        let receipt = inquiry.map(|q| self.root.join("triage-discard").join(format!("{q}.json")));
+        if let Some(path) = &receipt {
+            std::fs::create_dir_all(path.parent().expect("receipt directory"))?;
+        }
         self.write_tombstone(&resolved)?;
-        if let Err(e) = self.remove_record_with_attachments(&resolved, |p| std::fs::remove_file(p))
-        {
+        if let Err(e) = self.remove_record_with_attachments(&resolved, |p| match &receipt {
+            Some(path) => std::fs::rename(p, path),
+            None => std::fs::remove_file(p),
+        }) {
             // A record that is still there was not deleted: take the marker
             // back. One already gone keeps it, so the deletion still reads
             // as deliberate.

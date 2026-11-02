@@ -420,6 +420,30 @@ pub(crate) fn state_for_question(home: &Path, question_id: &str) -> Option<Watch
         .find(|s| s.question.as_deref() == Some(question_id))
 }
 
+/// Quiet watcher effects retain receipts even after the PR watch is retired.
+pub(crate) fn quiet_effect_applied(home: &Path, q: &Question) -> Result<bool> {
+    if q.node != crate::bump::NOTICE_NODE
+        || q.seat != "release-watch"
+        || !matches!(q.resolution().as_deref(), Some(HOLD | LEAVE_IT))
+    {
+        return Ok(false);
+    }
+    let watcher = Watcher::new(Box::new(GhForge), home.to_path_buf());
+    if watcher.stored().iter().any(|st| st.applied.contains(&q.id)) {
+        return Ok(true);
+    }
+    let bytes = match std::fs::read(
+        home.join("release-watch-receipts")
+            .join(format!("{}.json", q.id)),
+    ) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e.into()),
+    };
+    let st: WatchState = serde_json::from_slice(&bytes)?;
+    Ok(st.applied.contains(&q.id))
+}
+
 /// Resolve a release notification through its saved watch record, never its prose.
 pub(crate) fn question_for_notice(home: &Path, key: &str) -> Option<String> {
     let pr = key.strip_prefix("release-pr:")?;
@@ -729,6 +753,21 @@ impl Watcher {
             let tmp = path.with_extension("json.tmp");
             std::fs::write(&tmp, serde_json::to_string_pretty(st)?)?;
             std::fs::rename(&tmp, &path)?;
+            // Preserve per-inquiry evidence beyond the bounded applied list and
+            // watch retirement. These are local effects, never rerun receipts.
+            let receipts = self.home.join("release-watch-receipts");
+            if !st.applied.is_empty() {
+                std::fs::create_dir_all(&receipts)?;
+                for id in &st.applied {
+                    let path = receipts.join(format!("{id}.json"));
+                    if path.exists() {
+                        continue;
+                    }
+                    let tmp = path.with_extension("json.tmp");
+                    std::fs::write(&tmp, serde_json::to_vec(st)?)?;
+                    std::fs::rename(tmp, path)?;
+                }
+            }
             Ok(())
         };
         match write() {
@@ -1469,6 +1508,11 @@ impl Watcher {
 
     /// The pull request is confirmed merged or closed: clear everything.
     fn finish(&self, pr: &str, st: &WatchState) {
+        // Do not retire the last live evidence until per-inquiry receipts are
+        // durable too (including recovery after a partial save).
+        if !st.applied.is_empty() && !self.save(pr, st) {
+            return;
+        }
         let _ =
             Notices::at(self.home.join("notifications")).dismiss(&notices::id_of(&notice_key(pr)));
         if let Some(id) = &st.question {
@@ -1832,6 +1876,82 @@ mod tests {
         w.questions()
             .update(id, |q| q.answer(Answer::Choice(choice.to_owned())))
             .unwrap();
+    }
+
+    #[test]
+    fn quiet_effect_receipts_survive_watch_retirement_and_restart() {
+        for choice in [HOLD, LEAVE_IT, RERUN_AGAIN] {
+            let (dir, _fake, w) = rig();
+            let mut q = Question::new(
+                "run".into(),
+                crate::bump::NOTICE_NODE.into(),
+                "release-watch".into(),
+                "stalled release".into(),
+                String::new(),
+                vec![choice.into()],
+            );
+            q.answer(Answer::Choice(choice.into())).unwrap();
+            let mut st = WatchState {
+                url: URL.into(),
+                question: Some(q.id.clone()),
+                ..WatchState::default()
+            };
+            assert!(
+                !quiet_effect_applied(dir.path(), &q).unwrap(),
+                "answering is not application"
+            );
+            w.apply_answer("o/r#7", &mut st, &red(), &q, 3000);
+            assert!(
+                !quiet_effect_applied(dir.path(), &q).unwrap(),
+                "memory is not durable evidence"
+            );
+            assert!(w.save("o/r#7", &st));
+            assert_eq!(
+                quiet_effect_applied(dir.path(), &q).unwrap(),
+                choice != RERUN_AGAIN
+            );
+            // Both the rolling applied list and the live watch may disappear.
+            st.applied.clear();
+            assert!(w.save("o/r#7", &st));
+            w.finish("o/r#7", &st);
+            assert!(w.stored().is_empty());
+            assert_eq!(
+                quiet_effect_applied(dir.path(), &q).unwrap(),
+                choice != RERUN_AGAIN
+            );
+        }
+    }
+
+    #[test]
+    fn receipt_write_failure_keeps_the_watch_for_reconciliation() {
+        let (dir, _fake, w) = rig();
+        let mut q = Question::new(
+            "run".into(),
+            crate::bump::NOTICE_NODE.into(),
+            "release-watch".into(),
+            "release".into(),
+            String::new(),
+            vec![HOLD.into()],
+        );
+        q.answer(Answer::Choice(HOLD.into())).unwrap();
+        let mut st = WatchState {
+            url: URL.into(),
+            ..WatchState::default()
+        };
+        w.apply_answer("o/r#7", &mut st, &red(), &q, 3000);
+        let receipts = dir.path().join("release-watch-receipts");
+        std::fs::write(&receipts, "unavailable").unwrap();
+        assert!(!w.save("o/r#7", &st));
+        w.finish("o/r#7", &st);
+        assert_eq!(w.stored().len(), 1, "live effect evidence is retained");
+        std::fs::remove_file(receipts).unwrap();
+        let restarted = Watcher::new(
+            Box::new(std::sync::Arc::new(Fake::default())),
+            dir.path().into(),
+        );
+        restarted.finish("o/r#7", &restarted.load("o/r#7"));
+        assert!(restarted.stored().is_empty());
+        assert!(quiet_effect_applied(dir.path(), &q).unwrap());
     }
 
     #[tokio::test]

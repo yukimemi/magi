@@ -892,7 +892,7 @@ fn apply_deps_answer(queue: &Queue, questions: &Questions, q: &Question, now: Ti
         }
         DepsAction::Discard => {
             detach_dependants(queue, questions, &root.id);
-            return queue.remove(&root.id, false, questions).is_ok();
+            return queue.discard_triage(&root.id, questions, &q.id).is_ok();
         }
         DepsAction::Detach => detach_dependants(queue, questions, &root.id),
         // Matches no offered choice, so there is nothing to apply. Left unmarked:
@@ -1084,7 +1084,7 @@ pub fn apply_answers(queue: &Queue, questions: &Questions) -> Vec<String> {
                     task.hold_manual(Some(note));
                 }
                 AnswerAction::Discard => {
-                    if queue.remove(&task.id, false, questions).is_ok() {
+                    if queue.discard_triage(&task.id, questions, &q.id).is_ok() {
                         applied.push(task.id);
                     }
                     continue;
