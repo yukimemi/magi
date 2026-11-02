@@ -3437,7 +3437,10 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
                 );
             } else {
                 magi::repair_budget::authorize_terminal()?;
-                let receipt = magi::repair_budget::grant(&q, &magi::run::home(), request).await?;
+                // Run-state admission is large; do not embed it in every task
+                // command's future, including simple queue-only operations.
+                let receipt =
+                    Box::pin(magi::repair_budget::grant(&q, &magi::run::home(), request)).await?;
                 println!("{}", serde_json::to_string_pretty(&receipt)?);
             }
             Ok(())
@@ -7567,6 +7570,25 @@ command = ['sh', '-c', 'cat >/dev/null; printf "%s" "{\"duplicate\":true,\"reaso
             q.get(&id).unwrap().instruction,
             "old instruction",
             "a refused edit must not touch the stored task"
+        );
+    }
+
+    #[test]
+    fn task_command_future_fits_the_default_thread_stack() {
+        // A caller can retain several command futures (as the claimed-task
+        // test below does). Admission of a stopped run must not inflate each
+        // queue operation until their combined frames overflow a 2 MiB stack.
+        let command = task_cmd_on(
+            TaskCmd::Hold {
+                id: "fixture".into(),
+                reason: Vec::new(),
+            },
+            Queue::at(PathBuf::from("unused-queue")),
+        );
+        let bytes = std::mem::size_of_val(&command);
+        assert!(
+            bytes < 64 * 1024,
+            "task command future occupies {bytes} bytes"
         );
     }
 

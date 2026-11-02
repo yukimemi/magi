@@ -196,6 +196,17 @@ async fn grant_refuses_stale_head_pass_ownership_holds_and_live_driver_without_m
         // SAFETY: the live file descriptor stays owned until the lease drops.
         assert_eq!(unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
     }
+    #[cfg(windows)] {
+        use std::os::windows::io::AsRawHandle;
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn LockFile(file: *mut std::ffi::c_void, offset_low: u32, offset_high: u32,
+                length_low: u32, length_high: u32) -> i32;
+        }
+        // SAFETY: live handle and the same nonblocking Win32 lease as the
+        // driver uses; closing the file below releases the locked byte.
+        assert_ne!(unsafe { LockFile(lease.as_raw_handle(), 0, 0, 1, 0) }, 0);
+    }
     refused(&request, "execution lease unavailable");
     drop(lease);
     let queue = Queue::open(); let _claim = queue.claim(&task.id).unwrap();

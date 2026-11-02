@@ -292,7 +292,11 @@ async fn execute(
             .await?
         }
         Operation::GrantRepair { request } => {
-            serde_json::to_string(&crate::repair_budget::grant(queue, home, request).await?)?
+            // Keep run-state admission out of the shared control dispatcher
+            // future, which is also embedded in ordinary CLI task operations.
+            serde_json::to_string(
+                &Box::pin(crate::repair_budget::grant(queue, home, request)).await?,
+            )?
         }
         Operation::Resume { run } => {
             let t = resume(queue, home, &run)?;
