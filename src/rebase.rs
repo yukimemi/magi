@@ -491,10 +491,31 @@ async fn legacy_baseline(
     Ok((outside_diff(&out.stdout, paths), head, pick))
 }
 
-async fn rebase_target(scratch: &Path) -> Result<String> {
+pub(crate) async fn rebase_target(scratch: &Path) -> Result<String> {
     let path = git::git(scratch, &["rev-parse", "--git-path", "rebase-merge/onto"]).await?;
     let target = std::fs::read_to_string(scratch.join(path))?;
     git::rev_parse(scratch, &format!("{}^{{commit}}", target.trim())).await
+}
+
+/// Read the original branch identity retained by a paused merge-backend rebase.
+pub(crate) async fn saved_base_identity(scratch: &Path, branch: &str) -> Result<String> {
+    let read = |name: &'static str| async move {
+        let path = git::git(
+            scratch,
+            &["rev-parse", "--git-path", &format!("rebase-merge/{name}")],
+        )
+        .await?;
+        anyhow::Ok(
+            std::fs::read_to_string(scratch.join(path))?
+                .trim()
+                .to_owned(),
+        )
+    };
+    anyhow::ensure!(
+        read("head-name").await? == format!("refs/heads/{branch}"),
+        "saved rebase belongs to another branch"
+    );
+    git::rev_parse(scratch, &format!("{}^{{commit}}", read("orig-head").await?)).await
 }
 
 async fn stop_identity(scratch: &Path, original: &str, onto: &str) -> Result<()> {
@@ -833,19 +854,16 @@ async fn launcher_stage(
     Ok(Launch::Advanced)
 }
 
-/// Judge a rebase that is no longer in progress by what git says.
-async fn finish(
-    state: &mut RunState,
+type CompletedProblem = Option<(&'static str, Vec<String>)>;
+
+/// Read-only validation shared by normal completion and crash reconciliation.
+async fn completed_result(
+    repo: &Path,
     scratch: &Path,
-    branch: &str,
     orig: &str,
     onto_sha: &str,
     touched: &[String],
-    said: &str,
-) -> Result<Rebased> {
-    let repo = state.repo.clone();
-    let spent = state.rebase_fixes.len();
-    let cap = state.config.graph.review_rounds;
+) -> Result<(String, CompletedProblem)> {
     let unmerged = git::unmerged_paths(scratch).await.unwrap_or_default();
     let head = git::rev_parse(scratch, "HEAD").await.unwrap_or_default();
     // Not only the paths seen unmerged at a round's start: one round may
@@ -872,7 +890,7 @@ async fn finish(
     // only acceptable when every original commit already has a patch twin on
     // the base.
     let emptied = head == onto_sha
-        && git::cherry(&repo, onto_sha, orig)
+        && git::cherry(repo, onto_sha, orig)
             .await
             .map_or(true, |(unmatched, _)| !unmatched.is_empty());
 
@@ -881,7 +899,7 @@ async fn finish(
     // vanishing. Find the commits that are neither in the result nor already
     // on the base.
     let dropped = if unmerged.is_empty() && marked.is_empty() && !emptied && !head.is_empty() {
-        dropped_commits(&repo, scratch, onto_sha, orig, &head).await
+        dropped_commits(repo, scratch, onto_sha, orig, &head).await
     } else {
         Ok(Vec::new())
     };
@@ -895,7 +913,7 @@ async fn finish(
             "the rebase ended with none of the branch's commits applied (all skipped)",
             touched.to_vec(),
         ))
-    } else if head.is_empty() || !git::is_ancestor(&repo, onto_sha, &head).await {
+    } else if head.is_empty() || !git::is_ancestor(repo, onto_sha, &head).await {
         Some((
             "the rebase ended without the base in the result (abandoned or skipped)",
             touched.to_vec(),
@@ -913,8 +931,117 @@ async fn finish(
     } else {
         None
     };
+    Ok((head, problem))
+}
+
+/// Revalidate retained Git evidence without rolling back or deleting a refused result.
+pub(crate) async fn recover_completed_base(
+    state: &RunState,
+    scratch: &Path,
+    branch: &str,
+    op: &crate::base_sync_recovery::Operation,
+    head: &str,
+) -> Result<bool> {
+    anyhow::ensure!(
+        scratch == state.dir().join("base-sync"),
+        "unexpected scratch location"
+    );
+    anyhow::ensure!(
+        !git::rebase_in_progress(scratch).await,
+        "scratch rebase is still active"
+    );
+    for (path, revision, expected) in [
+        (scratch, "HEAD".to_owned(), head),
+        (scratch, "ORIG_HEAD".to_owned(), op.head.as_str()),
+        (state.repo.as_path(), format!("refs/heads/{branch}"), head),
+    ] {
+        anyhow::ensure!(
+            git::rev_parse(path, &revision).await? == expected,
+            "completed scratch identity changed"
+        );
+    }
+    anyhow::ensure!(
+        git::current_branch(scratch).await?.as_deref() == Some(branch),
+        "scratch belongs to another branch"
+    );
+    let common = |path: &Path| {
+        let path = path.to_owned();
+        async move {
+            let common = git::git(
+                &path,
+                &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            )
+            .await?;
+            anyhow::Ok(std::fs::canonicalize(common)?)
+        }
+    };
+    anyhow::ensure!(
+        common(scratch).await? == common(&state.repo).await?,
+        "scratch belongs to another repository"
+    );
+    anyhow::ensure!(
+        git::is_clean(scratch).await?,
+        "completed scratch has uncommitted changes"
+    );
+    let record = git::rebase_record(scratch).await?;
+    // Bind the replay to the reserved base even though Git has removed
+    // rebase-merge/onto. Each recording exec observes one pick's result.
+    let mut previous = op.tip.as_str();
+    for result in &record.heads {
+        if result != previous {
+            anyhow::ensure!(
+                git::rev_parse(scratch, &format!("{result}^")).await? == previous,
+                "recorded replay does not start at the reserved base or contains extra commits"
+            );
+        }
+        previous = result;
+    }
+    for pick in record.picks {
+        anyhow::ensure!(
+            git::is_ancestor(&state.repo, &pick, &op.head).await,
+            "record contains a foreign pick"
+        );
+    }
+    let touched: Vec<_> = state
+        .rebase_fixes
+        .iter()
+        .filter(|round| round.from.as_deref() == Some(op.head.as_str()))
+        .flat_map(|round| round.paths.iter().cloned())
+        .collect();
+    let (result, problem) =
+        completed_result(&state.repo, scratch, &op.head, &op.tip, &touched).await?;
+    Ok(result == head && problem.is_none())
+}
+
+/// Judge a rebase that is no longer in progress by what git says.
+pub(crate) async fn finish(
+    state: &mut RunState,
+    scratch: &Path,
+    branch: &str,
+    orig: &str,
+    onto_sha: &str,
+    touched: &[String],
+    said: &str,
+) -> Result<Rebased> {
+    let repo = state.repo.clone();
+    let spent = state.rebase_fixes.len();
+    let cap = state.config.graph.review_rounds;
+    let (head, problem) = completed_result(&repo, scratch, orig, onto_sha, touched).await?;
     match problem {
         None => {
+            // The validated result may legitimately have different patch IDs
+            // after conflict resolution. Persist its exact identity before
+            // deleting the Git evidence needed to validate it again.
+            if scratch == state.dir().join("base-sync")
+                && state.winner().is_some_and(|winner| winner.branch == branch)
+                && let Some(op) = state.base_sync_recovery.operations.last_mut()
+                && !op.finished
+                && op.head == orig
+                && op.tip == onto_sha
+            {
+                op.validated_head = Some(head.clone());
+                state.save()?;
+            }
             git::worktree_remove(&repo, scratch).await.ok();
             state.event(
                 "rebase",

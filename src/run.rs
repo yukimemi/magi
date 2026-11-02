@@ -2049,8 +2049,8 @@ pub struct BaseSync {
     /// this round tried to close the gap. Zero means the tree already
     /// contained `tip`.
     pub behind: usize,
-    /// Cumulative rebase attempts. The ordinary cap is `graph::BASE_SYNC_ROUNDS`;
-    /// each explicit base recovery authorization may reserve one more.
+    /// Lifetime synchronization reservations, never reset. The active interval
+    /// in `base_sync_recovery` enforces `graph::BASE_SYNC_ROUNDS`.
     pub attempts: usize,
     /// What git said, if the most recent rebase attempt conflicted or could
     /// not be pushed. `Some` here is what makes a `Blocked` run read as
@@ -3548,6 +3548,7 @@ impl RunState {
     }
 
     pub(crate) fn save_under_at(&mut self, home: &Path, at: Timestamp) -> Result<()> {
+        self.record_base_interruption();
         self.updated_at = at;
         let dir = home.join("runs").join(&self.id);
         std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;

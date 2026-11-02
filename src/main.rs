@@ -256,7 +256,7 @@ enum Command {
         /// Continue an interrupted run.
         #[arg(long, value_name = "RUN_ID", conflicts_with_all = ["instruction", "file", "issue"])]
         resume: Option<String>,
-        /// Authorize one additional base rebase after movement exhausted its budget.
+        /// Authorize a new bounded base synchronization interval after movement exhaustion.
         #[arg(long, requires = "resume", conflicts_with = "dry_run")]
         recover_base: bool,
         #[command(flatten)]

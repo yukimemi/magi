@@ -458,7 +458,7 @@ impl ResumeRefusal {
 
     pub(crate) fn diagnostic(&self, state: &RunState) -> String {
         let reason = match self {
-            Self::BaseSyncStop => "base synchronization is stopped; inspect the retained work. For movement exhaustion only, use `magi run --resume <run> --recover-base` to authorize one additional rebase and fresh verification".into(),
+            Self::BaseSyncStop => "base synchronization is stopped; inspect the retained work. For movement exhaustion only, use `magi run --resume <run> --recover-base` to authorize a new bounded synchronization interval and fresh verification".into(),
             Self::Status(status) => format!("status `{}` is final; there is nothing left to resume", status.as_str()),
             Self::Released(_) => "execution was released".into(),
             Self::Retired(_) => "execution was retired".into(),
