@@ -49,6 +49,11 @@ pub(crate) mod bridge;
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "operation", deny_unknown_fields)]
 pub enum Operation {
+    /// Authorize bounded repair through the same transaction as the terminal.
+    GrantRepair {
+        /// Head-bound operator request.
+        request: crate::repair_budget::Request,
+    },
     /// File a new task through the launcher, including from read-only chats.
     Add {
         /// Validated filing inputs, without task state or a caller-selected id.
@@ -285,6 +290,9 @@ async fn execute(
                 },
             )
             .await?
+        }
+        Operation::GrantRepair { request } => {
+            serde_json::to_string(&crate::repair_budget::grant(queue, home, request).await?)?
         }
         Operation::Resume { run } => {
             let t = resume(queue, home, &run)?;

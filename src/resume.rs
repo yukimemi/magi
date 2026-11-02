@@ -62,7 +62,9 @@ pub(crate) async fn spawn_detached(home: &Path, id: &str) -> Result<crate::worke
     // and execution lease. Preflight checked run liveness, and the task claim
     // acquired above excludes a concurrent queue driver; no scheduler reclaim
     // is required before this explicit resume.
-    task.release_operator("resume", None);
+    if !crate::repair_budget::queue_resumption(&queue, &mut task, id)? {
+        task.release_operator("resume", None);
+    }
     task.resume_override = Some(crate::queue::OperatorResume {
         question_id: String::new(),
         at: jiff::Timestamp::now(),
@@ -132,7 +134,9 @@ pub(crate) fn pin_queued(
     {
         return Ok(true);
     }
-    task.release_operator(if applied.is_some() { "choice" } else { "chat" }, applied);
+    if !crate::repair_budget::queue_resumption(queue, &mut task, run)? {
+        task.release_operator(if applied.is_some() { "choice" } else { "chat" }, applied);
+    }
     task.resume_override = Some(crate::queue::OperatorResume {
         question_id: applied.unwrap_or_default().to_owned(),
         at: jiff::Timestamp::now(),

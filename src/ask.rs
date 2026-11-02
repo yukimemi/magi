@@ -1628,6 +1628,25 @@ impl Questions {
         all
     }
 
+    /// Strict read-only snapshot for control transactions. Unlike the UI
+    /// list, this neither upgrades question choices nor skips unreadable
+    /// records that might contain an unresolved owner decision.
+    pub(crate) fn snapshot(&self) -> Result<Vec<Question>> {
+        let entries = match std::fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error).context("inspect pending questions"),
+        };
+        let mut questions = Vec::new();
+        for entry in entries {
+            let path = entry?.path();
+            if path.extension().is_some_and(|ext| ext == "json") {
+                questions.push(read_path(&path)?);
+            }
+        }
+        Ok(questions)
+    }
+
     /// Open questions belonging to one run, newest first.
     ///
     /// Used to decide whether a parked run can be resumed: while this is

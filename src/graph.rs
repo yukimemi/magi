@@ -1632,6 +1632,8 @@ impl Runner {
         // Declare after the execution guard: on any claim error this short
         // lock must drop before that guard reloads and releases ownership.
         let _owner = owner;
+        crate::repair_budget::apply(&crate::run::home(), &mut execution.runner.state, &disk)
+            .await?;
         let state = &mut execution.runner.state;
         // Moving again, so it is no longer parked. Set before the walk rather
         // than in `resume`, so every way of re-entering the graph clears it
@@ -1673,8 +1675,252 @@ impl Runner {
         Ok(execution)
     }
 
+    /// A grant owns only these repair attempts. Confirmation reviews cannot
+    /// create another fixer allowance, and every operation is restart-checkpointed.
+    async fn execute_granted_repair(&mut self) -> Result<()> {
+        use crate::repair_budget::{Kind, Phase};
+        let index = self.state.repair_grants.len() - 1;
+        let winner = self
+            .state
+            .winner()
+            .cloned()
+            .context("repair winner missing")?;
+        loop {
+            let grant = self.state.repair_grants[index].clone();
+            match grant.phase {
+                Phase::Pending => {
+                    if grant.spent >= grant.receipt.request.rounds {
+                        self.state.repair_grants[index].phase = Phase::Complete;
+                        self.state.status = RunStatus::Blocked;
+                        self.state.save()?;
+                        return Ok(());
+                    }
+                    // Reserve before dispatch. A crash can consume an attempt,
+                    // but can never duplicate it or reset saved fixer history.
+                    self.state.repair_grants[index].spent += 1;
+                    self.state.repair_grants[index].phase = Phase::Fixing;
+                    self.state.save()?;
+                    match grant.receipt.request.kind {
+                        Kind::Gate => {
+                            let failed = self.state.gate.clone();
+                            let _ = self.gate_fix_round(&winner, &failed).await?;
+                        }
+                        Kind::Review => {
+                            let mut record = self
+                                .state
+                                .reviews
+                                .last()
+                                .cloned()
+                                .context("review failure missing")?;
+                            let round = record.round;
+                            let step = self.run_fix_round(&winner, &mut record).await?;
+                            self.state.reviews[round - 1] = record;
+                            if matches!(step, FixStep::Recorded { report_lost: true }) {
+                                self.state.repair_grants[index].phase = Phase::Complete;
+                                self.state.status = RunStatus::Blocked;
+                                self.state.event("repair-grant", "fixer continuation remains unresolved; repair grant cannot bypass its stop");
+                                self.state.save()?;
+                                return Ok(());
+                            }
+                            if matches!(step, FixStep::Resource) {
+                                self.stop_for_resource()?;
+                                return Ok(());
+                            }
+                            self.state.save()?;
+                        }
+                    }
+                    if self.resource_halt()? {
+                        return Ok(());
+                    }
+                }
+                Phase::Fixing => {
+                    // Interrupted fixers may have left source changes or an
+                    // unpushed commit. Preserve them before fresh assessment.
+                    let _coordination = self.coordinate(&winner.worktree).await?;
+                    let rescued = git::rescue_commit(
+                        &winner.worktree,
+                        "magi: preserve interrupted granted repair",
+                    )
+                    .await?;
+                    self.state.note_withheld("repair-grant", &rescued.withheld);
+                    // Fresh checks must supersede even a same-head failure.
+                    // Archive rather than erase failure evidence or counters.
+                    self.state
+                        .verification_history
+                        .push(crate::run::VerificationEvidence {
+                            superseded_by: None,
+                            archived_at: Some(Timestamp::now()),
+                            fixes_spent: Some(self.state.gate_fixes.len()),
+                            gate_head: self.state.gate_head.take(),
+                            gate_ran: std::mem::take(&mut self.state.gate_ran),
+                            gate: std::mem::take(&mut self.state.gate),
+                            e2e: self.state.head_e2e.take(),
+                        });
+                    if let Some(e2e) = self.state.gate_repair_e2e.take() {
+                        self.state
+                            .verification_history
+                            .push(crate::run::VerificationEvidence {
+                                superseded_by: None,
+                                archived_at: Some(Timestamp::now()),
+                                fixes_spent: Some(self.state.gate_fixes.len()),
+                                gate_head: None,
+                                gate_ran: false,
+                                gate: Vec::new(),
+                                e2e: Some(e2e),
+                            });
+                    }
+                    self.state.repair_grants[index].review_start = self.state.reviews.len();
+                    self.state.repair_grants[index].head =
+                        git::rev_parse(&winner.worktree, "HEAD").await?;
+                    self.state.repair_grants[index].phase = Phase::Reviewing;
+                    self.state.save()?;
+                }
+                Phase::Reviewing => {
+                    self.review_loop_pass().await?;
+                    if self.resource_halt()? {
+                        return Ok(());
+                    }
+                    let head = git::rev_parse(&winner.worktree, "HEAD").await?;
+                    let clean = self.state.reviews.len() > grant.review_start
+                        && self.state.reviews.last().is_some_and(|r| {
+                            r.head == head
+                                && r.clean
+                                && r.expected > 0
+                                && r.answered == r.expected
+                                && matches!(
+                                    r.e2e_status(),
+                                    E2eStatus::Passed | E2eStatus::NotConfigured
+                                )
+                        });
+                    if !clean {
+                        // A confirmation review carries no additional fix budget.
+                        self.state.repair_grants[index].phase = if grant.receipt.request.kind
+                            == Kind::Review
+                            && grant.spent < grant.receipt.request.rounds
+                            && self.state.reviews.last().is_some_and(|r| {
+                                r.fix.is_none()
+                                    && (r.blocking > 0 || r.e2e_status() == E2eStatus::Failed)
+                            }) {
+                            Phase::Pending
+                        } else {
+                            Phase::Complete
+                        };
+                        self.state.status = RunStatus::Blocked;
+                        self.state.event(
+                            "repair-grant",
+                            "fresh review did not clear the repaired head; no publication",
+                        );
+                        self.state.save()?;
+                        if self.state.repair_grants[index].phase == Phase::Pending {
+                            continue;
+                        }
+                        return Ok(());
+                    }
+                    self.state.repair_grants[index].phase = Phase::Gating;
+                    self.state.save()?;
+                }
+                Phase::Gating => {
+                    let head = git::rev_parse(&winner.worktree, "HEAD").await?;
+                    self.state.reconcile_verification_head(&head);
+                    let wait = self.repository_wait();
+                    if self
+                        .state
+                        .reviews
+                        .last()
+                        .is_none_or(|r| r.head != head || !r.clean)
+                    {
+                        self.state.status = RunStatus::Blocked;
+                        self.state.repair_grants[index].phase = Phase::Complete;
+                        self.state.event(
+                            "repair-grant",
+                            "head changed since fresh review; repair held",
+                        );
+                        self.state.save()?;
+                        return Ok(());
+                    }
+                    if !verify_current_head(&mut self.state, &winner, &wait).await? {
+                        return Ok(());
+                    }
+                    let outcomes = self.run_gate(&winner).await?;
+                    if verify_inconclusive(&outcomes) {
+                        return Ok(());
+                    }
+                    let after = git::rev_parse(&winner.worktree, "HEAD").await?;
+                    if after != head {
+                        self.state.repair_grants[index].review_start = self.state.reviews.len();
+                        self.state.repair_grants[index].head = after;
+                        self.state.repair_grants[index].phase = Phase::Reviewing;
+                        self.state.status = RunStatus::Blocked;
+                        self.state.event("repair-grant", "pre-gate changed the reviewed head; resume for fresh review before publication");
+                        self.state.save()?;
+                        return Ok(());
+                    }
+                    let passed = outcomes.iter().all(CommandOutcome::ok);
+                    self.state.repair_grants[index].succeeded = passed;
+                    self.state.gate = outcomes;
+                    self.state.gate_ran = true;
+                    self.state.status = if passed {
+                        RunStatus::Gating
+                    } else {
+                        RunStatus::Blocked
+                    };
+                    self.state.repair_grants[index].phase = if !passed
+                        && grant.receipt.request.kind == Kind::Gate
+                        && grant.spent < grant.receipt.request.rounds
+                    {
+                        Phase::Pending
+                    } else {
+                        Phase::Complete
+                    };
+                    if passed && self.state.config.merge.mode == MergeMode::Pr {
+                        // Persist publication debt with the successful checkpoint.
+                        self.state.pr_publication_pending = true;
+                    } else if passed {
+                        self.state.status = RunStatus::Ready;
+                    }
+                    self.state.save()?;
+                    if !passed {
+                        continue;
+                    }
+                    // Existing PR ownership and push lease stay in place. The
+                    // normal publisher owes the new reviewed/gated SHA, and
+                    // land's fresh owner approval remains mandatory.
+                    if self.state.config.merge.mode != MergeMode::Pr {
+                        self.state.status = RunStatus::Ready;
+                        self.state.event(
+                            "repair-grant",
+                            "repair verified locally; grant carries no merge authorization",
+                        );
+                        self.state.save()?;
+                        return Ok(());
+                    }
+                    return self.merge().await;
+                }
+                Phase::Complete => return Ok(()),
+            }
+        }
+    }
+
     async fn execute_graph(&mut self) -> Result<()> {
         self.state.configure_recovery_resume()?;
+        if self
+            .state
+            .repair_grants
+            .last()
+            .is_some_and(|g| g.phase != crate::repair_budget::Phase::Complete)
+        {
+            return self.execute_granted_repair().await;
+        }
+        if self
+            .state
+            .repair_grants
+            .last()
+            .is_some_and(|g| !g.succeeded)
+        {
+            self.state.status = RunStatus::Blocked;
+            self.state.save()?;
+            return Ok(());
+        }
         // Preservation may invalidate an old empty classification. Resolve it
         // before any resume shortcut can reuse a verdict or publish a branch.
         self.persist_candidates().await?;
@@ -6443,7 +6689,20 @@ impl Runner {
         let Some(winner) = self.state.winner().cloned() else {
             return Ok(());
         };
-        let max_rounds = self.state.config.graph.review_rounds;
+        let granted_review = self
+            .state
+            .repair_grants
+            .last()
+            .filter(|g| g.phase == crate::repair_budget::Phase::Reviewing)
+            .cloned();
+        let fresh_review = granted_review
+            .as_ref()
+            .is_some_and(|g| self.state.reviews.len() == g.review_start);
+        let max_rounds = granted_review
+            .as_ref()
+            .map_or(self.state.config.graph.review_rounds, |g| {
+                g.review_start.saturating_add(1)
+            });
         // A clean round, an exhausted round budget, or a stalled tree (see
         // `STAGNANT_LIMIT`) are all already-decided conclusions the moment
         // they are recorded — recomputed here, not read off `status`, so a
@@ -6453,7 +6712,9 @@ impl Runner {
         // `judge`/`deliberate` skip rewrites it on every reentry). The loop
         // below runs an empty range once the budget is spent, and would
         // otherwise fall through without touching `status` at all.
-        if let Some(status) = review_conclusion(&self.state.reviews, max_rounds) {
+        if let Some(status) =
+            review_conclusion(&self.state.reviews, max_rounds).filter(|_| !fresh_review)
+        {
             // A reentry after a crash between the last round's save and
             // `stop_reviewing` reaches the hand-off here, not there.
             if status == RunStatus::Gating {
@@ -6473,10 +6734,12 @@ impl Runner {
         // loop below has nothing left to do at all (its range is empty).
         // Retry that check directly instead, exactly the same retry
         // `stop_reviewing` already does for its own catch-up case.
-        if self.state.reviews.last().is_some_and(|r| {
-            r.e2e_status() == E2eStatus::ResourceBlocked
-                || (r.e2e_status() == E2eStatus::Deferred && r.blocking == 0 && r.fix.is_none())
-        }) {
+        if !fresh_review
+            && self.state.reviews.last().is_some_and(|r| {
+                r.e2e_status() == E2eStatus::ResourceBlocked
+                    || (r.e2e_status() == E2eStatus::Deferred && r.blocking == 0 && r.fix.is_none())
+            })
+        {
             let shell = self.state.config.shell();
             return self
                 .stop_unresolved_review(
@@ -6487,7 +6750,9 @@ impl Runner {
                 .await;
         }
 
-        self.recovery_repair(&winner).await?;
+        if granted_review.is_none() {
+            self.recovery_repair(&winner).await?;
+        }
         if self.resource_halt()? {
             return Ok(());
         }
@@ -7802,7 +8067,14 @@ impl Runner {
         winner: &Candidate,
         outcomes: &[CommandOutcome],
     ) -> Result<GateFix> {
-        let cap = self.state.config.graph.gate_fix_rounds;
+        let cap = if self.state.repair_grants.last().is_some_and(|g| {
+            g.phase == crate::repair_budget::Phase::Fixing
+                && g.receipt.request.kind == crate::repair_budget::Kind::Gate
+        }) {
+            self.state.gate_fixes.len().saturating_add(1)
+        } else {
+            self.state.config.graph.gate_fix_rounds
+        };
         let spent = self.state.gate_fixes.len();
         if spent >= cap {
             if cap > 0 {
@@ -11261,7 +11533,7 @@ pub(crate) enum GateFix {
 /// 126 / 127 are the POSIX shell's "cannot execute" / "not found". Output-free
 /// exits carry nothing for a fixer to act on. Language-agnostic on purpose:
 /// what the command is stays the gate's business.
-fn gate_fixable(outcomes: &[CommandOutcome]) -> bool {
+pub(crate) fn gate_fixable(outcomes: &[CommandOutcome]) -> bool {
     let mut red = outcomes.iter().filter(|o| !o.ok()).peekable();
     red.peek().is_some()
         && red.all(|o| {

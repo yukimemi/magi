@@ -2228,6 +2228,9 @@ pub struct RunState {
     pub seed: u64,
     /// Config snapshot, so a resumed run behaves like the original.
     pub config: Config,
+    /// Applied explicit repair authorizations and crash checkpoints.
+    #[serde(default)]
+    pub repair_grants: Vec<crate::repair_budget::Applied>,
     /// Additive approval policy; retained even if a later head removes it.
     #[serde(default)]
     pub branch_owner_holds: Vec<BranchOwnerHold>,
@@ -2746,6 +2749,7 @@ impl RunState {
             seed,
             config,
             branch_owner_holds: Vec::new(),
+            repair_grants: Vec::new(),
             enabled_worktree_config: false,
             foreign_checkout: None,
             pr_head: None,

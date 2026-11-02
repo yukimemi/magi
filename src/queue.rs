@@ -447,6 +447,9 @@ pub struct Task {
     /// *after* the answer. See [`OperatorResume`]. `#[serde(default)]`.
     #[serde(default)]
     pub resume_override: Option<OperatorResume>,
+    /// Immutable repair receipts, saved atomically with the exact-run queue pin.
+    #[serde(default)]
+    pub repair_grants: Vec<crate::repair_budget::Receipt>,
     /// Latest explicit operator release. Historical answers remain audit evidence;
     /// this approval takes precedence over their earlier waiting premises.
     #[serde(default)]
@@ -947,6 +950,7 @@ impl Task {
             triage_applied: Vec::new(),
             actions_applied: Vec::new(),
             resume_override: None,
+            repair_grants: Vec::new(),
             resumption: None,
             resumption_history: Vec::new(),
             operator_decided_at: None,
@@ -2568,6 +2572,21 @@ impl Queue {
     fn merge_stored(&self, task: &mut Task) {
         if let Ok(mut stored) = read_path(&self.path_of(&task.id)) {
             stored.import_chat_notice();
+            for receipt in &stored.repair_grants {
+                if !task
+                    .repair_grants
+                    .iter()
+                    .any(|r| r.request.request == receipt.request.request)
+                {
+                    // A pre-grant snapshot cannot drop the atomic queue reservation.
+                    task.repair_grants.push(receipt.clone());
+                    task.resume_override = stored.resume_override.clone();
+                    task.status = stored.status;
+                    task.hold_source = stored.hold_source;
+                    task.hold_reason = stored.hold_reason.clone();
+                    task.held_at = stored.held_at;
+                }
+            }
             // The task's message chat is recorded once and never rewound or
             // dropped by a writer holding an older snapshot.
             if task.chat.is_none() {
