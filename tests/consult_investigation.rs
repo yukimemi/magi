@@ -128,7 +128,9 @@ printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"T
         );
         run.parked = true;
         run.save_under(tmp.path()).unwrap();
-        question.run = run.id.clone();
+        // This suite exercises legacy, non-task consultation. Task-owned
+        // inquiries are unconditionally delivered by their own chat turn.
+        question.run = "legacy-consultation".into();
         let queue = magi::queue::Queue::at(tmp.path().join("queue"));
         let mut task = magi::queue::Task::new(
             "Original task".into(),

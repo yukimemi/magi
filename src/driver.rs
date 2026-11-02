@@ -246,6 +246,14 @@ pub(crate) fn reconcile(home: &Path) -> Vec<String> {
 /// Explicit owner action, separate from startup reconciliation. Never turn
 /// Unknown into permission to retire a record. Claims share this owner lock.
 pub(crate) fn abandon_proven_dead(home: &Path, id: &str) -> Result<()> {
+    abandon_with_receipt(home, id, None)
+}
+
+pub(crate) fn abandon_decision(home: &Path, id: &str, inquiry: &str, request: &str) -> Result<()> {
+    abandon_with_receipt(home, id, Some((inquiry, request)))
+}
+
+fn abandon_with_receipt(home: &Path, id: &str, receipt: Option<(&str, &str)>) -> Result<()> {
     anyhow::ensure!(crate::run::is_run_id(id), "invalid run id");
     let _owner = crate::pr_head::owner_lock(home, id)?;
     let mut state = RunState::load_under(id, home)?;
@@ -257,6 +265,11 @@ pub(crate) fn abandon_proven_dead(home: &Path, id: &str) -> Result<()> {
     anyhow::ensure!(state.status.resumable(), "run is already terminal");
     state.clear_active();
     state.status = crate::run::RunStatus::Failed;
+    if let Some((inquiry, request)) = receipt {
+        state
+            .abandonment_receipts
+            .insert(inquiry.to_owned(), request.to_owned());
+    }
     state.event(
         "owner-choice",
         "abandoned by an explicit choice after driver liveness was proven gone",

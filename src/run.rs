@@ -2417,6 +2417,9 @@ pub struct RunState {
     /// Owner stop/withdraw/replacement checkpoint, independent of PR head movement.
     #[serde(default)]
     pub merge_decision: Option<crate::merge_decision::Decision>,
+    /// Exact owner requests committed atomically with abandonment.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub abandonment_receipts: BTreeMap<String, String>,
     /// Previous attempt replaced by this run; its PR is never reused.
     #[serde(default)]
     pub replaces: Option<crate::merge_decision::Replacement>,
@@ -2844,6 +2847,7 @@ impl RunState {
             land_approval: None,
             merge_repairs: Vec::new(),
             merge_decision: None,
+            abandonment_receipts: BTreeMap::new(),
             replaces: None,
             github_text: None,
             change_summary: None,

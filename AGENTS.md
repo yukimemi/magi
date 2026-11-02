@@ -3617,3 +3617,12 @@ run 付きの非タスク問い合わせにも legacy foreground 経路がある
 queue 書込み失敗の結果は不確実として保持する。
 撤回は対応する質問・対象の閉鎖確認と実行終了の永続記録で解決する。
 watch の既報の起動待ちタイムアウトと再現検証の限界は README の検証記録を参照する。
+
+判断待ち基盤の受領記録は後続の状態遷移から独立させる。
+着地保留は適用時に task の `decision_effects` に記録し、旧形式の
+`actions_applied` と run の対応 checkpoint も引き続き照合する。
+dispatch 前に再開 pin を置換・削除する queue 書込みは、元の依頼 ID と run を
+`superseded_resumes` に保存する。通常の Running 遷移で pin を消費しただけでは
+置換扱いにせず、実行開始記録を待つ。放棄は run の Failed 更新と同時に
+`abandonment_receipts` へ依頼 ID と正確な操作を保存する。
+明示的照合も再起動時の照合もこれらを読み、操作を再実行しない。

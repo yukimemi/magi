@@ -466,6 +466,10 @@ pub struct Task {
     /// These receipts survive subsequent transitions and execution starts.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub decision_effects: std::collections::BTreeMap<String, String>,
+    /// Exact resume pins explicitly replaced or removed before dispatch.
+    /// Retained independently of later task transitions and stale writers.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub superseded_resumes: std::collections::BTreeMap<String, String>,
     /// The operator's "resume" answer to a triage question, kept until the
     /// task actually runs (or is done) so `crate::conduct` cannot silently
     /// undo it and `crate::triage` can tell that a hold it sees now came
@@ -976,6 +980,7 @@ impl Task {
             triage_applied: Vec::new(),
             actions_applied: Vec::new(),
             decision_effects: Default::default(),
+            superseded_resumes: Default::default(),
             resume_override: None,
             repair_grants: Vec::new(),
             resumption: None,
@@ -2714,6 +2719,18 @@ impl Queue {
                     task.hold_reason = stored.hold_reason.clone();
                     task.held_at = stored.held_at;
                 }
+            }
+            task.superseded_resumes.extend(stored.superseded_resumes);
+            if task.status != TaskStatus::Running
+                && let Some(pin) = &stored.resume_override
+                && !pin.question_id.is_empty()
+                && let Some(run) = &pin.pinned_run
+                && task.resume_override.as_ref().is_none_or(|next| {
+                    next.question_id != pin.question_id || next.pinned_run != pin.pinned_run
+                })
+            {
+                task.superseded_resumes
+                    .insert(pin.question_id.clone(), run.clone());
             }
             // A writer holding an older task snapshot must never erase or
             // rewrite proof that a chat command already committed its effect.

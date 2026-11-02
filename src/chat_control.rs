@@ -634,6 +634,9 @@ async fn execute_decision(
                     "resume queued for {run}; execution start remains unconfirmed"
                 ))
             })
+    } else if let Operation::Abandon { run } = &command {
+        crate::driver::abandon_decision(home, run, id, &request)
+            .map(|()| format!("abandoned run {run}"))
     } else {
         Box::pin(execute(queue, home, talks, chat, command)).await
     };
@@ -837,6 +840,7 @@ fn reconcile_task_decision(queue: &Queue, home: &Path, chat: &str, id: &str) -> 
                 && task.status == TaskStatus::Queued
         }
         Operation::Resume { run } => resume_started(home, &task, id, &run)?,
+        Operation::Abandon { run } => abandonment_receipt(home, &task, id, &run, &request)?,
         _ => anyhow::bail!(
             "external effects require their authoritative receipt; no operation was replayed"
         ),
@@ -848,7 +852,8 @@ fn reconcile_task_decision(queue: &Queue, home: &Path, chat: &str, id: &str) -> 
     outbox.update_decision(id, |d| d.applied("owner-requested reconciliation: exact intended task condition confirmed under its claim; no effect remains necessary"))
 }
 
-/// Read the exact request's committed execution pass, not a transient task status.
+/// Read the exact request's committed execution pass or durable pin supersession.
+/// A transient task status alone never proves either outcome.
 pub(crate) fn resume_started(home: &Path, task: &Task, inquiry: &str, run: &str) -> Result<bool> {
     ensure!(
         crate::run::is_run_id(run) && task.runs.iter().any(|id| id == run),
@@ -856,12 +861,38 @@ pub(crate) fn resume_started(home: &Path, task: &Task, inquiry: &str, run: &str)
     );
     let state = crate::run::RunState::load_under(run, home)?;
     ensure!(state.repo == task.repo, "resume run repository changed");
+    if task
+        .superseded_resumes
+        .get(inquiry)
+        .is_some_and(|target| target == run)
+    {
+        return Ok(true);
+    }
     Ok(state.decision_starts.get(inquiry).is_some_and(|index| {
         state
             .passes
             .get(*index)
             .is_some_and(|pass| pass.index == *index)
     }))
+}
+
+fn abandonment_receipt(
+    home: &Path,
+    task: &Task,
+    id: &str,
+    run: &str,
+    request: &str,
+) -> Result<bool> {
+    ensure!(
+        task.runs.iter().any(|own| own == run),
+        "abandon run ownership changed"
+    );
+    let state = crate::run::RunState::load_under(run, home)?;
+    ensure!(state.repo == task.repo, "abandon run repository changed");
+    Ok(state
+        .abandonment_receipts
+        .get(id)
+        .is_some_and(|receipt| receipt == request))
 }
 
 fn merge_receipt(
@@ -955,12 +986,16 @@ fn reconcile_inquiry(
     let queued_resume = matches!(&command, Operation::Resume { .. });
     let mut pending_external = false;
     let receipt = match command {
+        Operation::Abandon { run } => {
+            abandonment_receipt(home, &task, &inquiry.id, &run, &request)?
+                .then(|| format!("run {run}: exact abandonment receipt committed"))
+        }
         Operation::Resume { run } => {
             let task = queue.get(&inquiry.task)?;
             ensure!(task.repo == inquiry.repo, "resume task repository changed");
             resume_started(home, &task, &inquiry.id, &run)?.then(|| {
                 format!(
-                    "run {run}: durable execution-start receipt for {}",
+                    "run {run}: durable execution-start or supersession receipt for {}",
                     inquiry.id
                 )
             })

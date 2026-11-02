@@ -1079,3 +1079,119 @@ async fn real_foreground_ask_with_a_run_survives_migration_and_receives_a_fresh_
     assert_eq!(Questions::at(home.join("questions")).get(&q.id).unwrap().resolution().as_deref(), Some("Fresh foreground reply"));
 }
 }
+
+common::e2e! {
+async fn superseded_resume_pins_reconcile_without_starting_or_replaying() {
+    use magi::{chat_control::{self, Operation}, run::{RunState, RunStatus}, task_decision::Status};
+    let fx = common::fixture(common::home_lock().await, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("superseded-pins");
+    let queue = Queue::at(home.join("queue"));
+    let talks = Talks::at(home.join("talks"));
+    let chat = talk::begin(&talks, &fx.config, fx.repo.clone(), Some("alpha")).unwrap();
+    for transition in ["replacement", "done", "retry", "dispatch"] {
+        let mut run = RunState::new(fx.repo.clone(), "main".into(), "base".into(), "work".into(), fx.config.clone());
+        run.reserve_under(&home).unwrap();
+        run.status = RunStatus::Blocked;
+        run.driver_exited = true;
+        run.save_under(&home).unwrap();
+        let mut task = Task::new("work".into(), "work".into(), fx.repo.clone(), Source::Human);
+        task.chat = Some(chat.id.clone());
+        task.runs.push(run.id.clone());
+        queue.put(&mut task).unwrap();
+        let outbox = Outbox::at(&home);
+        let first = outbox.file(&task, Some(run.id.clone()), "owner".into(), "Resume", transition).unwrap();
+        outbox.deliver(&queue, &talks, &first.id).unwrap();
+        chat_control::dispatch(&queue, &home, &talks, &chat.id, Operation::ForDecision {
+            inquiry: first.id.clone(), command: Box::new(Operation::Resume { run: run.id.clone() })
+        }).await.unwrap();
+        chat_control::reconcile_decisions(&queue, &home).unwrap();
+        assert_eq!(outbox.get(&first.id).unwrap().decision.unwrap().status, Status::Queued);
+        if transition == "dispatch" {
+            let mut pending = queue.get(&task.id).unwrap();
+            pending.start(run.id.clone());
+            queue.put(&mut pending).unwrap();
+            chat_control::reconcile_decisions(&queue, &home).unwrap();
+            assert_eq!(outbox.get(&first.id).unwrap().decision.unwrap().status, Status::Queued,
+                "normal dispatch consumes the pin but still owes a committed execution pass");
+            assert!(queue.get(&task.id).unwrap().superseded_resumes.is_empty());
+            continue;
+        }
+        if transition == "replacement" {
+            let second = outbox.file(&task, Some(run.id.clone()), "owner".into(), "Resume again", "New request").unwrap();
+            outbox.deliver(&queue, &talks, &second.id).unwrap();
+            chat_control::dispatch(&queue, &home, &talks, &chat.id, Operation::ForDecision {
+                inquiry: second.id.clone(), command: Box::new(Operation::Resume { run: run.id.clone() })
+            }).await.unwrap();
+            chat_control::reconcile_decisions(&queue, &home).unwrap();
+            assert_eq!(outbox.get(&second.id).unwrap().decision.unwrap().status, Status::Queued);
+        } else {
+            let operation = if transition == "done" {
+                Operation::Done { task: task.id.clone() }
+            } else {
+                Operation::Retry { task: task.id.clone(), title: None, instruction: "New instruction".into() }
+            };
+            chat_control::dispatch(&queue, &home, &talks, &chat.id, operation).await.unwrap();
+        }
+        // Re-open both stores to exercise the durable receipt, including explicit reconciliation.
+        chat_control::reconcile_decisions(&Queue::at(home.join("queue")), &home).unwrap();
+        chat_control::dispatch(&queue, &home, &talks, &chat.id, Operation::ReconcileDecision { inquiry: first.id.clone() }).await.unwrap();
+        assert_eq!(Outbox::at(&home).get(&first.id).unwrap().decision.unwrap().status, Status::Resolved);
+        let disk = RunState::load_under(&run.id, &home).unwrap();
+        assert!(disk.decision_starts.is_empty());
+        assert!(disk.passes.is_empty());
+    }
+}
+}
+
+common::e2e! {
+async fn abandonment_receipt_recovers_a_lost_outcome_without_reexecution() {
+    use magi::{chat_control::{self, Operation}, run::{RunState, RunStatus}, task_decision::{Decision, Status}};
+    let fx = common::fixture(common::home_lock().await, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("abandon-receipt");
+    let queue = Queue::at(home.join("queue"));
+    let talks = Talks::at(home.join("talks"));
+    let chat = talk::begin(&talks, &fx.config, fx.repo.clone(), Some("alpha")).unwrap();
+    let mut run = RunState::new(fx.repo.clone(), "main".into(), "base".into(), "work".into(), fx.config.clone());
+    run.reserve_under(&home).unwrap();
+    run.status = RunStatus::Blocked;
+    run.driver_exited = true;
+    run.save_under(&home).unwrap();
+    let mut task = Task::new("work".into(), "work".into(), fx.repo.clone(), Source::Human);
+    task.chat = Some(chat.id.clone());
+    task.runs.push(run.id.clone());
+    queue.put(&mut task).unwrap();
+    let outbox = Outbox::at(&home);
+    let record = outbox.file(&task, Some(run.id.clone()), "owner".into(), "Abandon", "Stop the dead execution").unwrap();
+    outbox.deliver(&queue, &talks, &record.id).unwrap();
+    let command = Operation::Abandon { run: run.id.clone() };
+    let request = serde_json::to_string(&command).unwrap();
+    chat_control::dispatch(&queue, &home, &talks, &chat.id, Operation::ForDecision {
+        inquiry: record.id.clone(), command: Box::new(command)
+    }).await.unwrap();
+    let disk = RunState::load_under(&run.id, &home).unwrap();
+    assert_eq!(disk.status, RunStatus::Failed);
+    assert_eq!(disk.abandonment_receipts.get(&record.id), Some(&request));
+    let run_bytes = std::fs::read(home.join("runs").join(&run.id).join("run.json")).unwrap();
+    // Simulate the final projection write being lost after the run commit.
+    let mut lost = outbox.get(&record.id).unwrap();
+    let mut decision = Decision::awaiting("Abandon".into());
+    decision.accept(&request).unwrap();
+    decision.start().unwrap();
+    decision.fail("Outcome write lost").unwrap();
+    lost.decision = Some(decision);
+    let path = home.join("notifications/task-inquiries").join(format!("{}.json", record.id));
+    std::fs::write(&path, serde_json::to_vec(&lost).unwrap()).unwrap();
+    chat_control::dispatch(&queue, &home, &talks, &chat.id, Operation::ReconcileDecision { inquiry: record.id.clone() }).await.unwrap();
+    assert_eq!(outbox.get(&record.id).unwrap().decision.unwrap().status, Status::Resolved);
+    std::fs::write(&path, serde_json::to_vec(&lost).unwrap()).unwrap();
+    chat_control::reconcile_decisions(&Queue::at(home.join("queue")), &home).unwrap();
+    assert_eq!(Outbox::at(&home).get(&record.id).unwrap().decision.unwrap().status, Status::Resolved);
+    assert_eq!(std::fs::read(home.join("runs").join(&run.id).join("run.json")).unwrap(), run_bytes);
+    // A terminal status alone cannot confirm a different inquiry.
+    let other = outbox.file(&task, Some(run.id.clone()), "owner".into(), "Another abandonment", "No receipt for this request").unwrap();
+    outbox.deliver(&queue, &talks, &other.id).unwrap();
+    outbox.update_decision(&other.id, |d| { d.accept(&request)?; d.start()?; Ok(true) }).unwrap();
+    chat_control::reconcile_decisions(&queue, &home).unwrap();
+    assert_ne!(outbox.get(&other.id).unwrap().decision.unwrap().status, Status::Resolved);
+}
+}

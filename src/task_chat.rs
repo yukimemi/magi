@@ -899,6 +899,17 @@ fn effect_receipt(
         && (choice.eq_ignore_ascii_case(crate::land::HOLD)
             || crate::merge_decision::selected_agent(&choice).is_some())
     {
+        // New holds carry a receipt in the same task write as the effect,
+        // independent even of reopening the old run's landing checkpoint.
+        if choice.eq_ignore_ascii_case(crate::land::HOLD)
+            && let Some(task) = &task
+            && task.decision_effects.get(&q.id) == Some(&format!("decision: {choice}"))
+        {
+            return Ok(Some(format!(
+                "task {}: landing hold {} committed",
+                task.id, q.id
+            )));
+        }
         let run = crate::run::RunState::load_under(&q.run, home)?;
         let Some(receipt) = run.merge_decision.as_ref().filter(|receipt| {
             receipt.question == q.id
@@ -911,14 +922,7 @@ fn effect_receipt(
         };
         if choice.eq_ignore_ascii_case(crate::land::HOLD) {
             return Ok(task
-                .filter(|task| {
-                    task.action_applied(&q.id)
-                        && task.runs.last() == Some(&q.run)
-                        && task.status == crate::queue::TaskStatus::Held
-                        && task.hold_source == Some(crate::queue::HoldSource::Manual)
-                        && run.status == crate::run::RunStatus::Blocked
-                        && run.land_armed_head.is_none()
-                })
+                .filter(|task| task.action_applied(&q.id))
                 .map(|task| format!("task {}: landing hold {} committed", task.id, q.id)));
         }
         // Resume only transports a replacement request to the old driver.
@@ -1528,11 +1532,27 @@ mod tests {
             run.save_under(home).unwrap();
             if choice == crate::land::HOLD {
                 // A checkpoint alone is insufficient until the task hold commits.
+                task.actions_applied.clear();
                 task.status = TaskStatus::Running;
                 queue.put(&mut task).unwrap();
                 check(Status::Queued);
                 task.hold_manual(Some("landing stopped".into()));
+                task.mark_action_applied(&q.id);
                 queue.put(&mut task).unwrap();
+                // A later release must not erase the already committed hold.
+                task.release_operator("chat", None);
+                queue.put(&mut task).unwrap();
+                assert!(
+                    effect_receipt(home, &queue, &q, Some(&task.id))
+                        .unwrap()
+                        .is_some()
+                );
+                // New receipts also survive reopening/removing the run checkpoint.
+                task.decision_effects
+                    .insert(q.id.clone(), format!("decision: {choice}"));
+                queue.put(&mut task).unwrap();
+                run.merge_decision = None;
+                run.save_under(home).unwrap();
                 check(Status::Resolved);
             } else {
                 check(Status::Queued); // Failed closure, despite the old pass marker.

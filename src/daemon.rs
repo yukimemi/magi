@@ -2004,6 +2004,10 @@ fn settle_and_diagnose(
             } else { format!("PR closure was not confirmed. Task held; inspect the existing run before starting replacement work. {}", state.merge.as_ref().map_or("", |m| m.detail.as_str())) }));
         }
         task.mark_action_applied(&d.question);
+        if d.choice.eq_ignore_ascii_case(land::HOLD) {
+            task.decision_effects
+                .insert(d.question.clone(), format!("decision: {}", d.choice));
+        }
         if let Some(pass) = state.passes.last() {
             task.record_pass_at(
                 &state.id,
@@ -11788,6 +11792,54 @@ mod tests {
             "release keeps run history but must not resume it"
         );
         assert_eq!(released.runs, ["stalled-run"]);
+    }
+
+    #[test]
+    fn landing_hold_receipt_survives_release_retry_and_checkpoint_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let mut state = run_state(RunStatus::Blocked);
+        state.merge_decision = Some(crate::merge_decision::Decision {
+            question: "hold-inquiry".into(),
+            target: crate::merge_decision::Target {
+                pr: "https://example.test/pull/1".into(),
+                head: "reviewed-head".into(),
+                language: "en".into(),
+            },
+            choice: land::HOLD.into(),
+            closed: false,
+            replacement_run: None,
+            replacement_pr: None,
+        });
+        let mut t = task();
+        t.start(state.id.clone());
+        settle_and_diagnose(
+            &mut t,
+            Verdict {
+                status: RunStatus::Blocked,
+                left_pr: true,
+                quota_hit: false,
+                parked: false,
+                no_viable_candidates: false,
+            },
+            "held",
+            2,
+            &state,
+        );
+        queue.put(&mut t).unwrap();
+        t.release_operator("chat", None);
+        t.edit("revised".into(), "revised instruction".into())
+            .unwrap();
+        queue.put(&mut t).unwrap();
+        drop(state);
+        assert_eq!(
+            queue
+                .get(&t.id)
+                .unwrap()
+                .decision_effects
+                .get("hold-inquiry"),
+            Some(&format!("decision: {}", land::HOLD))
+        );
     }
 
     fn stopped_public_run(status: RunStatus) -> RunState {
