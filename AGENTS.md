@@ -3639,6 +3639,8 @@ owner claim の取得後に開始 pass と `decision_starts` を同時保存す�
 run 保存を試みた後の失敗は引き続き不確実として扱う。
 相談テストではタスク所有の質問と実在する run の関連を維持し、本番の task chat
 配送経路で実行不変を確認する。非タスク相談も実在する独立 run を使って維持する。
+非タスク deputy の再起動テストも `Origin::operator()` の実在する独立 run を使う。
+存在しない run を非タスクの代用にしない。移行時には所有者不明の判断として保留される。
 
 release-watch の hold / leave it は `WatchState::applied` と、watch 削除前に保存する
 `release-watch-receipts/<inquiry>.json` で照合する。rerun の transport 用記録を
