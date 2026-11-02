@@ -18152,10 +18152,11 @@ esac
 
         let mut config = Config::default();
         config.verify.e2e = vec![format!("CARGO_TARGET_DIR='{}' true", cache_dir.display())];
-        // `verify.gate` stays empty (the default). Bounded so a regression
-        // that does start waiting fails the test in seconds, not hangs it.
+        // `verify.gate` stays empty (the default). Any accidental cache
+        // acquisition must report contention immediately, regardless of how
+        // long unrelated Git subprocesses take under parallel test load.
         config.graph.timeout_verify = Some(2);
-        config.graph.timeout_resource_wait = 2;
+        config.graph.timeout_resource_wait = 0;
 
         let other = crate::cache::Owner::here("other-run", "e2e", "e2e", &repo, "deadbeef");
         let _held = match crate::cache::try_acquire(&home, &cache_dir, &other)
@@ -18252,11 +18253,15 @@ esac
             interrupt: Pause::new(),
         };
 
-        let started = std::time::Instant::now();
         runner.gate().await.expect("gate");
+        assert!(runner.state.resource_block.is_none());
         assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "a gate with nothing to run must never wait on a lease it never needed"
+            !runner
+                .state
+                .events
+                .iter()
+                .any(|event| { event.message.contains("waiting for the shared build cache") }),
+            "a gate with nothing to run must never request the held cache lease"
         );
         assert!(
             runner.state.gate_ran,
