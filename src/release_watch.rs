@@ -1013,6 +1013,7 @@ impl Watcher {
                 }
             },
             PrLifecycle::Open => {
+                let consumed = st.question.clone();
                 let approved = match st.question.clone() {
                     None => Approved::NoQuestion,
                     Some(id) => match self.questions().get(&id) {
@@ -1054,7 +1055,18 @@ impl Watcher {
                 }
                 match step {
                     LocalStep::Wait => {}
-                    LocalStep::Hold(head) => st.held_head = Some(head),
+                    LocalStep::Hold(head) => {
+                        st.held_head = Some(head);
+                        if let Some(id) = consumed
+                            && self
+                                .questions()
+                                .get(&id)
+                                .is_ok_and(|q| q.resolution().as_deref() == Some(HOLD))
+                            && !st.applied.contains(&id)
+                        {
+                            st.applied.push(id);
+                        }
+                    }
                     LocalStep::Ask => {
                         st.held_head = None;
                         st.asked_head = Some(snap.head.clone());
@@ -1430,6 +1442,9 @@ impl Watcher {
                         }
                         Some(Answer::Choice(c)) if c == LEAVE_IT => {
                             st.ignored = true;
+                            if !st.applied.contains(&q.id) {
+                                st.applied.push(q.id.clone());
+                            }
                             let _ = Notices::at(self.home.join("notifications"))
                                 .dismiss(&notices::id_of(&notice_key(pr)));
                         }
@@ -2152,6 +2167,102 @@ mod tests {
     }
 
     // ---- [release] mode = "local" ----
+
+    #[tokio::test]
+    async fn local_quiet_decisions_reconcile_through_the_real_watch_consumers() {
+        use crate::{
+            queue::{Queue, Source, Task},
+            talk::{self, Talks},
+            task_decision::Status,
+            task_inquiry::Outbox,
+        };
+        for choice in [HOLD, LEAVE_IT] {
+            let (dir, fake, w) = rig();
+            let home = dir.path();
+            let repo = home.join("repo");
+            std::fs::create_dir(&repo).unwrap();
+            let mut config = crate::config::Config::default();
+            config.agents.push(
+                serde_json::from_value(serde_json::json!({
+                    "id": "test", "kind": "command", "command": [std::env::current_exe().unwrap()]
+                }))
+                .unwrap(),
+            );
+            let talks = Talks::at(home.join("talks"));
+            let chat = talk::begin(&talks, &config, repo.clone(), Some("test")).unwrap();
+            let queue = Queue::at(home.join("queue"));
+            let mut task = Task::new(
+                "release".into(),
+                "release".into(),
+                repo.clone(),
+                Source::Human,
+            );
+            task.runs.push("run1".into());
+            task.origin_chat = Some(chat.id.clone());
+            task.status = crate::queue::TaskStatus::Done;
+            queue.put(&mut task).unwrap();
+            register(home, &repo, URL, "run1");
+            *fake.local.lock().unwrap() = true;
+            *fake.snap.lock().unwrap() = Some(snap(
+                if choice == HOLD {
+                    PrLifecycle::Open
+                } else {
+                    PrLifecycle::Merged
+                },
+                "h1",
+                vec![],
+            ));
+            *fake.info.lock().unwrap() = Some(PrInfo {
+                branch: "chore/release-v1.0.0".into(),
+                merge_commit: Some("deadbeef".into()),
+                title: "release".into(),
+            });
+            // The failed-job case uses the actual release driver: the empty
+            // fixture repository cannot provide the release commit.
+            w.watch(&repo, URL, 60, 1, &|| false).await;
+            let questions = w.questions();
+            let q = questions
+                .list()
+                .into_iter()
+                .find(|q| q.status.open())
+                .unwrap();
+            crate::task_chat::sweep(&queue, &talks, &questions, home);
+            crate::chat_control::decide(&talks, home, &chat.id, &q.id, choice).unwrap();
+            assert_eq!(
+                Outbox::at(home)
+                    .get(&q.id)
+                    .unwrap()
+                    .decision
+                    .unwrap()
+                    .status,
+                Status::Queued
+            );
+            w.watch(&repo, URL, 60, 2, &|| false).await;
+            let st = w.load("o/r#7");
+            assert!(st.applied.contains(&q.id));
+            if choice == HOLD {
+                assert_eq!(st.held_head.as_deref(), Some("h1"));
+            } else {
+                assert!(st.ignored);
+            }
+            for now in [3, 4] {
+                let restarted = Watcher::new(Box::new(fake.clone()), home.into());
+                restarted.watch(&repo, URL, 60, now, &|| false).await;
+                crate::task_chat::sweep(&Queue::at(home.join("queue")), &talks, &questions, home);
+                assert_eq!(
+                    Outbox::at(home)
+                        .get(&q.id)
+                        .unwrap()
+                        .decision
+                        .unwrap()
+                        .status,
+                    Status::Resolved
+                );
+            }
+            assert!(fake.merges.lock().unwrap().is_empty());
+            assert!(fake.reruns.lock().unwrap().is_empty());
+        }
+    }
 
     fn local_st(asked: Option<&str>, held: Option<&str>) -> WatchState {
         WatchState {

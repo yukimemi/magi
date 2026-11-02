@@ -725,7 +725,7 @@ enum ControlCmd {
     },
     /// Reconcile an uncertain task-local effect without replaying it.
     ReconcileDecision { inquiry: String },
-    /// Explicitly settle discussion with no remaining effect, or supersede it.
+    /// Explicitly confirm no effect remains, including accepted legacy choices.
     SettleDecision {
         inquiry: String,
         /// Owner's reason; reading or delivery never settles a decision.

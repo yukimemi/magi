@@ -52,6 +52,10 @@ pub struct Decision {
     /// Migration never fills this field from a saved reply.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_answer_at: Option<Timestamp>,
+    /// Explicit owner confirmation that an accepted legacy effect has no
+    /// remaining work. Operational source readers must not consume it again.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub legacy_settled: bool,
     /// Complete lifecycle history; never pruned by delivery or read receipts.
     pub history: Vec<Event>,
 }
@@ -66,6 +70,7 @@ impl Decision {
             error: None,
             retry_safe: false,
             source_answer_at: None,
+            legacy_settled: false,
             history: vec![],
         }
     }
@@ -164,6 +169,30 @@ impl Decision {
         self.error = None;
         self.retry_safe = false;
         Ok(self.event(Status::Resolved, receipt))
+    }
+
+    /// Owner settlement is distinct from an application receipt. Legacy
+    /// consumers cannot always prove their external outcome; the owner may
+    /// explicitly confirm that no effect remains after inspecting it.
+    pub(crate) fn settle_legacy(&mut self, reason: &str) -> Result<bool> {
+        ensure!(
+            self.request
+                .as_deref()
+                .is_some_and(|r| r.starts_with("decision: ")),
+            "only an accepted legacy source decision supports this settlement"
+        );
+        ensure!(
+            self.status != Status::InProgress,
+            "effect consumer is still executing"
+        );
+        ensure!(!reason.trim().is_empty(), "settlement reason is empty");
+        if self.status == Status::Resolved {
+            return Ok(false);
+        }
+        self.legacy_settled = true;
+        self.error = None;
+        self.retry_safe = false;
+        Ok(self.event(Status::Resolved, reason))
     }
 
     /// Explicitly settle discussion without an operation, or supersede it with

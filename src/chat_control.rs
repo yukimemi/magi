@@ -73,7 +73,7 @@ pub enum Operation {
         /// Existing typed task/run command.
         command: Box<Operation>,
     },
-    /// Explicitly settle discussion with no remaining effect, or supersede it.
+    /// Explicitly confirm no effect remains, including accepted legacy choices.
     SettleDecision {
         /// Stable inquiry id.
         inquiry: String,

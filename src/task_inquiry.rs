@@ -473,7 +473,9 @@ impl Outbox {
     /// Explicit settlement belongs to the owning task chat. Replacement must
     /// already exist and have the same task/repository; it executes nothing.
     /// Undelivered ownerless imports may be settled from any authorized chat
-    /// without assigning that chat or inventing a task association.
+    /// without assigning that chat or inventing a task association. Accepted
+    /// legacy choices support explicit owner confirmation of no remaining
+    /// effect; native command uncertainty still requires its receipt.
     pub fn settle(
         &self,
         id: &str,
@@ -517,14 +519,24 @@ impl Outbox {
             );
             format!("superseded by {replacement}: {reason}")
         } else {
-            format!("owner settled without an effect: {reason}")
+            format!("owner settled; no further effect remains: {reason}")
         };
-        if current
+        let decision = current
             .decision
             .as_mut()
-            .context("inquiry is informational")?
-            .settle(&reason)?
+            .context("inquiry is informational")?;
+        let changed = if decision
+            .request
+            .as_deref()
+            .is_some_and(|r| r.starts_with("decision: "))
         {
+            decision.settle_legacy(&format!(
+                "owner confirmed no remaining legacy effect: {reason}"
+            ))?
+        } else {
+            decision.settle(&reason)?
+        };
+        if changed {
             self.save(&current)?;
         }
         Ok(())

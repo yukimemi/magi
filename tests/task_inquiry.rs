@@ -1398,3 +1398,56 @@ esac
     assert!(calls.lines().filter(|line| line.starts_with("pr merge")).all(|line| line.contains("--disable-auto")));
 }
 }
+
+common::e2e! {
+async fn accepted_legacy_effects_support_explicit_settlement_without_replay() {
+    use magi::{ask::{Question, Questions}, chat_control::{self, Operation}, task_decision::Status};
+    let fx = common::fixture(common::home_lock().await, common::Judges::Unanimous, false);
+    for (node, seat, choice) in [
+        (magi::bump::NOTICE_NODE, "release-watch", "merge"),
+        (magi::bump::NOTICE_NODE, "release-watch", "retry"),
+        (magi::bump::NOTICE_NODE, "release-watch", "rerun again"),
+        (magi::reconcile::NODE, magi::reconcile::SEAT, "keep"),
+    ] {
+        let home = fx.tmp.path().join(choice);
+        let queue = Queue::at(home.join("queue"));
+        let questions = Questions::at(home.join("questions"));
+        let talks = Talks::at(home.join("talks"));
+        let chat = talk::begin(&talks, &fx.config, fx.repo.clone(), Some("alpha")).unwrap();
+        let other = talk::begin(&talks, &fx.config, fx.repo.clone(), Some("alpha")).unwrap();
+        let mut task = Task::new("legacy".into(), "legacy".into(), fx.repo.clone(), Source::Human);
+        task.origin_chat = Some(chat.id.clone()); task.runs.push("run-a".into()); queue.put(&mut task).unwrap();
+        let mut q = Question::new("run-a".into(), node.into(), seat.into(), "Owner decision".into(), String::new(), vec![choice.into()]);
+        if choice == "merge" { q.merge_target = Some(magi::merge_decision::Target { pr: "https://example.test/pull/1".into(), head: "head".into(), language: "en".into() }); }
+        questions.put(&mut q).unwrap();
+        magi::task_chat::sweep(&queue, &talks, &questions, &home);
+        chat_control::decide(&talks, &home, &chat.id, &q.id, choice).unwrap();
+        let saved = std::fs::read(questions.path_of(&q.id)).unwrap();
+        assert_eq!(Outbox::at(&home).get(&q.id).unwrap().decision.unwrap().status, Status::Queued);
+        assert!(chat_control::dispatch(&queue, &home, &talks, &chat.id, Operation::ReconcileDecision { inquiry: q.id.clone() }).await.is_err());
+        for (speaker, reason) in [(&other.id, "Owner inspected the outcome"), (&chat.id, " ")] {
+            assert!(chat_control::dispatch(&queue, &home, &talks, speaker, Operation::SettleDecision { inquiry: q.id.clone(), reason: reason.into(), replacement: None }).await.is_err());
+        }
+        // Preserve the uncertain outcome in history, then explicitly confirm
+        // that no further effect is needed. This is not an application receipt.
+        if choice == "retry" {
+            Outbox::at(&home).update_decision(&q.id, |d| d.start()).unwrap();
+            assert!(chat_control::dispatch(&queue, &home, &talks, &chat.id, Operation::SettleDecision { inquiry: q.id.clone(), reason: "Do not hide an executing consumer".into(), replacement: None }).await.is_err());
+            Outbox::at(&home).update_decision(&q.id, |d| d.fail("Consumer ended without an authoritative receipt")).unwrap();
+        }
+        chat_control::dispatch(&queue, &home, &talks, &chat.id, Operation::SettleDecision { inquiry: q.id.clone(), reason: "Owner inspected the external outcome and confirms no effect remains".into(), replacement: None }).await.unwrap();
+        for _ in 0..2 {
+            magi::task_chat::sweep(&queue, &talks, &questions, &home);
+            let decision = Outbox::at(&home).get(&q.id).unwrap().decision.unwrap();
+            assert_eq!(decision.status, Status::Resolved); assert!(decision.legacy_settled);
+            assert_eq!(decision.request.as_deref(), Some(format!("decision: {choice}").as_str()));
+            if choice == "retry" { assert!(decision.history.iter().any(|e| e.status == Status::RetryNeeded)); }
+            assert!(questions.get(&q.id).unwrap().answer.is_none());
+            assert!(!questions.get(&q.id).unwrap().status.open());
+            assert!(!questions.list().into_iter().any(|q| q.answer.is_some()));
+            assert_eq!(std::fs::read(questions.path_of(&q.id)).unwrap(), saved);
+            assert!(chat_control::decide(&talks, &home, &chat.id, &q.id, choice).is_err());
+        }
+    }
+}
+}

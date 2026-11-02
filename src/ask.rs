@@ -1583,6 +1583,23 @@ impl Questions {
     }
 
     fn consumption_view_in(&self, mut q: Question, migrated: bool) -> Question {
+        if self.root.parent().is_some_and(|home| {
+            crate::task_inquiry::Outbox::at(home)
+                .get(&q.id)
+                .is_ok_and(|record| {
+                    record.decision.is_some_and(|d| {
+                        d.legacy_settled && d.status == crate::task_decision::Status::Resolved
+                    })
+                })
+        }) {
+            // Keep the immutable source reply in read_history, while every
+            // operational reader observes the owner's explicit settlement.
+            q.answer = None;
+            q.answered_at = None;
+            q.answer_authority = None;
+            q.status = QuestionStatus::Abandoned;
+            return q;
+        }
         if let Some(home) = self.root.parent()
             && migrated
             && !crate::task_chat::standalone_inquiry(home, &q)

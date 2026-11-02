@@ -1669,8 +1669,8 @@ pending item while redelivery in the same generation remains deduplicated.
 If the owner explicitly settles discussion with no effect remaining necessary,
 the chat uses `magi task control settle-decision <id> --reason <reason>`. Add
 `--replacement <new-inquiry-id>` to supersede an unanswered inquiry with an
-existing active one in the same task chat. Accepted or uncertain operations need
-receipt reconciliation first. For a task-local crash window, the owner can ask
+existing active one in the same task chat. Native commands with accepted or
+uncertain effects need receipt reconciliation first. For a task-local crash window, the owner can ask
 for `magi task control reconcile-decision <id>`: it executes nothing and resolves
 only if the exact intended task condition is already durably confirmed. External
 merge and check-rerun operations retain their own request-bound receipts. No exact owner phrase, quote fingerprint or button
@@ -1681,13 +1681,21 @@ An imported inquiry with missing ownership can be explicitly settled from any
 existing authorized chat using `settle-decision <id> --reason <reason>` when the
 owner confirms no effect remains. This assigns neither a task nor a delivery
 chat and executes no operation. Its ID and recovery instructions appear in the
-Pending decisions list. Requests with accepted or uncertain effects still require
-receipt reconciliation. A successful obsolete-approval dismissal is confirmed by
+Pending decisions list. Native commands with accepted or uncertain effects still
+require receipt reconciliation. A successful obsolete-approval dismissal is confirmed by
 its durable run checkpoint, including when its task is already done or has moved
 to another attempt; it does not require changing that task's later outcome.
 release-watch の hold / leave it は、監視終了後にも残す適用済み問い合わせ ID で
 照合する。triage の破棄は削除対象のタスクを問い合わせ専用の受領記録へ原子的に
 移すため、タスク削除後も再起動時の照合証拠を失わず、その判断を解決できる。
+
+ローカルのリリース承認の hold と、失敗ジョブへの leave it も、効果を保存する
+同じ監視状態に問い合わせ ID を記録する。merge / retry / 従来の rerun など、
+consumer が完了受領記録を出せない従来型依頼は、結果を確認した所有者が
+`settle-decision <id> --reason <reason>` で残る効果がないことを明示的に精算できる。
+これは成功受領記録や実行中の操作の取消ではない。元の依頼・回答・不確実な結果の
+履歴を残し、精算済みの回答は以後の consumer に実行可能な回答として渡さない。
+通常の再照合は操作を繰り返さず、読むことや回答の保存だけで精算されることもない。
 
 Existing task-scoped source inquiries are imported under their original delivery
 keys, including saved replies without confirmed effects. A saved reply is

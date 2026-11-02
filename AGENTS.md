@@ -3642,3 +3642,11 @@ release-watch の hold / leave it は `WatchState::applied` と、watch 削除�
 外部実行の成功証拠にしない。triage / triage-deps の discard は queue の task
 本体を `triage-discard/<inquiry>.json` に原子的に移す。受領記録は task 削除と
 同じ操作で成立し、単に task が見つからないことは成功証拠にしない。
+
+ローカル監視の `watch_local::LocalStep::Hold` と `settle_job_question` の leave it
+も、効果保存と同じ `WatchState::applied` に問い合わせ ID を記録する。
+受領記録を生成できない受理済みの従来型 `decision: ...` は、所有者が結果を確認し
+残る効果がないと明示した `settle-decision --reason` で精算できる。
+`Decision::legacy_settled` は成功受領記録ではなく、この明示的精算を表す。
+Questions の `get` / `list` は精算済み回答を実行しない表示へ投影し、元の JSON は
+監査履歴として保持する。native コマンドの不確実性は引き続き受領記録を要する。
