@@ -27,10 +27,18 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Self {
-        Self::with_task_repository(false).await
+        Self::build(false, true).await
+    }
+
+    async fn legacy() -> Self {
+        Self::build(false, false).await
     }
 
     async fn with_task_repository(other: bool) -> Self {
+        Self::build(other, true).await
+    }
+
+    async fn build(other: bool, routed: bool) -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let cli_path = format!(
             "{}:{}",
@@ -52,7 +60,9 @@ impl Fixture {
         let mode = tmp.path().join("mode");
         std::fs::write(&mode, "reply").unwrap();
         let cli = tmp.path().join("codex");
-        std::fs::write(&cli, r#"#!/bin/sh
+        std::fs::write(
+            &cli,
+            r#"#!/bin/sh
 cat >/dev/null
 # Title generation reuses the agent on its own seat at turn 0; it must not
 # overwrite the conversation's first-turn trace.
@@ -62,11 +72,18 @@ printf '%s\n' "$@" > "$TRACE/$MAGI_TURN.args"
 printf '%s\n' "$MAGI_ALLOW_WRITE" > "$TRACE/$MAGI_TURN.write"
 printf '%s\n' '{"type":"thread.started","thread_id":"standing-session"}'
 case "$(cat "$MODE")" in
-  answer) "$ANSWER_BIN" answer "$QUESTION" --reply hold > "$TRACE/$MAGI_TURN.answer" 2>&1 || exit 9;;
+  answer)
+    if [ "$ROUTED" = "1" ]; then
+      "$ANSWER_BIN" task control decide "$QUESTION" hold > "$TRACE/$MAGI_TURN.answer" 2>&1 || exit 9
+    else
+      "$ANSWER_BIN" answer "$QUESTION" --reply hold > "$TRACE/$MAGI_TURN.answer" 2>&1 || exit 9
+    fi;;
   closed) cp "$CLOSED_RECORD" "$TALK_RECORD";;
 esac
 printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"Turn reply."}}'
-"#).unwrap();
+"#,
+        )
+        .unwrap();
         std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
         let mut cfg = Config {
             coordination: Some(toml::from_str("contract_file='updater.contract'\ncontract_token='test-v1'\nlock_file='updater.lock'").unwrap()),
@@ -128,9 +145,21 @@ printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"T
         );
         run.parked = true;
         run.save_under(tmp.path()).unwrap();
-        // This suite exercises legacy, non-task consultation. Task-owned
-        // inquiries are unconditionally delivered by their own chat turn.
-        question.run = "legacy-consultation".into();
+        question.run = run.id.clone();
+        // Legacy consultations still name a real run. The routed fixtures
+        // retain the original association with the running task below.
+        question.legacy_foreground = !routed;
+        let mut owned_run = run.clone();
+        if !routed {
+            owned_run = magi::run::RunState::new(
+                run.repo.clone(),
+                "main".into(),
+                "base-head".into(),
+                "Independent running task".into(),
+                cfg.clone(),
+            );
+            owned_run.save_under(tmp.path()).unwrap();
+        }
         let queue = magi::queue::Queue::at(tmp.path().join("queue"));
         let mut task = magi::queue::Task::new(
             "Original task".into(),
@@ -142,13 +171,17 @@ printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"T
             },
         );
         task.status = magi::queue::TaskStatus::Running;
-        task.runs.push(run.id.clone());
+        task.runs.push(owned_run.id.clone());
+        if routed {
+            task.chat = Some(talk.id.clone());
+        }
         queue.put(&mut task).unwrap();
         let claim = queue.claim(&task.id).unwrap();
         let mut execution_files: Vec<(PathBuf, Vec<u8>)> = [
             queue.path_of(&task.id),
             tmp.path().join("queue").join(format!("{}.lock", task.id)),
             tmp.path().join("runs").join(&run.id).join("run.json"),
+            tmp.path().join("runs").join(&owned_run.id).join("run.json"),
         ]
         .into_iter()
         .map(|path| {
@@ -157,7 +190,27 @@ printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"T
         })
         .collect();
         questions.put(&mut question).unwrap();
-        magi::consult::begin(&questions, &talks, &question, &talk).unwrap();
+        if routed {
+            assert_eq!(question.routed_task.as_deref(), Some(task.id.as_str()));
+            let before = std::fs::read(questions.path_of(&question.id)).unwrap();
+            let rejection = magi::consult::begin(&questions, &talks, &question, &talk).unwrap_err();
+            assert!(
+                rejection
+                    .to_string()
+                    .contains("task decision is delivered by its own chat turn")
+            );
+            assert_eq!(
+                std::fs::read(questions.path_of(&question.id)).unwrap(),
+                before
+            );
+            assert_eq!(
+                magi::task_chat::post(&queue, &talks, tmp.path(), &task.id, &question).unwrap(),
+                talk.id
+            );
+        } else {
+            assert!(question.routed_task.is_none());
+            magi::consult::begin(&questions, &talks, &question, &talk).unwrap();
+        }
         let question = questions.get(&question.id).unwrap();
         questions.beat(&question.id, magi::ask::WaiterKind::Daemon);
         let waiter_lease = questions.lease_path(&question.id);
@@ -165,6 +218,9 @@ printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"T
         cfg.agents[0]
             .env
             .insert("QUESTION".into(), question.id.clone());
+        cfg.agents[0]
+            .env
+            .insert("ROUTED".into(), if routed { "1" } else { "0" }.into());
         Self {
             _tmp: tmp,
             talks,
@@ -277,6 +333,11 @@ async fn owner_request_in_a_consultation_is_answered_by_the_turn_without_a_quote
     assert_eq!(answered.resolution().as_deref(), Some(magi::land::HOLD));
     assert_eq!(answered.consult, f.question.consult);
     assert_eq!(answered.waiter, f.question.waiter);
+    assert_eq!(
+        magi::task_inquiry::Outbox::at(f._tmp.path()).get(&f.question.id).unwrap().decision.unwrap().status,
+        magi::task_decision::Status::Queued,
+        "recording a task decision must not claim its execution effect"
+    );
     // Recording the answer moves no execution state by itself.
     for (path, original) in &f.execution_files {
         assert_eq!(&std::fs::read(path).unwrap(), original);
@@ -340,7 +401,7 @@ async fn closing_during_a_consultation_turn_keeps_the_conversation_closed() {
 
 common::e2e! {
 async fn ending_one_consultation_keeps_the_other_open_and_the_turns_ordinary() {
-    let mut f = Fixture::new().await;
+    let mut f = Fixture::legacy().await;
     f.delivery().await;
     let mut other = magi::ask::Question::new(
         f.question.run.clone(), "implement".into(), "implement".into(),
@@ -371,9 +432,16 @@ async fn ending_one_consultation_keeps_the_other_open_and_the_turns_ordinary() {
 }
 }
 
-async fn read_only_consultation_answers(free_text: bool) {
-    let mut f = Fixture::new().await;
+async fn read_only_consultation_answers(free_text: bool, routed: bool) {
+    let mut f = if routed {
+        Fixture::new().await
+    } else {
+        Fixture::legacy().await
+    };
     f.cfg.talk.allow_write = false;
+    // Ordinary questions use the supported answer bridge, not the machinery's
+    // typed decision command, including when they belong to a task.
+    f.cfg.agents[0].env.insert("ROUTED".into(), "0".into());
     let (q, ()) = f
         .questions
         .update(&f.question.id, |q| {
@@ -420,16 +488,31 @@ async fn read_only_consultation_answers(free_text: bool) {
     f.say("通常の会話を続けます。").await;
     assert!(f.trace(3, "args").contains("read-only"));
     assert_eq!(f.trace(3, "write").trim(), "0");
+    for (path, original) in &f.execution_files {
+        assert_eq!(&std::fs::read(path).unwrap(), original);
+    }
 }
 
 common::e2e! {
 async fn read_only_consultation_can_answer_an_ordinary_question() {
-    read_only_consultation_answers(false).await;
+    read_only_consultation_answers(false, true).await;
 }
 }
 
 common::e2e! {
 async fn read_only_consultation_can_answer_a_free_text_question() {
-    read_only_consultation_answers(true).await;
+    read_only_consultation_answers(true, true).await;
+}
+}
+
+common::e2e! {
+async fn read_only_legacy_consultation_can_answer_an_ordinary_question() {
+    read_only_consultation_answers(false, false).await;
+}
+}
+
+common::e2e! {
+async fn read_only_legacy_consultation_can_answer_a_free_text_question() {
+    read_only_consultation_answers(true, false).await;
 }
 }

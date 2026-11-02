@@ -1195,3 +1195,206 @@ async fn abandonment_receipt_recovers_a_lost_outcome_without_reexecution() {
     assert_ne!(outbox.get(&other.id).unwrap().decision.unwrap().status, Status::Resolved);
 }
 }
+
+common::e2e! {
+async fn applied_legacy_choice_receipts_survive_later_task_transitions() {
+    use magi::{ask::{ChoiceAction, Question, Questions}, chat_control, run::{RunState, RunStatus}, task_decision::Status};
+    let fx = common::fixture(common::home_lock().await, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("choice-receipts");
+    let queue = Queue::at(home.join("queue"));
+    let talks = Talks::at(home.join("talks"));
+    let questions = Questions::at(home.join("questions"));
+    let chat = talk::begin(&talks, &fx.config, fx.repo.clone(), Some("alpha")).unwrap();
+    for action in [ChoiceAction::Requeue, ChoiceAction::Hold, ChoiceAction::Done] {
+        let mut run = RunState::new(fx.repo.clone(), "main".into(), "base".into(), "work".into(), fx.config.clone());
+        run.reserve_under(&home).unwrap();
+        run.status = RunStatus::Blocked; run.driver_exited = true; run.save_under(&home).unwrap();
+        let mut task = Task::new("work".into(), "work".into(), fx.repo.clone(), Source::Human);
+        task.chat = Some(chat.id.clone()); task.runs.push(run.id.clone()); task.hold_manual(Some("Awaiting input".into()));
+        queue.put(&mut task).unwrap();
+        let mut q = Question::new(run.id.clone(), "implement".into(), "impl-A".into(), "Choose next step".into(), String::new(), vec!["apply".into()]);
+        q.actions.insert("apply".into(), action.clone());
+        questions.put(&mut q).unwrap();
+        magi::task_chat::post(&queue, &talks, &home, &task.id, &q).unwrap();
+        chat_control::decide(&talks, &home, &chat.id, &q.id, "apply").unwrap();
+        let outbox = Outbox::at(&home);
+        assert_eq!(outbox.get(&q.id).unwrap().decision.unwrap().status, Status::Queued);
+        magi::daemon::apply_choice_actions(&queue, &questions, &home).await;
+        let mut applied = queue.get(&task.id).unwrap();
+        assert!(applied.action_applied(&q.id));
+        assert_eq!(applied.decision_effects.get(&q.id).map(String::as_str), Some("decision: apply"));
+        match action {
+            ChoiceAction::Requeue => {
+                assert!(applied.fresh_start);
+                applied.start(run.id.clone()); // A worker wins the race before the next sweep.
+                assert!(!applied.fresh_start);
+            }
+            ChoiceAction::Hold => {
+                applied.release_operator("chat", None);
+                applied.hold_manual(Some("A later, unrelated reason".into()));
+            }
+            ChoiceAction::Done => assert_eq!(applied.status, magi::queue::TaskStatus::Done),
+            _ => unreachable!(),
+        }
+        queue.put(&mut applied).unwrap();
+        let before = std::fs::read(queue.path_of(&task.id)).unwrap();
+        magi::daemon::apply_choice_actions(&queue, &questions, &home).await;
+        assert_eq!(std::fs::read(queue.path_of(&task.id)).unwrap(), before, "the legacy effect still executes once");
+        magi::task_chat::sweep(&Queue::at(home.join("queue")), &talks, &questions, &home);
+        assert_eq!(Outbox::at(&home).get(&q.id).unwrap().decision.unwrap().status, Status::Resolved);
+        assert_eq!(std::fs::read(queue.path_of(&task.id)).unwrap(), before, "receipt reconciliation must not replay an effect");
+    }
+}
+}
+
+common::e2e! {
+async fn abandonment_preflight_is_retryable_but_a_failed_write_remains_uncertain() {
+    use magi::{chat_control::{self, Operation}, run::{RunState, RunStatus}, task_decision::Status};
+    let fx = common::fixture(common::home_lock().await, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("abandon-preflight");
+    let queue = Queue::at(home.join("queue"));
+    let talks = Talks::at(home.join("talks"));
+    let chat = talk::begin(&talks, &fx.config, fx.repo.clone(), Some("alpha")).unwrap();
+    for cause in ["live", "terminal", "write"] {
+        let mut run = RunState::new(fx.repo.clone(), "main".into(), "base".into(), "work".into(), fx.config.clone());
+        run.reserve_under(&home).unwrap();
+        run.status = if cause == "terminal" { RunStatus::Failed } else { RunStatus::Blocked };
+        run.driver_exited = cause != "live";
+        if cause == "live" {
+            run.driver_pid = Some(std::process::id());
+            run.driver_started_at = magi::proc::process_started_at(std::process::id());
+        }
+        run.save_under(&home).unwrap();
+        let run_path = home.join("runs").join(&run.id).join("run.json");
+        let before = std::fs::read(&run_path).unwrap();
+        let mut task = Task::new("work".into(), "work".into(), fx.repo.clone(), Source::Human);
+        task.chat = Some(chat.id.clone()); task.runs.push(run.id.clone()); queue.put(&mut task).unwrap();
+        let outbox = Outbox::at(&home);
+        let record = outbox.file(&task, Some(run.id.clone()), "owner".into(), "Abandon", cause).unwrap();
+        outbox.deliver(&queue, &talks, &record.id).unwrap();
+        let blocked_write = home.join("runs").join(&run.id).join("run.json.tmp");
+        if cause == "write" { std::fs::create_dir(&blocked_write).unwrap(); }
+        for _ in 0..2 {
+            assert!(chat_control::dispatch(&queue, &home, &talks, &chat.id, Operation::ForDecision {
+                inquiry: record.id.clone(), command: Box::new(Operation::Abandon { run: run.id.clone() })
+            }).await.is_err());
+            let failed = outbox.get(&record.id).unwrap().decision.unwrap();
+            assert_eq!(failed.status, Status::RetryNeeded);
+            assert_eq!(failed.retry_safe, cause != "write");
+            assert_eq!(std::fs::read(&run_path).unwrap(), before);
+        }
+        if cause == "live" {
+            run.driver_pid = None; run.driver_started_at = None; run.driver_exited = true;
+            run.save_under(&home).unwrap();
+            chat_control::dispatch(&queue, &home, &talks, &chat.id, Operation::ForDecision {
+                inquiry: record.id.clone(), command: Box::new(Operation::Abandon { run: run.id.clone() })
+            }).await.unwrap();
+            assert_eq!(outbox.get(&record.id).unwrap().decision.unwrap().status, Status::Resolved);
+            assert_eq!(RunState::load_under(&run.id, &home).unwrap().status, RunStatus::Failed);
+        } else {
+            let settlement = chat_control::dispatch(&queue, &home, &talks, &chat.id, Operation::SettleDecision {
+                inquiry: record.id.clone(), reason: "Cancel the refused request".into(), replacement: None
+            }).await;
+            if cause == "terminal" {
+                settlement.unwrap();
+                assert_eq!(outbox.get(&record.id).unwrap().decision.unwrap().status, Status::Resolved);
+            } else {
+                assert!(settlement.is_err());
+                std::fs::remove_dir(&blocked_write).unwrap();
+                chat_control::reconcile_decisions(&queue, &home).unwrap();
+                assert_eq!(outbox.get(&record.id).unwrap().decision.unwrap().status, Status::RetryNeeded);
+            }
+        }
+    }
+}
+}
+
+#[cfg(unix)]
+common::e2e! {
+async fn native_resume_of_a_landing_hold_records_its_exact_execution_pass() {
+    use magi::{chat_control::{self, Operation}, merge_decision::{Decision, Target}, run::{RunState, RunStatus, Origin, PrRecord}, task_decision::Status};
+    use std::os::unix::fs::PermissionsExt as _;
+    let mut fx = common::fixture(common::home_lock().await, common::Judges::Unanimous, false);
+    fx.config.disk.min_free_bytes = 0; fx.config.disk.auto_fold = false; fx.config.disk.cache_limit_bytes = 0;
+    let home = magi::run::home();
+    let queue = Queue::at(home.join("queue"));
+    let talks = Talks::at(home.join("talks"));
+    let chat = talk::begin(&talks, &fx.config, fx.repo.clone(), Some("alpha")).unwrap();
+    let mut task = Task::new("Resume held landing".into(), "Preserve the existing work".into(), fx.repo.clone(), Source::Human);
+    task.chat = Some(chat.id.clone());
+    let head = magi::git::git(&fx.repo, &["rev-parse", "HEAD"]).await.unwrap().trim().to_owned();
+    let forge = fx.tmp.path().join("held-landing-forge");
+    std::fs::create_dir(&forge).unwrap();
+    let script = forge.join("gh");
+    std::fs::write(&script, r#"#!/bin/sh
+printf '%s
+' "$*" >> "$RESUME_FORGE/calls"
+case "$1 $2" in
+  'pr view') cat "$RESUME_FORGE/view.json" ;;
+  'api graphql') cat "$RESUME_FORGE/checks.json" ;;
+  'api repos/{owner}/{repo}/pulls/1/comments') echo '[]' ;;
+  'pr merge') case "$*" in *--disable-auto*) exit 0 ;; *) exit 99 ;; esac ;;
+  *) exit 1 ;;
+esac
+"#).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let url = "https://github.com/example/repo/pull/1";
+    std::fs::write(forge.join("view.json"), serde_json::to_vec(&serde_json::json!({
+        "url":url, "number":1, "state":"OPEN", "title":"Existing work", "reviews":[], "comments":[],
+        "mergeStateStatus":"CLEAN", "headRefOid":head, "baseRefName":"main", "autoMergeRequest":null
+    })).unwrap()).unwrap();
+    std::fs::write(forge.join("checks.json"), serde_json::to_vec(&serde_json::json!({
+        "data":{"repository":{"pullRequest":{"commits":{"nodes":[{"commit":{"oid":head,
+        "statusCheckRollup":{"contexts":{"pageInfo":{"hasNextPage":false},"nodes":[
+        {"__typename":"CheckRun","name":"ci","status":"COMPLETED","conclusion":"SUCCESS"}]}}}}]}}}}
+    })).unwrap()).unwrap();
+    let mut paths = vec![forge.clone()];
+    paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+    // SAFETY: this e2e runs in its own process before spawning the runner.
+    unsafe {
+        std::env::set_var("PATH", std::env::join_paths(paths).unwrap());
+        std::env::set_var("RESUME_FORGE", &forge);
+    }
+    let mut state = RunState::new(fx.repo.clone(), "main".into(), head.clone(), task.instruction.clone(), fx.config.clone());
+    state.reserve_under(&home).unwrap();
+    state.origin = Some(Origin::queue(&task.id));
+    state.status = RunStatus::Blocked; state.driver_exited = true;
+    state.merge_decision = Some(Decision {
+        question:"previous-hold".into(), target:Target { pr:url.into(), head:head.clone(), language:"en".into() },
+        choice:magi::land::HOLD.into(), closed:false, replacement_run:None, replacement_pr:None,
+    });
+    state.pr = Some(PrRecord { url:url.into(), number:1, state:"open".into(), checks:"green".into(), round:1, rounds:1, red_at_merge:vec![] });
+    state.begin_pass(); state.save_under(&home).unwrap();
+    let old_passes = state.passes.len();
+    task.runs.push(state.id.clone()); task.hold_manual(Some("Landing held by owner".into())); queue.put(&mut task).unwrap();
+    let record = Outbox::at(&home).file(&task, Some(state.id.clone()), "owner".into(), "Resume the held landing", "Ask for a fresh decision").unwrap();
+    Outbox::at(&home).deliver(&queue, &talks, &record.id).unwrap();
+    chat_control::dispatch(&queue, &home, &talks, &chat.id, Operation::ForDecision {
+        inquiry:record.id.clone(), command:Box::new(Operation::Resume { run:state.id.clone() })
+    }).await.unwrap();
+    assert_eq!(Outbox::at(&home).get(&record.id).unwrap().decision.unwrap().status, Status::Queued);
+    let config = fx.tmp.path().join("held-landing-config.toml");
+    std::fs::write(&config, toml::to_string(&fx.config).unwrap()).unwrap();
+    let opts = magi::daemon::Opts { repo:fx.repo.clone(), config:Some(config), worktrees_root:Some(fx.tmp.path().join("held-landing-wt")), ..Default::default() };
+    let mut pending = queue.get(&task.id).unwrap();
+    let claim = queue.claim(&task.id).unwrap();
+    magi::daemon::run_claimed(&opts, &queue, &mut pending).await;
+    drop(claim);
+    let disk = RunState::load_under(&state.id, &home).unwrap();
+    assert_eq!(disk.passes.len(), old_passes + 1);
+    let pass = disk.decision_starts.get(&record.id).expect("landing-stop branch must carry the native request into begin_pass");
+    assert_eq!(*pass, old_passes);
+    assert!(disk.passes[*pass].task_entry);
+    assert!(disk.parked, "the existing held PR should await a fresh owner answer: {:?}", queue.get(&task.id).unwrap().last_error);
+    assert!(disk.merge_decision.is_none(), "the old hold was reopened");
+    assert!(disk.land_approval.as_ref().is_some_and(|approval| approval.question != "previous-hold"));
+    let current = queue.get(&task.id).unwrap();
+    assert_eq!(current.runs, vec![state.id.clone()]);
+    assert!(current.superseded_resumes.is_empty(), "normal dispatch is not supersession");
+    chat_control::reconcile_decisions(&queue, &home).unwrap();
+    chat_control::dispatch(&queue, &home, &talks, &chat.id, Operation::ReconcileDecision { inquiry:record.id.clone() }).await.unwrap();
+    assert_eq!(Outbox::at(&home).get(&record.id).unwrap().decision.unwrap().status, Status::Resolved);
+    let calls = std::fs::read_to_string(forge.join("calls")).unwrap();
+    assert!(calls.lines().filter(|line| line.starts_with("pr merge")).all(|line| line.contains("--disable-auto")));
+}
+}

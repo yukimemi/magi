@@ -636,6 +636,13 @@ async fn execute_decision(
             })
     } else if let Operation::Abandon { run } = &command {
         crate::driver::abandon_decision(home, run, id, &request)
+            .map_err(|error| {
+                if error.is::<crate::driver::BeforeAbandonWrite>() {
+                    anyhow::Error::new(BeforeEffect(error))
+                } else {
+                    error
+                }
+            })
             .map(|()| format!("abandoned run {run}"))
     } else {
         Box::pin(execute(queue, home, talks, chat, command)).await

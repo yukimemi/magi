@@ -253,16 +253,24 @@ pub(crate) fn abandon_decision(home: &Path, id: &str, inquiry: &str, request: &s
     abandon_with_receipt(home, id, Some((inquiry, request)))
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("abandon did not reach its run write: {0:#}")]
+pub(crate) struct BeforeAbandonWrite(pub anyhow::Error);
+
 fn abandon_with_receipt(home: &Path, id: &str, receipt: Option<(&str, &str)>) -> Result<()> {
-    anyhow::ensure!(crate::run::is_run_id(id), "invalid run id");
-    let _owner = crate::pr_head::owner_lock(home, id)?;
-    let mut state = RunState::load_under(id, home)?;
-    let claims = crate::daemon::is_working_on(home, id, jiff::Timestamp::now());
-    anyhow::ensure!(
-        state.liveness_under(home, claims) == Liveness::Dead,
-        "run liveness is not proven gone"
-    );
-    anyhow::ensure!(state.status.resumable(), "run is already terminal");
+    let prepare = || -> Result<_> {
+        anyhow::ensure!(crate::run::is_run_id(id), "invalid run id");
+        let owner = crate::pr_head::owner_lock(home, id)?;
+        let state = RunState::load_under(id, home)?;
+        let claims = crate::daemon::is_working_on(home, id, jiff::Timestamp::now());
+        anyhow::ensure!(
+            state.liveness_under(home, claims) == Liveness::Dead,
+            "run liveness is not proven gone"
+        );
+        anyhow::ensure!(state.status.resumable(), "run is already terminal");
+        Ok((owner, state))
+    };
+    let (_owner, mut state) = prepare().map_err(BeforeAbandonWrite)?;
     state.clear_active();
     state.status = crate::run::RunStatus::Failed;
     if let Some((inquiry, request)) = receipt {

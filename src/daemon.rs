@@ -1592,6 +1592,12 @@ pub(crate) fn apply_task_choice_actions(queue: &Queue, questions: &Questions, ho
             continue;
         }
         let done = matches!(decision, ActionDecision::Done);
+        // Resume owes an execution pass; only these task-local effects finish
+        // in this write. Stale/refused actions never acquire an effect receipt.
+        let completed = matches!(
+            decision,
+            ActionDecision::Requeue | ActionDecision::Hold | ActionDecision::Done
+        );
         match decision {
             ActionDecision::Skip => continue,
             ActionDecision::Resume(run) => {
@@ -1637,6 +1643,12 @@ pub(crate) fn apply_task_choice_actions(queue: &Queue, questions: &Questions, ho
             }
         }
         task.mark_action_applied(&q.id);
+        if completed {
+            task.decision_effects.insert(
+                q.id.clone(),
+                format!("decision: {}", q.resolution().expect("answered action")),
+            );
+        }
         // The applied id travels with the transition, so a failed save loses
         // neither and the answer is acted on at the next poll.
         record(queue, &mut task);
@@ -4189,8 +4201,25 @@ async fn attempt(
         runner.on_pause(stop.pause());
         runner.watch_interrupt(interrupt_pause);
         let quota_before = runner.state.quota.clone();
+        let before_start = task.clone();
+        runner.state.next_pass_inquiry = task
+            .resume_override
+            .as_ref()
+            .filter(|pin| pin.pinned_run.as_ref() == Some(&owner.id) && !pin.question_id.is_empty())
+            .map(|pin| pin.question_id.clone());
         task.start(owner.id.clone());
-        record(queue, task);
+        if let Err(error) = queue.put(task) {
+            *task = before_start;
+            let error = runner.fail_startup("task-start", error);
+            if let Some(failure) = error.downcast_ref::<crate::run::StartupFailure>() {
+                task.record_startup_failure(failure.clone());
+            }
+            task.hold_manual(Some(format!(
+                "Could not persist task start; no agents dispatched: {error:#}"
+            )));
+            record(queue, task);
+            return Vec::new();
+        }
         lock(status).current.push(Current {
             worker: None,
             task: task.id.clone(),

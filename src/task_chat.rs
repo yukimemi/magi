@@ -981,6 +981,24 @@ fn effect_receipt(
     if let Some(task) = &task
         && task.action_applied(&q.id)
     {
+        if matches!(
+            q.chosen_action(),
+            Some(
+                crate::ask::ChoiceAction::Done
+                    | crate::ask::ChoiceAction::Hold
+                    | crate::ask::ChoiceAction::Requeue
+            )
+        ) && task.decision_effects.get(&q.id)
+            == Some(&format!(
+                "decision: {}",
+                q.resolution().expect("answered action")
+            ))
+        {
+            return Ok(Some(format!(
+                "task {}: exact choice effect {} committed",
+                task.id, q.id
+            )));
+        }
         let applied = match q.chosen_action() {
             Some(crate::ask::ChoiceAction::Resume { run }) => {
                 crate::chat_control::resume_started(home, task, &q.id, run)?

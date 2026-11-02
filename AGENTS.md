@@ -3626,3 +3626,13 @@ dispatch 前に再開 pin を置換・削除する queue 書込みは、元の�
 置換扱いにせず、実行開始記録を待つ。放棄は run の Failed 更新と同時に
 `abandonment_receipts` へ依頼 ID と正確な操作を保存する。
 明示的照合も再起動時の照合もこれらを読み、操作を再実行しない。
+
+通常の ChoiceAction の Hold / Requeue / Done も、実際に適用する task 書込みで
+`decision_effects` に受領記録を残す。Stale / Refuse や、まだ実行開始を待つ
+Resume に完了受領記録を付けない。状態フラグだけを後から完了証拠にしない。
+着地停止用の `attempt` 分岐も通常の再開分岐と同じく、`task.start` が pin を
+消費する前に `next_pass_inquiry` へ依頼 ID を渡し、task の開始保存に失敗したら
+実行しない。放棄の保存前拒否は `BeforeAbandonWrite` として再試行・取消可能にし、
+run 保存を試みた後の失敗は引き続き不確実として扱う。
+相談テストではタスク所有の質問と実在する run の関連を維持し、本番の task chat
+配送経路で実行不変を確認する。非タスク相談も実在する独立 run を使って維持する。
