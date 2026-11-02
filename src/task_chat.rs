@@ -306,14 +306,67 @@ pub(crate) fn migrated_source(home: &Path, id: &str) -> bool {
     )
 }
 
+/// A live answer update is distinct from importing a saved reply. Persist its
+/// exact generation before Questions exposes it to an effect consumer, even
+/// when the first migration sweep has not run yet. Queuing is not resolution.
+pub(crate) fn accept_fresh_reply(home: &Path, q: &Question) -> Result<()> {
+    if standalone_inquiry(home, q) {
+        return Ok(());
+    }
+    let outbox = crate::task_inquiry::Outbox::at(home);
+    match outbox.get(&q.id) {
+        Ok(record)
+            if record.decision.as_ref().is_some_and(|decision| {
+                decision.status == crate::task_decision::Status::Resolved
+            }) =>
+        {
+            return Ok(());
+        }
+        Ok(_) => {}
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            let tasks = Queue::at(home.join("queue")).list();
+            let watches = crate::release_watch::states_for_questions(home, std::slice::from_ref(q));
+            let task_id = task_of_with_watches(q, &tasks, &watches);
+            let Some(task) = tasks.iter().find(|task| Some(&task.id) == task_id.as_ref()) else {
+                return Ok(());
+            };
+            let mut inquiry = history_record(q, Some(task));
+            inquiry.run = task.runs.contains(&q.run).then(|| q.run.clone());
+            inquiry.archived = false;
+            inquiry.display = format!("{}\n\n{}", q.summary, q.detail);
+            inquiry.text = format!(
+                "{}\n\nAn owner response was recorded. Its effect is not yet confirmed; do not replay it.",
+                inquiry.display
+            );
+            inquiry.decision = Some(crate::task_decision::Decision::awaiting(q.summary.clone()));
+            outbox.enqueue(inquiry)?;
+        }
+        Err(error) => return Err(error),
+    }
+    outbox.update_decision(&q.id, |decision| {
+        let accepted =
+            decision.accept(&format!("decision: {}", q.resolution().unwrap_or_default()))?;
+        let changed = decision.source_answer_at != q.answered_at;
+        decision.source_answer_at = q.answered_at;
+        Ok(accepted || changed)
+    })?;
+    Ok(())
+}
+
 /// Import never turns a saved reply into an executable request. Only a fresh
-/// task/chat command can authorize consumption of a quarantined source reply.
+/// owner answer can authorize consumption of a quarantined source reply.
 pub(crate) fn saved_reply_requires_confirmation(home: &Path, q: &Question) -> bool {
     migrated_source(home, &q.id) && source_reply_needs_confirmation(home, q)
 }
 
 pub(crate) fn source_reply_needs_confirmation(home: &Path, q: &Question) -> bool {
-    if q.answer.is_none() {
+    if q.answer.is_none()
+        || (q.accepted_answer_at.is_some() && q.accepted_answer_at == q.answered_at)
+    {
         return false;
     }
     let request = format!("decision: {}", q.resolution().unwrap_or_default());
@@ -564,6 +617,7 @@ fn migrate_batch(
                 record.decision = Some(crate::task_decision::Decision::awaiting(q.summary.clone()));
                 record.delivery_error = Some("Owning task is missing or ambiguous. Restore the original task/run association, or ask any chat to use task control settle-decision with this inquiry ID and a reason. Migration executed no operation.".into());
                 outbox.enqueue(record)?;
+                sync_effect_receipt(home, queue, &q);
             }
             Ok(())
         })();
@@ -801,6 +855,14 @@ pub fn sweep(queue: &Queue, talks: &Talks, questions: &Questions, home: &Path) {
 /// Project only authoritative durable application evidence. Answered, delivered
 /// and read fields are deliberately not treated as effect receipts.
 pub(crate) fn sync_effect_receipt(home: &Path, queue: &Queue, q: &Question) {
+    if q.answer.is_some()
+        && q.accepted_answer_at.is_some()
+        && q.accepted_answer_at == q.answered_at
+        && let Err(error) = accept_fresh_reply(home, q)
+    {
+        tracing::warn!("decision {} acceptance: {error:#}", q.id);
+        return;
+    }
     let outbox = crate::task_inquiry::Outbox::at(home);
     let Ok(record) = outbox.get(&q.id) else {
         return;

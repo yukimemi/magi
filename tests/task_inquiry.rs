@@ -1472,3 +1472,54 @@ async fn accepted_legacy_effects_support_explicit_settlement_without_replay() {
     }
 }
 }
+
+common::e2e! {
+async fn fresh_cli_answers_survive_migration_before_and_after_first_sweep() {
+    use magi::{ask::{Answer, ChoiceAction, Question, Questions}, task_decision::Status};
+    let fx = common::fixture(common::home_lock().await, common::Judges::Unanimous, false);
+    for (migrate_first, associate_later) in [(false, false), (true, false), (false, true)] {
+        let home = fx.tmp.path().join(format!("fresh-cli-{migrate_first}-{associate_later}"));
+        let queue = Queue::at(home.join("queue"));
+        let talks = Talks::at(home.join("talks"));
+        let questions = Questions::at(home.join("questions"));
+        let mut task = Task::new("work".into(), "work".into(), fx.repo.clone(), Source::Human);
+        task.runs.push("run-a".into());
+        if !associate_later { queue.put(&mut task).unwrap(); }
+        let mut fresh = Question::new("run-a".into(), "implement".into(), "impl-A".into(), "Fresh decision".into(), "Keep this work held".into(), vec!["hold".into()]);
+        fresh.actions.insert("hold".into(), ChoiceAction::Hold);
+        questions.put(&mut fresh).unwrap();
+        let mut historical = fresh.clone();
+        historical.id = format!("{}-historical", fresh.id);
+        historical.answer(Answer::Choice("hold".into())).unwrap();
+        questions.put(&mut historical).unwrap();
+        let history_before = historical.clone();
+        if migrate_first { magi::task_chat::sweep(&queue, &talks, &questions, &home); }
+        let output = common::magi_cli(&home).args(["answer", &fresh.id, "--reply", "hold"])
+            .current_dir(&fx.repo).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        if associate_later { queue.put(&mut task).unwrap(); }
+        for _ in 0..2 {
+            magi::task_chat::sweep(&queue, &talks, &questions, &home);
+            let reopened = Questions::at(home.join("questions")).get(&fresh.id).unwrap();
+            assert_eq!(reopened.resolution().as_deref(), Some("hold"));
+            let decision = Outbox::at(&home).get(&fresh.id).unwrap().decision.unwrap();
+            assert_eq!(decision.request.as_deref(), Some("decision: hold"));
+            assert_eq!(decision.source_answer_at, reopened.answered_at);
+            assert_eq!(decision.status, Status::Queued, "acceptance is not an effect receipt");
+            assert!(questions.get(&historical.id).unwrap().answer.is_none());
+            assert!(Outbox::at(&home).get(&historical.id).unwrap().decision.unwrap().request.is_none());
+        }
+        magi::daemon::apply_choice_actions(&queue, &questions, &home).await;
+        magi::task_chat::sweep(&queue, &talks, &questions, &home);
+        let applied = queue.get(&task.id).unwrap();
+        assert!(applied.operator_held());
+        assert!(applied.action_applied(&fresh.id));
+        assert!(!applied.action_applied(&historical.id));
+        assert_eq!(Outbox::at(&home).get(&fresh.id).unwrap().decision.unwrap().status, Status::Resolved);
+        let history_after: Question = serde_json::from_slice(&std::fs::read(questions.path_of(&historical.id)).unwrap()).unwrap();
+        assert_eq!(history_before.answer, history_after.answer);
+        assert_eq!(history_before.answered_at, history_after.answered_at);
+        assert!(history_after.accepted_answer_at.is_none(), "migration must not accept saved history");
+    }
+}
+}

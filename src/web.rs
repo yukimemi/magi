@@ -13089,6 +13089,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fresh_api_answers_survive_task_inquiry_migration() {
+        use crate::{ask::ChoiceAction, task_decision::Status, task_inquiry::Outbox};
+        for migrate_first in [false, true] {
+            let fx = Fixture::start().await;
+            let mut task = Task::new(
+                "work".into(),
+                "work".into(),
+                PathBuf::from("/repo/magi"),
+                Source::Human,
+            );
+            task.runs.push("run-a".into());
+            fx.queue().put(&mut task).unwrap();
+            let mut q = Question::new(
+                "run-a".into(),
+                "implement".into(),
+                "impl-A".into(),
+                "Keep held?".into(),
+                String::new(),
+                vec!["hold".into()],
+            );
+            q.actions.insert("hold".into(), ChoiceAction::Hold);
+            fx.questions().put(&mut q).unwrap();
+            if migrate_first {
+                crate::task_chat::sweep(&fx.queue(), &fx.talks(), &fx.questions(), fx.home.path());
+            }
+            let response = fx
+                .post(
+                    &format!("/api/questions/{}/answer", q.id),
+                    Some(r#"{"choice":"hold"}"#),
+                )
+                .await;
+            assert_eq!(response.status, 200, "{}", response.body);
+            for _ in 0..2 {
+                crate::task_chat::sweep(&fx.queue(), &fx.talks(), &fx.questions(), fx.home.path());
+                let source = fx.questions().get(&q.id).unwrap();
+                assert_eq!(source.resolution().as_deref(), Some("hold"));
+                let decision = Outbox::at(fx.home.path())
+                    .get(&q.id)
+                    .unwrap()
+                    .decision
+                    .unwrap();
+                assert_eq!(decision.request.as_deref(), Some("decision: hold"));
+                assert_eq!(decision.source_answer_at, source.answered_at);
+                assert_eq!(decision.status, Status::Queued);
+            }
+            assert_eq!(
+                fx.post(
+                    &format!("/api/questions/{}/answer", q.id),
+                    Some(r#"{"choice":"hold"}"#)
+                )
+                .await
+                .status,
+                409
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn question_text_handler_uses_running_capabilities_and_preserves_text_answers() {
         let home = tempfile::tempdir().unwrap();
         let ui = delta_test_ui(home.path());

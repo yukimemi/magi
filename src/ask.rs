@@ -642,6 +642,10 @@ pub struct Question {
     pub triage_generation: Option<u64>,
     /// When the owner answered, if they did.
     pub answered_at: Option<Timestamp>,
+    /// Exact response generation recorded by a live answer update. Absent on
+    /// imported history; survives an answer made before task ownership exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_answer_at: Option<Timestamp>,
     /// What they said.
     pub answer: Option<Answer>,
     /// Everything said after the question itself, oldest first: the owner
@@ -778,6 +782,7 @@ impl Question {
             asked_at: Timestamp::now(),
             triage_generation: None,
             answered_at: None,
+            accepted_answer_at: None,
             answer: None,
             thread: Vec::new(),
             answer_timeout: 0,
@@ -1491,7 +1496,13 @@ impl Questions {
                 })
         };
         let was_dismissed = effective_dismissal(&q);
+        let prior_answer = (q.answered_at, q.resolution());
         let out = f(&mut q)?;
+        if q.resolution().is_some() && prior_answer != (q.answered_at, q.resolution()) {
+            let home = self.root.parent().context("question store has no home")?;
+            q.accepted_answer_at = q.answered_at;
+            crate::task_chat::accept_fresh_reply(home, &q)?;
+        }
         if !was_dismissed && effective_dismissal(&q) {
             let home = self.root.parent().context("question store has no home")?;
             crate::merge_decision::dismiss(home, &q)?;
@@ -1572,7 +1583,7 @@ impl Questions {
     }
 
     // Keep the source JSON intact for the passive history decoder. Every
-    // operational reader sees an unanswered hold until a native owner command
+    // operational reader sees an unanswered hold until a fresh owner answer
     // exists; neither delivery nor a saved legacy reply supplies that authority.
     fn consumption_view(&self, q: Question) -> Question {
         let migrated = self

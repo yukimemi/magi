@@ -784,7 +784,10 @@ async fn decision_cli_withdraw_closes_and_terminates_only_after_confirmation() {
     let chat = magi::talk::begin(&talks, &fx.config, fx.repo.clone(), Some("alpha")).unwrap();
     task.chat = Some(chat.id.clone()); queue.put(&mut task).unwrap();
     magi::task_chat::sweep(&queue, &talks, &Questions::open(), &home);
-    magi::chat_control::decide(&talks, &home, &chat.id, &question, magi::merge_decision::WITHDRAW).unwrap();
+    // The CLI already recorded a fresh answer before task association. A
+    // migration sweep must retain it, without requiring another owner answer.
+    assert_eq!(Questions::open().get(&question).unwrap().resolution().as_deref(), Some(magi::merge_decision::WITHDRAW));
+    assert!(magi::chat_control::decide(&talks, &home, &chat.id, &question, magi::merge_decision::WITHDRAW).is_err(), "a second answer must stay rejected");
     let outbox = magi::task_inquiry::Outbox::at(&home);
     assert_eq!(outbox.get(&question).unwrap().decision.unwrap().status, magi::task_decision::Status::Queued);
     serve_decision(&fx, &runner.state).await;

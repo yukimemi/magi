@@ -1274,19 +1274,6 @@ fn record_decision(
         };
         r.publication_title = title;
         r.answer(answer)?;
-        // Persist acceptance before exposing the answer to a concurrent
-        // consumer. A crash before the question save leaves a queued intent,
-        // never a fabricated application receipt.
-        let outbox = crate::task_inquiry::Outbox::at(home);
-        if outbox.get(&r.id).is_ok() {
-            outbox.update_decision(&r.id, |d| {
-                let accepted =
-                    d.accept(&format!("decision: {}", r.resolution().unwrap_or_default()))?;
-                let changed = d.source_answer_at != r.answered_at;
-                d.source_answer_at = r.answered_at;
-                Ok(accepted || changed)
-            })?;
-        }
         Ok(())
     })?;
     Ok(q)
