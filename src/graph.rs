@@ -5202,7 +5202,13 @@ impl Runner {
                 }
             }
             // Never retarget an operation across a crash, even if main moved.
+            // sync_to_head resets and cleans with -x, so even ignored untracked
+            // files must stop recovery independently of the old tracked tree.
             if git::rev_parse(&repo, &format!("refs/heads/{}", winner.branch)).await? != head
+                || (head != op.head
+                    && !git::git(&winner.worktree, &["ls-files", "--others", "-z"])
+                        .await?
+                        .is_empty())
                 || (!git::is_clean(&winner.worktree).await?
                     && !git::git_raw(&winner.worktree, &["diff", "--quiet", &op.head])
                         .await
@@ -16977,6 +16983,62 @@ esac
         assert_eq!(runner.state.base_episode_used(), 1);
         assert_eq!(runner.state.base_sync.as_ref().unwrap().attempts, 5);
         assert!(!runner.state.base_sync_blocked());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn base_recovery_crash_preserves_untracked_files() {
+        for ignored in [false, true] {
+            let (_tmp, mut runner, head, task) = exhausted_base_fixture().await;
+            runner.state.authorize_base_sync(&task).unwrap();
+            assert!(runner.state.consume_base_recovery(&head));
+            let tip = runner.state.base_sync.as_ref().unwrap().tip.clone();
+            runner.state.reserve_base_operation(&head, &tip);
+            runner.state.save().unwrap();
+            let scratch = runner.state.dir().join("base-sync");
+            assert_eq!(
+                crate::rebase::rebase_with_fixer(&mut runner.state, &scratch, "fix/retained", &tip)
+                    .await
+                    .unwrap(),
+                crate::rebase::Rebased::Applied
+            );
+            let repo = &runner.state.repo;
+            let result = git::rev_parse(repo, "HEAD").await.unwrap();
+            assert_ne!(result, head);
+            if ignored {
+                let exclude = git::git(repo, &["rev-parse", "--git-path", "info/exclude"])
+                    .await
+                    .unwrap();
+                std::fs::write(repo.join(exclude), "local-notes\n").unwrap();
+            }
+            std::fs::write(repo.join("local-notes"), "retained work\n").unwrap();
+            assert!(
+                git::git_raw(repo, &["diff", "--quiet", &head])
+                    .await
+                    .unwrap()
+                    .ok()
+            );
+            // Resume after the branch moved, before its checkout was reset.
+            runner.state = RunState::load(&runner.state.id).unwrap();
+            runner.sync_to_base().await.unwrap();
+            assert!(runner.state.base_sync_blocked());
+            assert!(!runner.state.base_sync_recovery.operations[0].finished);
+            assert_eq!(runner.state.base_sync.as_ref().unwrap().attempts, 5);
+            assert_eq!(
+                git::rev_parse(&runner.state.repo, "HEAD").await.unwrap(),
+                result
+            );
+            assert_eq!(
+                std::fs::read_to_string(runner.state.repo.join("local-notes")).unwrap(),
+                "retained work\n"
+            );
+            assert!(
+                git::git_raw(&runner.state.repo, &["diff", "--quiet", &head])
+                    .await
+                    .unwrap()
+                    .ok()
+            );
+        }
     }
 
     #[cfg(unix)]
