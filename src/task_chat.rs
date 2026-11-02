@@ -703,7 +703,17 @@ pub fn sweep(queue: &Queue, talks: &Talks, questions: &Questions, home: &Path) {
             continue;
         }
         if let Ok(record) = outbox.get(&q.id) {
-            sync_effect_receipt(home, queue, q);
+            // Execution views quarantine imported replies. Receipt projection
+            // needs their original payload, without making it executable.
+            match questions.read_history(&q.id) {
+                Ok(source) => sync_effect_receipt(home, queue, &source),
+                Err(error) => {
+                    tracing::warn!("decision {} source history: {error:#}", q.id);
+                    let _ = outbox.update_decision(&q.id, |d| {
+                        d.fail(&format!("Source history needs reconciliation: {error:#}"))
+                    });
+                }
+            }
             // Missing ownership is recoverable, but never guessed or routed
             // around the compatibility policy while its consumer still exists.
             if record.task.is_empty()
@@ -820,6 +830,38 @@ fn effect_receipt(
 ) -> Result<Option<String>> {
     if q.resolution().is_none() {
         return Ok(None);
+    }
+
+    if q.node == crate::land::APPROVAL_NODE
+        && q.resolution().as_deref() == Some(crate::land::REPAIR)
+    {
+        let run = crate::run::RunState::load_under(&q.run, home)?;
+        let Some(repair) = run.merge_repairs.iter().find(|r| r.question == q.id) else {
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            q.merge_target
+                .as_ref()
+                .is_none_or(|target| { target.pr == repair.pr && target.head == repair.head }),
+            "repair receipt targets a different PR or head"
+        );
+        return match repair.phase {
+            crate::run::MergeRepairPhase::Complete => Ok(Some(format!(
+                "run {}: repair and re-review {} completed for {} at {}",
+                q.run, q.id, repair.pr, repair.head
+            ))),
+            crate::run::MergeRepairPhase::Failed => anyhow::bail!(
+                "repair {} failed: {}",
+                q.id,
+                repair
+                    .failure
+                    .as_deref()
+                    .unwrap_or("inspect the run's repair evidence before retrying")
+            ),
+            // A Resume pass is only transport; even a finished fixer still
+            // owes the requested fresh review and gate.
+            _ => Ok(None),
+        };
     }
 
     if q.node == crate::land::APPROVAL_NODE
@@ -1275,6 +1317,123 @@ mod tests {
             written
         );
     }
+    #[test]
+    fn repair_receipts_keep_transport_and_failed_repairs_pending() {
+        use crate::{
+            ask::ChoiceAction,
+            run::{MergeRepair, MergeRepairPhase as Phase, RunState},
+            task_decision::{Decision, Status},
+            task_inquiry::Outbox,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let queue = Queue::at(home.join("queue"));
+        let mut run = RunState::new(
+            home.into(),
+            "main".into(),
+            "base".into(),
+            "work".into(),
+            Config::default(),
+        );
+        run.reserve_under(home).unwrap();
+        let mut q = Question::new(
+            run.id.clone(),
+            crate::land::APPROVAL_NODE.into(),
+            "land".into(),
+            "Repair findings".into(),
+            String::new(),
+            vec![crate::land::REPAIR.into()],
+        );
+        q.merge_target = Some(crate::merge_decision::Target {
+            pr: "https://example.test/pull/1".into(),
+            head: "head".into(),
+            language: "en".into(),
+        });
+        q.actions.insert(
+            crate::land::REPAIR.into(),
+            ChoiceAction::Resume {
+                run: run.id.clone(),
+            },
+        );
+        q.answer(Answer::Choice(crate::land::REPAIR.into()))
+            .unwrap();
+        run.next_pass_inquiry = Some(q.id.clone());
+        run.begin_pass();
+        run.save_under(home).unwrap();
+        let mut task = Task::new(
+            "work".into(),
+            "work".into(),
+            home.into(),
+            crate::queue::Source::Human,
+        );
+        task.runs.push(run.id.clone());
+        task.mark_action_applied(&q.id);
+        queue.put(&mut task).unwrap();
+        let outbox = Outbox::at(home);
+        let mut record = history_record(&q, Some(&task));
+        let mut decision = Decision::awaiting(q.summary.clone());
+        decision
+            .accept(&format!("decision: {}", crate::land::REPAIR))
+            .unwrap();
+        record.decision = Some(decision);
+        record.archived = false;
+        outbox.enqueue(record).unwrap();
+        let check = |expected| {
+            sync_effect_receipt(home, &Queue::at(home.join("queue")), &q);
+            let decision = Outbox::at(home).get(&q.id).unwrap().decision.unwrap();
+            assert_eq!(decision.status, expected);
+            decision
+        };
+        check(Status::Queued); // Resume started; no repair request was consumed yet.
+        run.merge_repairs.push(MergeRepair {
+            question: "unrelated".into(),
+            head: "head".into(),
+            pr: q.merge_target.as_ref().unwrap().pr.clone(),
+            reviews: vec![],
+            gate: vec![],
+            gate_head: None,
+            gate_fixes: vec![],
+            pre_gate: vec![],
+            phase: Phase::Complete,
+            failure: None,
+        });
+        run.save_under(home).unwrap();
+        check(Status::Queued);
+        run.merge_repairs[0].question = q.id.clone();
+        for phase in [
+            Phase::Requested,
+            Phase::Fixing,
+            Phase::Reviewing,
+            Phase::Failed,
+        ] {
+            run.merge_repairs[0].phase = phase;
+            run.merge_repairs[0].failure =
+                (phase == Phase::Failed).then(|| "dirty worktree; inspect before retry".into());
+            run.save_under(home).unwrap();
+            let decision = check(if phase == Phase::Failed {
+                Status::RetryNeeded
+            } else {
+                Status::Queued
+            });
+            if phase == Phase::Failed {
+                assert!(decision.error.unwrap().contains("dirty worktree"));
+                assert!(
+                    !decision.retry_safe,
+                    "a repair failure cannot authorize blind replay"
+                );
+            }
+        }
+        run.merge_repairs[0].phase = Phase::Complete;
+        run.merge_repairs[0].head = "different-head".into();
+        run.save_under(home).unwrap();
+        check(Status::RetryNeeded);
+        run.merge_repairs[0].head = "head".into();
+        run.merge_repairs[0].failure = None;
+        run.save_under(home).unwrap();
+        check(Status::Resolved);
+        check(Status::Resolved);
+    }
+
     #[test]
     fn landing_stop_receipts_require_the_intended_effect_after_restart() {
         use crate::{

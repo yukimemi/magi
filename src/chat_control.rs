@@ -786,7 +786,7 @@ fn reconcile_task_decision(queue: &Queue, home: &Path, chat: &str, id: &str) -> 
         .request
         .context("decision has no accepted operation to reconcile")?;
     if request.starts_with("decision: ") {
-        let source = crate::ask::Questions::at(home.join("questions")).get(id)?;
+        let source = crate::ask::Questions::at(home.join("questions")).read_history(id)?;
         crate::task_chat::sync_effect_receipt(home, queue, &source);
         ensure!(
             outbox

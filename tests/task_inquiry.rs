@@ -826,6 +826,52 @@ async fn scheduler_effect_consumers_never_replay_migrated_or_deferred_saved_answ
 }
 
 common::e2e! {
+async fn imported_effect_receipts_recover_from_delay_and_unreadable_receipts_without_replay() {
+    use magi::{ask::{Answer, ChoiceAction, Question, Questions}, task_decision::Status};
+    let fx = common::fixture(common::home_lock().await, common::Judges::Unanimous, false);
+    for corrupt_receipt in [false, true] {
+        let home = fx.tmp.path().join(format!("late-source-receipt-{corrupt_receipt}"));
+        let queue = Queue::at(home.join("queue"));
+        let talks = Talks::at(home.join("talks"));
+        let chat = talk::begin(&talks, &fx.config, fx.repo.clone(), Some("alpha")).unwrap();
+        let mut task = Task::new("work".into(), "work".into(), fx.repo.clone(), Source::Human);
+        task.chat = Some(chat.id.clone()); task.runs.push("run-a".into()); queue.put(&mut task).unwrap();
+        let questions = Questions::at(home.join("questions"));
+        let mut q = Question::new("run-a".into(), "conduct".into(), "conductor".into(),
+            "Saved resume request".into(), "Do not replay this historical reply".into(), vec!["resume".into()]);
+        let action = ChoiceAction::ResumeRun { run: "20260101-000000-abcd".into() };
+        q.actions.insert("resume".into(), action.clone());
+        q.answer(Answer::Choice("resume".into())).unwrap(); questions.put(&mut q).unwrap();
+        let receipt = home.join("choice-actions").join(format!("{}.json", q.id));
+        std::fs::create_dir_all(receipt.parent().unwrap()).unwrap();
+        if corrupt_receipt { std::fs::write(&receipt, "{truncated").unwrap(); }
+        let before_task = std::fs::read(queue.path_of(&task.id)).unwrap();
+        magi::task_chat::sweep(&queue, &talks, &questions, &home);
+        let outbox = Outbox::at(&home);
+        let pending = outbox.get(&q.id).unwrap().decision.unwrap();
+        assert_eq!(pending.status, Status::RetryNeeded);
+        assert!(pending.request.is_none());
+        assert!(questions.get(&q.id).unwrap().resolution().is_none(), "execution view must still quarantine the saved reply");
+        let before_source = std::fs::read(questions.path_of(&q.id)).unwrap();
+        // An already-running legacy consumer can commit this receipt later;
+        // migration and subsequent reconciliation may only observe it.
+        std::fs::write(&receipt, serde_json::to_vec(&serde_json::json!({"action":action,"status":"applied"})).unwrap()).unwrap();
+        for _ in 0..2 {
+            magi::task_chat::sweep(&Queue::at(home.join("queue")), &Talks::at(home.join("talks")), &Questions::at(home.join("questions")), &home);
+            magi::daemon::apply_choice_actions(&queue, &questions, &home).await;
+            let decision = Outbox::at(&home).get(&q.id).unwrap().decision.unwrap();
+            assert_eq!(decision.status, Status::Resolved);
+            assert!(decision.request.is_none(), "receipt observation must not manufacture owner authority");
+            assert!(questions.get(&q.id).unwrap().resolution().is_none());
+            assert_eq!(std::fs::read(questions.path_of(&q.id)).unwrap(), before_source);
+            assert_eq!(std::fs::read(queue.path_of(&task.id)).unwrap(), before_task);
+            assert!(magi::worker::active(&home).unwrap().is_empty());
+        }
+    }
+}
+}
+
+common::e2e! {
 async fn retired_routing_opt_out_does_not_strand_saved_task_intent() {
     use magi::ask::{Question, Questions, ChoiceAction, Answer};
     let mut fx = common::fixture(common::home_lock().await, common::Judges::Unanimous, false);
