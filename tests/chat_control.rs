@@ -944,21 +944,21 @@ esac
         )
         .unwrap();
     outbox.deliver(&f.queue(), &f.talks, &inquiry.id).unwrap();
-    let routed = |request: &str| {
+    let routed_for = |decision: &str, request: &str, head: &str, workflow: &str| {
         common::magi_cli(f.tmp.path())
             .args([
                 "task",
                 "control",
                 "--decision",
-                &inquiry.id,
+                decision,
                 "rerun-checks",
                 &f.run.id,
                 "--request",
                 request,
                 "--head",
-                "current",
+                head,
                 "--workflow",
-                "42",
+                workflow,
             ])
             .env("MAGI_CONFIG_DIR", "")
             .env("MAGI_RUN", &f.talk)
@@ -970,6 +970,7 @@ esac
             .output()
             .unwrap()
     };
+    let routed = |request: &str| routed_for(&inquiry.id, request, "current", "42");
     let awaiting = outbox.get(&inquiry.id).unwrap().decision.unwrap();
     assert!(refused(routed("bad/id")).contains("safe filename"));
     assert_eq!(outbox.get(&inquiry.id).unwrap().decision.unwrap(), awaiting);
@@ -1010,6 +1011,105 @@ esac
         std::fs::read_to_string(f.tmp.path().join("sent")).unwrap(),
         "42\n42\n42\n"
     );
+
+    let file_decision = |source: &str| {
+        let record = outbox
+            .file(
+                &task,
+                Some(f.run.id.clone()),
+                source.into(),
+                "Retry checks",
+                "",
+            )
+            .unwrap();
+        outbox.deliver(&f.queue(), &f.talks, &record.id).unwrap();
+        record.id
+    };
+    let controls = f.tmp.path().join("chat-controls").join(&f.talk);
+    let busy = file_decision("rerun-contention");
+    let lock = std::fs::File::create(controls.join("busy.lock")).unwrap();
+    use std::os::fd::AsRawFd;
+    // Hold the production receipt lock while a separate CLI process attempts
+    // admission. No forge invocation or started receipt may result.
+    assert_eq!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    for _ in 0..2 {
+        refused(routed_for(&busy, "busy", "current", "42"));
+        let decision = outbox.get(&busy).unwrap().decision.unwrap();
+        assert_eq!(decision.status, magi::task_decision::Status::RetryNeeded);
+        assert!(decision.retry_safe);
+        assert!(!controls.join("busy.json").exists());
+        assert_eq!(
+            std::fs::read_to_string(f.tmp.path().join("sent")).unwrap(),
+            "42\n42\n42\n"
+        );
+    }
+    drop(lock);
+    passed(routed_for(&busy, "busy", "current", "42"));
+    assert_eq!(
+        outbox.get(&busy).unwrap().decision.unwrap().status,
+        magi::task_decision::Status::Resolved
+    );
+    let sent = std::fs::read(f.tmp.path().join("sent")).unwrap();
+    for (index, request, head, workflow) in [
+        (0, "once", "other", "42"),
+        (1, "once", "current", "43"),
+        (2, "uncertain", "other", "42"),
+    ] {
+        let collision = file_decision(&format!("rerun-collision-{index}"));
+        let receipt = std::fs::read(controls.join(format!("{request}.json"))).unwrap();
+        for _ in 0..2 {
+            assert!(
+                refused(routed_for(&collision, request, head, workflow))
+                    .contains("different operation")
+            );
+            let decision = outbox.get(&collision).unwrap().decision.unwrap();
+            assert_eq!(decision.status, magi::task_decision::Status::RetryNeeded);
+            assert!(decision.retry_safe);
+            magi::chat_control::reconcile_decisions(&f.queue(), f.tmp.path()).unwrap();
+            assert!(outbox.get(&collision).unwrap().decision.unwrap().retry_safe);
+        }
+        passed(f.control(&[
+            "settle-decision",
+            &collision,
+            "--reason",
+            "Owner cancels the rejected request",
+        ]));
+        assert_eq!(
+            outbox.get(&collision).unwrap().decision.unwrap().status,
+            magi::task_decision::Status::Resolved
+        );
+        assert_eq!(
+            std::fs::read(controls.join(format!("{request}.json"))).unwrap(),
+            receipt
+        );
+        assert_eq!(std::fs::read(f.tmp.path().join("sent")).unwrap(), sent);
+    }
+    // The identical operation's started receipt remains uncertain, unlike a
+    // collision with an unrelated operation. It cannot be replayed or settled.
+    let uncertain = file_decision("rerun-identical-uncertainty");
+    let receipt = std::fs::read(controls.join("uncertain.json")).unwrap();
+    assert!(
+        refused(routed_for(&uncertain, "uncertain", "current", "42")).contains("uncertain result")
+    );
+    let decision = outbox.get(&uncertain).unwrap().decision.unwrap();
+    assert_eq!(decision.status, magi::task_decision::Status::RetryNeeded);
+    assert!(!decision.retry_safe);
+    magi::chat_control::reconcile_decisions(&f.queue(), f.tmp.path()).unwrap();
+    refused(routed_for(&uncertain, "uncertain", "current", "42"));
+    refused(f.control(&[
+        "settle-decision",
+        &uncertain,
+        "--reason",
+        "Cannot erase an uncertain effect",
+    ]));
+    assert_eq!(
+        std::fs::read(controls.join("uncertain.json")).unwrap(),
+        receipt
+    );
+    assert_eq!(std::fs::read(f.tmp.path().join("sent")).unwrap(), sent);
 }
 
 #[tokio::test]

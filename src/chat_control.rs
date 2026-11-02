@@ -1477,7 +1477,7 @@ pub async fn rerun_checks(
         .truncate(false)
         .write(true)
         .open(dir.join(format!("{request}.lock")))?;
-    crate::pr_head::try_lock_file(&lock)?;
+    crate::pr_head::try_lock_file(&lock).map_err(|error| BeforeEffect(error.into()))?;
     let path = dir.join(format!("{request}.json"));
     let pr = &state
         .pr
@@ -1489,10 +1489,12 @@ pub async fn rerun_checks(
     });
     if path.exists() {
         let prior: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
-        ensure!(
-            prior["action"] == action,
-            "request ID already binds a different operation"
-        );
+        if prior["action"] != action {
+            return Err(BeforeEffect(anyhow::anyhow!(
+                "request ID already binds a different operation"
+            ))
+            .into());
+        }
         ensure!(
             prior["status"] == "applied",
             "previous request has an uncertain result; inspect its receipt before a new request"
