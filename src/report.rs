@@ -994,7 +994,7 @@ pub fn run(state: &RunState) -> String {
                 a.proof.as_str()
             ))
         } else if let Some(c) = &bs.conflict {
-            red(&format!("conflict: {}", first_line(c)))
+            red(&format!("stopped: {}", first_line(c)))
         } else if bs.behind == 0 {
             green("in sync")
         } else {
@@ -1006,11 +1006,20 @@ pub fn run(state: &RunState) -> String {
             state.base_branch,
             short(&bs.tip),
             if bs.attempts > 0 {
-                format!("  ({} rebase attempt(s))", bs.attempts)
+                format!(
+                    "  (interval {}/{}, lifetime {} synchronization attempt(s))",
+                    state.base_episode_used(),
+                    crate::graph::BASE_SYNC_ROUNDS,
+                    bs.attempts
+                )
             } else {
                 String::new()
             }
         );
+    }
+
+    if state.base_sync.is_some() {
+        let _ = writeln!(s, "  next: {}", state.base_sync_next_action());
     }
 
     if !state.pre_gate.is_empty() {

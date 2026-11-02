@@ -7686,11 +7686,12 @@ function renderSection(runId, s) {
           : req.unverified_commit ? el("p", { class: "rmeta rwarn", text: "committed, but the follow-up review could not be opened" }) : null)));
     case "base_sync": {
       const b = s.base_sync;
-      const label = { already_in: "already in base", conflict: "conflict", in_sync: "in sync", behind: `${b.behind} behind` }[b.state] || b.state;
+      const label = { already_in: "already in base", conflict: "conflict", exhausted: "synchronization allowance exhausted", resource_wait: "resource wait", in_sync: "in sync", behind: `${b.behind} behind` }[b.state] || b.state;
       return card([rtag(label, s.tone)], rlines([
-        `${b.base_branch} @ ${b.tip}${b.attempts ? ` (${b.attempts} rebase attempt(s))` : ""}`,
+        `${b.base_branch} @ ${b.tip}${b.attempts ? ` (interval ${b.episode_used}/${b.episode_limit}; lifetime ${b.attempts} synchronization attempt(s))` : ""}`,
         b.already_in ? `already in ${b.base_branch} as ${b.already_in}` : null,
-        b.conflict ? `conflict: ${b.conflict}` : null,
+        b.conflict ? `stopped: ${b.conflict}` : null,
+        b.next_action ? `next: ${b.next_action}` : null,
       ].filter(Boolean)));
     }
     case "pre_gate":

@@ -554,6 +554,12 @@ pub struct BaseSyncView {
     pub behind: usize,
     /// Rebase attempts.
     pub attempts: usize,
+    /// Active interval consumption, distinct from lifetime attempts.
+    pub episode_used: usize,
+    /// Synchronization reservations allowed in this interval.
+    pub episode_limit: usize,
+    /// Actual next operation for this checkpoint.
+    pub next_action: String,
     /// First line of the conflict.
     pub conflict: Option<String>,
     /// `a as b (proof match)`, when already in the base.
@@ -1377,8 +1383,19 @@ pub fn build_with(
     if let Some(bs) = &state.base_sync {
         let (st, tone) = if bs.already_in.is_some() {
             ("already_in", Tone::Neutral)
+        } else if state.resource_block.is_some() {
+            ("resource_wait", Tone::Warn)
         } else if bs.conflict.is_some() {
-            ("conflict", Tone::Fail)
+            (
+                match state.base_sync_recovery.stop.as_ref().map(|s| &s.kind) {
+                    Some(crate::base_sync_recovery::StopKind::Exhausted) => "exhausted",
+                    Some(crate::base_sync_recovery::StopKind::Publication) => "publication",
+                    Some(crate::base_sync_recovery::StopKind::Divergence) => "divergence",
+                    Some(crate::base_sync_recovery::StopKind::Conflict) => "conflict",
+                    _ => "stopped",
+                },
+                Tone::Fail,
+            )
         } else if bs.behind == 0 {
             ("in_sync", Tone::Ok)
         } else {
@@ -1392,6 +1409,9 @@ pub fn build_with(
                 state: st,
                 behind: bs.behind,
                 attempts: bs.attempts,
+                episode_used: state.base_episode_used(),
+                episode_limit: crate::graph::BASE_SYNC_ROUNDS,
+                next_action: state.base_sync_next_action(),
                 conflict: bs.conflict.as_deref().map(first_line),
                 already_in: bs
                     .already_in
