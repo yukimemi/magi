@@ -110,7 +110,7 @@ fn refused(out: Output) -> String {
 
 #[cfg(unix)]
 #[test]
-fn routed_merge_rejects_invalid_input_and_retries_pre_receipt_failures() {
+fn routed_merge_preserves_admission_retries_and_reconciles_refused_receipts() {
     use std::os::unix::fs::PermissionsExt;
 
     let f = Fixture::new();
@@ -141,6 +141,7 @@ fn routed_merge_rejects_invalid_input_and_retries_pre_receipt_failures() {
         r#"#!/bin/sh
 if [ "$1 $2" = 'pr merge' ]; then
   echo merge >> sent
+  if [ -f refuse ]; then exit 1; fi
   touch merged
 elif [ -f merged ]; then
   cat merged.json
@@ -184,6 +185,49 @@ fi
     assert_eq!(outbox.get(&inquiry.id).unwrap().decision.unwrap(), awaiting);
     assert!(!f.tmp.path().join("chat-controls").exists());
 
+    // Admission failures leave the decision entirely unbound. Keep real
+    // flock guards in this process while each independent CLI attempts entry.
+    for lock_path in [
+        f.tmp
+            .path()
+            .join("chat-merge-locks/github.com_example_project_pull_1.lock"),
+        f.tmp
+            .path()
+            .join("chat-controls")
+            .join(&f.talk)
+            .join("merge-once.lock"),
+    ] {
+        use std::os::fd::AsRawFd;
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        refused(invoke("merge-once", &head));
+        assert_eq!(outbox.get(&inquiry.id).unwrap().decision.unwrap(), awaiting);
+        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
+    }
+    let receipt_path = f
+        .tmp
+        .path()
+        .join("chat-controls")
+        .join(&f.talk)
+        .join("other-request.json");
+    let foreign_receipt = serde_json::to_vec(&serde_json::json!({
+        "action": {"repo": "example/project", "number": 1, "head": "b".repeat(40), "request": "other-request"},
+        "status": "started", "detail": "another operation is uncertain"
+    })).unwrap();
+    std::fs::write(&receipt_path, &foreign_receipt).unwrap();
+    assert!(refused(invoke("other-request", &head)).contains("different operation"));
+    assert_eq!(outbox.get(&inquiry.id).unwrap().decision.unwrap(), awaiting);
+    assert_eq!(std::fs::read(&receipt_path).unwrap(), foreign_receipt);
+
     // A forge read fails before the service writes its started receipt.
     refused(invoke("merge-once", &head));
     let failed = outbox.get(&inquiry.id).unwrap().decision.unwrap();
@@ -210,6 +254,17 @@ fi
         )
         .unwrap();
     }
+    std::fs::write(f.tmp.path().join("refuse"), "").unwrap();
+    passed(invoke("merge-once", &head));
+    let refused_decision = outbox.get(&inquiry.id).unwrap().decision.unwrap();
+    assert_eq!(
+        refused_decision.status,
+        magi::task_decision::Status::RetryNeeded
+    );
+    assert!(!refused_decision.retry_safe);
+    // A separate owner operation merged this head. The next invocation may
+    // only read its outcome, even though our saved receipt said refused.
+    std::fs::write(f.tmp.path().join("merged"), "").unwrap();
     passed(invoke("merge-once", &head));
     passed(invoke("merge-once", &head));
     assert_eq!(

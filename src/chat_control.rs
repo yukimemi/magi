@@ -599,6 +599,12 @@ async fn execute_decision(
         // that can never reach its effect service.
         action.validate()?;
     }
+    // Keep admission across acceptance and execution: contention and request
+    // collisions must not bind a fresh decision to an unstartable operation.
+    let merge_admission = merge
+        .as_ref()
+        .map(|action| crate::chat_merge::admit(home, talks, chat, action))
+        .transpose()?;
     if decision.request.is_none() && decision.status == Status::RetryNeeded {
         if let Ok(source) = crate::ask::Questions::at(home.join("questions")).get(id) {
             ensure!(
@@ -676,6 +682,16 @@ async fn execute_decision(
                 }
             })
             .map(|()| format!("abandoned run {run}"))
+    } else if let Some(admission) = merge_admission {
+        crate::chat_merge::merge_admitted(home, merge.as_ref().unwrap().clone(), admission)
+            .await
+            .map_err(|error| {
+                if error.is::<crate::chat_merge::BeforeMergeWrite>() {
+                    anyhow::Error::new(BeforeEffect(error))
+                } else {
+                    error
+                }
+            })
     } else {
         Box::pin(execute(queue, home, talks, chat, command)).await
     };

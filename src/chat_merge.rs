@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::talk::Talks;
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct Request {
     pub repo: String,
     pub number: u64,
@@ -256,6 +256,52 @@ pub(crate) async fn merge(
     merge_with(home, talks, talk, action, &Gh).await
 }
 
+/// Admission locks must span decision acceptance and the effect service. A
+/// refusal here leaves a new decision unbound, including when another request
+/// currently owns the target or request ID.
+pub(crate) struct Admission {
+    _target: TargetLock,
+    _request: TargetLock,
+    repo: std::path::PathBuf,
+    path: std::path::PathBuf,
+    receipt: Option<Receipt>,
+}
+
+pub(crate) fn admit(home: &Path, talks: &Talks, talk: &str, action: &Request) -> Result<Admission> {
+    action.validate()?;
+    let target = target_lock(home, &action.url())?;
+    let conversation = crate::chat_control::authorize(talks, talk, crate::queue::CHAT_NODE)?;
+    let dir = home.join("chat-controls").join(talk);
+    std::fs::create_dir_all(&dir)?;
+    let request = request_lock(&dir, &action.request)?;
+    let path = dir.join(format!("{}.json", action.request));
+    let receipt = if path.exists() {
+        let prior: Receipt = serde_json::from_slice(&std::fs::read(&path)?)?;
+        ensure!(
+            prior.action == *action,
+            "request ID already binds a different operation"
+        );
+        Some(prior)
+    } else {
+        None
+    };
+    Ok(Admission {
+        _target: target,
+        _request: request,
+        repo: conversation.repo,
+        path,
+        receipt,
+    })
+}
+
+pub(crate) async fn merge_admitted(
+    home: &Path,
+    action: Request,
+    admission: Admission,
+) -> Result<String> {
+    merge_admitted_with(home, action, admission, &Gh).await
+}
+
 async fn merge_with(
     home: &Path,
     talks: &Talks,
@@ -263,28 +309,27 @@ async fn merge_with(
     action: Request,
     forge: &impl Forge,
 ) -> Result<String> {
-    action.validate()?;
+    let admission = admit(home, talks, talk, &action)?;
+    merge_admitted_with(home, action, admission, forge).await
+}
+
+async fn merge_admitted_with(
+    home: &Path,
+    action: Request,
+    mut admission: Admission,
+    forge: &impl Forge,
+) -> Result<String> {
     let url = action.url();
-    let _target = target_lock(home, &url)?;
-    let conversation = crate::chat_control::authorize(talks, talk, crate::queue::CHAT_NODE)?;
-    let dir = home.join("chat-controls").join(talk);
-    std::fs::create_dir_all(&dir)?;
-    let _request = request_lock(&dir, &action.request)?;
-    let path = dir.join(format!("{}.json", action.request));
-    let mut receipt = if path.exists() {
-        let prior: Receipt = serde_json::from_slice(&std::fs::read(&path)?)?;
-        ensure!(
-            prior.action == action,
-            "request ID already binds a different operation"
-        );
-        if prior.status != "started" && prior.status != "unknown" && prior.status != "pending" {
+    let path = &admission.path;
+    let mut receipt = if let Some(prior) = admission.receipt.take() {
+        if prior.status == "merged" {
             return Ok(prior.detail);
         }
         prior
     } else {
         let seen = async {
             refuse_pending(home, &url)?;
-            let seen = forge.view(&conversation.repo, &url).await?;
+            let seen = forge.view(&admission.repo, &url).await?;
             ensure!(
                 canonical(&seen.url) == canonical(&url),
                 "forge returned a different PR"
@@ -310,9 +355,9 @@ async fn merge_with(
             status: "started".into(),
             detail: "merge started; outcome unknown".into(),
         };
-        save(&path, &rec)?;
+        save(path, &rec)?;
         match forge
-            .merge(&conversation.repo, &url, &rec.action.head, &seen.title)
+            .merge(&admission.repo, &url, &rec.action.head, &seen.title)
             .await
         {
             Ok((true, _)) => {
@@ -320,7 +365,7 @@ async fn merge_with(
                 // acceptance, then require a forge-confirmed MERGED lifecycle.
                 rec.status = "pending".into();
                 rec.detail = "forge accepted merge command; completion not confirmed".into();
-                save(&path, &rec)?;
+                save(path, &rec)?;
             }
             Ok((false, output)) => {
                 rec.detail = format!("forge refused or outcome unknown: {output}")
@@ -329,7 +374,7 @@ async fn merge_with(
         }
         rec
     };
-    match forge.view(&conversation.repo, &url).await {
+    match forge.view(&admission.repo, &url).await {
         Ok(after)
             if canonical(&after.url) == canonical(&url)
                 && after.state == "MERGED"
@@ -350,11 +395,13 @@ async fn merge_with(
             );
         }
         Ok(after) if canonical(&after.url) == canonical(&url) && after.state != "MERGED" => {
-            receipt.status = "refused".into();
-            receipt.detail = format!(
-                "merge not applied ({}) : {}; no retry will be issued",
-                after.state, receipt.detail
-            );
+            if receipt.status != "refused" {
+                receipt.detail = format!(
+                    "merge not applied ({}) : {}; no retry will be issued",
+                    after.state, receipt.detail
+                );
+                receipt.status = "refused".into();
+            }
         }
         _ => {
             if receipt.status != "pending" {
@@ -366,7 +413,7 @@ async fn merge_with(
             );
         }
     }
-    save(&path, &receipt)?;
+    save(path, &receipt)?;
     Ok(receipt.detail)
 }
 
@@ -628,7 +675,15 @@ mod tests {
         closed.state = "CLOSED".into();
         let fake = Fake::new(
             home.path(),
-            vec![Ok(snapshot()), Ok(snapshot()), Ok(closed)],
+            vec![
+                Ok(snapshot()),
+                Ok(snapshot()),
+                Ok(Snapshot {
+                    state: "CLOSED".into(),
+                    ..snapshot()
+                }),
+                Ok(closed),
+            ],
             true,
         );
         assert!(
@@ -646,10 +701,33 @@ mod tests {
     #[tokio::test]
     async fn refused_merge_is_confirmed_and_never_reissued() {
         let (home, talks) = fixture("マージして");
-        let fake = Fake::new(home.path(), vec![Ok(snapshot()), Ok(snapshot())], false);
+        let fake = Fake::new(
+            home.path(),
+            vec![
+                Ok(snapshot()),
+                Ok(snapshot()),
+                Ok(snapshot()),
+                Ok(merged_snapshot()),
+            ],
+            false,
+        );
         let first = apply(home.path(), &talks, &fake).await.unwrap();
         assert!(first.contains("merge not applied"));
         assert_eq!(apply(home.path(), &talks, &fake).await.unwrap(), first);
+        // An owner may complete the same head through another supported path.
+        // Reconciliation reads the forge and never reissues our refused merge.
+        assert!(
+            apply(home.path(), &talks, &fake)
+                .await
+                .unwrap()
+                .starts_with("merged ")
+        );
+        assert!(
+            apply(home.path(), &talks, &fake)
+                .await
+                .unwrap()
+                .starts_with("merged ")
+        );
         assert_eq!(*fake.calls.lock().unwrap(), 1);
     }
 
