@@ -2476,9 +2476,9 @@ pub struct RunState {
     /// owner claim have been acquired. Later completion/holds retain them.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub decision_starts: BTreeMap<String, usize>,
-    /// Inquiry whose pinned resume this upcoming execution will consume.
+    /// Inquiries whose dispatched resumes this upcoming execution will consume.
     #[serde(skip)]
-    pub next_pass_inquiry: Option<String>,
+    pub next_pass_inquiries: Vec<String>,
     /// Set by whoever is about to execute this run on a task's behalf, read
     /// and cleared by the next [`RunState::begin_pass`]. Never persisted.
     #[serde(skip)]
@@ -2862,7 +2862,7 @@ impl RunState {
             withheld: Vec::new(),
             passes: Vec::new(),
             decision_starts: BTreeMap::new(),
-            next_pass_inquiry: None,
+            next_pass_inquiries: Vec::new(),
             next_pass_task_entry: false,
             parked: false,
             resource_wait: None,
@@ -3045,6 +3045,19 @@ impl RunState {
         }
     }
 
+    /// Carry durable dispatch ownership into driver admission without treating
+    /// dispatch itself as a receipt or replaying the owner's command.
+    pub(crate) fn carry_dispatched_resumes(&mut self, task: &crate::queue::Task) {
+        self.next_pass_inquiries = task
+            .dispatched_resumes
+            .iter()
+            .filter(|(inquiry, run)| {
+                **run == self.id && !self.decision_starts.contains_key(*inquiry)
+            })
+            .map(|(inquiry, _)| inquiry.clone())
+            .collect();
+    }
+
     /// Open a pass for the process that is about to drive this run. A pass
     /// left open by an earlier process is closed as [`PassEnd::Unrecorded`];
     /// one that recorded its own end is never touched.
@@ -3057,8 +3070,10 @@ impl RunState {
             last.end = Some(PassEnd::Unrecorded);
             last.ended_at = Some(now);
         }
-        if let Some(inquiry) = self.next_pass_inquiry.take() {
-            self.decision_starts.insert(inquiry, self.passes.len());
+        for inquiry in std::mem::take(&mut self.next_pass_inquiries) {
+            self.decision_starts
+                .entry(inquiry)
+                .or_insert(self.passes.len());
         }
         let resumed = !self.passes.is_empty() || !self.candidates.is_empty();
         self.passes.push(RunPass {

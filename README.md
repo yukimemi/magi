@@ -1659,6 +1659,11 @@ can retry the same command after fixing the cause or explicitly cancel it with
 reconciliation requirement. Restart itself performs no retry. Resume requests
 remain active until the scheduler observes the owning execution running.
 
+再開 pin を消費するタスク開始保存には、依頼 ID と対象 run の対応も含める。
+開始 pass の保存前に worker が終了しても、再起動後の実行へこの対応を引き継ぐ。
+タスクが Running になっただけでは解決せず、実行 lease と所有権を取得して
+`decision_starts` と開始 pass を永続化したことを確認して解決する。
+
 Task-local hold, release, completion and instruction-retry effects save the exact
 command receipt in the same queue write as their transition. Restart recovery
 can therefore finish an interrupted decision projection even after the task has

@@ -1399,7 +1399,7 @@ mod tests {
         );
         q.answer(Answer::Choice(crate::land::REPAIR.into()))
             .unwrap();
-        run.next_pass_inquiry = Some(q.id.clone());
+        run.next_pass_inquiries = vec![q.id.clone()];
         run.begin_pass();
         run.save_under(home).unwrap();
         let mut task = Task::new(
@@ -1532,7 +1532,7 @@ mod tests {
             }
             q.answer(Answer::Choice(choice.into())).unwrap();
             // The old run consumed the Resume transport, but closure may fail.
-            run.next_pass_inquiry = Some(q.id.clone());
+            run.next_pass_inquiries = vec![q.id.clone()];
             run.begin_pass();
             run.save_under(home).unwrap();
             let mut task = Task::new("work".into(), "work".into(), home.into(), Source::Human);

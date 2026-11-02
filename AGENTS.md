@@ -3631,8 +3631,11 @@ dispatch 前に再開 pin を置換・削除する queue 書込みは、元の�
 `decision_effects` に受領記録を残す。Stale / Refuse や、まだ実行開始を待つ
 Resume に完了受領記録を付けない。状態フラグだけを後から完了証拠にしない。
 着地停止用の `attempt` 分岐も通常の再開分岐と同じく、`task.start` が pin を
-消費する前に `next_pass_inquiry` へ依頼 ID を渡し、task の開始保存に失敗したら
-実行しない。放棄の保存前拒否は `BeforeAbandonWrite` として再試行・取消可能にし、
+消費するときに依頼 ID と run の対応を task の `dispatched_resumes` に保存する。
+この対応は再起動・回収・古い task の保存でも失わせず、開始保存に失敗したら
+実行しない。実行前に未記録の対応を `next_pass_inquiries` に復元し、実行 lease と
+owner claim の取得後に開始 pass と `decision_starts` を同時保存するまでは解決しない。
+後続の pass で元の開始受領記録を上書きしない。放棄の保存前拒否は `BeforeAbandonWrite` として再試行・取消可能にし、
 run 保存を試みた後の失敗は引き続き不確実として扱う。
 相談テストではタスク所有の質問と実在する run の関連を維持し、本番の task chat
 配送経路で実行不変を確認する。非タスク相談も実在する独立 run を使って維持する。

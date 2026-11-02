@@ -470,6 +470,11 @@ pub struct Task {
     /// Retained independently of later task transitions and stale writers.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub superseded_resumes: std::collections::BTreeMap<String, String>,
+    /// Resume inquiry ownership committed atomically with task dispatch.
+    /// This is not effect evidence: only the run's committed pass proves execution.
+    /// Retained across recovery and stale writers until that pass can consume it.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub dispatched_resumes: std::collections::BTreeMap<String, String>,
     /// The operator's "resume" answer to a triage question, kept until the
     /// task actually runs (or is done) so `crate::conduct` cannot silently
     /// undo it and `crate::triage` can tell that a hold it sees now came
@@ -981,6 +986,7 @@ impl Task {
             actions_applied: Vec::new(),
             decision_effects: Default::default(),
             superseded_resumes: Default::default(),
+            dispatched_resumes: Default::default(),
             resume_override: None,
             repair_grants: Vec::new(),
             resumption: None,
@@ -1331,6 +1337,13 @@ impl Task {
         self.status = TaskStatus::Running;
         self.attempts += 1;
         self.runs.retain(|id| id != &run);
+        if let Some(pin) = &self.resume_override
+            && pin.pinned_run.as_ref() == Some(&run)
+            && !pin.question_id.is_empty()
+        {
+            self.dispatched_resumes
+                .insert(pin.question_id.clone(), run.clone());
+        }
         self.runs.push(run);
         self.last_error = None;
         self.park_reason = None;
@@ -2721,6 +2734,7 @@ impl Queue {
                 }
             }
             task.superseded_resumes.extend(stored.superseded_resumes);
+            task.dispatched_resumes.extend(stored.dispatched_resumes);
             if task.status != TaskStatus::Running
                 && let Some(pin) = &stored.resume_override
                 && !pin.question_id.is_empty()

@@ -522,7 +522,19 @@ async fn a_fast_completed_resume_has_an_exact_durable_start_receipt_after_restar
     pending.status=magi::queue::TaskStatus::Running; queue.put(&mut pending).unwrap();
     chat_control::reconcile_decisions(&queue,&home).unwrap();
     assert_eq!(outbox.get(&record.id).unwrap().decision.unwrap().status,Status::Queued,"a task status alone is not execution-start proof");
-    pending.status=magi::queue::TaskStatus::Queued; queue.put(&mut pending).unwrap();
+    // Crash boundary: dispatch committed, but no driver admission or pass save.
+    pending.start(state.id.clone()); queue.put(&mut pending).unwrap();
+    drop(pending);
+    let mut pending=Queue::at(home.join("queue")).get(&task.id).unwrap();
+    assert!(pending.resume_override.is_none());
+    assert_eq!(pending.dispatched_resumes.get(&record.id),Some(&state.id));
+    assert!(RunState::load_under(&state.id,&home).unwrap().decision_starts.is_empty());
+    chat_control::reconcile_decisions(&queue,&home).unwrap();
+    assert_eq!(outbox.get(&record.id).unwrap().decision.unwrap().status,Status::Queued);
+    // Recovery retains the dispatched mapping; explicitly release the held task.
+    pending.hold_manual(Some("Recovered before driver admission".into())); queue.put(&mut pending).unwrap();
+    chat_control::dispatch(&queue,&home,&talks,&chat.id,Operation::Release{task:task.id.clone()}).await.unwrap();
+    let mut pending=queue.get(&task.id).unwrap();
     let opts=magi::daemon::Opts{repo:fx.repo.clone(),config:Some(config),worktrees_root:Some(fx.tmp.path().join("resume-wt")),..Default::default()};
     let claim=queue.claim(&task.id).unwrap(); Box::pin(magi::daemon::run_claimed(&opts,&queue,&mut pending)).await; drop(claim);
     let finished=queue.get(&task.id).unwrap(); assert_ne!(finished.status,magi::queue::TaskStatus::Running);

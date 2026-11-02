@@ -4216,11 +4216,6 @@ async fn attempt(
         runner.watch_interrupt(interrupt_pause);
         let quota_before = runner.state.quota.clone();
         let before_start = task.clone();
-        runner.state.next_pass_inquiry = task
-            .resume_override
-            .as_ref()
-            .filter(|pin| pin.pinned_run.as_ref() == Some(&owner.id) && !pin.question_id.is_empty())
-            .map(|pin| pin.question_id.clone());
         task.start(owner.id.clone());
         if let Err(error) = queue.put(task) {
             *task = before_start;
@@ -4239,6 +4234,7 @@ async fn attempt(
             task: task.id.clone(),
             run: owner.id,
         });
+        runner.state.carry_dispatched_resumes(task);
         runner.state.next_pass_task_entry = true;
         let result = runner.execute().await;
         return finish_attempt(
@@ -4930,11 +4926,6 @@ async fn attempt(
     // `Running` before `execute` is what makes a crash mid-run legible.
     let run = runner.state.id.clone();
     let before_start = task.clone();
-    runner.state.next_pass_inquiry = task
-        .resume_override
-        .as_ref()
-        .filter(|pin| pin.pinned_run.as_ref() == Some(&run) && !pin.question_id.is_empty())
-        .map(|pin| pin.question_id.clone());
     task.start(run.clone());
     if let Err(error) = queue.put(task) {
         *task = before_start;
@@ -4957,6 +4948,7 @@ async fn attempt(
     // `RunState::quota` is the run's whole history across every resume, so
     // only what this execution added may arm the cooldown or earn a refund.
     let quota_before = runner.state.quota.clone();
+    runner.state.carry_dispatched_resumes(task);
     runner.state.next_pass_task_entry = true;
     let result = runner.execute().await;
     finish_attempt(
@@ -9337,6 +9329,62 @@ mod tests {
             t.status,
             TaskStatus::Done,
             "a run that actually finished must not stay `running` forever"
+        );
+    }
+
+    #[test]
+    fn reclaim_preserves_dispatched_inquiries_until_a_committed_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let mut task = task();
+        let mut run = run_state(RunStatus::Blocked);
+        run.reserve_under(dir.path()).unwrap();
+        run.driver_exited = true;
+        run.save_under(dir.path()).unwrap();
+        queue.put(&mut task).unwrap();
+        let stale = task.clone();
+        task.resume_override = Some(crate::queue::OperatorResume {
+            question_id: "pending-resume".into(),
+            at: Timestamp::now(),
+            conductor_rehold: None,
+            forced: true,
+            pinned_run: Some(run.id.clone()),
+        });
+        task.start(run.id.clone());
+        queue.put(&mut task).unwrap();
+        // Discard every in-memory handoff, as a worker death before execute does.
+        let mut recovered = queue.get(&task.id).unwrap();
+        let disk = RunState::load_under(&run.id, dir.path()).unwrap();
+        reclaim(&mut recovered, Some(disk), 2, "en");
+        queue.put(&mut recovered).unwrap();
+        assert!(recovered.resume_override.is_none());
+        assert_eq!(
+            recovered.dispatched_resumes.get("pending-resume"),
+            Some(&run.id)
+        );
+        let mut stale = stale;
+        queue.put(&mut stale).unwrap();
+        assert_eq!(
+            stale.dispatched_resumes, recovered.dispatched_resumes,
+            "a stale task writer cannot erase dispatch ownership"
+        );
+        let mut resumed = RunState::load_under(&run.id, dir.path()).unwrap();
+        assert!(resumed.decision_starts.is_empty());
+        resumed.carry_dispatched_resumes(&queue.get(&task.id).unwrap());
+        assert!(
+            resumed.decision_starts.is_empty(),
+            "handoff is not execution proof"
+        );
+        resumed.begin_pass();
+        resumed.save_under(dir.path()).unwrap();
+        let mut disk = RunState::load_under(&run.id, dir.path()).unwrap();
+        assert_eq!(disk.decision_starts.get("pending-resume"), Some(&0));
+        disk.carry_dispatched_resumes(&recovered);
+        disk.begin_pass();
+        assert_eq!(
+            disk.decision_starts.get("pending-resume"),
+            Some(&0),
+            "later execution must preserve the original pass receipt"
         );
     }
 
