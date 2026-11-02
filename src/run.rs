@@ -2161,6 +2161,36 @@ pub struct FetchedBase {
     pub fetched_at: Timestamp,
 }
 
+/// Durable evidence recorded before startup can acquire repository assets.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Startup {
+    /// Implementation, review, or public-head recovery.
+    pub kind: String,
+    /// Requested review branch, before any checkout or ref changes.
+    pub branch: Option<String>,
+    /// Last durable startup boundary.
+    pub stage: String,
+    /// Construction finished successfully; false forbids graph resumption.
+    pub complete: bool,
+    /// Original startup error, or an interruption requiring inspection.
+    pub failure: Option<String>,
+}
+
+/// Error context preserves the underlying typed refusal/resource error.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StartupFailure {
+    /// Reserved run retained for audit.
+    pub run: String,
+    /// Boundary that failed.
+    pub stage: String,
+}
+
+impl std::fmt::Display for StartupFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "run {} startup failed at {}", self.run, self.stage)
+    }
+}
+
 /// The whole run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunState {
@@ -2180,6 +2210,9 @@ pub struct RunState {
     /// Guarded destination for an isolated review of a foreign checkout.
     #[serde(default)]
     pub foreign_checkout: Option<crate::foreign_checkout::ForeignCheckout>,
+    /// Reservation lifecycle; incomplete startups must never execute as fresh work.
+    #[serde(default)]
+    pub startup: Option<Startup>,
     /// The task, verbatim.
     pub instruction: String,
     /// Authored task criteria before review scaffolding was generated.
@@ -2775,6 +2808,7 @@ impl RunState {
             seeds: Vec::new(),
             sources: crate::refs::Sources::default(),
             prep_failure: None,
+            startup: None,
             prep_complete: Some(false),
             seats: BTreeMap::new(),
             active: BTreeMap::new(),
@@ -3488,16 +3522,6 @@ impl RunState {
             },
         )?;
         Ok(())
-    }
-
-    /// Withdraw a run that was reserved but never exposed (a pre-start check
-    /// failed), so its record cannot be mistaken for an owner of anything.
-    /// Removes only this run's own freshly reserved directory.
-    pub fn discard_reserved(&self) {
-        let dir = self.dir();
-        if let Err(e) = std::fs::remove_dir_all(&dir) {
-            tracing::warn!("discard reserved run {}: {e:#}", self.id);
-        }
     }
 
     /// Flush to `run.json`, atomically, under the process-global [`home`].

@@ -328,6 +328,16 @@ enum Command {
         #[arg(long)]
         allow_stale: bool,
     },
+    /// Inspect an empty legacy review reservation; --apply records a verified
+    /// startup failure without resuming the task or changing its approvals.
+    ReconcileStartup {
+        /// JSON attribution and the operator-reviewed refusal log excerpt.
+        #[arg(long)]
+        evidence: PathBuf,
+        /// Apply the audited repair; by default only validate and print the plan.
+        #[arg(long)]
+        apply: bool,
+    },
     /// List recorded runs.
     List {
         /// How many to show.
@@ -1713,6 +1723,16 @@ async fn dispatch(command: Command) -> Result<()> {
                     print!("{}", report::stats(&st));
                 }
             }
+            Ok(())
+        }
+
+        Command::ReconcileStartup { evidence, apply } => {
+            let evidence: magi::startup_reconcile::Evidence =
+                serde_json::from_slice(&std::fs::read(evidence)?)?;
+            println!(
+                "{}",
+                magi::startup_reconcile::reconcile(&magi::run::home(), &evidence, apply)?
+            );
             Ok(())
         }
 
@@ -3321,6 +3341,12 @@ async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
                 for p in &attachments {
                     println!("  {}", p.display());
                 }
+            }
+            for failure in &t.startup_failures {
+                println!(
+                    "startup failed {} at {} (not execution history)",
+                    failure.run, failure.stage
+                );
             }
             if !t.runs.is_empty() {
                 println!("runs      {}", t.runs.join(", "));

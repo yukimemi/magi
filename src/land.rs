@@ -8062,25 +8062,38 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             assert!(holder.is_some());
             let cancelled = Arc::new(AtomicBool::new(false));
             let signal = cancelled.clone();
+            let waiting = Arc::new(tokio::sync::Notify::new());
+            let observed = waiting.clone();
             let wait = crate::repo_lock::WaitPolicy::new(Duration::from_secs(30), move || {
+                observed.notify_one();
                 signal.load(Ordering::SeqCst)
             });
             let forge = Scripted::new(vec![seen(&head, Checks::Green, "CLEAN", false)], vec![]);
             let url = green_pr().url;
-            let (result, ()) = tokio::join!(
-                tokio::time::timeout(
-                    Duration::from_secs(2),
-                    wait.scope(publish_landing_head(&mut state, &head, &url, &forge)),
-                ),
-                async {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    cancelled.store(true, Ordering::SeqCst);
-                }
-            );
+            let result = {
+                let mut publishing =
+                    Box::pin(wait.scope(publish_landing_head(&mut state, &head, &url, &forge)));
+                // Git and fixture I/O precede local coordination. Start the
+                // cancellation deadline only once the inherited wait policy
+                // is polled, rather than timing those unrelated subprocesses.
+                tokio::time::timeout(Duration::from_secs(30), async {
+                    tokio::select! {
+                        result = &mut publishing => panic!(
+                            "verification must wait behind the held seat: {result:?}"
+                        ),
+                        () = waiting.notified() => {}
+                    }
+                })
+                .await
+                .expect("verification must reach the inherited coordination wait");
+                cancelled.store(true, Ordering::SeqCst);
+                tokio::time::timeout(Duration::from_secs(2), publishing).await
+            };
             let error = result
                 .expect("cancellation must release the verification waiter")
                 .unwrap_err();
             assert!(error.is::<crate::repo_lock::ResourceBlocked>(), "{error:#}");
+            assert!(error.to_string().contains("cancelled"), "{error:#}");
             assert!(forge.argvs().is_empty());
             assert_eq!(
                 git::remote_head(&state.repo, "origin", "task-head")

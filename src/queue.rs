@@ -346,6 +346,9 @@ pub struct Task {
     /// contain repeated ids; execution history lives in the run pass records.
     #[serde(default)]
     pub runs: Vec<String>,
+    /// Reserved startups that failed before execution; never a resume source or execution attempt.
+    #[serde(default)]
+    pub startup_failures: Vec<crate::run::StartupFailure>,
     /// Why the last attempt did not land.
     #[serde(default)]
     pub last_error: Option<String>,
@@ -931,6 +934,7 @@ impl Task {
             attempts: 0,
             attempt_limit: None,
             runs: Vec::new(),
+            startup_failures: Vec::new(),
             last_error: None,
             hold_reason: None,
             hold_source: None,
@@ -1233,6 +1237,13 @@ impl Task {
         self.interrupt = false;
         // The answer has been honoured: the task got its turn.
         self.resume_override = None;
+    }
+
+    /// Attribute a failed reservation once without spending an execution attempt.
+    pub fn record_startup_failure(&mut self, failure: crate::run::StartupFailure) {
+        if !self.startup_failures.iter().any(|f| f.run == failure.run) {
+            self.startup_failures.push(failure);
+        }
     }
 
     /// Note that `run` serves this task without otherwise changing its life:
@@ -2567,6 +2578,9 @@ impl Queue {
                     task.chat_notices.push(key);
                 }
             }
+            for failure in stored.startup_failures {
+                task.record_startup_failure(failure);
+            }
             for run in stored.runs {
                 if !task.runs.contains(&run) {
                     task.runs.push(run);
@@ -2589,6 +2603,16 @@ impl Queue {
                 task.chat_notice = Some(n);
             }
         }
+    }
+
+    /// Audit-only update; caller holds the task write lock and claim. Preserve
+    /// timestamps, controls and notification state while appending startup evidence.
+    pub(crate) fn write_startup_history(&self, task: &Task) -> Result<()> {
+        let path = self.path_of(&task.id);
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, serde_json::to_vec_pretty(task)?)?;
+        std::fs::rename(tmp, path)?;
+        Ok(())
     }
 
     /// Stamp and write `task` atomically; the caller holds the id's lock.

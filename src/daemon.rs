@@ -4632,6 +4632,11 @@ async fn attempt(
             })
         }
     }})).await;
+    if let Err(error) = &started
+        && let Some(failure) = error.downcast_ref::<crate::run::StartupFailure>()
+    {
+        task.record_startup_failure(failure.clone());
+    }
     let mut runner = match started {
         Ok(r) => r,
         Err(e) if e.is::<crate::repo_lock::ResourceBlocked>() => {
@@ -4653,10 +4658,6 @@ async fn attempt(
         Err(e) if task.pr_recovery.is_some() => {
             task.startup_notice_cause("startup-public-head");
             task.attempts += 1;
-            if let Some(partial) = e.downcast_ref::<crate::pr_recovery::StartupFailed>() {
-                task.link_run(&partial.run);
-                task.record_pass(&partial.run, 0, task.attempts, None);
-            }
             task.last_error = Some(format!("{start_failed}{e:#}"));
             task.hold_unrequested_retry(Some(format!(
                 "Selected public-head recovery could not start: {e:#}. Correct the cause and use `magi task recover-pr` with the approved public head; automatic recovery is stopped."
@@ -4777,8 +4778,12 @@ async fn attempt(
                 ),
             );
             if let Err(e) = old.save() {
+                let error = runner.fail_startup("replacement-history", e);
+                if let Some(failure) = error.downcast_ref::<crate::run::StartupFailure>() {
+                    task.record_startup_failure(failure.clone());
+                }
                 task.hold_manual(Some(format!(
-                    "Could not link replacement history: {e}; no agents dispatched"
+                    "Could not link replacement history: {error:#}; no agents dispatched"
                 )));
                 record(queue, task);
                 return Vec::new();
@@ -4802,8 +4807,20 @@ async fn attempt(
     // `start` has minted the run, so the task can now point at it. Persisting
     // `Running` before `execute` is what makes a crash mid-run legible.
     let run = runner.state.id.clone();
+    let before_start = task.clone();
     task.start(run.clone());
-    record(queue, task);
+    if let Err(error) = queue.put(task) {
+        *task = before_start;
+        let error = runner.fail_startup("task-start", error);
+        if let Some(failure) = error.downcast_ref::<crate::run::StartupFailure>() {
+            task.record_startup_failure(failure.clone());
+        }
+        task.hold_manual(Some(format!(
+            "Could not persist task start; no agents dispatched: {error:#}"
+        )));
+        record(queue, task);
+        return Vec::new();
+    }
     lock(status).current.push(Current {
         worker: None,
         task: task.id.clone(),
@@ -5724,7 +5741,8 @@ enum Starter {
 }
 
 /// A second bound independent of inputs and the resettable failure counter.
-/// Count recovery records, not history entries: resuming appends the same id.
+/// Count execution and failed-startup recovery records once per run. Startup
+/// failures can retain unrecorded preparation assets without an execution pass.
 /// Unknown history is not evidence that a new set of worktrees is affordable.
 fn retained_attempt_hold(
     task: &Task,
@@ -5736,7 +5754,12 @@ fn retained_attempt_hold(
         return None;
     }
     let mut retained = 0;
-    for id in task.runs.iter().collect::<std::collections::BTreeSet<_>>() {
+    for id in task
+        .runs
+        .iter()
+        .chain(task.startup_failures.iter().map(|failure| &failure.run))
+        .collect::<std::collections::BTreeSet<_>>()
+    {
         let state = match load(id) {
             Ok(state) if state.id == *id => state,
             _ => {
@@ -12432,6 +12455,75 @@ mod tests {
         assert!(check(&restored, &Starter::Start, 8).is_some());
         assert!(check(&restored, &Starter::Resume(task.runs[0].clone()), 8).is_none());
         assert!(check(&restored, &Starter::Start, 0).is_none());
+    }
+
+    #[test]
+    fn retained_attempt_bound_includes_failed_startups_without_execution_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut task = Task::new(
+            "recover selected PR".into(),
+            "preserve implementation".into(),
+            tmp.path().join("repo"),
+            crate::queue::Source::Human,
+        );
+        let mut failed = run_state(RunStatus::Failed);
+        failed.id = "20260101-000000-fail".into();
+        failed.candidates.clear();
+        failed.prep_complete = Some(false);
+        failed.config.graph.worktree_root = Some(tmp.path().join("worktrees"));
+        failed.startup = Some(crate::run::Startup {
+            kind: "pr-recovery".into(),
+            branch: Some("selected-public-head".into()),
+            stage: "worktree-setup".into(),
+            complete: false,
+            failure: Some("setup modified a tracked file and failed".into()),
+        });
+        // Setup may fail before a candidate is recorded; its dirty worktree
+        // still needs protection and consumes the independent retained bound.
+        let worktree = failed.worktree_root().join("under-review");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let retained_edit = worktree.join("implementation");
+        std::fs::write(&retained_edit, "retained setup edit").unwrap();
+        task.record_startup_failure(crate::run::StartupFailure {
+            run: failed.id.clone(),
+            stage: "worktree-setup".into(),
+        });
+        let task: Task = serde_json::from_slice(&serde_json::to_vec(&task).unwrap()).unwrap();
+        assert!(task.runs.is_empty() && task.passes.is_empty());
+        assert_eq!(task.attempts, 0);
+        let starter = Starter::Review("selected-public-head".into());
+        assert!(
+            retained_attempt_hold(&task, &starter, 1, |_| Ok(failed.clone()))
+                .unwrap()
+                .contains("1 unretired")
+        );
+        assert!(retained_attempt_hold(&task, &starter, 2, |_| Ok(failed.clone())).is_none());
+        assert!(
+            retained_attempt_hold(&task, &starter, 2, |_| anyhow::bail!("unreadable"))
+                .unwrap()
+                .contains("Cannot verify")
+        );
+        // Older or mixed writers can link the same reservation in both lists.
+        let mut mixed = task.clone();
+        mixed.runs.push(failed.id.clone());
+        mixed
+            .startup_failures
+            .push(task.startup_failures[0].clone());
+        assert!(retained_attempt_hold(&mixed, &starter, 2, |_| Ok(failed.clone())).is_none());
+        failed.retired_to = Some("verified-recovery-owner".into());
+        assert!(retained_attempt_hold(&task, &starter, 1, |_| Ok(failed.clone())).is_none());
+        assert!(
+            retained_attempt_hold(&task, &Starter::Resume(failed.id.clone()), 1, |_| {
+                panic!("resuming the existing owner must not allocate a new attempt")
+            })
+            .is_none()
+        );
+        assert_eq!(
+            std::fs::read_to_string(retained_edit).unwrap(),
+            "retained setup edit"
+        );
+        assert!(task.runs.is_empty() && task.passes.is_empty());
+        assert_eq!(task.attempts, 0);
     }
 
     #[test]
