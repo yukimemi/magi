@@ -507,6 +507,7 @@ async fn execute_decision(
 ) -> Result<String> {
     use crate::task_decision::Status;
     let outbox = crate::task_inquiry::Outbox::at(home);
+    let _execution = outbox.execution_claim(id)?;
     let inquiry = outbox.get(id)?;
     ensure!(
         inquiry.delivered_to.as_deref() == Some(chat),
@@ -856,6 +857,16 @@ fn reconcile_task_decision(queue: &Queue, home: &Path, chat: &str, id: &str) -> 
         return Ok(());
     }
     let command: Operation = serde_json::from_str(&request)?;
+    if let Operation::Resume { run } = &command {
+        reconcile_resume_decision(queue, home, &outbox, id, run)?;
+        ensure!(
+            outbox.get(id)?.decision.is_some_and(|d| {
+                d.status == crate::task_decision::Status::Resolved || d.retry_safe
+            }),
+            "resume remains queued or executing; no operation was replayed"
+        );
+        return Ok(());
+    }
     let (_claim, task) = claimed(queue, &inquiry.task)?;
     ensure!(task.repo == inquiry.repo, "decision repository changed");
     if let Some(receipt) = task.decision_effects.get(id) {
@@ -894,7 +905,6 @@ fn reconcile_task_decision(queue: &Queue, home: &Path, chat: &str, id: &str) -> 
                 && title.as_ref().is_none_or(|title| *title == task.title)
                 && task.status == TaskStatus::Queued
         }
-        Operation::Resume { run } => resume_started(home, &task, id, &run)?,
         Operation::Abandon { run } => abandonment_receipt(home, &task, id, &run, &request)?,
         _ => anyhow::bail!(
             "external effects require their authoritative receipt; no operation was replayed"
@@ -929,6 +939,48 @@ pub(crate) fn resume_started(home: &Path, task: &Task, inquiry: &str, run: &str)
             .get(*index)
             .is_some_and(|pass| pass.index == *index)
     }))
+}
+
+/// Publication writes the pin and actions_applied marker atomically. Fence the
+/// publisher and scheduler before treating their absence as pre-effect proof.
+/// A published pin may already be consumed, so its absence alone is not proof.
+fn reconcile_resume_decision(
+    queue: &Queue,
+    home: &Path,
+    outbox: &crate::task_inquiry::Outbox,
+    id: &str,
+    run: &str,
+) -> Result<()> {
+    let Ok(_execution) = outbox.execution_claim(id) else {
+        return Ok(());
+    };
+    let inquiry = outbox.get(id)?;
+    let Ok(_claim) = queue.claim(&inquiry.task) else {
+        return Ok(());
+    };
+    let task = queue.get(&inquiry.task)?;
+    ensure!(task.repo == inquiry.repo, "resume task repository changed");
+    let decision = inquiry.decision.context("inquiry is informational")?;
+    if decision.status == crate::task_decision::Status::Resolved {
+        return Ok(());
+    }
+    if resume_started(home, &task, id, run)? {
+        outbox.update_decision(id, |d| {
+            d.applied("exact resume execution-start or supersession receipt confirmed")
+        })?;
+    } else if !task.action_applied(id)
+        && !task.dispatched_resumes.contains_key(id)
+        && !task.superseded_resumes.contains_key(id)
+        && !task
+            .resume_override
+            .as_ref()
+            .is_some_and(|pin| pin.question_id == id)
+    {
+        outbox.update_decision(id, |d| {
+            d.fail_before_effect("Resume was not published to the queue; the owner may retry the same request or cancel it. No operation was replayed.")
+        })?;
+    }
+    Ok(())
 }
 
 fn abandonment_receipt(
@@ -1026,6 +1078,9 @@ fn reconcile_inquiry(
     let Ok(command) = serde_json::from_str::<Operation>(&request) else {
         return Ok(());
     };
+    if let Operation::Resume { run } = &command {
+        return reconcile_resume_decision(queue, home, outbox, &inquiry.id, run);
+    }
     let task = queue.get(&inquiry.task)?;
     ensure!(task.repo == inquiry.repo, "decision repository changed");
     if let Some(receipt) = task.decision_effects.get(&inquiry.id) {
@@ -1038,22 +1093,11 @@ fn reconcile_inquiry(
         })?;
         return Ok(());
     }
-    let queued_resume = matches!(&command, Operation::Resume { .. });
     let mut pending_external = false;
     let receipt = match command {
         Operation::Abandon { run } => {
             abandonment_receipt(home, &task, &inquiry.id, &run, &request)?
                 .then(|| format!("run {run}: exact abandonment receipt committed"))
-        }
-        Operation::Resume { run } => {
-            let task = queue.get(&inquiry.task)?;
-            ensure!(task.repo == inquiry.repo, "resume task repository changed");
-            resume_started(home, &task, &inquiry.id, &run)?.then(|| {
-                format!(
-                    "run {run}: durable execution-start or supersession receipt for {}",
-                    inquiry.id
-                )
-            })
         }
         Operation::RerunChecks {
             request,
@@ -1113,7 +1157,6 @@ fn reconcile_inquiry(
     if let Some(receipt) = receipt {
         outbox.update_decision(&inquiry.id, |d| d.applied(&receipt))?;
     } else if decision.status == Status::InProgress
-        && !queued_resume
         && !pending_external
         && outbox
             .get(&inquiry.id)?
@@ -1533,6 +1576,54 @@ mod tests {
         );
         queue.put(&mut t).unwrap();
         t
+    }
+
+    #[test]
+    fn resume_recovery_waits_for_the_inquiry_publisher() {
+        let tmp = tempfile::tempdir().unwrap();
+        let queue = Queue::at(tmp.path().join("queue"));
+        let mut task = filed(&queue, "talk-a", "work");
+        let mut state = crate::run::RunState::new(
+            task.repo.clone(),
+            "main".into(),
+            "base".into(),
+            "work".into(),
+            crate::config::Config::default(),
+        );
+        state.status = crate::run::RunStatus::Blocked;
+        state.driver_exited = true;
+        state.save_under(tmp.path()).unwrap();
+        task.runs.push(state.id.clone());
+        queue.put(&mut task).unwrap();
+        let outbox = crate::task_inquiry::Outbox::at(tmp.path());
+        let inquiry = outbox
+            .file(
+                &task,
+                Some(state.id.clone()),
+                "resume".into(),
+                "Resume?",
+                "",
+            )
+            .unwrap();
+        let request = serde_json::to_string(&Operation::Resume {
+            run: state.id.clone(),
+        })
+        .unwrap();
+        outbox
+            .update_decision(&inquiry.id, |d| {
+                d.accept(&request)?;
+                d.start()
+            })
+            .unwrap();
+        let before = outbox.get(&inquiry.id).unwrap().decision.unwrap();
+        let publisher = outbox.execution_claim(&inquiry.id).unwrap();
+        reconcile_decisions(&queue, tmp.path()).unwrap();
+        assert_eq!(outbox.get(&inquiry.id).unwrap().decision.unwrap(), before);
+        drop(publisher);
+        reconcile_decisions(&queue, tmp.path()).unwrap();
+        let recovered = outbox.get(&inquiry.id).unwrap().decision.unwrap();
+        assert_eq!(recovered.status, crate::task_decision::Status::RetryNeeded);
+        assert!(recovered.retry_safe);
     }
 
     #[test]

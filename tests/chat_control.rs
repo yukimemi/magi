@@ -108,6 +108,128 @@ fn refused(out: Output) -> String {
     String::from_utf8(out.stderr).unwrap()
 }
 
+#[tokio::test]
+async fn interrupted_resume_publication_recovers_only_unpublished_requests() {
+    use magi::{chat_control::Operation, task_decision::Status, task_inquiry::Outbox};
+    let _home = common::home_lock().await;
+    // Recreate the durable boundaries left by process loss, then use fresh
+    // store handles and real CLI commands to reconcile, retry or cancel.
+    for boundary in ["accepted", "started", "uncertain"] {
+        for cancel in [false, true] {
+            let f = Fixture::new();
+            let queue = f.queue();
+            let mut task = f.saved();
+            task.chat = Some(f.talk.clone());
+            queue.put(&mut task).unwrap();
+            let outbox = Outbox::at(f.tmp.path());
+            let inquiry = outbox
+                .file(
+                    &task,
+                    Some(f.run.id.clone()),
+                    "resume".into(),
+                    "Resume?",
+                    boundary,
+                )
+                .unwrap();
+            outbox.deliver(&queue, &f.talks, &inquiry.id).unwrap();
+            let request = serde_json::to_string(&Operation::Resume {
+                run: f.run.id.clone(),
+            })
+            .unwrap();
+            outbox
+                .update_decision(&inquiry.id, |d| {
+                    d.accept(&request)?;
+                    if boundary != "accepted" {
+                        d.start()?;
+                    }
+                    if boundary == "uncertain" {
+                        d.fail("Interrupted without a receipt")?;
+                    }
+                    Ok(true)
+                })
+                .unwrap();
+            let before = std::fs::read(queue.path_of(&task.id)).unwrap();
+            let claim = queue.claim(&task.id).unwrap();
+            magi::chat_control::reconcile_decisions(&queue, f.tmp.path()).unwrap();
+            assert!(
+                !outbox
+                    .get(&inquiry.id)
+                    .unwrap()
+                    .decision
+                    .unwrap()
+                    .retry_safe,
+                "contention cannot establish absence of publication"
+            );
+            drop(claim);
+            // Both the startup sweep and the explicit supported command can
+            // recover this gap, without modifying the queue or starting work.
+            if cancel {
+                passed(f.control(&["reconcile-decision", &inquiry.id]));
+            } else {
+                magi::chat_control::reconcile_decisions(
+                    &Queue::at(f.tmp.path().join("queue")),
+                    f.tmp.path(),
+                )
+                .unwrap();
+            }
+            let recovered = Outbox::at(f.tmp.path())
+                .get(&inquiry.id)
+                .unwrap()
+                .decision
+                .unwrap();
+            assert_eq!(recovered.status, Status::RetryNeeded);
+            assert!(recovered.retry_safe);
+            assert_eq!(std::fs::read(queue.path_of(&task.id)).unwrap(), before);
+            assert!(
+                RunState::load_under(&f.run.id, f.tmp.path())
+                    .unwrap()
+                    .decision_starts
+                    .is_empty()
+            );
+            if cancel {
+                passed(f.control(&[
+                    "settle-decision",
+                    &inquiry.id,
+                    "--reason",
+                    "Owner cancels the unpublished request",
+                ]));
+                assert_eq!(
+                    outbox.get(&inquiry.id).unwrap().decision.unwrap().status,
+                    Status::Resolved
+                );
+                assert_eq!(std::fs::read(queue.path_of(&task.id)).unwrap(), before);
+            } else {
+                passed(f.control(&["--decision", &inquiry.id, "resume", &f.run.id]));
+                let published = queue.get(&task.id).unwrap();
+                assert!(published.action_applied(&inquiry.id));
+                assert_eq!(published.resume_override.unwrap().question_id, inquiry.id);
+                // Process loss after publication but before the projection's
+                // queued write must never enable another publication/cancel.
+                outbox.update_decision(&inquiry.id, |d| d.start()).unwrap();
+                magi::chat_control::reconcile_decisions(&queue, f.tmp.path()).unwrap();
+                let pending = outbox.get(&inquiry.id).unwrap().decision.unwrap();
+                assert_eq!(pending.status, Status::InProgress);
+                assert!(!pending.retry_safe);
+                refused(f.control(&["--decision", &inquiry.id, "resume", &f.run.id]));
+                refused(f.control(&[
+                    "settle-decision",
+                    &inquiry.id,
+                    "--reason",
+                    "Cannot cancel published work",
+                ]));
+                // The pin can be consumed before a pass receipt is committed.
+                let mut dispatched = queue.get(&task.id).unwrap();
+                dispatched.start(f.run.id.clone());
+                queue.put(&mut dispatched).unwrap();
+                magi::chat_control::reconcile_decisions(&queue, f.tmp.path()).unwrap();
+                let pending = outbox.get(&inquiry.id).unwrap().decision.unwrap();
+                assert_eq!(pending.status, Status::InProgress);
+                assert!(!pending.retry_safe);
+            }
+        }
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn routed_merge_preserves_admission_retries_and_reconciles_refused_receipts() {

@@ -3667,3 +3667,9 @@ release-watch と daemon の choice consumer が使う。精算は待機せず�
 `rerun_preflight` は run の所有・保存済み PR・request 名を受理前と実行時に検証する。
 修正可能な入力エラーで判断を命令へ固定しない。実行時の同じ事前検証での拒否も
 `BeforeEffect` とするが、既存の不確実な受領記録や書込み失敗には適用しない。
+
+native 判断の実行も `Outbox::execution_claim` を受理前から保持する。
+再開要求の公開前中断は、この実行権と task claim を取得してから再読込し、
+`actions_applied`（pin と同じ queue 書込み）、pin、`dispatched_resumes`、
+`superseded_resumes` と run の開始受領記録で判定する。未公開と証明できる場合だけ
+再試行・取消可能にする。公開済みの pin が消費されたことを未公開の証拠にしない。
