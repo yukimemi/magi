@@ -131,6 +131,23 @@ impl Outbox {
         }
     }
 
+    /// Shared with legacy consumers: acquire before reading an executable reply
+    /// and retain through its effect and receipt. Nonblocking so a settlement
+    /// cannot wait for (and then hide) an operation currently in flight.
+    pub(crate) fn execution_claim(&self, id: &str) -> Result<File> {
+        self.path(id)?;
+        std::fs::create_dir_all(&self.root)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(self.root.join(format!("{id}.execution.lock")))?;
+        crate::pr_head::try_lock_file(&file)
+            .with_context(|| format!("effect consumer for inquiry {id} is busy"))?;
+        Ok(file)
+    }
+
     fn save(&self, inquiry: &Inquiry) -> Result<()> {
         let path = self.path(&inquiry.id)?;
         let temporary = path.with_extension("json.tmp");
@@ -484,6 +501,7 @@ impl Outbox {
         replacement: Option<&str>,
     ) -> Result<()> {
         ensure!(!reason.trim().is_empty(), "settlement reason is empty");
+        let _execution = self.execution_claim(id)?;
         let mut ids = vec![id];
         if let Some(replacement) = replacement {
             ensure!(replacement != id, "decision cannot supersede itself");

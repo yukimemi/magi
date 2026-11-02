@@ -876,6 +876,17 @@ impl Watcher {
             return;
         };
         let mut st = self.load(&pr);
+        let _execution = if let Some(id) = &st.question {
+            match crate::task_inquiry::Outbox::at(&self.home).execution_claim(id) {
+                Ok(claim) => Some(claim),
+                Err(error) => {
+                    tracing::debug!("release decision is busy: {error:#}");
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         st.repo = repo.to_string_lossy().into_owned();
         st.url = url.to_owned();
 
@@ -1771,6 +1782,9 @@ mod tests {
         merge_fails: Mutex<bool>,
         /// `Config::discover` itself fails.
         config_fails: Mutex<bool>,
+        merge_paused: std::sync::atomic::AtomicBool,
+        merge_entered: tokio::sync::Notify,
+        merge_release: tokio::sync::Notify,
     }
 
     impl ReleaseForge for std::sync::Arc<Fake> {
@@ -1803,7 +1817,13 @@ mod tests {
         fn merge<'a>(&'a self, _: &'a Path, _: &'a str, head: &'a str) -> Fut<'a, Result<bool>> {
             self.merges.lock().unwrap().push(head.to_owned());
             let fails = *self.merge_fails.lock().unwrap();
-            Box::pin(async move { if fails { bail!("refused") } else { Ok(true) } })
+            Box::pin(async move {
+                if self.merge_paused.load(std::sync::atomic::Ordering::SeqCst) {
+                    self.merge_entered.notify_one();
+                    self.merge_release.notified().await;
+                }
+                if fails { bail!("refused") } else { Ok(true) }
+            })
         }
         fn land_approval<'a>(&'a self, _: &'a Path) -> Fut<'a, Result<bool>> {
             let a = *self.approval.lock().unwrap();
@@ -2491,6 +2511,79 @@ mod tests {
         assert_eq!(qs.len(), 1, "one approval question, not one per lap");
         assert_eq!(qs[0].choices, vec![land::APPROVE, land::HOLD]);
         assert!(fake.merges.lock().unwrap().is_empty(), "silence is a hold");
+    }
+
+    #[tokio::test]
+    async fn legacy_settlement_is_fenced_through_the_external_merge() {
+        for settle_first in [false, true] {
+            let (dir, fake, w) = rig();
+            *fake.local.lock().unwrap() = true;
+            *fake.snap.lock().unwrap() = Some(open(vec![]));
+            let repo = PathBuf::from("/nowhere");
+            w.lap(std::slice::from_ref(&repo), 60, 1, &|| false).await;
+            let q = w.questions().list().pop().unwrap();
+            answer(&w, &q.id, land::APPROVE);
+            let outbox = crate::task_inquiry::Outbox::at(dir.path());
+            let task = crate::queue::Task::new(
+                "release".into(),
+                "release".into(),
+                repo.clone(),
+                crate::queue::Source::Human,
+            );
+            let mut inquiry = outbox
+                .file(&task, None, "release-watch".into(), "Merge release", "")
+                .unwrap();
+            inquiry.id = q.id.clone();
+            inquiry.task.clear();
+            inquiry
+                .decision
+                .as_mut()
+                .unwrap()
+                .accept("decision: merge")
+                .unwrap();
+            outbox.enqueue(inquiry).unwrap();
+            if settle_first {
+                outbox
+                    .settle(&q.id, "chat", "Owner confirmed no effect remains", None)
+                    .unwrap();
+            }
+            fake.merge_paused
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let no = || false;
+            let lap = w.lap(std::slice::from_ref(&repo), 60, 2, &no);
+            tokio::pin!(lap);
+            if !settle_first {
+                tokio::select! {
+                    () = fake.merge_entered.notified() => {}
+                    () = &mut lap => panic!("merge did not reach the held external call"),
+                    () = tokio::time::sleep(std::time::Duration::from_secs(5)) => panic!("merge did not start"),
+                }
+                assert!(
+                    outbox
+                        .settle(&q.id, "chat", "Cannot settle an executing merge", None)
+                        .is_err()
+                );
+                assert_eq!(
+                    outbox.get(&q.id).unwrap().decision.unwrap().status,
+                    crate::task_decision::Status::Queued
+                );
+                fake.merge_release.notify_one();
+            }
+            lap.await;
+            assert_eq!(
+                fake.merges.lock().unwrap().len(),
+                usize::from(!settle_first)
+            );
+            // After the consumer returns, explicit settlement is supported.
+            outbox
+                .settle(&q.id, "chat", "Owner inspected the outcome", None)
+                .unwrap();
+            w.lap(std::slice::from_ref(&repo), 60, 3, &no).await;
+            assert_eq!(
+                fake.merges.lock().unwrap().len(),
+                usize::from(!settle_first)
+            );
+        }
     }
 
     #[tokio::test]

@@ -3650,3 +3650,11 @@ release-watch の hold / leave it は `WatchState::applied` と、watch 削除�
 `Decision::legacy_settled` は成功受領記録ではなく、この明示的精算を表す。
 Questions の `get` / `list` は精算済み回答を実行しない表示へ投影し、元の JSON は
 監査履歴として保持する。native コマンドの不確実性は引き続き受領記録を要する。
+
+従来型の精算と consumer の実行は同じ実行権で排他する。
+`Outbox::execution_claim` は回答を読む前から効果・受領記録の保存まで保持し、
+release-watch と daemon の choice consumer が使う。精算は待機せず実行中を拒否する。
+タスク所有の精算は queue claim も保持する。triage は claim 取得後に回答を読み直し、
+取得前に読んだ精算済み回答を実行しない。Queued の表示だけで未実行と判断しない。
+チェック再実行の開始コールバック前の forge 読取り失敗は `BeforeEffect` とし、
+同じ依頼の明示的再試行を許す。開始受領記録以後の失敗は不確実として残す。

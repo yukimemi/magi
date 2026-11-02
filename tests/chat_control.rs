@@ -636,6 +636,78 @@ esac
         std::fs::read_to_string(f.tmp.path().join("sent")).unwrap(),
         "42\n42\n"
     );
+
+    // The same routed decision remains retryable when the forge read fails
+    // before the started callback. Exercise CLI persistence across processes.
+    let mut task = f.saved();
+    task.chat = Some(f.talk.clone());
+    f.queue().put(&mut task).unwrap();
+    let outbox = magi::task_inquiry::Outbox::at(f.tmp.path());
+    let inquiry = outbox
+        .file(
+            &task,
+            Some(f.run.id.clone()),
+            "checks".into(),
+            "Retry checks",
+            "",
+        )
+        .unwrap();
+    outbox.deliver(&f.queue(), &f.talks, &inquiry.id).unwrap();
+    let routed = || {
+        common::magi_cli(f.tmp.path())
+            .args([
+                "task",
+                "control",
+                "--decision",
+                &inquiry.id,
+                "rerun-checks",
+                &f.run.id,
+                "--request",
+                "preflight",
+                "--head",
+                "current",
+                "--workflow",
+                "42",
+            ])
+            .env("MAGI_CONFIG_DIR", "")
+            .env("MAGI_RUN", &f.talk)
+            .env("MAGI_NODE", CHAT_NODE)
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .output()
+            .unwrap()
+    };
+    let snapshot = std::fs::read(f.tmp.path().join("snapshot.json")).unwrap();
+    std::fs::remove_file(f.tmp.path().join("snapshot.json")).unwrap();
+    refused(routed());
+    let decision = outbox.get(&inquiry.id).unwrap().decision.unwrap();
+    assert_eq!(decision.status, magi::task_decision::Status::RetryNeeded);
+    assert!(decision.retry_safe);
+    assert!(
+        !f.tmp
+            .path()
+            .join("chat-controls")
+            .join(&f.talk)
+            .join("preflight.json")
+            .exists()
+    );
+    assert_eq!(
+        std::fs::read_to_string(f.tmp.path().join("sent")).unwrap(),
+        "42\n42\n"
+    );
+    std::fs::write(f.tmp.path().join("snapshot.json"), snapshot).unwrap();
+    passed(routed());
+    passed(routed());
+    assert_eq!(
+        outbox.get(&inquiry.id).unwrap().decision.unwrap().status,
+        magi::task_decision::Status::Resolved
+    );
+    assert_eq!(
+        std::fs::read_to_string(f.tmp.path().join("sent")).unwrap(),
+        "42\n42\n42\n"
+    );
 }
 
 #[tokio::test]

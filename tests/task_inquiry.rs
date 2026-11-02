@@ -1428,6 +1428,15 @@ async fn accepted_legacy_effects_support_explicit_settlement_without_replay() {
         for (speaker, reason) in [(&other.id, "Owner inspected the outcome"), (&chat.id, " ")] {
             assert!(chat_control::dispatch(&queue, &home, &talks, speaker, Operation::SettleDecision { inquiry: q.id.clone(), reason: reason.into(), replacement: None }).await.is_err());
         }
+        // Task-backed consumers share their task claim with settlement, even
+        // when they do not project InProgress into the decision record.
+        let before_contention = Outbox::at(&home).get(&q.id).unwrap().decision.unwrap();
+        let claim = queue.claim(&task.id).unwrap();
+        assert!(chat_control::dispatch(&queue, &home, &talks, &chat.id, Operation::SettleDecision {
+            inquiry: q.id.clone(), reason: "Consumer is still executing".into(), replacement: None,
+        }).await.is_err());
+        assert_eq!(Outbox::at(&home).get(&q.id).unwrap().decision.unwrap(), before_contention);
+        drop(claim);
         // Preserve the uncertain outcome in history, then explicitly confirm
         // that no further effect is needed. This is not an application receipt.
         if choice == "retry" {

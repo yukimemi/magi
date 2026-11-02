@@ -1252,6 +1252,13 @@ pub async fn apply_choice_actions(queue: &Queue, questions: &Questions, home: &P
 /// release watcher need not have a queue task, and a predecessor is another run.
 async fn apply_maintenance_choices(queue: &Queue, questions: &Questions, home: &Path) {
     for q in questions.list() {
+        // Read again under the same fence used by explicit settlement.
+        let Ok(_execution) = crate::task_inquiry::Outbox::at(home).execution_claim(&q.id) else {
+            continue;
+        };
+        let Ok(q) = questions.get(&q.id) else {
+            continue;
+        };
         let Some(action) = q.chosen_action().filter(|a| a.maintenance()) else {
             continue;
         };
@@ -1511,6 +1518,13 @@ pub(crate) async fn rerun_checks_once(
 pub(crate) fn apply_task_choice_actions(queue: &Queue, questions: &Questions, home: &Path) {
     let tasks = queue.list();
     for q in questions.list() {
+        // Read again under the same fence used by explicit settlement.
+        let Ok(_execution) = crate::task_inquiry::Outbox::at(home).execution_claim(&q.id) else {
+            continue;
+        };
+        let Ok(q) = questions.get(&q.id) else {
+            continue;
+        };
         // Dismissal is committed by the question writer, never a resume.
         if q.resolution().as_deref() == Some(crate::merge_decision::DISMISS) {
             continue;

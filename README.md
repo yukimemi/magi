@@ -1696,6 +1696,9 @@ consumer が完了受領記録を出せない従来型依頼は、結果を確�
 これは成功受領記録や実行中の操作の取消ではない。元の依頼・回答・不確実な結果の
 履歴を残し、精算済みの回答は以後の consumer に実行可能な回答として渡さない。
 通常の再照合は操作を繰り返さず、読むことや回答の保存だけで精算されることもない。
+実行中の consumer が共有実行権を保持している間は精算を拒否する。
+チェック再実行で forge の事前読取りに失敗した場合は、効果未開始として同じ依頼を
+再試行できる。開始受領記録を保存した後の失敗は、引き続き照合が必要な不確実な結果として残す。
 
 Existing task-scoped source inquiries are imported under their original delivery
 keys, including saved replies without confirmed effects. A saved reply is

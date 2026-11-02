@@ -315,6 +315,23 @@ async fn execute(
         } => {
             let outbox = crate::task_inquiry::Outbox::at(home);
             let record = outbox.get(&inquiry)?;
+            // Task-backed legacy consumers run under the task claim. Hold it
+            // through settlement; ownerless release consumers use the inquiry
+            // execution fence inside Outbox::settle instead.
+            let _task_claim = if !record.task.is_empty()
+                && record
+                    .decision
+                    .as_ref()
+                    .is_some_and(|d| d.request.is_some())
+            {
+                Some(
+                    queue
+                        .claim(&record.task)
+                        .context("decision task is executing")?,
+                )
+            } else {
+                None
+            };
             if record
                 .decision
                 .as_ref()
@@ -1407,10 +1424,21 @@ pub async fn rerun_checks(
         Ok(())
     };
     let operation = format!("chat:{talk}:{request}");
+    let started = std::sync::atomic::AtomicBool::new(false);
     crate::daemon::rerun_checks_once(home, &operation, &state.repo, pr, head, workflows, || {
+        // Once a receipt exists, failure must remain uncertain even if the
+        // external command has not returned yet.
+        started.store(true, std::sync::atomic::Ordering::SeqCst);
         record("started")
     })
-    .await?;
+    .await
+    .map_err(|error| {
+        if started.load(std::sync::atomic::Ordering::SeqCst) {
+            error
+        } else {
+            anyhow::Error::new(BeforeEffect(error))
+        }
+    })?;
     record("applied")?;
     Ok(workflows.to_vec())
 }
