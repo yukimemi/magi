@@ -819,7 +819,15 @@ async fn decision_withdraw_failure_holds_without_terminating_or_repairing() {
     let chat = magi::talk::begin(&talks, &fx.config, fx.repo.clone(), Some("alpha")).unwrap();
     task.chat = Some(chat.id.clone()); queue.put(&mut task).unwrap();
     magi::task_chat::sweep(&queue, &talks, &Questions::open(), &home);
-    magi::chat_control::decide(&talks, &home, &chat.id, &question, magi::merge_decision::WITHDRAW).unwrap();
+    // Use the fresh CLI answer retained through migration; a second chat
+    // answer must not be needed to exercise a failed withdrawal.
+    let source = Questions::open().get(&question).unwrap();
+    assert_eq!(source.resolution().as_deref(), Some(magi::merge_decision::WITHDRAW));
+    assert!(magi::chat_control::decide(&talks, &home, &chat.id, &question, magi::merge_decision::WITHDRAW).is_err(), "a second answer must stay rejected");
+    let accepted = magi::task_inquiry::Outbox::at(&home).get(&question).unwrap().decision.unwrap();
+    assert_eq!(accepted.request, Some(format!("decision: {}", magi::merge_decision::WITHDRAW)));
+    assert_eq!(accepted.source_answer_at, source.answered_at);
+    assert_eq!(accepted.status, magi::task_decision::Status::Queued);
     std::fs::write(fx.tmp.path().join("forge/refuse-close"), "").unwrap();
     serve_decision(&fx, &runner.state).await;
     let disk = RunState::load(&runner.state.id).unwrap();
