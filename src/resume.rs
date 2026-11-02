@@ -89,6 +89,10 @@ pub(crate) async fn start(home: &Path, id: String) -> Result<()> {
     spawn_detached(home, &id).await.map(|_| ())
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("resume task claim was not acquired: {0:#}")]
+pub(crate) struct ClaimContended(pub anyhow::Error);
+
 /// Hand a resumable run back to the queue task that owns it, pinned to that
 /// exact run, so the loop's ordinary start logic resumes it under the graph's
 /// execution lease. Never starts a driver itself. `Ok(false)` means no task
@@ -113,7 +117,7 @@ pub(crate) fn pin_queued(
     else {
         return Ok(false);
     };
-    let _claim = queue.claim(&listed.id)?;
+    let _claim = queue.claim(&listed.id).map_err(ClaimContended)?;
     let mut task = queue.get(&listed.id)?;
     ensure!(
         task.execution_runs().last().map(String::as_str) == Some(run)

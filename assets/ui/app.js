@@ -10153,6 +10153,7 @@ function decisionCard(item) {
       ...(item.run ? [el("a", { href: `#/runs/${encodeURIComponent(item.run)}`, text: "Run" })] : []),
       ...(item.chat ? [el("a", { href: decisionChatLink(item), text: "チャットの問い合わせへ" })]
         : [el("span", { text: "チャットへの配送待ち" })])));
+  if (!item.task && !item.chat) card.append(el("p", { text: `問い合わせ ${item.id}：元のタスクを復元するか、既存のチャットで理由を伝えて明示的な解決を依頼できます（settle-decision）。` }));
   if (d.error || item.delivery_error) card.append(el("p", { class: "decision-error", text: d.error || item.delivery_error }));
   if (d.history.length) card.append(el("details", {}, el("summary", { text: "状態の履歴" }),
     el("ol", {}, d.history.map(event => el("li", { text: `${decisionLabels[event.status] || event.status}: ${event.evidence}` })))));

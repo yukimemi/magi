@@ -1580,6 +1580,7 @@ impl Questions {
     fn consumption_view_in(&self, mut q: Question, migrated: bool) -> Question {
         if let Some(home) = self.root.parent()
             && migrated
+            && !crate::task_chat::standalone_inquiry(&q)
             && crate::task_chat::source_reply_needs_confirmation(home, &q)
         {
             let saved = q.resolution().unwrap_or_default();

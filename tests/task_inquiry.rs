@@ -507,6 +507,15 @@ async fn a_fast_completed_resume_has_an_exact_durable_start_receipt_after_restar
     state.reserve_under(&home).unwrap(); state.origin=Some(Origin::queue(&task.id)); state.status=RunStatus::Blocked; state.driver_exited=true; state.begin_pass(); state.save_under(&home).unwrap();
     task.runs.push(state.id.clone()); task.hold_manual(Some("Owner input required".into())); queue.put(&mut task).unwrap();
     let outbox=Outbox::at(&home); let record=outbox.file(&task,Some(state.id.clone()),"owner".into(),"Resume this execution","Explicit owner request").unwrap(); outbox.deliver(&queue,&talks,&record.id).unwrap();
+    let claim = queue.claim(&task.id).unwrap();
+    assert!(chat_control::dispatch(&queue,&home,&talks,&chat.id,Operation::ForDecision{inquiry:record.id.clone(),command:Box::new(Operation::Resume{run:state.id.clone()})}).await.is_err());
+    let failed = Outbox::at(&home).get(&record.id).unwrap().decision.unwrap();
+    assert_eq!(failed.status, Status::RetryNeeded);
+    assert!(failed.retry_safe, "claim contention has not begun the resume");
+    assert!(queue.get(&task.id).unwrap().resume_override.is_none());
+    drop(claim);
+    chat_control::reconcile_decisions(&queue, &home).unwrap();
+    assert_eq!(outbox.get(&record.id).unwrap().decision.unwrap().status, Status::RetryNeeded);
     chat_control::dispatch(&queue,&home,&talks,&chat.id,Operation::ForDecision{inquiry:record.id.clone(),command:Box::new(Operation::Resume{run:state.id.clone()})}).await.unwrap();
     let mut pending=queue.get(&task.id).unwrap();
     assert_eq!(pending.resume_override.as_ref().unwrap().question_id,record.id);
@@ -861,5 +870,61 @@ async fn informational_release_notices_never_become_pending_decisions_during_mig
     for _ in 0..2 { magi::task_chat::sweep(&queue, &talks, &questions, &home); }
     assert!(Outbox::at(&home).list().unwrap().is_empty());
     assert!(talks.get(&chat.id).unwrap().pending_messages.is_empty());
+}
+}
+
+common::e2e! {
+async fn ownerless_migration_can_be_explicitly_settled_without_assigning_an_owner_or_replaying() {
+    use magi::{ask::{Answer, ChoiceAction, Question, Questions}, chat_control::{self, Operation}, task_decision::Status};
+    let fx = common::fixture(common::home_lock().await, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("ownerless-settlement");
+    let queue = Queue::at(home.join("queue")); let talks = Talks::at(home.join("talks"));
+    let chat = talk::begin(&talks, &fx.config, fx.repo.clone(), Some("alpha")).unwrap();
+    let questions = Questions::at(home.join("questions"));
+    let mut q = Question::new("missing-run".into(), "implement".into(), "impl-A".into(), "Old request".into(), "Owner confirms no effect remains".into(), vec!["hold".into()]);
+    q.actions.insert("hold".into(), ChoiceAction::Hold);
+    q.answer(Answer::Choice("hold".into())).unwrap(); questions.put(&mut q).unwrap();
+    let source_before = std::fs::read(questions.path_of(&q.id)).unwrap();
+    magi::task_chat::sweep(&queue, &talks, &questions, &home);
+    let outbox = Outbox::at(&home);
+    let imported = outbox.get(&q.id).unwrap().decision.unwrap();
+    assert_eq!(imported.status, Status::RetryNeeded, "historical replies without receipts need reconciliation");
+    assert!(imported.request.is_none(), "a historical reply is not an accepted operation");
+    chat_control::dispatch(&queue, &home, &talks, &chat.id, Operation::SettleDecision { inquiry: q.id.clone(), reason: "Owner confirms this obsolete inquiry needs no effect".into(), replacement: None }).await.unwrap();
+    for _ in 0..2 {
+        magi::task_chat::sweep(&queue, &talks, &questions, &home);
+        magi::daemon::apply_choice_actions(&queue, &questions, &home).await;
+    }
+    let settled = Outbox::at(&home).get(&q.id).unwrap();
+    assert_eq!(settled.decision.unwrap().status, Status::Resolved);
+    assert!(settled.task.is_empty()); assert!(settled.delivered_to.is_none());
+    assert!(queue.list().is_empty()); assert!(magi::worker::active(&home).unwrap().is_empty());
+    assert_eq!(source_before, std::fs::read(questions.path_of(&q.id)).unwrap());
+}
+}
+
+common::e2e! {
+async fn foreground_non_task_questions_remain_answerable_after_migration_and_restart() {
+    use magi::ask::{Answer, Question, Questions};
+    let fx = common::fixture(common::home_lock().await, common::Judges::Unanimous, false);
+    for old_boundary in ["new", "pending", "completed"] {
+        let home = fx.tmp.path().join(format!("foreground-{old_boundary}"));
+        let queue = Queue::at(home.join("queue")); let talks = Talks::at(home.join("talks"));
+        let questions = Questions::at(home.join("questions"));
+        let mut q = Question::new(String::new(), "ask".into(), "operator".into(), "Standalone question".into(), "Foreground wait must receive the reply".into(), vec![]);
+        questions.put(&mut q).unwrap();
+        if old_boundary != "new" {
+            let dir = home.join("notifications/task-chat-migration-v1"); std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("state.json"), serde_json::to_vec(&serde_json::json!({"schema":1,"pending":if old_boundary == "pending" { vec![q.id.clone()] } else { vec![] },"sources":[q.id],"errors":{}})).unwrap()).unwrap();
+        }
+        magi::task_chat::sweep(&queue, &talks, &questions, &home);
+        questions.update(&q.id, |q| q.answer(Answer::Text("Fresh owner reply".into()))).unwrap();
+        for _ in 0..2 {
+            magi::task_chat::sweep(&queue, &talks, &questions, &home);
+            assert_eq!(Questions::at(home.join("questions")).get(&q.id).unwrap().resolution().as_deref(), Some("Fresh owner reply"));
+            assert_eq!(questions.list()[0].resolution().as_deref(), Some("Fresh owner reply"));
+            assert!(Outbox::at(&home).list().unwrap().is_empty());
+        }
+    }
 }
 }

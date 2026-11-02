@@ -321,7 +321,9 @@ async fn execute(
                 .is_some_and(|d| d.request.is_none())
             {
                 let questions = crate::ask::Questions::at(home.join("questions"));
-                if let Ok(source) = questions.get(&inquiry) {
+                if let Ok(source) = questions.get(&inquiry)
+                    && !(record.task.is_empty() && record.delivered_to.is_none())
+                {
                     ensure!(
                         !crate::task_chat::awaits_decision(&source),
                         "a legacy effect still awaits consumer reconciliation; settlement executes no action"
@@ -616,7 +618,13 @@ async fn execute_decision(
             .map_err(|e| anyhow::Error::new(BeforeEffect(e)))
             .and_then(|()| -> Result<String> {
                 ensure!(
-                    crate::resume::pin_queued(queue, run, None, Some(id))?,
+                    crate::resume::pin_queued(queue, run, None, Some(id)).map_err(|error| {
+                        if error.is::<crate::resume::ClaimContended>() {
+                            anyhow::Error::new(BeforeEffect(error))
+                        } else {
+                            error
+                        }
+                    })?,
                     "no queued task owns this run"
                 );
                 Ok(format!(

@@ -250,7 +250,23 @@ pub(crate) fn migration_sources(home: &Path) -> Result<Option<std::collections::
     Ok(state.sources)
 }
 
+/// A foreground ask without run/task attribution retains legacy ownership.
+/// Release-watch inquiries may have an empty run but still belong to a task.
+pub(crate) fn standalone_inquiry(q: &Question) -> bool {
+    q.run.is_empty()
+        && q.routed_task.is_none()
+        && !(q.node == crate::bump::NOTICE_NODE && q.seat == "release-watch")
+}
+
 pub(crate) fn migrated_source(home: &Path, id: &str) -> bool {
+    // Also repairs the effective scope of older, overbroad journals without
+    // decoding the entire history on each scheduler lap.
+    if Questions::at(home.join("questions"))
+        .read_history(id)
+        .is_ok_and(|q| standalone_inquiry(&q))
+    {
+        return false;
+    }
     migration_sources(home).map_or_else(
         |error| {
             tracing::warn!("source {id} stays held: {error:#}");
@@ -449,6 +465,12 @@ fn migrate_batch(
     for id in batch {
         let result = (|| -> Result<()> {
             let q = questions.read_history(&id)?;
+            if standalone_inquiry(&q) {
+                if let Some(sources) = &mut migration.sources {
+                    sources.remove(&id);
+                }
+                return Ok(());
+            }
             if q.node == crate::bump::NOTICE_NODE && q.choices.is_empty() {
                 return Ok(());
             }
@@ -478,7 +500,7 @@ fn migrate_batch(
                                 .unwrap()
                                 .fail(&format!("Source receipt needs reconciliation: {error:#}"))?;
                             record.delivery_error =
-                                Some("Restore the original task ownership before acting.".into());
+                                Some("Restore the original task ownership before acting, or explicitly settle with task control settle-decision and a reason.".into());
                             record.archived = false;
                             outbox.enqueue(record)?;
                         }
@@ -510,7 +532,7 @@ fn migrate_batch(
                 let mut record = history_record(&q, None);
                 record.archived = false;
                 record.decision = Some(crate::task_decision::Decision::awaiting(q.summary.clone()));
-                record.delivery_error = Some("Owning task is missing or ambiguous. Restore the original task/run association; migration executed no operation.".into());
+                record.delivery_error = Some("Owning task is missing or ambiguous. Restore the original task/run association, or ask any chat to use task control settle-decision with this inquiry ID and a reason. Migration executed no operation.".into());
                 outbox.enqueue(record)?;
             }
             Ok(())
@@ -863,17 +885,20 @@ fn effect_receipt(
     if q.node == crate::land::APPROVAL_NODE
         && q.resolution().as_deref() == Some(crate::merge_decision::DISMISS)
     {
-        // `merge_decision::dismiss` persists the run stop and the task's
-        // applied marker; both are the receipt, read without replaying it.
+        // The durable run stop is the dismissal receipt. Done tasks and
+        // later attempts deliberately retain their existing task outcome.
         let run = crate::run::RunState::load_under(&q.run, home)?;
         let stopped = run
             .merge_decision
             .as_ref()
             .is_some_and(|d| d.question == q.id && d.choice == crate::merge_decision::DISMISS);
-        let settled = queue
-            .list()
-            .iter()
-            .any(|t| t.runs.contains(&q.run) && t.action_applied(&q.id));
+        // A still-active latest owner needs its queue transition too. A
+        // crash after saving the stop but before that write is not completion.
+        let settled = queue.list().iter().all(|task| {
+            task.runs.last() != Some(&q.run)
+                || task.status == crate::queue::TaskStatus::Done
+                || task.action_applied(&q.id)
+        });
         if stopped && settled {
             return Ok(Some(format!(
                 "run {}: obsolete approval {} dismissed; PR unchanged",
@@ -1135,5 +1160,121 @@ mod tests {
             std::fs::metadata(&path).unwrap().modified().unwrap(),
             written
         );
+    }
+    #[test]
+    fn dismiss_receipt_resolves_done_tasks_and_later_attempts_without_task_markers() {
+        use crate::{
+            ask::Answer,
+            queue::{Source, Task, TaskStatus},
+            run::{LandApproval, PrRecord, RunState, RunStatus},
+            task_decision::{Decision, Status},
+            task_inquiry::Outbox,
+        };
+        for (later_attempt, incomplete) in [(false, false), (true, false), (false, true)] {
+            let temp = tempfile::tempdir().unwrap();
+            let home = temp.path();
+            let queue = Queue::at(home.join("queue"));
+            let mut state = RunState::new(
+                home.into(),
+                "main".into(),
+                "base".into(),
+                "work".into(),
+                Config::default(),
+            );
+            state.reserve_under(home).unwrap();
+            state.status = RunStatus::Blocked;
+            state.driver_exited = true;
+            let mut q = Question::new(
+                state.id.clone(),
+                crate::land::APPROVAL_NODE.into(),
+                "land".into(),
+                "Obsolete approval".into(),
+                String::new(),
+                vec![crate::merge_decision::DISMISS.into()],
+            );
+            state.land_approval = Some(LandApproval {
+                question: q.id.clone(),
+                head: "head".into(),
+            });
+            state.pr = Some(PrRecord {
+                url: "https://example.test/pull/1".into(),
+                number: 1,
+                state: "open".into(),
+                checks: "green".into(),
+                round: 1,
+                rounds: 2,
+                red_at_merge: vec![],
+            });
+            state.save_under(home).unwrap();
+            let mut task = Task::new("work".into(), "work".into(), home.into(), Source::Human);
+            task.runs.push(state.id.clone());
+            task.status = TaskStatus::Done;
+            if later_attempt {
+                task.runs.push("later-run".into());
+                task.status = TaskStatus::Queued;
+            }
+            if incomplete {
+                task.status = TaskStatus::Parked;
+            }
+            queue.put(&mut task).unwrap();
+            q.answer(Answer::Choice(crate::merge_decision::DISMISS.into()))
+                .unwrap();
+            let outbox = Outbox::at(home);
+            let mut record = history_record(&q, Some(&task));
+            let mut decision = Decision::awaiting(q.summary.clone());
+            decision.accept("decision: dismiss").unwrap();
+            record.decision = Some(decision);
+            record.archived = false;
+            outbox.enqueue(record).unwrap();
+            if incomplete {
+                // Crash window: the run stop was saved, but the latest
+                // task transition has not yet committed.
+                state.merge_decision = Some(crate::merge_decision::Decision {
+                    question: q.id.clone(),
+                    target: crate::merge_decision::Target {
+                        pr: state.pr.as_ref().unwrap().url.clone(),
+                        head: "head".into(),
+                        language: "en".into(),
+                    },
+                    choice: crate::merge_decision::DISMISS.into(),
+                    closed: false,
+                    replacement_run: None,
+                    replacement_pr: None,
+                });
+                state.save_under(home).unwrap();
+                sync_effect_receipt(home, &queue, &q);
+                assert_eq!(
+                    outbox.get(&q.id).unwrap().decision.unwrap().status,
+                    Status::Queued
+                );
+            }
+            crate::merge_decision::dismiss(home, &q).unwrap();
+            let after = std::fs::read(queue.path_of(&task.id)).unwrap();
+            assert_eq!(
+                queue.get(&task.id).unwrap().action_applied(&q.id),
+                incomplete
+            );
+            for _ in 0..2 {
+                sync_effect_receipt(home, &queue, &q);
+                assert_eq!(
+                    Outbox::at(home)
+                        .get(&q.id)
+                        .unwrap()
+                        .decision
+                        .unwrap()
+                        .status,
+                    Status::Resolved
+                );
+                assert_eq!(std::fs::read(queue.path_of(&task.id)).unwrap(), after);
+            }
+            assert_eq!(
+                RunState::load_under(&q.run, home)
+                    .unwrap()
+                    .pr
+                    .unwrap()
+                    .state,
+                "open"
+            );
+        }
     }
 }

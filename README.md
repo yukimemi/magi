@@ -1677,12 +1677,24 @@ merge and check-rerun operations retain their own request-bound receipts. No exa
 click is required; silence remains a hold and landing approval remains on by
 default.
 
+An imported inquiry with missing ownership can be explicitly settled from any
+existing authorized chat using `settle-decision <id> --reason <reason>` when the
+owner confirms no effect remains. This assigns neither a task nor a delivery
+chat and executes no operation. Its ID and recovery instructions appear in the
+Pending decisions list. Requests with accepted or uncertain effects still require
+receipt reconciliation. A successful obsolete-approval dismissal is confirmed by
+its durable run checkpoint, including when its task is already done or has moved
+to another attempt; it does not require changing that task's later outcome.
+
 Existing task-scoped source inquiries are imported under their original delivery
 keys, including saved replies without confirmed effects. A saved reply is
 historical evidence, never a new owner instruction or approval. Migration posts
 no operation and retains unresolved outcomes. Source decision consumers still
-exist during this continuation; their complete retirement remains necessary
-before calling step 3 finished.
+remain operational in this foundation stage. Their complete retirement, including
+Questions, deputy, waiter, legacy CLI/API/UI and choice-effect consumers, is
+explicitly deferred to the subsequent migration task. This stage does not claim
+that retirement is complete. Non-task foreground inquiries retain their legacy
+answer and wait workflow.
 
 Unreadable saved inquiry files are included in the migration boundary. Their
 source identities and errors remain visible in Pending decisions across visits

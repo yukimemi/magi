@@ -471,6 +471,8 @@ impl Outbox {
 
     /// Explicit settlement belongs to the owning task chat. Replacement must
     /// already exist and have the same task/repository; it executes nothing.
+    /// Undelivered ownerless imports may be settled from any authorized chat
+    /// without assigning that chat or inventing a task association.
     pub fn settle(
         &self,
         id: &str,
@@ -493,7 +495,10 @@ impl Outbox {
             .collect::<Result<_>>()?;
         let mut current = self.get(id)?;
         ensure!(
-            current.delivered_to.as_deref() == Some(chat),
+            current.delivered_to.as_deref() == Some(chat)
+                || (current.task.is_empty()
+                    && current.delivered_to.is_none()
+                    && replacement.is_none()),
             "decision belongs to another chat"
         );
         let reason = if let Some(replacement) = replacement {

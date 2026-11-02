@@ -3594,3 +3594,16 @@ binds both the operation and `source_answer_at`. This timestamp identifies the
 accepted source response generation; it is not owner quote/consent evidence.
 Do not execute an older payload between native acceptance and the source write.
 Passive history reads preserve the raw source; legacy workers skip imported IDs.
+
+
+This foundation stage intentionally retains Questions, deputy, waiter, legacy
+CLI/API/UI and choice-effect consumers. Full retirement belongs to the subsequent
+migration task, as approved on 2026-11-02. Preserve non-task foreground inquiries:
+empty-run, unassociated questions stay outside the task migration quarantine.
+Older overbroad migration boundaries must release those standalone sources too.
+Ownerless imported pending decisions support explicit `settle-decision --reason`
+from an authorized existing chat without inventing ownership or executing an
+effect; accepted uncertain requests still require reconciliation. Resume queue
+claim contention is pre-effect and retryable; a queue persistence failure remains
+uncertain. Dismissal's durable run checkpoint confirms its effect even when the
+owning task is Done or has a later attempt and intentionally receives no marker.

@@ -92,3 +92,19 @@ test('migration failures stay visible beside readable decisions until source rep
   assert.equal(node('decisions-error').visible, false);
   assert.equal(node('decisions-empty').visible, true);
 });
+
+
+test('ownerless decision card exposes an inquiry identity and an explicit settlement path', () => {
+  const section = source.slice(source.indexOf('const decisionState ='), source.indexOf('function renderDecisions()'));
+  const card = runInNewContext(`${section}\ndecisionCard`, {
+    el: (tag, attrs, ...children) => ({ tag, ...attrs, children, append(child) { this.children.push(child); } }),
+  });
+  const rendered = card({ id: 'orphan-id', task: '', chat: null, run: 'old-run',
+    decision: { status: 'awaiting_owner', reason: 'Unresolved', history: [] } });
+  const text = JSON.stringify(rendered);
+  assert.match(text, /orphan-id/);
+  assert.match(text, /settle-decision/);
+  assert.match(text, /既存のチャット/);
+  assert.match(text, /#\/runs\/old-run/);
+  assert.doesNotMatch(text, /#\/chat\//);
+});
