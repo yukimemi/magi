@@ -695,7 +695,7 @@ async fn a_release_merge_settle_can_say_the_follow_ups_were_not_queued() {
 }
 
 common::e2e! {
-async fn a_merge_settle_on_an_operator_held_task_goes_through_without_a_quote() {
+async fn a_chat_merge_decision_on_an_operator_held_task_goes_through_without_a_quote() {
     let s = scene(home_lock().await);
     let land = file_land(&s.store, "Merge #7?");
     s.store.update(&s.q.id, |q| { q.abandon("not under test"); Ok(()) }).unwrap();
@@ -708,18 +708,28 @@ async fn a_merge_settle_on_an_operator_held_task_goes_through_without_a_quote() 
     );
     task.runs.push(land.run.clone());
     task.hold_manual(Some("operator says wait".to_owned()));
+    let talks = magi::talk::Talks::at(s.home.join("talks"));
+    let chat = magi::talk::begin(&talks, &s.fx.config, s.fx.repo.clone(), Some("alpha")).unwrap();
+    task.origin_chat = Some(chat.id.clone());
     queue.put(&mut task).unwrap();
     assert!(queue.get(&task.id).unwrap().operator_held());
+    s.store.update(&land.id, |q| {
+        q.merge_target = Some(magi::merge_decision::Target {
+            pr: "https://example.test/pull/7".into(),
+            head: "deadbeef".into(),
+            language: "en".into(),
+        });
+        Ok(())
+    }).unwrap();
+    magi::task_chat::sweep(&queue, &talks, &s.store, &s.home);
+    assert_eq!(s.store.get(&land.id).unwrap().routed_chat.as_deref(), Some(chat.id.as_str()));
     // The owner speaks after their own hold: that answer is the newer decision.
     s.store.update(&land.id, |q| q.say("マージしていいよ")).unwrap();
-    let inspect = format!("MAGI task show {} > /dev/null", task.id);
-    script(&s, &[
-        &inspect,
-        "MAGI ask --settle \"$qid\" --choice merge",
-    ]);
-
+    // Task-owned inquiries use their chat, never a legacy deputy. Acceptance
+    // needs no quoted consent and records no merge effect by itself.
     turn(&mut deputies(&s, 2)).await;
-    assert_actions_succeeded(&s, 2);
+    assert!(log(&s).is_empty(), "the task chat owns the inquiry");
+    magi::chat_control::decide(&talks, &s.home, &chat.id, &land.id, "merge").unwrap();
 
     let q = s.store.get(&land.id).unwrap();
     assert_eq!(q.status, QuestionStatus::Answered, "{:?}", q.thread);
@@ -727,6 +737,8 @@ async fn a_merge_settle_on_an_operator_held_task_goes_through_without_a_quote() 
     // Settling records the answer only; land applies it to the saved head.
     let held = queue.get(&task.id).unwrap();
     assert_eq!(held.runs, task.runs);
+    assert!(held.operator_held(), "recording approval applies no task effect");
+    assert_eq!(held.held_at, task.held_at);
 }
 }
 
