@@ -920,14 +920,21 @@ enum ActionDecision {
     Refuse(String),
 }
 
-/// Decide what the choice answered on `q` means for `task`. Pure: `load`
-/// reads a run's state, as with [`unfinished_run_with`].
+/// Decide what the choice answered on `q` means for `task`. `load` reads a
+/// run's state, as with [`unfinished_run_with`]. `home` must name that same
+/// store for driver leases and question checkpoints.
 ///
 /// `Resume` only fires on the task's *latest* run, and only while that run
 /// could actually make progress ([`RunStatus::resumable`], not released, review
 /// budget left); an answer naming anything else is refused rather than
 /// reinterpreted as a fresh competition.
-fn decide_action<F>(task: &Task, q: &ask::Question, p: &Phrases, load: F) -> ActionDecision
+fn decide_action<F>(
+    home: &Path,
+    task: &Task,
+    q: &ask::Question,
+    p: &Phrases,
+    load: F,
+) -> ActionDecision
 where
     F: FnOnce(&str) -> Result<RunState>,
 {
@@ -994,7 +1001,7 @@ where
                             .is_some_and(|binding| binding.question == q.id)
                     {
                         ActionDecision::Stale
-                    } else if s.liveness(false) == Liveness::Live {
+                    } else if s.liveness_under(home, false) == Liveness::Live {
                         ActionDecision::Skip
                     } else if s.status == RunStatus::Landing
                         && !s.released()
@@ -1015,7 +1022,7 @@ where
                         // A live/manual driver already consumed or superseded
                         // this answer. Do not hold its fresh approval wait.
                         ActionDecision::Stale
-                    } else if s.liveness(false) == Liveness::Live {
+                    } else if s.liveness_under(home, false) == Liveness::Live {
                         ActionDecision::Skip
                     } else if s.status != RunStatus::Landing
                         || s.released()
@@ -1034,10 +1041,10 @@ where
                         ActionDecision::Resume(run.clone())
                     }
                 }
-                Ok(s) if s.liveness(false) == Liveness::Live => {
+                Ok(s) if s.liveness_under(home, false) == Liveness::Live => {
                     ActionDecision::Refuse("run already has a live driver".into())
                 }
-                Ok(s) => match crate::handover::resume_refusal(&s) {
+                Ok(s) => match crate::handover::resume_refusal_under(&s, Some(home)) {
                     None => ActionDecision::Resume(run.clone()),
                     Some(reason) => ActionDecision::Refuse((p.resume_cannot_progress)(
                         q.short(),
@@ -1550,7 +1557,7 @@ pub(crate) fn apply_task_choice_actions(queue: &Queue, questions: &Questions, ho
             }
         }
         let language = language_of(&task, Path::new("."));
-        let decision = decide_action(&task, &q, phrases(&language), |id| {
+        let decision = decide_action(home, &task, &q, phrases(&language), |id| {
             RunState::load_under(id, home)
         });
         let ran = matches!(
@@ -6809,6 +6816,7 @@ mod tests {
 
     #[test]
     fn resumption_actions_survive_automatic_holds_of_hand_started_runs() {
+        let home = crate::run::test_home();
         crate::run::pin_test_home();
         let dir = tempfile::tempdir().unwrap();
         let queue = Queue::at(dir.path().join("queue"));
@@ -6838,12 +6846,12 @@ mod tests {
                 ActionDecision::Requeue
             };
             assert_eq!(
-                decide_action(&t, &q, phrases("en"), |_| Ok(state.clone())),
+                decide_action(&home, &t, &q, phrases("en"), |_| Ok(state.clone())),
                 expected
             );
             t.hold_manual(Some("later explicit hold".into()));
             assert_eq!(
-                decide_action(&t, &q, phrases("en"), |_| Ok(state.clone())),
+                decide_action(&home, &t, &q, phrases("en"), |_| Ok(state.clone())),
                 ActionDecision::Stale
             );
         }
@@ -8473,6 +8481,7 @@ mod tests {
 
     #[test]
     fn refusals_and_recovery_prose_follow_the_language() {
+        let home = crate::run::test_home();
         let t = held_task_with("r1");
         let q = action_question(
             "r1",
@@ -8480,7 +8489,7 @@ mod tests {
                 run: "r1".to_owned(),
             },
         );
-        let refuse = |p: &Phrases| match decide_action(&t, &q, p, |_: &str| bail!("gone")) {
+        let refuse = |p: &Phrases| match decide_action(&home, &t, &q, p, |_: &str| bail!("gone")) {
             ActionDecision::Refuse(s) => s,
             other => panic!("{other:?}"),
         };
@@ -11745,7 +11754,9 @@ mod tests {
             );
             let question = action_question(&state.id, resume_action(&state.id));
             assert_eq!(
-                decide_action(&task, &question, &PHRASES_EN, |_| Ok(state.clone())),
+                decide_action(home.path(), &task, &question, &PHRASES_EN, |_| Ok(
+                    state.clone()
+                )),
                 ActionDecision::Resume(state.id.clone())
             );
             // The control-plane command uses this same preflight before pinning.
@@ -11803,7 +11814,9 @@ mod tests {
             assert!(unfinished_run_with(&task.runs, task.short(), |_| Ok(state.clone())).is_none());
             let question = action_question(&state.id, resume_action(&state.id));
             assert_ne!(
-                decide_action(&task, &question, &PHRASES_EN, |_| Ok(state.clone())),
+                decide_action(home.path(), &task, &question, &PHRASES_EN, |_| Ok(
+                    state.clone()
+                )),
                 ActionDecision::Resume(state.id.clone())
             );
             let error = crate::resume::validate(home.path(), &state.id)
@@ -11898,7 +11911,9 @@ mod tests {
             );
             let question = action_question(&state.id, resume_action(&state.id));
             assert_eq!(
-                decide_action(&task, &question, &PHRASES_EN, |_| Ok(state.clone())),
+                decide_action(home.path(), &task, &question, &PHRASES_EN, |_| Ok(
+                    state.clone()
+                )),
                 ActionDecision::Resume(state.id.clone())
             );
             assert_eq!(
@@ -12058,7 +12073,6 @@ mod tests {
 
     #[test]
     fn resume_refusals_explain_admission_without_changing_task_or_run() {
-        crate::run::pin_test_home();
         use crate::handover::{ResumeRefusal, resume_refusal_under};
         let home = tempfile::tempdir().unwrap();
         let mut exhausted = run_state(RunStatus::Blocked);
@@ -12168,10 +12182,15 @@ mod tests {
             );
             let question = action_question(&state.id, resume_action(&state.id));
             for phrases in [&PHRASES_EN, &PHRASES_JA] {
-                let ActionDecision::Refuse(detail) =
-                    decide_action(&task, &question, phrases, |_| Ok(state.clone()))
-                else {
-                    panic!("refusal expected");
+                let decision = decide_action(home.path(), &task, &question, phrases, |id| {
+                    RunState::load_under(id, home.path())
+                });
+                let ActionDecision::Refuse(detail) = decision else {
+                    panic!(
+                        "refusal expected: decision={decision:?}, refusal={refusal:?}, run={}, home={}",
+                        state.id,
+                        home.path().display()
+                    );
                 };
                 assert!(detail.contains(expected), "{detail}");
             }
@@ -12187,6 +12206,105 @@ mod tests {
         for target in ["released", "retired", "owner"] {
             assert!(detail.contains(&format!("magi show {target}")));
         }
+    }
+
+    #[test]
+    fn resume_action_ignores_question_checkpoints_in_another_home() {
+        crate::run::pin_test_home();
+        let home = tempfile::tempdir().unwrap();
+        let mut state = run_state(RunStatus::Blocked);
+        // The private directory reserves this fixture's identity even while
+        // other tests write questions into the process-wide store.
+        state.id = format!(
+            "resume-context-{}",
+            home.path().file_name().unwrap().to_str().unwrap()
+        );
+        state.driver_exited = true;
+        state.config.graph.review_rounds = 1;
+        state.reviews = vec![review_round(1)];
+        state.save_under(home.path()).unwrap();
+        let task = held_task_with(&state.id);
+        let answer = action_question(&state.id, resume_action(&state.id));
+        let mut checkpoint = approval_question(&state.id);
+        let foreign = Questions::open();
+        foreign.put(&mut checkpoint).unwrap();
+        let refusal = crate::handover::resume_refusal_under(&state, Some(home.path()));
+        let decision = decide_action(home.path(), &task, &answer, &PHRASES_EN, |id| {
+            RunState::load_under(id, home.path())
+        });
+        let matching: Vec<_> = foreign
+            .list()
+            .into_iter()
+            .filter(|q| q.run == state.id && q.status.open())
+            .collect();
+        std::fs::remove_file(foreign.path_of(&checkpoint.id)).unwrap();
+        assert!(
+            matches!(decision, ActionDecision::Refuse(_)),
+            "decision={decision:?}, refusal={refusal:?}, run={}, home={}, foreign_home={}, matching={matching:?}",
+            state.id,
+            home.path().display(),
+            crate::run::test_home().display()
+        );
+        assert_eq!(
+            refusal,
+            Some(crate::handover::ResumeRefusal::ReviewBudget { used: 1, limit: 1 })
+        );
+        let local = Questions::at(home.path().join("questions"));
+        for status in [
+            ask::QuestionStatus::Open,
+            ask::QuestionStatus::Answered,
+            ask::QuestionStatus::Abandoned,
+        ] {
+            let mut question = checkpoint.clone();
+            match status {
+                ask::QuestionStatus::Open => {}
+                ask::QuestionStatus::Answered => {
+                    question
+                        .answer(ask::Answer::Choice(question.choices[0].clone()))
+                        .unwrap();
+                }
+                ask::QuestionStatus::Abandoned => question.abandon("fixture closed"),
+            }
+            local.put(&mut question).unwrap();
+            let decision = decide_action(home.path(), &task, &answer, &PHRASES_EN, |id| {
+                RunState::load_under(id, home.path())
+            });
+            if status.open() {
+                assert_eq!(decision, ActionDecision::Resume(state.id.clone()));
+            } else {
+                assert!(
+                    matches!(decision, ActionDecision::Refuse(ref detail) if detail.contains("review budget exhausted")),
+                    "status={status:?}, decision={decision:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn resume_action_checks_the_driver_lease_in_the_supplied_home() {
+        let home = tempfile::tempdir().unwrap();
+        let mut state = run_state(RunStatus::Stalled);
+        state.id = format!(
+            "resume-driver-{}",
+            home.path().file_name().unwrap().to_str().unwrap()
+        );
+        state.driver_claimed = Some(false);
+        state.save_under(home.path()).unwrap();
+        let task = held_task_with(&state.id);
+        let question = action_question(&state.id, resume_action(&state.id));
+        let decide = || {
+            decide_action(home.path(), &task, &question, &PHRASES_EN, |id| {
+                RunState::load_under(id, home.path())
+            })
+        };
+        let lease = crate::driver::maintenance(home.path(), &state.id).unwrap();
+        assert_eq!(state.liveness_under(home.path(), false), Liveness::Live);
+        assert_eq!(
+            decide(),
+            ActionDecision::Refuse("run already has a live driver".into())
+        );
+        drop(lease);
+        assert_eq!(decide(), ActionDecision::Resume(state.id.clone()));
     }
 
     #[test]
@@ -12673,6 +12791,7 @@ mod tests {
 
     #[test]
     fn explicitly_resumed_older_run_remains_the_release_and_question_target() {
+        let home = crate::run::test_home();
         for parked in [false, true] {
             let mut t = task();
             t.start("A".into());
@@ -12687,7 +12806,7 @@ mod tests {
             let q = action_question("A", resume_action("A"));
             assert_eq!(action_standing(&t, &q), ActionStanding::Pending);
             assert_eq!(
-                decide_action(&t, &q, &PHRASES_EN, |id| {
+                decide_action(&home, &t, &q, &PHRASES_EN, |id| {
                     assert_eq!(id, "A");
                     Ok(resumed.clone())
                 }),
@@ -12712,6 +12831,7 @@ mod tests {
 
     #[test]
     fn merge_repair_dispatch_refuses_obsolete_bindings_and_unsupported_owners() {
+        let home = crate::run::test_home();
         let mut state = crate::land::tests::repair_state(true, true);
         state.status = RunStatus::Landing;
         state.parked = true;
@@ -12734,14 +12854,14 @@ mod tests {
         let mut task = held_task_with(&state.id);
         task.status = TaskStatus::Parked;
         assert_eq!(
-            decide_action(&task, &q, &PHRASES_EN, |_| Ok(state.clone())),
+            decide_action(&home, &task, &q, &PHRASES_EN, |_| Ok(state.clone())),
             ActionDecision::Resume(state.id.clone())
         );
         q.asked_at = "2026-01-01T00:00:00Z".parse().unwrap();
         q.answered_at = Some("2026-01-01T00:00:20Z".parse().unwrap());
         task.operator_decided_at = Some("2026-01-01T00:00:10Z".parse().unwrap());
         assert_eq!(
-            decide_action(&task, &q, &PHRASES_EN, |_| Ok(state.clone())),
+            decide_action(&home, &task, &q, &PHRASES_EN, |_| Ok(state.clone())),
             ActionDecision::Resume(state.id.clone()),
             "a repair answer newer than the manual hold resumes the existing owner"
         );
@@ -12749,7 +12869,7 @@ mod tests {
         for answered_at in [q.answered_at, None] {
             let mut older = q.clone();
             older.answered_at = answered_at;
-            let refused = decide_action(&task, &older, &PHRASES_EN, |_| {
+            let refused = decide_action(&home, &task, &older, &PHRASES_EN, |_| {
                 panic!("a later manual hold must prevent dispatch")
             });
             let ActionDecision::Refuse(reason) = refused else {
@@ -12762,7 +12882,7 @@ mod tests {
         let mut superseded = state.clone();
         superseded.land_approval.as_mut().unwrap().question = "fresh-decision".into();
         assert_eq!(
-            decide_action(&task, &q, &PHRASES_EN, |_| Ok(superseded)),
+            decide_action(&home, &task, &q, &PHRASES_EN, |_| Ok(superseded)),
             ActionDecision::Stale
         );
         for case in 1..4 {
@@ -12773,18 +12893,20 @@ mod tests {
                 _ => changed.land_approval.as_mut().unwrap().head.clear(),
             }
             assert!(matches!(
-                decide_action(&task, &q, &PHRASES_EN, |_| Ok(changed)),
+                decide_action(&home, &task, &q, &PHRASES_EN, |_| Ok(changed)),
                 ActionDecision::Refuse(_)
             ));
         }
         assert!(matches!(
-            decide_action(&task, &q, &PHRASES_EN, |_| anyhow::bail!("missing owner")),
+            decide_action(&home, &task, &q, &PHRASES_EN, |_| anyhow::bail!(
+                "missing owner"
+            )),
             ActionDecision::Refuse(_)
         ));
         task.runs.push("replacement".into());
         task.operator_decided_at = Some("2026-01-01T00:00:30Z".parse().unwrap());
         assert_eq!(
-            decide_action(&task, &q, &PHRASES_EN, |_| panic!(
+            decide_action(&home, &task, &q, &PHRASES_EN, |_| panic!(
                 "old owner must not load"
             )),
             ActionDecision::Stale
@@ -12840,17 +12962,25 @@ mod tests {
 
     #[test]
     fn decide_action_resumes_only_the_latest_resumable_run() {
+        let home = crate::run::test_home();
         let t = held_task_with("r1");
         let q = action_question("r1", resume_action("r1"));
         let load = |s: RunState| move |_: &str| Ok(s);
         assert_eq!(
-            decide_action(&t, &q, &PHRASES_EN, load(run_state(RunStatus::Blocked))),
+            decide_action(
+                &home,
+                &t,
+                &q,
+                &PHRASES_EN,
+                load(run_state(RunStatus::Blocked))
+            ),
             ActionDecision::Resume("r1".into())
         );
         // Not the latest run of the task.
         let q_other = action_question("r1", resume_action("r0"));
         assert!(matches!(
             decide_action(
+                &home,
                 &t,
                 &q_other,
                 &PHRASES_EN,
@@ -12860,30 +12990,38 @@ mod tests {
         ));
         // A finished run cannot make progress.
         assert!(matches!(
-            decide_action(&t, &q, &PHRASES_EN, load(run_state(RunStatus::Ready))),
+            decide_action(
+                &home,
+                &t,
+                &q,
+                &PHRASES_EN,
+                load(run_state(RunStatus::Ready))
+            ),
             ActionDecision::Refuse(_)
         ));
         // A released one either.
         let mut released = run_state(RunStatus::Blocked);
         released.released_to = Some("elsewhere".into());
         assert!(matches!(
-            decide_action(&t, &q, &PHRASES_EN, load(released)),
+            decide_action(&home, &t, &q, &PHRASES_EN, load(released)),
             ActionDecision::Refuse(_)
         ));
         // Unreadable state is a refusal, never a fresh competition.
         assert!(matches!(
-            decide_action(&t, &q, &PHRASES_EN, |_: &str| bail!("gone")),
+            decide_action(&home, &t, &q, &PHRASES_EN, |_: &str| bail!("gone")),
             ActionDecision::Refuse(_)
         ));
     }
 
     #[test]
     fn decide_action_ignores_a_question_about_an_earlier_run() {
+        let home = crate::run::test_home();
         let mut t = held_task_with("r1");
         t.runs.push("r2".to_owned());
         let never = |_: &str| -> Result<RunState> { bail!("not read") };
         assert_eq!(
             decide_action(
+                &home,
                 &t,
                 &action_question("r1", ask::ChoiceAction::Done),
                 &PHRASES_EN,
@@ -12895,10 +13033,12 @@ mod tests {
 
     #[test]
     fn decide_action_maps_requeue_and_done_and_never_acts_twice() {
+        let home = crate::run::test_home();
         let mut t = held_task_with("r1");
         let never = |_: &str| -> Result<RunState> { bail!("not read") };
         assert_eq!(
             decide_action(
+                &home,
                 &t,
                 &action_question("r1", ask::ChoiceAction::Requeue),
                 &PHRASES_EN,
@@ -12908,12 +13048,12 @@ mod tests {
         );
         let done_q = action_question("r1", ask::ChoiceAction::Done);
         assert_eq!(
-            decide_action(&t, &done_q, &PHRASES_EN, never),
+            decide_action(&home, &t, &done_q, &PHRASES_EN, never),
             ActionDecision::Done
         );
         t.mark_action_applied(&done_q.id);
         assert_eq!(
-            decide_action(&t, &done_q, &PHRASES_EN, never),
+            decide_action(&home, &t, &done_q, &PHRASES_EN, never),
             ActionDecision::Skip
         );
 
@@ -12921,7 +13061,7 @@ mod tests {
         let mut plain = action_question("r1", ask::ChoiceAction::Done);
         plain.actions.clear();
         assert_eq!(
-            decide_action(&held_task_with("r1"), &plain, &PHRASES_EN, never),
+            decide_action(&home, &held_task_with("r1"), &plain, &PHRASES_EN, never),
             ActionDecision::Skip
         );
         // A running task is left alone.
@@ -12929,6 +13069,7 @@ mod tests {
         running.status = TaskStatus::Running;
         assert_eq!(
             decide_action(
+                &home,
                 &running,
                 &action_question("r1", ask::ChoiceAction::Done),
                 &PHRASES_EN,
