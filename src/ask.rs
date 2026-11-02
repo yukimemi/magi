@@ -603,7 +603,7 @@ pub struct Question {
     pub routed_task: Option<String>,
     /// `ask_cmd` chose the legacy foreground path because no task owned it.
     /// Persist this provenance: a nonempty run alone is not task ownership.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub legacy_foreground: bool,
     /// Set after delivery; merge consent remains in this record.
     #[serde(default)]

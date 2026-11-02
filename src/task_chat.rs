@@ -852,6 +852,62 @@ fn effect_receipt(
         .filter(|id| !id.is_empty())
         .map(|id| queue.get(id))
         .transpose()?;
+    if q.node == crate::land::APPROVAL_NODE
+        && let Some(choice) = q.resolution()
+        && (choice.eq_ignore_ascii_case(crate::land::HOLD)
+            || crate::merge_decision::selected_agent(&choice).is_some())
+    {
+        let run = crate::run::RunState::load_under(&q.run, home)?;
+        let Some(receipt) = run.merge_decision.as_ref().filter(|receipt| {
+            receipt.question == q.id
+                && receipt.choice == choice
+                && q.merge_target
+                    .as_ref()
+                    .is_none_or(|target| target == &receipt.target)
+        }) else {
+            return Ok(None);
+        };
+        if choice.eq_ignore_ascii_case(crate::land::HOLD) {
+            return Ok(task
+                .filter(|task| {
+                    task.action_applied(&q.id)
+                        && task.runs.last() == Some(&q.run)
+                        && task.status == crate::queue::TaskStatus::Held
+                        && task.hold_source == Some(crate::queue::HoldSource::Manual)
+                        && run.status == crate::run::RunStatus::Blocked
+                        && run.land_armed_head.is_none()
+                })
+                .map(|task| format!("task {}: landing hold {} committed", task.id, q.id)));
+        }
+        // Resume only transports a replacement request to the old driver.
+        // Neither that pass nor a queued replacement proves dispatch occurred.
+        if receipt.closed
+            && run.status == crate::run::RunStatus::Superseded
+            && run.pr.as_ref().is_some_and(|pr| {
+                pr.url == receipt.target.pr && pr.state.eq_ignore_ascii_case("closed")
+            })
+            && let Some(next) = &receipt.replacement_run
+            && let Some(task) = &task
+            && task.runs.contains(next)
+        {
+            let replacement = crate::run::RunState::load_under(next, home)?;
+            if replacement.repo == task.repo
+                && replacement.replaces.as_ref().is_some_and(|r| {
+                    r.question == q.id
+                        && r.run == q.run
+                        && r.pr == receipt.target.pr
+                        && Some(r.agent.as_str()) == crate::merge_decision::selected_agent(&choice)
+                })
+                && replacement.passes.iter().any(|pass| pass.task_entry)
+            {
+                return Ok(Some(format!(
+                    "run {}: PR closure confirmed; replacement {next} started for {}",
+                    q.run, q.id
+                )));
+            }
+        }
+        return Ok(None);
+    }
     if let Some(action) = q.chosen_action().filter(|a| a.maintenance()) {
         let path = home.join("choice-actions").join(format!("{}.json", q.id));
         let bytes = match std::fs::read(path) {
@@ -1219,6 +1275,143 @@ mod tests {
             written
         );
     }
+    #[test]
+    fn landing_stop_receipts_require_the_intended_effect_after_restart() {
+        use crate::{
+            ask::ChoiceAction,
+            merge_decision::{self as md, Replacement, Target},
+            queue::{Source, TaskStatus},
+            run::{PrRecord, RunState, RunStatus},
+            task_decision::{Decision, Status},
+            task_inquiry::Outbox,
+        };
+        for choice in [crate::land::HOLD, "reimplement:beta"] {
+            let temp = tempfile::tempdir().unwrap();
+            let home = temp.path();
+            let queue = Queue::at(home.join("queue"));
+            let mut run = RunState::new(
+                home.into(),
+                "main".into(),
+                "base".into(),
+                "work".into(),
+                Config::default(),
+            );
+            run.reserve_under(home).unwrap();
+            run.status = RunStatus::Blocked;
+            run.driver_exited = true;
+            run.pr = Some(PrRecord {
+                url: "https://example.test/pull/1".into(),
+                number: 1,
+                state: "open".into(),
+                checks: "green".into(),
+                round: 1,
+                rounds: 2,
+                red_at_merge: vec![],
+            });
+            let mut q = Question::new(
+                run.id.clone(),
+                crate::land::APPROVAL_NODE.into(),
+                "land".into(),
+                "Stop landing".into(),
+                String::new(),
+                vec![choice.into()],
+            );
+            q.merge_target = Some(Target {
+                pr: run.pr.as_ref().unwrap().url.clone(),
+                head: "head".into(),
+                language: "en".into(),
+            });
+            if choice != crate::land::HOLD {
+                q.actions.insert(
+                    choice.into(),
+                    ChoiceAction::Resume {
+                        run: run.id.clone(),
+                    },
+                );
+            }
+            q.answer(Answer::Choice(choice.into())).unwrap();
+            // The old run consumed the Resume transport, but closure may fail.
+            run.next_pass_inquiry = Some(q.id.clone());
+            run.begin_pass();
+            run.save_under(home).unwrap();
+            let mut task = Task::new("work".into(), "work".into(), home.into(), Source::Human);
+            task.runs.push(run.id.clone());
+            task.hold_manual(Some("landing stopped".into()));
+            task.mark_action_applied(&q.id);
+            queue.put(&mut task).unwrap();
+            let mut record = history_record(&q, Some(&task));
+            let mut decision = Decision::awaiting(q.summary.clone());
+            decision.accept(&format!("decision: {choice}")).unwrap();
+            record.decision = Some(decision);
+            record.archived = false;
+            Outbox::at(home).enqueue(record).unwrap();
+            let check = |expected| {
+                sync_effect_receipt(home, &Queue::at(home.join("queue")), &q);
+                assert_eq!(
+                    Outbox::at(home)
+                        .get(&q.id)
+                        .unwrap()
+                        .decision
+                        .unwrap()
+                        .status,
+                    expected
+                );
+            };
+            check(Status::Queued);
+            run.merge_decision = Some(md::Decision {
+                question: q.id.clone(),
+                target: q.merge_target.clone().unwrap(),
+                choice: choice.into(),
+                closed: false,
+                replacement_run: None,
+                replacement_pr: None,
+            });
+            run.save_under(home).unwrap();
+            if choice == crate::land::HOLD {
+                // A checkpoint alone is insufficient until the task hold commits.
+                task.status = TaskStatus::Running;
+                queue.put(&mut task).unwrap();
+                check(Status::Queued);
+                task.hold_manual(Some("landing stopped".into()));
+                queue.put(&mut task).unwrap();
+                check(Status::Resolved);
+            } else {
+                check(Status::Queued); // Failed closure, despite the old pass marker.
+                run.merge_decision.as_mut().unwrap().closed = true;
+                run.status = RunStatus::Superseded;
+                run.pr.as_mut().unwrap().state = "closed".into();
+                run.save_under(home).unwrap();
+                check(Status::Queued); // Closure and queueing are not replacement execution.
+                let mut next = RunState::new(
+                    home.into(),
+                    "main".into(),
+                    "base".into(),
+                    "replacement".into(),
+                    Config::default(),
+                );
+                next.reserve_under(home).unwrap();
+                next.replaces = Some(Replacement {
+                    question: q.id.clone(),
+                    run: run.id.clone(),
+                    pr: q.merge_target.as_ref().unwrap().pr.clone(),
+                    agent: "beta".into(),
+                    context: String::new(),
+                });
+                next.save_under(home).unwrap();
+                run.merge_decision.as_mut().unwrap().replacement_run = Some(next.id.clone());
+                run.save_under(home).unwrap();
+                task.start(next.id.clone());
+                queue.put(&mut task).unwrap();
+                check(Status::Queued); // Crash before the replacement enters execution.
+                next.next_pass_task_entry = true;
+                next.begin_pass();
+                next.save_under(home).unwrap();
+                check(Status::Resolved);
+            }
+            check(Status::Resolved);
+        }
+    }
+
     #[test]
     fn dismiss_receipt_resolves_done_tasks_and_later_attempts_without_task_markers() {
         use crate::{
