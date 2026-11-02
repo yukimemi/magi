@@ -65,6 +65,20 @@ pub struct Outbox {
     root: PathBuf,
 }
 
+/// Release the execution fence even if a concurrent fork still retains a
+/// descriptor for the same open file description.
+pub(crate) struct ExecutionClaim(File);
+
+#[cfg(unix)]
+impl Drop for ExecutionClaim {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        // SAFETY: this guard owns the live descriptor; LOCK_UN releases only
+        // this open file description's flock.
+        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
 fn valid_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 160
@@ -134,7 +148,7 @@ impl Outbox {
     /// Shared with legacy consumers: acquire before reading an executable reply
     /// and retain through its effect and receipt. Nonblocking so a settlement
     /// cannot wait for (and then hide) an operation currently in flight.
-    pub(crate) fn execution_claim(&self, id: &str) -> Result<File> {
+    pub(crate) fn execution_claim(&self, id: &str) -> Result<ExecutionClaim> {
         self.path(id)?;
         std::fs::create_dir_all(&self.root)?;
         let file = OpenOptions::new()
@@ -145,7 +159,7 @@ impl Outbox {
             .open(self.root.join(format!("{id}.execution.lock")))?;
         crate::pr_head::try_lock_file(&file)
             .with_context(|| format!("effect consumer for inquiry {id} is busy"))?;
-        Ok(file)
+        Ok(ExecutionClaim(file))
     }
 
     fn save(&self, inquiry: &Inquiry) -> Result<()> {
@@ -641,6 +655,23 @@ impl Outbox {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn execution_claim_releases_while_an_inherited_descriptor_remains_open() {
+        let home = tempfile::tempdir().unwrap();
+        let outbox = Outbox::at(home.path());
+        let claim = outbox.execution_claim("legacy-inquiry").unwrap();
+        // A fork shares this open file description until exec closes it.
+        let inherited = claim.0.try_clone().unwrap();
+        assert!(outbox.execution_claim("legacy-inquiry").is_err());
+        drop(claim);
+        let next = outbox.execution_claim("legacy-inquiry").unwrap();
+        drop(inherited);
+        assert!(outbox.execution_claim("legacy-inquiry").is_err());
+        drop(next);
+        assert!(outbox.execution_claim("legacy-inquiry").is_ok());
+    }
     use crate::{
         queue::{Source, Task},
         task_decision::Status,

@@ -110,6 +110,120 @@ fn refused(out: Output) -> String {
 
 #[cfg(unix)]
 #[test]
+fn routed_merge_rejects_invalid_input_and_retries_pre_receipt_failures() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let f = Fixture::new();
+    let mut task = f.saved();
+    task.chat = Some(f.talk.clone());
+    f.queue().put(&mut task).unwrap();
+    let mut run = f.run.clone();
+    run.pr = Some(magi::run::PrRecord {
+        url: "https://github.com/example/project/pull/1".into(),
+        number: 1,
+        state: "open".into(),
+        checks: "green".into(),
+        round: 0,
+        rounds: 1,
+        red_at_merge: vec![],
+    });
+    run.save_under(f.tmp.path()).unwrap();
+    let outbox = magi::task_inquiry::Outbox::at(f.tmp.path());
+    let inquiry = outbox
+        .file(&task, Some(run.id), "merge".into(), "Merge PR", "")
+        .unwrap();
+    outbox.deliver(&f.queue(), &f.talks, &inquiry.id).unwrap();
+    let bin = f.tmp.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let gh = bin.join("gh");
+    std::fs::write(
+        &gh,
+        r#"#!/bin/sh
+if [ "$1 $2" = 'pr merge' ]; then
+  echo merge >> sent
+  touch merged
+elif [ -f merged ]; then
+  cat merged.json
+else
+  cat open.json
+fi
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let head = "a".repeat(40);
+    let invoke = |request: &str, sha: &str| {
+        common::magi_cli(f.tmp.path())
+            .args([
+                "task",
+                "control",
+                "--decision",
+                &inquiry.id,
+                "merge-pr",
+                "example/project",
+                "1",
+                "--head",
+                sha,
+                "--request",
+                request,
+            ])
+            .env("MAGI_CONFIG_DIR", "")
+            .env("MAGI_RUN", &f.talk)
+            .env("MAGI_NODE", CHAT_NODE)
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .output()
+            .unwrap()
+    };
+    let awaiting = outbox.get(&inquiry.id).unwrap().decision.unwrap();
+    assert!(refused(invoke("merge-once", "abc")).contains("full SHA"));
+    assert_eq!(outbox.get(&inquiry.id).unwrap().decision.unwrap(), awaiting);
+    assert!(refused(invoke("bad/id", &head)).contains("invalid request ID"));
+    assert_eq!(outbox.get(&inquiry.id).unwrap().decision.unwrap(), awaiting);
+    assert!(!f.tmp.path().join("chat-controls").exists());
+
+    // A forge read fails before the service writes its started receipt.
+    refused(invoke("merge-once", &head));
+    let failed = outbox.get(&inquiry.id).unwrap().decision.unwrap();
+    assert_eq!(failed.status, magi::task_decision::Status::RetryNeeded);
+    assert!(failed.retry_safe);
+    assert!(
+        !f.tmp
+            .path()
+            .join("chat-controls")
+            .join(&f.talk)
+            .join("merge-once.json")
+            .exists()
+    );
+    assert!(!f.tmp.path().join("sent").exists());
+    for (file, state) in [("open.json", "OPEN"), ("merged.json", "MERGED")] {
+        std::fs::write(
+            f.tmp.path().join(file),
+            serde_json::to_vec(&serde_json::json!({
+                "url": "https://github.com/example/project/pull/1", "state": state,
+                "isDraft": false, "mergeable": "MERGEABLE", "headRefOid": head,
+                "title": "Example change"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+    passed(invoke("merge-once", &head));
+    passed(invoke("merge-once", &head));
+    assert_eq!(
+        outbox.get(&inquiry.id).unwrap().decision.unwrap().status,
+        magi::task_decision::Status::Resolved
+    );
+    assert_eq!(
+        std::fs::read_to_string(f.tmp.path().join("sent")).unwrap(),
+        "merge\n"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn ordinary_chat_turn_uses_inherited_controls_without_store_grants() {
     common::isolated(
         "ordinary_chat_turn_uses_inherited_controls_without_store_grants",

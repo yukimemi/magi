@@ -16,7 +16,7 @@ pub(crate) struct Request {
 }
 
 impl Request {
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         let parts: Vec<_> = self.repo.split('/').collect();
         ensure!(
             parts.len() == 2
@@ -243,6 +243,10 @@ fn save(path: &Path, receipt: &Receipt) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("{0:#}")]
+pub(crate) struct BeforeMergeWrite(anyhow::Error);
+
 pub(crate) async fn merge(
     home: &Path,
     talks: &Talks,
@@ -278,24 +282,29 @@ async fn merge_with(
         }
         prior
     } else {
-        refuse_pending(home, &url)?;
-        let seen = forge.view(&conversation.repo, &url).await?;
-        ensure!(
-            canonical(&seen.url) == canonical(&url),
-            "forge returned a different PR"
-        );
-        ensure!(
-            seen.state == "OPEN" && !seen.is_draft && seen.mergeable == "MERGEABLE",
-            "PR must be open, not draft, and mergeable"
-        );
-        ensure!(
-            seen.head_ref_oid.eq_ignore_ascii_case(&action.head),
-            "PR head differs from the given SHA"
-        );
-        ensure!(
-            !seen.title.trim().is_empty() && !seen.title.contains(['\n', '\r', '\0']),
-            "invalid PR title"
-        );
+        let seen = async {
+            refuse_pending(home, &url)?;
+            let seen = forge.view(&conversation.repo, &url).await?;
+            ensure!(
+                canonical(&seen.url) == canonical(&url),
+                "forge returned a different PR"
+            );
+            ensure!(
+                seen.state == "OPEN" && !seen.is_draft && seen.mergeable == "MERGEABLE",
+                "PR must be open, not draft, and mergeable"
+            );
+            ensure!(
+                seen.head_ref_oid.eq_ignore_ascii_case(&action.head),
+                "PR head differs from the given SHA"
+            );
+            ensure!(
+                !seen.title.trim().is_empty() && !seen.title.contains(['\n', '\r', '\0']),
+                "invalid PR title"
+            );
+            Ok::<_, anyhow::Error>(seen)
+        }
+        .await
+        .map_err(BeforeMergeWrite)?;
         let mut rec = Receipt {
             action,
             status: "started".into(),

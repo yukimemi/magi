@@ -385,20 +385,25 @@ async fn execute(
             number,
             head,
             request,
-        } => {
-            crate::chat_merge::merge(
-                home,
-                talks,
-                talk,
-                crate::chat_merge::Request {
-                    repo,
-                    number,
-                    head,
-                    request,
-                },
-            )
-            .await?
-        }
+        } => crate::chat_merge::merge(
+            home,
+            talks,
+            talk,
+            crate::chat_merge::Request {
+                repo,
+                number,
+                head,
+                request,
+            },
+        )
+        .await
+        .map_err(|error| {
+            if error.is::<crate::chat_merge::BeforeMergeWrite>() {
+                anyhow::Error::new(BeforeEffect(error))
+            } else {
+                error
+            }
+        })?,
         Operation::GrantRepair { request } => {
             // Keep run-state admission out of the shared control dispatcher
             // future, which is also embedded in ordinary CLI task operations.
@@ -588,6 +593,11 @@ async fn execute_decision(
         // Reject correctable input before binding the decision to this exact
         // command. Execution revalidates these reads before taking its lock.
         rerun_preflight(queue, home, run, request)?;
+    }
+    if let Some(action) = &merge {
+        // Malformed input must not durably bind this decision to a command
+        // that can never reach its effect service.
+        action.validate()?;
     }
     if decision.request.is_none() && decision.status == Status::RetryNeeded {
         if let Ok(source) = crate::ask::Questions::at(home.join("questions")).get(id) {
