@@ -89,6 +89,7 @@ pub mod retention;
 pub mod review_repair;
 pub mod rng;
 pub mod run;
+pub mod run_progress;
 pub mod scrub;
 mod seat_process;
 pub mod settings;

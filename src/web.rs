@@ -1599,6 +1599,7 @@ impl Ui {
             .route("/api/upgrade", post(upgrade_post))
             .route("/api/runs", get(runs_list))
             .route("/api/runs/{id}", get(run_detail).delete(run_delete))
+            .route("/api/runs/{id}/progress", get(run_progress))
             .route("/api/runs/{id}/core", get(run_core))
             .route("/api/runs/{id}/report", get(run_report))
             .route("/api/runs/{id}/report.json", get(run_report_json))
@@ -3778,6 +3779,7 @@ async fn upgrade_and_restart(home: PathBuf) -> Result<()> {
 /// is what makes the history usable on a mobile link.
 #[derive(Debug, Serialize)]
 struct RunSummary {
+    activity: String,
     id: String,
     short: String,
     status: String,
@@ -3835,6 +3837,7 @@ struct RunSummary {
 impl RunSummary {
     fn of(state: &RunState, waiting: bool, live: crate::run::Liveness) -> Self {
         Self {
+            activity: crate::run_progress::activity(state, live, waiting),
             id: state.id.clone(),
             short: state.short().to_owned(),
             status: status_word(state.status),
@@ -4049,6 +4052,7 @@ where
 /// instead.
 #[derive(Debug, Serialize)]
 struct RunDetailView {
+    progress: crate::run_progress::Progress,
     stop_reason: Option<String>,
     #[serde(flatten)]
     state: RunState,
@@ -4452,6 +4456,7 @@ impl RunDetailView {
         );
         let badge_status = run_badge_status(&state, &display_status, live, superseded_by.is_some());
         Self {
+            progress: crate::run_progress::build(&state, live, waiting),
             stop_reason,
             pass_views: state.passes.iter().map(|p| PassView::of(p, None)).collect(),
             instruction_md: md::to_nodes(&state.instruction, &md::ImageBase::None),
@@ -4487,6 +4492,29 @@ async fn run_core(
             None,
             None,
         )))
+    })
+    .await
+}
+
+/// Lightweight observation: never replaces the evidence used by controls.
+async fn run_progress(
+    State(ui): State<Arc<Ui>>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    blocking(move || {
+        let id = resolve_run(&ui.runs, &id)?;
+        let state = read_run(&ui.runs, &id)?;
+        let live = state.liveness(crate::daemon::is_working_on(
+            &ui.home,
+            &id,
+            Timestamp::now(),
+        ));
+        let waiting = !ui.questions.open_for(&id).is_empty();
+        Ok(Json(serde_json::json!({
+            "id": id, "updated_at": state.updated_at, "live": live,
+            "observed_at": Timestamp::now(),
+            "progress": crate::run_progress::build(&state, live, waiting),
+        })))
     })
     .await
 }
@@ -5816,6 +5844,7 @@ async fn search_get(
 /// One attempt in a task's history, as the task page lists it.
 #[derive(Debug, Serialize)]
 struct TaskRunView {
+    activity: Option<String>,
     /// 1-based position in [`Task::runs`].
     n: usize,
     id: String,
@@ -6106,6 +6135,7 @@ fn task_run_view(id: &str, state: Option<&RunState>, at: RunSlot<'_>, task: &Tas
     let short = run::short_of(id).to_owned();
     let Some(s) = state else {
         return TaskRunView {
+            activity: None,
             n,
             id: id.to_owned(),
             short,
@@ -6296,6 +6326,7 @@ fn task_run_view(id: &str, state: Option<&RunState>, at: RunSlot<'_>, task: &Tas
     }
     let exit_label = exit_label.unwrap_or_else(|| exit.edge_label(Some(status.as_str())));
     TaskRunView {
+        activity: None,
         n,
         id: id.to_owned(),
         short,
@@ -6705,6 +6736,7 @@ fn mark_badges(ui: &Ui, task: &Task, history: &mut [TaskRunView]) {
             |p| probe.borrow_mut().started_at(p),
         );
         let waiting = !ui.questions.open_for(&h.id).is_empty();
+        h.activity = Some(crate::run_progress::activity(&state, live, waiting));
         let display = run_display_status(&state, waiting, live);
         let word = run_badge_status(&state, &display, live, task.successor_of(&h.id).is_some());
         if matches!(word.as_str(), "stale" | "superseded")
@@ -19370,6 +19402,47 @@ mod tests {
             .map(|r| r["origin_label"].as_str().unwrap().to_owned())
             .collect();
         assert!(labels.contains(&"chat 4a7b".to_owned()), "{list}");
+    }
+
+    #[tokio::test]
+    async fn run_progress_observation_exposes_activity_without_control_evidence() {
+        let f = Fixture::start().await;
+        let mut state = RunState::new(
+            PathBuf::from("/repo"),
+            "main".into(),
+            "abc".into(),
+            "task".into(),
+            Config::default(),
+        );
+        state.status = RunStatus::Implementing;
+        state.seat_started(
+            "implement",
+            "implement-A",
+            std::time::Duration::from_secs(60),
+            0,
+        );
+        state.save_under(f.home.path()).unwrap();
+        let observed = f
+            .get(&format!("/api/runs/{}/progress", state.id))
+            .await
+            .json();
+        assert_eq!(observed["id"], state.id);
+        assert!(observed["observed_at"].is_string());
+        assert_eq!(observed["updated_at"], state.updated_at.to_string());
+        assert!(observed["progress"]["activity"].is_string());
+        for field in [
+            "config",
+            "candidates",
+            "land_approval",
+            "task",
+            "waiting",
+            "done",
+        ] {
+            assert!(
+                observed.get(field).is_none(),
+                "progress must not expose control evidence: {field}"
+            );
+        }
     }
 
     /// The gap `driver_pid` exists to close: a manual `magi run` / `magi

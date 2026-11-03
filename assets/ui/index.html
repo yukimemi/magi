@@ -222,6 +222,22 @@
       <p class="card-note run-task-line" id="run-task-line" hidden></p>
     </div>
 
+    <section id="run-progress" class="run-progress" aria-label="Live run progress" hidden>
+      <div class="progress-eyebrow">RUN PULSE <span id="progress-connection"></span></div>
+      <div class="progress-heading"><span id="progress-state-marker" aria-hidden="true"></span><p id="progress-activity"></p></div>
+      <p id="progress-announcement" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></p>
+      <p id="progress-freshness" class="card-note"></p>
+      <ul id="progress-seats" class="progress-seats" aria-label="Current activity"></ul>
+      <div class="progress-recent-head">Latest records <a id="progress-timeline" href="#/runs">Full timeline →</a></div>
+      <ol id="progress-recent"></ol>
+      <details id="progress-pipeline" open>
+        <summary>Pipeline <span class="card-note">Recorded results · no estimated progress</span></summary>
+        <ol id="progress-phases"></ol>
+        <ol id="progress-rounds" aria-label="Recorded review rounds"></ol>
+      </details>
+
+    </section>
+
     <div class="run-tabs" id="run-tabs" role="tablist" aria-label="Run sections">
       <a class="run-tab" role="tab" id="run-tab-overview" data-tab="overview" aria-controls="run-tabpanel-overview" href="#/runs">Overview</a>
       <a class="run-tab" role="tab" id="run-tab-timeline" data-tab="timeline" aria-controls="run-tabpanel-timeline" href="#/runs">Timeline <span class="count" id="run-tab-timeline-count"></span></a>
@@ -244,7 +260,7 @@
       </div>
 
       <div class="panel" id="run-active-panel" hidden>
-        <h2>Running now <span class="count" id="run-active-count"></span></h2>
+        <h2><span id="run-active-label">Running now</span> <span class="count" id="run-active-count"></span></h2>
         <p class="panel-note" id="run-active-note" hidden></p>
         <ul class="plain" id="run-active"></ul>
       </div>

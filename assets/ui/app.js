@@ -588,51 +588,6 @@ function toneOf(status, table) {
   return (table[status] || { tone: "ink" }).tone;
 }
 
-/* A question names the graph node it came from — `implement`, `review`,
-   `gate` — while the rail is indexed by run status: `implementing`,
-   `reviewing`, `gating`. The node name being the stem of its status is the
-   only relationship the two vocabularies have, so it is matched as one. A
-   table mapping them by hand would go stale the first time a node is added,
-   and the failure would be silent: a parked run with no rail at all. */
-function phaseOf(node) {
-  if (!node) return null;
-  return PHASES.find((phase) => phase === node || phase.startsWith(node)) || null;
-}
-
-/* Where an in-flight run has reached. The summary carries no progress field,
-   so the position is derived from the status against the fixed node order.
-   A parked run passes the node its question came from, so the rail still says
-   how far the run got while marking that segment stopped instead of pulsing:
-   the same rail cannot mean "working" and "halted" on colour alone.
-
-   `note`, when given, is which seat(s) in the current phase have not answered
-   yet — the answer to "is it agy again?" without opening the seats panel.
-   It only ever touches the label: the rail's squares are one per *node*, not
-   one per seat, so a seat that is still out changes what the current square
-   means, not how many squares there are. */
-function phaseRail(status, node, note) {
-  const parked = phaseOf(node);
-  const at = PHASES.indexOf(parked || status);
-  if (at < 0) return null;
-  const rail = el("div", {
-    class: "phases",
-    role: "img",
-    "aria-label": parked
-      ? `Stopped at phase ${at + 1} of ${PHASES.length}, ${parked}, waiting for your answer`
-      : `Phase ${at + 1} of ${PHASES.length}: ${status}${note ? ` — ${note}` : ""}`,
-  });
-  for (let i = 0; i < PHASES.length; i += 1) {
-    const here = i === at;
-    rail.append(el("span", {
-      class: "phase",
-      "data-on": parked ? (i < at ? "1" : null) : (i <= at ? "1" : null),
-      "data-now": here && !parked ? "1" : null,
-      "data-parked": here && parked ? "1" : null,
-    }));
-  }
-  return rail;
-}
-
 /* How many land rounds the loop has spent of its budget. Same vocabulary as
    the phase rail, because it is the same idea: a fixed number of steps and
    the one it is on. */
@@ -1587,7 +1542,7 @@ function createRunCard() {
   const superseded = el("p", { class: "card-note card-superseded" });
   const event = el("p", { class: "card-event" });
   const snippet = el("p", { class: "card-snippet", hidden: true });
-  const rail = el("div");
+  const rail = el("p", { class: "run-activity-brief" });
 
   const card = el("a", { class: "card run-card" },
     el("div", { class: "card-top" }, chipSlot, whenSlot),
@@ -1677,16 +1632,12 @@ function updateRunCard(row, run) {
      "verdict rests on 1 of 3 judges (quorum 2)" sat unread in the record, and
      a `blocked` one offered a guess with an "or" in it instead of "no check
      status is readable on the pull request". */
-  const moving = !run.done;
   setText(r.event, run.event || "");
   show(r.event, Boolean(run.event));
 
-  /* A parked run keeps its rail so the operator can see how far it got, with
-     the node it stopped in drawn halted rather than pulsing. */
   const ask = parked ? openFor(run.id)[0] : null;
-  const rail = moving ? phaseRail(status, ask ? ask.node : null) : null;
-  clear(r.rail);
-  if (rail) r.rail.append(rail);
+  setText(r.rail, run.activity || "");
+  show(r.rail, Boolean(run.activity));
 
   updateRunTail(row, run, { parked, ask });
 }
@@ -6242,6 +6193,9 @@ function sectionNotice(anchorId, key, message, retry, { pending = false, snapsho
 }
 
 // A frame callback runs before paint; the following task lets that paint finish.
+// Joined core reads also share that barrier so an immediate sections response
+// cannot finish before a second caller resumes and dispatches duplicate work.
+const talkCorePaints = new WeakMap();
 function afterTalkPaint() {
   return new Promise(resolve => {
     // Hidden tabs suspend animation frames; they still need refreshes to settle,
@@ -6309,7 +6263,10 @@ async function loadTalk(id, { background = false } = {}) {
     // Coalesced reads wait for trailing refreshes but keep the first promise's
     // value. Use the status recorded by the latest core callback instead.
     loaded = detail.coreLoaded;
-    if (loaded && current()) await afterTalkPaint();
+    if (loaded && current()) {
+      if (!talkCorePaints.has(core)) talkCorePaints.set(core, afterTalkPaint());
+      await talkCorePaints.get(core);
+    }
   } finally { release(); }
   if (!loaded || !current()) return;
   sectionNotice("talk-task-progress", "talk-sections-state", "Loading related tasks and choices…", null, { pending: true, snapshot: Boolean(detail.sections) });
@@ -7796,6 +7753,221 @@ function renderReportCards() {
   ]);
 }
 
+/* Display observations never become control evidence. The full detail loader
+   owns approval freshness and retains its paired core/evidence guard. */
+let progressFlight = null;
+let progressAttemptAt = 0;
+function progressElapsed(start, end = Date.now()) {
+  const ms = Date.parse(start || "");
+  if (!Number.isFinite(ms)) return "unknown";
+  const secs = Math.max(0, Math.floor((end - ms) / 1000));
+  if (secs < 60) return `${secs}s`;
+  if (secs < 3600) return `${Math.floor(secs / 60)}m ${secs % 60}s`;
+  return `${Math.floor(secs / 3600)}h ${Math.floor(secs % 3600 / 60)}m`;
+}
+function progressSnapshot(run) {
+  const observation = state.detail.progressObservation;
+  return observation && observation.id === run.id && observation.updated_at === run.updated_at
+    ? observation : run;
+}
+async function observeRunProgress(force = false) {
+  const detail = state.detail, run = detail.run;
+  if (document.hidden || state.route.name !== "run" || !run || run.isShell || run.done || progressFlight) return;
+  if (!force && Date.now() - progressAttemptAt < 30000) return;
+  progressAttemptAt = Date.now();
+  const request = runDetailRequests.get(run.id);
+  const observedSince = Date.now();
+  const controller = new AbortController();
+  const deadline = setTimeout(() => controller.abort(), 15000);
+  const flight = getJson(`${API.run(run.id)}/progress`, { signal: controller.signal, priority: "low" });
+  progressFlight = flight;
+  try {
+    const observation = await flight;
+    // Navigation and newer full reads invalidate even a same-id observation.
+    if (state.detail !== detail || detail.run !== run || runDetailRequests.get(run.id) !== request) return;
+    if (observation.updated_at !== run.updated_at) {
+      if (!detail.evidencePending) loadRun(run.id, { background: true });
+      return;
+    }
+    const previousLive = progressSnapshot(run).live;
+    detail.progressObservation = observation;
+    detail.progressObservedAt = observedSince;
+    renderRunProgress(run);
+    if (previousLive !== observation.live) renderActive(run);
+  } catch {
+    // Keep the last successful observation with its original age.
+    tickRunProgress();
+  } finally {
+    clearTimeout(deadline);
+    if (progressFlight === flight) progressFlight = null;
+  }
+}
+// Presentation only: these symbols never supply approval or liveness evidence.
+function progressOverall(run, live) {
+  const status = displayedRunStatus(run);
+  if (["superseded", "stale"].includes(status)) return [status, "⊘"];
+  if (run.waiting || status === "waiting") return ["waiting", "Ⅱ"];
+  if (run.resource_block || run.parked || ["blocked", "parked"].includes(status)) return ["held", "■"];
+  if (run.resource_wait) return ["waiting", "Ⅱ"];
+  if (["failed", "stalled"].includes(status)) return ["failed", "×"];
+  if (run.done) return ["complete", "✓"];
+  if (live === "dead") return ["exited", "⊘"];
+  if (live !== "live") return ["unknown", "?"];
+  return ["active", "▸"];
+}
+function progressImplementers(run, phase, live) {
+  const seats = new Map(Object.entries(run.active || {}).filter(([, seat]) => seat.node === "implement"));
+  const items = (run.candidates || []).map(c => {
+    const key = `implement-${c.label}`;
+    const seat = seats.get(key);
+    seats.delete(key);
+    const recorded = c.duration_ms > 0 || c.failed != null || c.verified_noop != null;
+    const state = seat ? (phase.state === "current" && live === "live" ? "running" : "paused")
+      : c.failed != null ? "failed" : recorded ? "complete" : "unrecorded";
+    return { key, label: `Candidate ${c.label}`, state, start: seat?.started_at,
+      duration: recorded ? c.duration_ms : null };
+  });
+  for (const [key, seat] of seats) items.push({key, label: key,
+    state: phase.state === "current" && live === "live" ? "running" : "paused", start: seat.started_at});
+  return items;
+}
+const PROGRESS_STEP_MS = 450;
+function flashProgressPhase(row) {
+  // CSS animation events may never arrive when folded, hidden or motion is reduced.
+  // Keep the transient state bounded independently of animation delivery.
+  clearTimeout(row.progressChangeTimer);
+  row.style.setProperty("--progress-step-duration", `${PROGRESS_STEP_MS}ms`);
+  setAttr(row, "data-changed", "1");
+  row.progressChangeTimer = setTimeout(() => row.removeAttribute("data-changed"), PROGRESS_STEP_MS);
+}
+function progressRow() {
+  const marker = el("span", { class: "progress-marker", "aria-hidden": "true" });
+  const title = el("strong");
+  const detail = el("span", { class: "progress-detail" });
+  const items = el("ul", { class: "progress-implementers" });
+  const row = el("li", {}, marker, el("div", {}, title, detail, items));
+  row.refs = { marker, title, detail, items };
+  return row;
+}
+function renderRunProgress(run) {
+  const box = $("run-progress");
+  if (!box) return;
+  const ready = run && !run.isShell && run.progress;
+  show(box, Boolean(ready));
+  if (!ready) return;
+  const snapshot = progressSnapshot(run);
+  const p = snapshot.progress;
+  setText($("progress-activity"), p.activity);
+  const live = snapshot.live;
+  const [overall, glyph] = progressOverall(run, live);
+  setAttr(box, "data-state", overall);
+  setText($("progress-state-marker"), glyph);
+  const current = p.phases.filter(p => ["current", "paused", "unconfirmed"].includes(p.state)).map(p => p.label).join(", ");
+  const announcement = JSON.stringify([overall, displayedRunStatus(run), current]);
+  if (box.dataset.run === run.id && box.dataset.announcement !== announcement) {
+    setText($("progress-announcement"), `${run.status} · ${overall}${current ? ` · ${current}` : ""}`);
+  } else if (box.dataset.run !== run.id) {
+    setText($("progress-announcement"), "");
+  }
+  const sameRun = box.dataset.run === run.id;
+  box.dataset.run = run.id;
+  box.dataset.announcement = announcement;
+  setAttr($("progress-seats"), "aria-label", run.done || live !== "live" ? "Last recorded activity" : "Activity recorded by driver");
+  const active = Object.entries(run.active || {}).sort(([a], [b]) => a.localeCompare(b));
+  syncList($("progress-seats"), active, ([key]) => key, () => {
+    const title = el("strong"), node = el("span"), age = el("span", { class: "progress-seat-age" });
+    const row = el("li", {}, title, node, age);
+    row.refs = { title, node, age };
+    return row;
+  }, (row, [key, seat]) => {
+    setText(row.refs.title, key);
+    setText(row.refs.node, seat.task && seat.index && seat.total ? `${seat.node} · command ${seat.index}/${seat.total}` : seat.node);
+    row.refs.age.dataset.progressStart = seat.started_at;
+    row.refs.age.dataset.progressEnd = run.done || live === "dead" ? run.updated_at : "";
+    setAttr(row, "data-candidate", /^implement-[A-E]$/.test(key) ? key.slice(-1).toLowerCase() : null);
+  });
+  syncList($("progress-phases"), p.phases, phase => phase.key, progressRow, (row, phase) => {
+    const names = { complete: "Complete", failed: "Failed", unconfirmed: "Last recorded phase", current: "Current", paused: "Paused", recorded: "Recorded", skipped: "Not applicable", unrecorded: "Unrecorded", upcoming: "Upcoming", unknown: "Unknown" };
+    const previous = row.dataset.state;
+    if (sameRun && previous && previous !== phase.state) flashProgressPhase(row);
+    else if (!sameRun) setAttr(row, "data-changed", null);
+    setAttr(row, "data-state", phase.state);
+    setAttr(row, "aria-current", phase.state === "current" || phase.state === "paused" ? "step" : null);
+    setText(row.refs.marker, { complete: "✓", failed: "!", unconfirmed: "?", recorded: "◆", current: "●", paused: "Ⅱ", skipped: "−", unrecorded: "–", upcoming: "○", unknown: "?" }[phase.state]);
+    setText(row.refs.title, `${phase.label} · ${names[phase.state] || phase.state}`);
+    setText(row.refs.detail, phase.detail);
+    const items = phase.key === "implement" ? progressImplementers(run, phase, live) : [];
+    syncList(row.refs.items, items, item => item.key, () => {
+      const mark = el("span", { "aria-hidden": "true" }), name = el("strong"), status = el("span"), age = el("span", { class: "progress-seat-age" });
+      const child = el("li", {}, mark, name, status, age);
+      child.refs = { mark, name, status, age };
+      return child;
+    }, (child, item) => {
+      setAttr(child, "data-state", item.state);
+      setText(child.refs.mark, {running: "▸", paused: "Ⅱ", failed: "×", complete: "✓", unrecorded: "–"}[item.state]);
+      setText(child.refs.name, item.label);
+      setText(child.refs.status, item.state);
+      if (item.start) {
+        child.refs.age.dataset.progressStart = item.start;
+        child.refs.age.dataset.progressEnd = run.done || live === "dead" ? run.updated_at : "";
+      } else {
+        delete child.refs.age.dataset.progressStart;
+        delete child.refs.age.dataset.progressEnd;
+        setText(child.refs.age, item.duration != null ? `${Math.floor(item.duration / 1000)}s recorded` : "Duration unrecorded");
+      }
+    });
+  });
+  const rounds = p.rounds || [];
+  syncList($("progress-rounds"), rounds, r => String(r.round), progressRow, (row, round) => {
+    setText(row.refs.marker, "↳");
+    setText(row.refs.title, `Review round ${round.round} · recorded`);
+    setText(row.refs.detail, round.detail);
+  });
+  const events = (run.events || []).slice(-3).reverse();
+  syncList($("progress-recent"), events, e => JSON.stringify([e.at, e.node, e.message]), () => {
+    const age = el("time"), node = el("strong"), message = el("span");
+    const row = el("li", {}, el("div", {}, node, age), message);
+    row.refs = { age, node, message };
+    return row;
+  }, (row, event) => {
+    setText(row.refs.node, event.node || "Event");
+    setText(row.refs.message, event.message || "");
+    row.refs.age.dataset.progressAgo = event.at;
+    setAttr(row.refs.age, "datetime", event.at);
+    setAttr(row.refs.age, "title", event.at);
+  });
+  show($("progress-recent"), events.length > 0);
+  const via = state.route.taskId ? `#/queue/${encodeURIComponent(state.route.taskId)}/runs/` : "#/runs/";
+  setAttr($("progress-timeline"), "href", `${via}${encodeURIComponent(run.id)}/timeline`);
+  tickRunProgress();
+}
+function tickRunProgress() {
+  if (document.hidden || state.route.name !== "run") return;
+  const run = state.detail.run;
+  if (!run || run.isShell || !$("run-progress")) return;
+  const snapshot = progressSnapshot(run);
+  const observed = state.detail.progressObservedAt;
+  const old = !observed || Date.now() - observed > 65000;
+  const driver = snapshot.live === "live" ? "Driver confirmed" : snapshot.live === "dead" ? "Driver exited" : "Driver unconfirmed";
+  setText($("progress-connection"), state.streamOpen ? "Stream connected" : "Reconnecting · snapshots may be old");
+  setText($("progress-freshness"), `${progressElapsed(run.created_at, run.done ? Date.parse(run.updated_at) : Date.now())} ${run.done ? "recorded span" : "since start"} · ${driver} · ${observed ? `checked ${progressElapsed(new Date(observed).toISOString())} ago` : "checking observation"}${old ? " · observation is old" : ""}`);
+  setAttr($("run-progress"), "data-observation-old", old ? "true" : null);
+  for (const age of $("run-progress").querySelectorAll("[data-progress-start]")) {
+    setText(age, `${progressElapsed(age.dataset.progressStart, age.dataset.progressEnd ? Date.parse(age.dataset.progressEnd) : Date.now())} ${age.dataset.progressEnd ? "at last record" : "elapsed"}`);
+  }
+  for (const age of $("run-progress").querySelectorAll("[data-progress-ago]")) setText(age, `${progressElapsed(age.dataset.progressAgo)} ago`);
+}
+function tickSeatClocks() {
+  if (document.hidden || state.route.name !== "run") return;
+  const run = state.detail.run;
+  if (!run) return;
+  const live = progressSnapshot(run).live;
+  for (const age of document.querySelectorAll("#run-active [data-seat-start]")) {
+    const end = run.done || live === "dead" ? Date.parse(run.updated_at) : Date.now();
+    setText(age, `${progressElapsed(age.dataset.seatStart, end)} ${run.done || live === "dead" ? "at last record" : "elapsed"} · ${age.dataset.seatBudget}s budget`);
+  }
+}
+
 function renderRunDetail() {
   const run = state.detail.run;
   const report = state.detail.report;
@@ -7803,6 +7975,7 @@ function renderRunDetail() {
   $("run-report").dataset.wrap = state.wrap ? "1" : "0";
   applyRunTab();
   renderReportCards();
+  renderRunProgress(run);
 
   if (!run || run.isShell) {
     const summary = (state.runs || []).find((r) => r.id === state.detail.id);
@@ -7885,11 +8058,7 @@ function renderRunDetail() {
     reason.textContent = stopReason;
     head.append(reason);
   }
-  const parkedAt = parkedNow ? (openFor(run.id)[0] || {}).node || null : null;
-  const rail = PHASES.includes(status) || parkedAt
-    ? phaseRail(status, parkedAt, activeNote(run))
-    : null;
-  if (rail) head.append(rail);
+  // The evidence-based pipeline above the tabs replaces the ordinal rail.
   const note = successorNote(latest, inFlight);
   if (note) head.append(note);
   if (!superseded && !stopReason && meta.note) {
@@ -9296,19 +9465,6 @@ function isTaskEntry(a) {
   return !!(a && a.task);
 }
 
-/* One line for the phase rail's label: which seat(s)/task(s) the current
-   phase is still waiting on, or null when nothing is out. */
-function activeNote(run) {
-  const active = run.active && typeof run.active === "object" ? run.active : {};
-  const keys = Object.keys(active).sort();
-  if (keys.length === 0) return null;
-  if (run.live === "dead") return `${plural(keys.length, "seat", "seats")} left mid-answer by a dead process`;
-  if (run.live === "unknown") return `${plural(keys.length, "seat", "seats")} still listed as running; whether a process is still driving this run could not be confirmed`;
-  return keys.length === 1
-    ? `${keys[0]} has not answered yet`
-    : `${plural(keys.length, "seat", "seats")} have not answered yet (${keys.join(", ")})`;
-}
-
 /* Seats and running verify/gate tasks still mid-answer, for the panel
    between "Landing" and "Verdict" — the same place in the column as the ask
    panel's reasoning: while something is still out, nothing below it that
@@ -9325,51 +9481,48 @@ function activeNote(run) {
    pid this build could confirm either way — simply unknown; never folded
    into "dead" by guesswork. */
 function renderActive(run) {
+  const live = progressSnapshot(run).live;
   const active = run.active && typeof run.active === "object" ? run.active : {};
   const keys = Object.keys(active).sort();
   show($("run-active-panel"), keys.length > 0);
   if (keys.length === 0) return;
 
+  setText($("run-active-label"), live === "live" && !run.done && !run.waiting && !run.parked && !run.resource_wait && !run.resource_block ? "Running now" : "Recorded activity");
   setText($("run-active-count"), String(keys.length));
   const note = $("run-active-note");
-  const uncertain = run.live !== "live";
+  const uncertain = live !== "live";
   show(note, uncertain);
-  if (run.live === "dead") {
+  if (live === "dead") {
     setText(note, "No live daemon claims this run right now — likely left behind by a killed process, not a seat that is actually still working.");
-  } else if (run.live === "unknown") {
+  } else if (live === "unknown") {
     setText(note, "Whether a process is still driving this run could not be confirmed — this may still be genuinely running.");
   }
 
   const list = $("run-active");
   clear(list);
-  const now = Date.now();
+  const ended = run.done || live === "dead";
+  const end = ended ? Date.parse(run.updated_at) : Date.now();
   for (const key of keys) {
     const a = active[key];
-    const startedMs = Date.parse(a.started_at || "");
-    const elapsed = Number.isFinite(startedMs) ? Math.max(Math.round((now - startedMs) / 1000), 0) : null;
     const budget = Number(a.timeout_secs) || 0;
-    const remaining = elapsed === null ? null : Math.max(budget - elapsed, 0);
     const retry = Number(a.attempt) > 0 ? ` · retry ${a.attempt}` : "";
     const progress = isTaskEntry(a) && a.index && a.total ? ` (${a.index}/${a.total})` : "";
     list.append(el("li", {},
       el("span", { class: "seat", text: key }),
       el("span", { text: `${a.node || "?"}${retry}${progress}` }),
       el("span", {
-        text: elapsed === null
-          ? "in progress"
-          : `${elapsed}s elapsed · ${remaining}s left of ${budget}s`,
+        "data-seat-start": a.started_at || "", "data-seat-budget": String(budget),
+        text: `${progressElapsed(a.started_at, end)} ${ended ? "at last record" : "elapsed"} · ${budget}s budget`,
       }),
       isTaskEntry(a) && a.command ? el("span", { class: "card-note", text: a.command }) : null,
     ));
   }
 }
 
-/* Local clock tick, not a fetch: `renderActive` only recomputes the elapsed /
-   remaining text from data already in hand, so a run with one seat quiet for
-   ten minutes does not sit there showing the number from whenever the change
-   stream last had a reason to fire. Nothing here talks to the network. */
+/* Clock ticks update text only, without rebuilding rows or fetching. */
 function tickActive() {
-  if (state.route.name === "run" && state.detail.run) renderActive(state.detail.run);
+  tickRunProgress();
+  tickSeatClocks();
 }
 
 function renderQuota(run) {
@@ -9970,6 +10123,7 @@ function resumeConnection() {
   resetUnreachable();
   clearUnreachableBanner();
   loadHealth({ applyRevisions: true });
+  observeRunProgress(true);
 }
 
 /* A background refresh (not a person's action) that failed. A network-level
@@ -10118,6 +10272,7 @@ async function loadRun(id, { background = false } = {}) {
     }
   }
   const requestId = nextRunRequest(id);
+  const observedSince = Date.now();
   if (state.detail.id !== id) {
     state.detail = runShell(id, (state.runs || []).find(r => r.id === id));
     sectionNotice("run-report-note", "run-report-state", "");
@@ -10150,6 +10305,8 @@ async function loadRun(id, { background = false } = {}) {
     const wasGated = Boolean(detail.evidenceError);
     const unchanged = JSON.stringify(detail.run) === JSON.stringify(detail.evidence);
     detail.run = detail.evidence;
+    detail.progressObservation = null;
+    detail.progressObservedAt = observedSince;
     detail.evidenceError = false;
     detail.evidencePending = false;
     sectionNotice("run-meta", "run-evidence-state", "");
@@ -10217,6 +10374,7 @@ async function applyRevisions_(source) {
   const talksRev = source.talks_rev;
   const notificationsRev = source.notifications_rev;
   const jobs = [];
+  let runDetailStale = false;
   if (queueRev !== state.rev.queue || runsRev !== state.rev.runs
     || questionsRev !== state.rev.questions || talksRev !== state.rev.talks) refreshReferences();
 
@@ -10243,7 +10401,10 @@ async function applyRevisions_(source) {
   }
   if (runsRev !== state.rev.runs || queueRev !== state.rev.queue) {
     jobs.push(loadRuns({ rev: runsRev, delta: queueRev === state.rev.queue ? source.runs_delta : null }));
-    if (state.route.name === "run" && state.detail.id) jobs.push(loadRun(state.detail.id, { background: true }));
+    const delta = source.runs_delta;
+    const detailChanged = queueRev !== state.rev.queue || !delta || delta.base !== state.rev.runs
+      || [...delta.changed, ...delta.removed].includes(state.detail.id);
+    if (detailChanged) runDetailStale = true;
   }
   /* A task's page lists its runs' statuses, so either stream moving can stale it. */
   if (taskStale && state.taskDetail.id) {
@@ -10255,6 +10416,7 @@ async function applyRevisions_(source) {
   if (questionsRev !== state.rev.questions) {
     state.rev.questions = questionsRev;
     jobs.push(loadQuestions());
+    runDetailStale = true;
     /* The queue may have moved in the same event; its real delta was queued
        above and a later request replaces a pending one, so reuse it. */
     jobs.push(loadQueue({ rev: queueRev, delta: queueRev !== state.rev.queue
@@ -10276,6 +10438,7 @@ async function applyRevisions_(source) {
     state.rev.loop = source.loop_rev;
     jobs.push(loadLoop({ background: true }));
   }
+  if (runDetailStale && state.route.name === "run" && state.detail.id) jobs.push(loadRun(state.detail.id, { background: true }));
   if (jobs.length) {
     const saidBefore = saidAt;
     await Promise.allSettled(jobs);
@@ -10297,6 +10460,7 @@ function subscribe() {
 
   stream.addEventListener("open", () => {
     state.streamOpen = true;
+    observeRunProgress(true);
     ok();
   });
 
@@ -11207,6 +11371,7 @@ function renderTask() {
     if (h.provisional) top.append(el("span", { class: "tag", "data-tone": "rust", text: "provisional" }));
     if (h.passes_of_run > 1) top.append(el("span", { class: "tag", "data-tone": "ink", text: `pass ${h.pass_n} of ${h.passes_of_run}` }));
     const li = el("li", {}, top, el("div", { class: "task-run-desc", text: h.description }));
+    if (h.activity) li.append(el("p", { class: "run-activity-brief", text: h.activity }));
     if (h.outcome) li.append(el("div", { class: "task-run-out", text: h.outcome }));
     if (h.pr) li.append(el("a", { href: h.pr, target: "_blank", rel: "noopener noreferrer", text: "Pull request" }));
     list.append(li);
@@ -11903,6 +12068,7 @@ async function boot() {
   setInterval(() => {
     if (document.hidden) return;
     loadHealth({ applyRevisions: !state.streamOpen });
+    observeRunProgress();
   }, HEALTH_MS);
   setInterval(tickActive, 1000);
 }

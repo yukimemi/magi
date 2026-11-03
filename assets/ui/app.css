@@ -3031,3 +3031,76 @@ button[aria-busy="true"] {
   button[aria-busy="true"] { animation: none; opacity: var(--press-busy-opacity); }
 }
 @media print { #press-feedback { display: none; } }
+
+/* The pulse is a record, not a completion meter. Only new records animate. */
+.run-progress {
+  margin: 0 0 var(--s5);
+  padding: var(--s4);
+  border: 1px solid var(--line-2);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.progress-eyebrow { display: flex; flex-wrap: wrap; justify-content: space-between; gap: var(--s2); font: 600 var(--t1) var(--mono); letter-spacing: .08em; color: var(--teal); }
+#progress-connection { color: var(--ink-2); font-weight: 400; letter-spacing: 0; }
+#progress-activity { margin: var(--s3) 0 var(--s2); font-size: var(--t6); font-weight: 650; line-height: 1.35; text-transform: capitalize; }
+#progress-freshness { color: var(--ink-2); font-weight: 400; margin-bottom: var(--s4); font-variant-numeric: tabular-nums; }
+.progress-seats { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 145px), 1fr)); gap: var(--s2); list-style: none; padding: 0; margin: 0 0 var(--s3); }
+.progress-seats li { display: flex; flex-direction: column; gap: var(--s1); padding: var(--s3); background: var(--sunk); border-left: 3px solid var(--teal); border-radius: var(--radius-sm); font-size: var(--t2); }
+.progress-seats li[data-candidate="a"] { border-color: var(--cand-a); }
+.progress-seats li[data-candidate="b"] { border-color: var(--cand-b); }
+.progress-seats li[data-candidate="c"] { border-color: var(--cand-c); }
+.progress-seat-age { color: var(--ink-2); font-variant-numeric: tabular-nums; }
+#progress-pipeline { border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+#progress-pipeline summary { min-height: var(--tap); cursor: pointer; padding: var(--s3) 0; font-weight: 600; }
+#progress-pipeline summary span { color: var(--ink-2); display: block; padding-left: var(--s4); font-weight: 400; }
+#progress-phases, #progress-rounds { list-style: none; padding: 0; margin: 0; }
+#progress-phases > li, #progress-rounds > li { display: grid; grid-template-columns: 24px minmax(0, 1fr); gap: var(--s2); padding: var(--s2); border-radius: var(--radius-sm); font-size: var(--t2); transition: background-color .3s var(--ease); }
+#progress-phases > li > div, #progress-rounds > li > div { padding-bottom: var(--s2); }
+#progress-phases > li[data-state="current"] { background: var(--tint-teal); color: var(--on-teal); }
+#progress-phases > li[data-state="paused"] { background: var(--tint-rust); color: var(--on-rust); }
+#progress-phases > li[data-state="skipped"] { color: var(--ink-3); }
+.progress-marker { text-align: center; font-family: var(--mono); border-bottom: 1px solid var(--line-2); }
+.progress-detail { display: block; margin-top: 3px; color: var(--ink-2); line-height: 1.45; }
+#progress-rounds:not(:empty) { border-top: 1px dashed var(--line-2); padding-top: var(--s2); }
+.progress-recent-head { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; font-size: var(--t2); font-weight: 600; }
+.progress-recent-head a { display: inline-flex; min-height: var(--tap); align-items: center; }
+#progress-recent { list-style: none; padding: 0; margin: 0; }
+#progress-recent li { border-top: 1px solid var(--line); padding: var(--s2) 0; font-size: var(--t2); animation: progress-record-in .5s var(--ease) both; }
+#progress-recent li > div { display: flex; flex-wrap: wrap; justify-content: space-between; gap: var(--s2); margin-bottom: var(--s1); }
+#progress-recent time { color: var(--ink-3); font-variant-numeric: tabular-nums; }
+#progress-recent li > span { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; line-height: 1.5; }
+.run-activity-brief { margin: var(--s2) 0 0; font-size: var(--t2); color: var(--ink-2); overflow-wrap: anywhere; border-left: 2px solid var(--teal); padding-left: var(--s2); }
+@keyframes progress-record-in { from { background: var(--tint-gold); } to { background: transparent; } }
+@media (prefers-reduced-motion: reduce) {
+  #progress-recent li { animation: none; }
+  #progress-phases > li { transition: none; }
+}
+#progress-phases > li[data-state="failed"] { color: var(--verdict-failed); background: var(--tint-rust); }
+#progress-phases > li[data-state="complete"] .progress-marker { color: var(--teal); }
+
+/* State stays legible through shape, glyph and text as well as colour. */
+.progress-heading { display: flex; align-items: baseline; gap: var(--s3); }
+#progress-state-marker { display: inline-grid; place-items: center; flex: none; width: 26px; height: 26px; border: 2px solid currentColor; border-radius: 50%; color: var(--teal); font: 600 var(--t3) var(--mono); }
+.run-progress[data-state="waiting"] #progress-state-marker { border-radius: 5px; border-style: double; color: var(--gold-line); }
+.run-progress[data-state="held"] #progress-state-marker,
+.run-progress[data-state="exited"] #progress-state-marker { border-radius: 3px; color: var(--rust); }
+.run-progress[data-state="failed"] #progress-state-marker { border-radius: 0; color: var(--verdict-failed); }
+.run-progress[data-state="unknown"] #progress-state-marker,
+.run-progress[data-state="stale"] #progress-state-marker,
+.run-progress[data-state="superseded"] #progress-state-marker { border-style: dashed; background: transparent; color: var(--ink-3); }
+#progress-phases > li[data-state="unrecorded"] .progress-marker { border-bottom-style: dashed; }
+.progress-implementers { list-style: none; padding: 0; margin: var(--s2) 0 0; display: grid; gap: var(--s1); }
+.progress-implementers li { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--s1) var(--s2); padding: var(--s2); border-left: 2px solid var(--line-2); background: var(--sunk); border-radius: var(--radius-sm); }
+.progress-implementers li[data-state="failed"] { border-color: var(--verdict-failed); }
+.progress-implementers li[data-state="complete"] { border-color: var(--teal); }
+@media (prefers-reduced-motion: no-preference) {
+  .run-progress[data-state="active"]:not([data-observation-old]) #progress-phases > li[data-state="current"]:not([data-changed="1"]) .progress-marker { animation: progress-step-pulse 1.8s ease-in-out infinite; }
+  #progress-phases > li[data-changed="1"] .progress-marker { animation: progress-step-pop var(--progress-step-duration) ease-out 1; }
+  @keyframes progress-step-pulse { 50% { opacity: .5; } }
+  @keyframes progress-step-pop { 0% { transform: scale(.75); } 70% { transform: scale(1.1); } 100% { transform: scale(1); } }
+}
+
+.progress-implementers:empty { display: none; }
