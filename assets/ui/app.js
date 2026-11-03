@@ -344,8 +344,13 @@ function linkify(node, value, opts) {
    check reject late responses; unchanged results preserve selection. Nothing here
    changes the route. */
 const referenceRanges = new Set();
-let referencePending = [];
+// Weak handles avoid retaining detached transcripts while timers are throttled.
+const referencePending = new Map();
 let referenceTimer = null;
+let referenceFlight = null;
+let referenceRefresh = false;
+let referenceSweep = false;
+let referenceEpoch = 0;
 function referenceNodes(parts, styled) {
   return parts.map((part) => {
     const label = styled ? el("code", { text: part.text }) : document.createTextNode(part.text);
@@ -385,6 +390,8 @@ function referenceText(text, code = false, href = null, styled = false) {
     nodes[0].referenceRange = item; // The DOM retains its range; the registry does not.
     item.handle = new WeakRef(item);
     referenceRanges.add(item.handle);
+    referenceSweep = true;
+    scheduleReferences();
     // Markdown internal links already carry a server-validated destination.
     // Watch for later store changes without repeating that initial resolution.
     if (!href) queueReference(item);
@@ -397,41 +404,91 @@ function currentReference(item) {
     && item.nodes.every((node, i) => node.parentNode === parent && (!i || item.nodes[i - 1].nextSibling === node))
     && item.nodes.map((node) => node.textContent).join("") === item.text;
 }
+function scheduleReferences() {
+  if (document.hidden || referenceTimer !== null || referenceFlight) return;
+  if (!referenceRefresh && !referenceSweep && !referencePending.size) return;
+  // Use a task while visible; hidden tabs retain coalesced work until resumed.
+  referenceTimer = setTimeout(() => {
+    referenceTimer = null;
+    flushReferences();
+  }, 0);
+}
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) scheduleReferences();
+});
 function queueReference(item) {
-  referencePending.push({ item, generation: ++item.generation });
-  if (referenceTimer === null) {
-    referenceTimer = typeof requestAnimationFrame === "undefined" ? setTimeout(flushReferences, 0)
-      : requestAnimationFrame(() => { referenceTimer = setTimeout(flushReferences, 0); });
-  }
+  referencePending.set(item.handle, ++item.generation);
+  scheduleReferences();
 }
 function refreshReferences() {
-  for (const handle of referenceRanges) {
-    const item = handle.deref();
-    if (!item || !currentReference(item)) referenceRanges.delete(handle);
-    else queueReference(item);
-  }
+  // Collapse revision bursts before walking the registry, not only before I/O.
+  referenceEpoch++;
+  referenceRefresh = true;
+  scheduleReferences();
 }
-async function flushReferences() {
-  referenceTimer = null;
-  const pending = referencePending;
-  referencePending = [];
-  for (const handle of referenceRanges) {
-    const item = handle.deref();
-    if (!item || !currentReference(item)) referenceRanges.delete(handle);
-  }
-  while (pending.length) {
+function flushReferences() {
+  if (referenceFlight) return referenceFlight;
+  referenceFlight = drainReferences().finally(() => {
+    referenceFlight = null;
+    if (referenceRefresh || referenceSweep || referencePending.size) scheduleReferences();
+  });
+  return referenceFlight;
+}
+async function drainReferences() {
+  const yieldTask = () => new Promise(resolve => setTimeout(resolve, 0));
+  const now = () => typeof performance === "undefined" ? Date.now() : performance.now();
+  let scanned = 0, started = now();
+  const shouldYield = () => ++scanned >= 128 || now() - started >= 8;
+  const pause = async () => { await yieldTask(); scanned = 0; started = now(); };
+  while (referenceRefresh || referenceSweep || referencePending.size) {
+    if (document.hidden) return;
+    if (referenceRefresh || referenceSweep) {
+      const refresh = referenceRefresh;
+      referenceRefresh = false;
+      referenceSweep = false;
+      for (const handle of referenceRanges) {
+        const item = handle.deref();
+        if (!item || !currentReference(item)) {
+          referenceRanges.delete(handle);
+          referencePending.delete(handle);
+        } else if (refresh) queueReference(item);
+        // Dead ranges and stale entries cost time too. Bound all scanning,
+        // even when none of it produces a transport batch.
+        if (shouldYield()) {
+          await pause();
+          if (document.hidden) {
+            referenceRefresh ||= refresh;
+            referenceSweep = true;
+            return;
+          }
+        }
+      }
+    }
     const batch = [];
     let size = 0;
-    while (pending.length && batch.length < 64 && size + pending[0].item.text.length * 3 <= 65536) {
-      const entry = pending.shift();
-      size += entry.item.text.length * 3;
-      if (entry.generation === entry.item.generation && currentReference(entry.item)) batch.push(entry);
+    for (const [handle, generation] of referencePending) {
+      const item = handle.deref();
+      if (item && batch.length && size + item.text.length * 3 > 65536) break;
+      referencePending.delete(handle);
+      if (item && generation === item.generation && currentReference(item)) {
+        size += item.text.length * 3;
+        batch.push({ item, generation });
+      } else referenceRanges.delete(handle);
+      if (shouldYield()) await pause();
+      if (document.hidden || batch.length >= 64) break;
+    }
+    if (document.hidden) {
+      for (const { item, generation } of batch) {
+        if (!referencePending.has(item.handle)) referencePending.set(item.handle, generation);
+      }
+      return;
     }
     if (!batch.length) continue;
+    const epoch = referenceEpoch;
     try {
       const results = await postJson("/api/references", batch.map(({ item }) => ({ text: item.text, code: item.code })));
       batch.forEach(({ item, generation }, i) => {
-        if (item.generation !== generation || !currentReference(item) || !results[i]) return;
+        if (referenceEpoch !== epoch || item.generation !== generation || !currentReference(item) || !results[i]) return;
         if (!results[i].watch) referenceRanges.delete(item.handle);
         const signature = JSON.stringify(results[i].parts);
         if (item.signature === signature) return;
@@ -443,6 +500,7 @@ async function flushReferences() {
         nodes[0].referenceRange = item;
       });
     } catch (_) { /* Reference decoration is optional; keep the original text. */ }
+    if (referenceRefresh || referenceSweep || referencePending.size) await pause();
   }
 }
 
@@ -795,8 +853,19 @@ const conversationPriority = {
       if (--this.active === 0) this.waiting.splice(0).forEach(resolve => resolve());
     };
   },
-  async idle() {
-    if (this.active) await new Promise(resolve => this.waiting.push(resolve));
+  async idle(signal) {
+    if (signal?.aborted) throw signal.reason;
+    if (!this.active) return;
+    await new Promise((resolve, reject) => {
+      const finish = () => { signal?.removeEventListener("abort", abort); resolve(); };
+      const abort = () => {
+        const index = this.waiting.indexOf(finish);
+        if (index !== -1) this.waiting.splice(index, 1);
+        reject(signal.reason);
+      };
+      this.waiting.push(finish);
+      signal?.addEventListener("abort", abort, { once: true });
+    });
   },
 };
 
@@ -841,15 +910,19 @@ const getJson = async (url, options) => {
   const background = /^\/api\/(health|talks(?:\/page)?)(?:[?]|$)/.test(url);
   if (!background) return request(url, options).then(r => r.json());
   for (;;) {
-    await conversationPriority.idle();
+    await conversationPriority.idle(options?.signal);
+    if (options?.signal?.aborted) throw options.signal.reason;
     if (conversationPriority.active) continue;
     const controller = new AbortController();
+    const abort = () => controller.abort(options.signal.reason);
+    options?.signal?.addEventListener("abort", abort, { once: true });
     conversationPriority.background.add(controller);
     try {
       return await request(url, { ...options, signal: controller.signal, priority: "low" }).then(r => r.json());
     } catch (error) {
-      if (!controller.signal.aborted) throw error;
+      if (!controller.signal.aborted || options?.signal?.aborted) throw error;
     } finally {
+      options?.signal?.removeEventListener("abort", abort);
       conversationPriority.background.delete(controller);
     }
   }
@@ -6198,14 +6271,23 @@ function sectionNotice(anchorId, key, message, retry, { pending = false, snapsho
 const talkCorePaints = new WeakMap();
 function afterTalkPaint() {
   return new Promise(resolve => {
-    // Hidden tabs suspend animation frames; they still need refreshes to settle,
-    // including when visibility changes after the frame has been scheduled.
     const doc = typeof document === "undefined" ? null : document;
-    const finish = () => { doc?.removeEventListener("visibilitychange", hidden); resolve(); };
+    let done = false, frame, timeout;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      doc?.removeEventListener("visibilitychange", hidden);
+      if (typeof cancelAnimationFrame !== "undefined") cancelAnimationFrame(frame);
+      if (typeof clearTimeout !== "undefined") clearTimeout(timeout);
+      resolve();
+    };
     const hidden = () => { if (doc.hidden) finish(); };
     if (doc?.hidden) return setTimeout(finish, 0);
     doc?.addEventListener("visibilitychange", hidden);
-    requestAnimationFrame(() => setTimeout(finish, 0));
+    // A suspended frame must not hold conversationPriority (and every health
+    // read waiting behind it) forever, even if visibility has not changed.
+    timeout = setTimeout(finish, 250);
+    frame = requestAnimationFrame(() => setTimeout(finish, 0));
   });
 }
 
@@ -10122,8 +10204,9 @@ function resumeConnection() {
   unreachable.gen += 1;
   resetUnreachable();
   clearUnreachableBanner();
-  loadHealth({ applyRevisions: true });
+  const health = loadHealth({ applyRevisions: true });
   observeRunProgress(true);
+  return health;
 }
 
 /* A background refresh (not a person's action) that failed. A network-level
@@ -10147,11 +10230,42 @@ function failFor(background, message, error) {
   else fail(message);
 }
 
+/* Wake, stream fallback and the health interval share one consumer. Keep one
+   trailing read: an event received during I/O may describe newer disk state. */
+let healthFlight = null;
+function loadHealth({ applyRevisions = false, explicit = false } = {}) {
+  if (healthFlight) {
+    const pending = healthFlight.pending || {};
+    healthFlight.pending = {
+      applyRevisions: applyRevisions || pending.applyRevisions,
+      explicit: explicit || pending.explicit,
+    };
+    return healthFlight.promise;
+  }
+  const job = { pending: { applyRevisions, explicit } };
+  healthFlight = job;
+  job.promise = (async () => {
+    try {
+      while (job.pending) {
+        const options = job.pending;
+        job.pending = null;
+        await loadHealthOnce(options);
+      }
+    } finally { if (healthFlight === job) healthFlight = null; }
+  })();
+  return job.promise;
+}
+
 /* `explicit` is for a person's own action (Retry): reported at once. */
-async function loadHealth({ applyRevisions = false, explicit = false } = {}) {
+async function loadHealthOnce({ applyRevisions = false, explicit = false } = {}) {
   const gen = unreachable.gen;
+  const controller = new AbortController();
+  // A pre-sleep fetch must not occupy the single flight indefinitely.
+  const timeout = setTimeout(() => controller.abort(), 15000);
   try {
-    state.health = await getJson(API.health);
+    const health = await getJson(API.health, { signal: controller.signal });
+    if (gen !== unreachable.gen) return;
+    state.health = health;
     state.healthError = null;
     renderBell();
     /* Through applyLoop rather than a bare render, so a loop that went quiet
@@ -10162,7 +10276,10 @@ async function loadHealth({ applyRevisions = false, explicit = false } = {}) {
     /* health.questions_needs_owner is the count until /api/questions has
        answered, so the indicator is right on the very first paint. */
     renderAskBar();
-    if (applyRevisions) await applyRevisions_(state.health);
+    // Related reads may remain pending independently of a healthy server.
+    // Do not let them hold the health flight and block future polls or Retry.
+    if (applyRevisions) applyRevisions_(health).catch(error =>
+      failBackground(`Could not refresh data: ${error.message}`, error));
     resetUnreachable();
     ok();
   } catch (error) {
@@ -10191,7 +10308,7 @@ async function loadHealth({ applyRevisions = false, explicit = false } = {}) {
       && now - unreachable.since >= UNREACHABLE_GRACE_MS) {
       fail(message, "unreachable");
     }
-  }
+  } finally { clearTimeout(timeout); }
 }
 
 const runDetailRequests = new Map();

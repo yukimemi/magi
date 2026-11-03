@@ -252,7 +252,7 @@ async fn serve_with_client_probe(
             Some("state, upgrade, renderLoop, renderUpgradeError, loadHealth, ok")
         }
         ClientProbe::Connection => Some(
-            "state, loadHealth, loadLoop, loadTalk, tickTalkWaits, loadStats, resumeConnection, onPageShow, unreachable, loadQueue, applyRevisions_, acceptTalkUpdate, renderTalkTasks",
+            "state, loadHealth, loadLoop, loadTalk, tickTalkWaits, loadStats, resumeConnection, onPageShow, unreachable, loadQueue, applyRevisions_, acceptTalkUpdate, renderTalkTasks, applyRoute, subscribe",
         ),
     };
     let router = ui.router().layer(axum::middleware::from_fn(
@@ -2665,7 +2665,7 @@ async fn unreachable_banner_waits_out_transient_failures() {
     assert_eq!(r["successResets"], true);
     assert_eq!(r["cleared"], true);
     assert_eq!(r["offline"], false);
-    assert_eq!(r["resumeFailures"], 1);
+    assert_eq!(r["resumeFailures"], 0, "wake joins the held health request");
     assert_eq!(r["staleFailures"], 1);
     assert_eq!(r["stale"], false);
     assert_eq!(r["explicit"], true);
@@ -6263,5 +6263,330 @@ async fn run_progress_live_pipeline_observation_and_phone_layout() {
     run.event("merge", "Merge confirmed");
     run.save_under(&home).unwrap();
     browser.wait_for(&page, "document.getElementById('progress-activity').textContent === 'merged' && !!document.querySelector('#progress-phases li:last-child[data-state=\"complete\"]')", Duration::from_secs(30)).await.unwrap();
+    browser.close_page(&page).await;
+}
+
+/// Hold animation frames as a sleeping tab does, while store revisions arrive.
+#[tokio::test]
+async fn sleeping_reference_backlog_stays_bounded() {
+    let Some(chrome) = cdp::find_chrome() else {
+        assert!(std::env::var_os("CI").is_none(), "Chrome required in CI");
+        eprintln!("SKIP sleeping references: no Chrome");
+        return;
+    };
+    let guard = common::home_lock().await;
+    let fx = common::fixture(guard, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("magi-home");
+    let talks = Talks::at(home.join("talks"));
+    let mut chat = talk::begin(
+        &talks,
+        &fx.config,
+        fx.repo.clone(),
+        Some(&fx.config.agents[0].id),
+    )
+    .unwrap();
+    for i in 0..300 {
+        chat.turns.push(serde_json::from_value(serde_json::json!({
+            "who": "agent", "body": format!("Message {i}: task@abcd\n\n`abcd` and task@beef\n\nMore task@cafe"),
+            "at": "2026-11-01T00:00:00Z"
+        })).unwrap());
+    }
+    talks.put(&mut chat).unwrap();
+    let base = serve_with_client_probe(
+        &home,
+        Queue::at(home.join("queue")),
+        talks,
+        home.join("runs"),
+        &fx.repo,
+        ClientProbe::Connection,
+    )
+    .await;
+    let mut browser = cdp::Browser::launch(&chrome).await.expect("Chrome");
+    let page = browser
+        .open_page(&base, 1280, 900, false)
+        .await
+        .expect("page");
+    browser
+        .wait_for(&page, "!!window.deck", Duration::from_secs(30))
+        .await
+        .unwrap();
+    let result = browser.eval(&page, r#"(async () => {
+      const source = await (await fetch('/app.js')).text();
+      const code = source.slice(source.indexOf('const referenceRanges ='), source.indexOf('function setAttr('));
+      let frame, calls = 0, active = 0, peak = 0;
+      const root = document.createElement('div'); document.body.append(root);
+      const api = new Function('el', 'postJson', 'requestAnimationFrame', code + `
+        return {referenceText, refreshReferences, flushReferences,
+          size: () => referencePending.size ?? referencePending.length,
+          ranges: () => referenceRanges.size};`)(
+        (tag, props) => Object.assign(document.createElement(tag), {textContent: props.text}),
+        async (url, body) => {
+          calls++; peak = Math.max(peak, ++active);
+          await new Promise(resolve => setTimeout(resolve, 0)); active--;
+          return body.map(item => ({watch: true, parts: [{text: item.text, href: null}]}));
+        }, callback => { frame = callback; return 1; });
+      for (let i = 0; i < 1200; i++) root.append(api.referenceText('task@abcd ' + i));
+      const originals = [...root.childNodes];
+      const start = performance.now();
+      for (let i = 0; i < 120; i++) api.refreshReferences();
+      const queued = api.size(), enqueueMs = performance.now() - start;
+      let heartbeat = null;
+      const drainStart = performance.now();
+      setTimeout(() => { heartbeat = performance.now() - drainStart; }, 0);
+      await api.flushReferences();
+      await new Promise(resolve => setTimeout(resolve, 0));
+      const out = {queued, enqueueMs, drainMs: performance.now() - drainStart, heartbeat, calls, peak,
+        nodes: root.childNodes.length, reused: originals.every((node, i) => root.childNodes[i] === node)};
+      // Navigating repeatedly can leave thousands of dead weak handles even
+      // without a store revision. New prose must retire them incrementally.
+      const retired = document.createElement('div'); root.append(retired);
+      for (let i = 0; i < 5000; i++) retired.append(api.referenceText('task@dead ' + i));
+      retired.remove(); root.remove();
+      const next = document.createElement('div'); document.body.append(next);
+      next.append(api.referenceText('task@live'));
+      await api.flushReferences();
+      out.rangesAfterNavigation = api.ranges();
+      next.remove(); api.refreshReferences(); await api.flushReferences();
+      out.rangesAfterRemoval = api.ranges();
+      return out;
+    })()"#).await.expect("reference backlog probe");
+    eprintln!("sleeping reference backlog: {result}");
+    assert_eq!(result["queued"], 1200, "one pending entry per range");
+    assert_eq!(result["nodes"], 1200, "unchanged text retains DOM");
+    assert_eq!(
+        result["reused"], true,
+        "identical decoration preserves text nodes"
+    );
+    assert_eq!(result["rangesAfterNavigation"], 1);
+    assert_eq!(result["rangesAfterRemoval"], 0);
+    assert_eq!(result["peak"], 1, "one reference request at a time");
+    assert_eq!(result["calls"], 19, "one pass over the final revision");
+    assert!(result["heartbeat"].as_f64().unwrap() < 1000.0, "{result}");
+    browser.call(Some(&page.session), "Emulation.setEmulatedMedia", serde_json::json!({"features": [{"name": "prefers-reduced-motion", "value": "reduce"}]})).await.unwrap();
+    browser
+        .eval(
+            &page,
+            &format!(
+                "location.hash = '#/chat/{}'; deck.applyRoute(); true",
+                chat.id
+            ),
+        )
+        .await
+        .unwrap();
+    browser.wait_for(&page, "document.querySelectorAll('#talk-turns > .turn').length === 300 || document.getElementById('talk-turns').children.length === 300", Duration::from_secs(30)).await.expect("substantial transcript");
+    browser
+        .wait_for(
+            &page,
+            "!!deck.state.talkDetail.sections",
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+    browser
+        .call(
+            Some(&page.session),
+            "HeapProfiler.collectGarbage",
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+    let resources_before = browser
+        .call(
+            Some(&page.session),
+            "Memory.getDOMCounters",
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+    let recovery = browser.eval(&page, r#"(async () => {
+      await deck.loadHealth({applyRevisions: true});
+      const native = window.fetch, now = Date.now, ES = window.EventSource;
+      const snapshot = deck.state.health;
+      const accepted = [];
+      let latestHealth = snapshot;
+      Object.defineProperty(deck.state, 'health', {configurable: true,
+        get: () => latestHealth,
+        set: value => { accepted.push(value.recoveryMarker); latestHealth = value; }});
+      const input = document.getElementById('f-talk-say');
+      input.value = 'Retained draft'; input.focus({preventScroll: true}); input.setSelectionRange(4, 9);
+      const reply = deck.state.talkReply = {id: deck.state.talkDetail.id, target: {turn: 0, message: 0}, who: 'AGENT', excerpt: 'Keep reply'};
+      const attachment = {localId: 'pending-test', name: 'draft.png', status: 'done', serverId: 'pending-test', previewUrl: ''};
+      deck.state.talkAttachments.items.push(attachment);
+      const pane = document.getElementById('view-talk'); pane.scrollTop = 120;
+      const scroll = pane.scrollTop, selected = deck.state.talkDetail.id;
+      const rows = [...document.getElementById('talk-turns').children];
+      const bodies = rows.map(row => row.querySelector('.turn-body') || row.querySelector('.md'));
+      const elements = document.getElementById('talk-turns').querySelectorAll('*').length;
+      let calls = 0, active = 0, peak = 0, release, frames = 0;
+      const held = new Promise(resolve => { release = resolve; });
+      const events = {};
+      window.EventSource = class {
+        constructor() { frames++; }
+        addEventListener(type, handler) { events[type] = handler; }
+      };
+      deck.subscribe();
+      window.fetch = async (url, init) => {
+        if (!String(url).includes('/api/health')) return native(url, init);
+        const index = ++calls; peak = Math.max(peak, ++active);
+        await held; active--;
+        return new Response(JSON.stringify({...snapshot, recoveryMarker: index}));
+      };
+      const first = deck.loadHealth();
+      await new Promise(resolve => setTimeout(resolve, 0));
+      Date.now = () => now() + 8 * 60 * 60 * 1000;
+      try {
+        let last;
+        for (let i = 0; i < 100; i++) {
+          events.error();
+          deck.onPageShow({persisted: true});
+          last = deck.resumeConnection();
+          events.change({data: JSON.stringify({...snapshot, talks_rev: snapshot.talks_rev + '-wake'})});
+        }
+        // Let the single SSE fallback timer join the held recovery read.
+        await new Promise(resolve => setTimeout(resolve, 3100));
+        const heldCalls = calls;
+        input.setRangeText(' typed during recovery', input.value.length, input.value.length, 'preserve');
+        const preservedWhileHeld = !input.disabled && document.activeElement === input;
+        release(); await Promise.all([first, last]);
+        await new Promise(resolve => setTimeout(resolve, 300));
+        return {heldCalls, calls, peak, streams: frames, marker: deck.state.health.recoveryMarker, accepted,
+          preservedWhileHeld, draft: input.value, selection: [input.selectionStart, input.selectionEnd],
+          reply: deck.state.talkReply === reply, attachment: deck.state.talkAttachments.items[0] === attachment,
+          selected: deck.state.talkDetail.id === selected, scroll: pane.scrollTop === scroll, scrollBefore: scroll, scrollAfter: pane.scrollTop,
+          rows: rows.every((row, i) => document.getElementById('talk-turns').children[i] === row),
+          bodies: bodies.every((body, i) => (rows[i].querySelector('.turn-body') || rows[i].querySelector('.md')) === body),
+          elementsBefore: elements, elementsAfter: document.getElementById('talk-turns').querySelectorAll('*').length};
+      } finally {
+        release(); window.fetch = native; Date.now = now; window.EventSource = ES;
+        Object.defineProperty(deck.state, 'health', {configurable: true, writable: true, value: latestHealth});
+      }
+    })()"#).await.expect("recovery burst probe");
+    eprintln!("sleeping recovery burst: {recovery}");
+    assert_eq!(recovery["heldCalls"], 1);
+    assert_eq!(recovery["calls"], 2, "one trailing read after the burst");
+    assert_eq!(recovery["peak"], 1);
+    assert_eq!(recovery["streams"], 1);
+    assert_eq!(recovery["marker"], 2, "latest health wins");
+    assert_eq!(
+        recovery["accepted"],
+        serde_json::json!([2]),
+        "pre-wake success is ignored"
+    );
+    for key in [
+        "preservedWhileHeld",
+        "reply",
+        "attachment",
+        "selected",
+        "scroll",
+        "rows",
+        "bodies",
+    ] {
+        assert_eq!(recovery[key], true, "{key}: {recovery}");
+    }
+    assert_eq!(recovery["draft"], "Retained draft typed during recovery");
+    assert_eq!(recovery["selection"], serde_json::json!([4, 9]));
+    assert_eq!(recovery["elementsBefore"], recovery["elementsAfter"]);
+    browser
+        .call(
+            Some(&page.session),
+            "HeapProfiler.collectGarbage",
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+    let resources_after = browser
+        .call(
+            Some(&page.session),
+            "Memory.getDOMCounters",
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+    eprintln!("recovery DOM resources: {resources_before} -> {resources_after}");
+    assert!(
+        resources_after["jsEventListeners"].as_u64().unwrap()
+            <= resources_before["jsEventListeners"].as_u64().unwrap() + 20
+    );
+    browser.close_page(&page).await;
+}
+
+#[tokio::test]
+async fn health_recovery_continues_while_revision_loader_is_pending() {
+    let Some(chrome) = cdp::find_chrome() else {
+        assert!(std::env::var_os("CI").is_none(), "Chrome required in CI");
+        eprintln!("SKIP held revision recovery: no Chrome");
+        return;
+    };
+    let guard = common::home_lock().await;
+    let fx = common::fixture(guard, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("magi-home");
+    let base = serve_with_client_probe(
+        &home,
+        Queue::at(home.join("queue")),
+        Talks::at(home.join("talks")),
+        home.join("runs"),
+        &fx.repo,
+        ClientProbe::Connection,
+    )
+    .await;
+    let mut browser = cdp::Browser::launch(&chrome).await.expect("Chrome");
+    let page = browser.open_page(&base, 1280, 900, false).await.unwrap();
+    browser
+        .wait_for(&page, "!!window.deck", Duration::from_secs(30))
+        .await
+        .unwrap();
+    let result = browser.eval(&page, r#"(async () => {
+      const native = window.fetch;
+      const snapshot = await (await native('/api/health')).json();
+      for (const key of Object.keys(deck.state.rev)) deck.state.rev[key] = snapshot[key + '_rev'];
+      let calls = 0, notificationCalls = 0, release, notificationsHeld = true;
+      const held = new Promise(resolve => { release = resolve; });
+      window.fetch = async (url, init) => {
+        if (String(url) === '/api/health') {
+          return new Response(JSON.stringify({...snapshot, notifications_rev: 'held-revision', recoveryMarker: ++calls}));
+        }
+        if (String(url) === '/api/notifications') {
+          notificationCalls++;
+          await held;
+          notificationsHeld = false;
+          return new Response(JSON.stringify({unread: 0, items: []}));
+        }
+        return native(url, init);
+      };
+      const settledWithin = promise => new Promise((resolve, reject) => {
+        const timer = setTimeout(() => resolve(false), 1000);
+        promise.then(() => { clearTimeout(timer); resolve(true); }, error => { clearTimeout(timer); reject(error); });
+      });
+      const requests = [];
+      try {
+        const first = deck.loadHealth({applyRevisions: true}); requests.push(first);
+        const settled = [await settledWithin(first)];
+        for (const start of [() => deck.loadHealth(), () => deck.resumeConnection(), () => deck.loadHealth({explicit: true})]) {
+          const next = start(); requests.push(next);
+          settled.push(await settledWithin(next));
+        }
+        return {settled, calls, notificationCalls, notificationsHeld,
+          notificationsApplied: deck.state.notices !== null, marker: deck.state.health.recoveryMarker};
+      } finally {
+        release(); await Promise.allSettled(requests); window.fetch = native;
+      }
+    })()"#).await.expect("held revision recovery probe");
+    eprintln!("held revision recovery: {result}");
+    assert_eq!(
+        result["settled"],
+        serde_json::json!([true, true, true, true])
+    );
+    assert_eq!(
+        result["calls"], 4,
+        "poll, wake and Retry each read fresh health"
+    );
+    assert_eq!(result["notificationCalls"], 1);
+    assert_eq!(result["notificationsHeld"], true);
+    assert_eq!(result["notificationsApplied"], false);
+    assert_eq!(result["marker"], 4);
+    browser
+        .wait_for(&page, "deck.state.notices !== null", Duration::from_secs(5))
+        .await
+        .expect("held notifications still apply after release");
     browser.close_page(&page).await;
 }

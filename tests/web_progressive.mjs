@@ -12,6 +12,7 @@ const stats = source.slice(source.indexOf('async function loadStats('), source.i
 const flush = () => new Promise(resolve => setImmediate(resolve));
 function harness({ manualPaint = false, visibility } = {}) {
   const frames = [];
+  const paintTimeouts = [];
   const sectionRenders = [];
   const requests = [];
   const renders = [];
@@ -22,7 +23,8 @@ function harness({ manualPaint = false, visibility } = {}) {
   const get = (url, options) => new Promise((resolve, reject) => requests.push({ url, options, resolve, reject }));
   const api = runInNewContext(`${sections}\n${runs}\n${talks}\n${tasks}\n${stats}\n({loadRun, loadTalk, loadTask, loadStats, cancelDetailSections, sectionRequest, acceptTalkUpdate})`, {
     document: visibility,
-    requestAnimationFrame: callback => manualPaint ? frames.push(callback) : callback(), setTimeout: callback => callback(),
+    requestAnimationFrame: callback => manualPaint ? frames.push(callback) : callback(),
+    setTimeout: (callback, delay) => delay === 250 ? paintTimeouts.push(callback) : callback(),
     state, $: () => null, AbortController, URLSearchParams, API: { run: id => `run/${id}`, report: id => `raw/${id}`, reportJson: id => `report/${id}`, talk: id => `talk/${id}`, stats: 'stats', task: id => `task/${id}` },
     REPORT_VIEW_SCHEMA: 1, getJson: get, getText: get,
     renderRunDetail: () => renders.push(state.detail.run), renderReportCards: () => renders.push(state.detail.reportView),
@@ -32,7 +34,7 @@ function harness({ manualPaint = false, visibility } = {}) {
     show() {}, sectionNotice: (...args) => notices.push(args), trackTalkThinking() {}, rememberTalkChoices() {}, endTalkTurn() {},
     ok: (...args) => successes.push(args), failFor: (...args) => failures.push(args), shortId: id => id,
   });
-  return { api, requests, renders, sectionRenders, frames, notices, failures, successes, state };
+  return { api, requests, renders, sectionRenders, frames, paintTimeouts, notices, failures, successes, state };
 }
 function assertNoFailures(h) {
   assert.equal(h.failures.length, 0, 'successful loads must not call failFor');
@@ -466,7 +468,7 @@ test('conversation navigation rejects old core and enrichment even on return to 
   assertNoFailures(h);
 });
 
-function referenceHarness() {
+function referenceHarness({ hidden = false, manualTimers = false } = {}) {
   class Node {
     constructor(tag, text = '') { this.tag = tag; this.text = text; this.children = []; this.parentNode = null; }
     get textContent() { return this.text + this.children.map(node => node.textContent).join(''); }
@@ -499,17 +501,31 @@ function referenceHarness() {
     return node;
   };
   const requests = [];
+  const timers = [];
+  const listeners = [];
+  const document = { hidden,
+    addEventListener: (type, listener) => {
+      assert.equal(type, 'visibilitychange');
+      listeners.push(listener);
+    },
+    createTextNode: text => new Node('#text', text),
+    createDocumentFragment: () => new Node('#fragment'),
+  };
   const referenceSource = source.slice(source.indexOf('const referenceRanges ='), source.indexOf('function setAttr('));
   const markdownSource = source.slice(source.indexOf('function buildMd('), source.indexOf('/* Replace `container`'));
-  const api = runInNewContext(`${referenceSource}\n${markdownSource}\n({buildMd, flushReferences, refreshReferences})`, {
-    el: make, WeakRef, setTimeout: () => 1,
-    document: { createTextNode: text => new Node('#text', text), createDocumentFragment: () => new Node('#fragment') },
+  const api = runInNewContext(`${referenceSource}\n${markdownSource}\n({buildMd, flushReferences, refreshReferences, referencePending})`, {
+    el: make, WeakRef,
+    setTimeout: manualTimers ? callback => { timers.push(callback); return timers.length; } : setTimeout,
+    document,
     postJson: (url, body) => new Promise((resolve, reject) => requests.push({ url, body, resolve, reject })),
   });
   const root = make('root');
   root.connected = true;
   const walk = node => [node, ...node.children.flatMap(walk)];
-  return { api, root, requests, walk };
+  return { api, root, requests, walk, timers, setHidden(hidden) {
+    document.hidden = hidden;
+    for (const listener of listeners) listener();
+  } };
 }
 
 test('unlinked transcript Markdown is immediately useful and gains validated links after deferred resolution', async () => {
@@ -544,7 +560,7 @@ test('unlinked transcript Markdown is immediately useful and gains validated lin
   assert.equal(h.walk(h.root).find(node => node.tag === 'img').src, '/attachment.png');
 });
 
-test('late reference decoration never changes a replaced conversation', async () => {
+test('late reference decoration never changes a replaced conversation', { timeout: 5000 }, async () => {
   const h = referenceHarness();
   const previous = h.api.buildMd({ type: 'paragraph', children: [{ type: 'text', value: 'task@abcd' }] });
   h.root.append(previous);
@@ -552,10 +568,11 @@ test('late reference decoration never changes a replaced conversation', async ()
   previous.remove();
   h.root.append(h.api.buildMd({ type: 'paragraph', children: [{ type: 'text', value: 'task@abcd' }] }));
   h.requests[0].resolve([{ watch: true, parts: [{ text: 'task@abcd', href: '#/tasks/obsolete' }] }]);
-  await pending;
+  while (h.requests.length < 2) await new Promise(resolve => setTimeout(resolve, 0));
   assert.equal(h.root.textContent, 'task@abcd');
   assert.equal(h.walk(h.root).filter(node => node.tag === 'a').length, 0);
   const current = h.api.flushReferences();
+  assert.equal(current, pending, 'one consumer also drains work queued during I/O');
   h.requests[1].resolve([{ watch: true, parts: [{ text: 'task@abcd', href: '#/tasks/current' }] }]);
   await current;
   assert.equal(h.walk(h.root).find(node => node.tag === 'a').href, '#/tasks/current');
@@ -1127,4 +1144,187 @@ test('joined conversation reads share enrichment even if it completes before a s
   assert.equal(h.requests.length, 2, 'joined reads must not issue another sections request after enrichment already finished');
   await done;
   assert.deepEqual(h.state.talkDetail.talk.tasks, ['related']);
+});
+
+test('a suspended visible frame releases conversation work through the bounded paint fallback', async () => {
+  const listeners = new Set();
+  const visibility = { hidden: false,
+    addEventListener: (_, listener) => listeners.add(listener),
+    removeEventListener: (_, listener) => listeners.delete(listener) };
+  const h = harness({ manualPaint: true, visibility });
+  const done = h.api.loadTalk('a');
+  h.requests[0].resolve({ id: 'a' });
+  await flush();
+  assert.equal(h.requests.length, 1);
+  h.paintTimeouts.shift()();
+  await flush();
+  assert.equal(listeners.size, 0);
+  assert.equal(h.requests[1].url, 'talk/a/sections');
+  h.requests[1].resolve({ roster: [], personas: [] });
+  await done;
+  h.frames.shift()();
+  assert.equal(h.requests.length, 2, 'late frame does not restart completed work');
+});
+
+test('reference revisions during held I/O share one consumer and converge on the last result', { timeout: 5000 }, async () => {
+  const h = referenceHarness();
+  h.root.append(h.api.buildMd({ type: 'paragraph', children: [{ type: 'text', value: 'task@abcd' }] }));
+  const done = h.api.flushReferences();
+  for (let i = 0; i < 100; i++) h.api.refreshReferences();
+  assert.equal(h.api.flushReferences(), done);
+  assert.equal(h.requests.length, 1);
+  h.requests[0].resolve([{ watch: true, parts: [{ text: 'task@abcd', href: '#/tasks/stale' }] }]);
+  while (h.requests.length < 2) await new Promise(resolve => setTimeout(resolve, 0));
+  assert.equal(h.walk(h.root).filter(node => node.tag === 'a').length, 0);
+  h.requests[1].resolve([{ watch: true, parts: [{ text: 'task@abcd', href: '#/tasks/current' }] }]);
+  await done;
+  assert.equal(h.requests.length, 2);
+  assert.equal(h.walk(h.root).find(node => node.tag === 'a').href, '#/tasks/current');
+});
+
+test('health cancellation releases both an active background read and a conversation waiter', async () => {
+  const transport = source.slice(source.indexOf('const conversationPriority ='), source.indexOf('const getText ='));
+  const reads = [];
+  const api = runInNewContext(`${transport}\n({getJson, conversationPriority})`, {
+    AbortController, pendingForRequest: () => () => {},
+    fetch: (_, init) => new Promise((resolve, reject) => {
+      reads.push(init.signal);
+      init.signal.addEventListener('abort', () => reject(init.signal.reason), { once: true });
+    }),
+  });
+  const active = new AbortController();
+  const reading = api.getJson('/api/health', { signal: active.signal });
+  await flush();
+  assert.equal(reads.length, 1);
+  active.abort();
+  await assert.rejects(reading, { name: 'AbortError' });
+  assert.equal(api.conversationPriority.background.size, 0);
+  const release = api.conversationPriority.begin();
+  const waiting = new AbortController();
+  const blocked = api.getJson('/api/health', { signal: waiting.signal });
+  await flush();
+  assert.equal(api.conversationPriority.waiting.length, 1);
+  waiting.abort();
+  await assert.rejects(blocked, { name: 'AbortError' });
+  assert.equal(api.conversationPriority.waiting.length, 0);
+  assert.equal(reads.length, 1);
+  release();
+});
+
+test('hidden reference bursts schedule no work and visibility resumes bounded batches', async () => {
+  const h = referenceHarness({ hidden: true, manualTimers: true });
+  for (let i = 0; i < 300; i++) {
+    h.root.append(h.api.buildMd({ type: 'paragraph', children: [{ type: 'text', value: `task@${i}` }] }));
+  }
+  const original = h.root.textContent;
+  for (let i = 0; i < 200; i++) h.api.refreshReferences();
+  assert.equal(h.api.referencePending.size, 300);
+  assert.equal(h.timers.length, 0);
+  await h.api.flushReferences();
+  assert.equal(h.requests.length, 0, 'direct flush also respects visibility');
+  h.setHidden(false);
+  h.setHidden(false);
+  assert.equal(h.timers.length, 1, 'visibility bursts share one scheduled consumer');
+  h.timers.shift()();
+  await flush();
+  const done = h.api.flushReferences();
+  let count = 0;
+  let processed = 0;
+  for (let step = 0; step < 100 && (h.api.referencePending.size || processed < h.requests.length || h.timers.length); step++) {
+    while (processed < h.requests.length) {
+      const request = h.requests[processed++];
+      assert.ok(request.body.length <= 64);
+      count += request.body.length;
+      request.resolve(request.body.map(item => ({ watch: true, parts: [{ text: item.text }] })));
+    }
+    await flush();
+    if (h.timers.length) h.timers.shift()();
+    await flush();
+  }
+  await done;
+  assert.equal(h.api.referencePending.size, 0);
+  assert.equal(count, 300);
+  assert.equal(h.root.textContent, original);
+});
+
+test('a reference timer queued before hiding defers until visible again', async () => {
+  const h = referenceHarness({ manualTimers: true });
+  h.root.append(h.api.buildMd({ type: 'paragraph', children: [{ type: 'text', value: 'task@abcd' }] }));
+  assert.equal(h.timers.length, 1);
+  h.setHidden(true);
+  h.timers.shift()();
+  await flush();
+  assert.equal(h.requests.length, 0);
+  assert.equal(h.timers.length, 0, 'hidden completion does not reschedule');
+  h.setHidden(false);
+  assert.equal(h.timers.length, 1);
+  h.timers.shift()();
+  const done = h.api.flushReferences();
+  h.requests[0].resolve([{ watch: true, parts: [{ text: 'task@abcd' }] }]);
+  await done;
+});
+
+test('hiding during reference I/O retains the remaining batch without scheduling more work', async () => {
+  const h = referenceHarness({ manualTimers: true });
+  for (let i = 0; i < 70; i++) {
+    h.root.append(h.api.buildMd({ type: 'paragraph', children: [{ type: 'text', value: `task@${i}` }] }));
+  }
+  h.timers.shift()();
+  const done = h.api.flushReferences();
+  while (!h.requests.length) {
+    h.timers.shift()();
+    await flush();
+  }
+  assert.equal(h.requests[0].body.length, 64);
+  h.setHidden(true);
+  h.requests[0].resolve(h.requests[0].body.map(item => ({ watch: true, parts: [{ text: item.text }] })));
+  await flush();
+  // The existing cooperative yield finishes, then the consumer parks.
+  h.timers.shift()();
+  await done;
+  assert.equal(h.requests.length, 1);
+  assert.equal(h.api.referencePending.size, 6);
+  assert.equal(h.timers.length, 0);
+  h.setHidden(false);
+  h.timers.shift()();
+  const resumed = h.api.flushReferences();
+  assert.equal(h.requests[1].body.length, 6);
+  h.requests[1].resolve(h.requests[1].body.map(item => ({ watch: true, parts: [{ text: item.text }] })));
+  await resumed;
+});
+
+for (const count of [70, 300]) test(`hiding at a cooperative yield retains reference work (${count} ranges)`, async () => {
+  const h = referenceHarness({ manualTimers: true });
+  for (let i = 0; i < count; i++) {
+    h.root.append(h.api.buildMd({ type: 'paragraph', children: [{ type: 'text', value: `task@${i}` }] }));
+  }
+  h.timers.shift()();
+  const done = h.api.flushReferences();
+  h.api.refreshReferences();
+  assert.equal(h.requests.length, 0, 'consumer yields during scanning before transport');
+  h.setHidden(true);
+  h.timers.shift()();
+  await done;
+  assert.equal(h.requests.length, 0);
+  assert.equal(h.api.referencePending.size, count, 'partially collected batches remain pending');
+  assert.equal(h.timers.length, 0);
+  h.setHidden(false);
+  assert.equal(h.timers.length, 1);
+  h.timers.shift()();
+  const resumed = h.api.flushReferences();
+  let processed = 0;
+  let sent = 0;
+  for (let step = 0; step < 100; step++) {
+    while (processed < h.requests.length) {
+      const request = h.requests[processed++];
+      sent += request.body.length;
+      request.resolve(request.body.map(item => ({ watch: true, parts: [{ text: item.text }] })));
+    }
+    await flush();
+    if (h.timers.length) h.timers.shift()();
+    await flush();
+    if (!h.api.referencePending.size && !h.timers.length && processed === h.requests.length) break;
+  }
+  assert.equal(sent, count, 'visibility recovery resolves every range once');
+  await resumed;
 });
