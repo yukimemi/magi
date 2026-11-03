@@ -1731,7 +1731,7 @@ mod tests {
                     let lease = OutputLease::borrow(&wt).unwrap().unwrap();
                     let file = lease._file.try_clone().unwrap();
                     drop(lease);
-                    file.set_modified(std::time::SystemTime::try_from(recent).unwrap())
+                    file.set_modified(std::time::SystemTime::from(recent))
                         .unwrap();
                 }
                 _ => {
@@ -1752,8 +1752,7 @@ mod tests {
                     } else {
                         recent
                     };
-                    file.set_modified(std::time::SystemTime::try_from(at).unwrap())
-                        .unwrap();
+                    file.set_modified(std::time::SystemTime::from(at)).unwrap();
                 }
             }
             let mut disk = Fx::disk();
