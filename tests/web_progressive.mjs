@@ -468,7 +468,7 @@ test('conversation navigation rejects old core and enrichment even on return to 
   assertNoFailures(h);
 });
 
-function referenceHarness() {
+function referenceHarness({ hidden = false, manualTimers = false } = {}) {
   class Node {
     constructor(tag, text = '') { this.tag = tag; this.text = text; this.children = []; this.parentNode = null; }
     get textContent() { return this.text + this.children.map(node => node.textContent).join(''); }
@@ -501,17 +501,31 @@ function referenceHarness() {
     return node;
   };
   const requests = [];
+  const timers = [];
+  const listeners = [];
+  const document = { hidden,
+    addEventListener: (type, listener) => {
+      assert.equal(type, 'visibilitychange');
+      listeners.push(listener);
+    },
+    createTextNode: text => new Node('#text', text),
+    createDocumentFragment: () => new Node('#fragment'),
+  };
   const referenceSource = source.slice(source.indexOf('const referenceRanges ='), source.indexOf('function setAttr('));
   const markdownSource = source.slice(source.indexOf('function buildMd('), source.indexOf('/* Replace `container`'));
-  const api = runInNewContext(`${referenceSource}\n${markdownSource}\n({buildMd, flushReferences, refreshReferences})`, {
-    el: make, WeakRef, setTimeout,
-    document: { createTextNode: text => new Node('#text', text), createDocumentFragment: () => new Node('#fragment') },
+  const api = runInNewContext(`${referenceSource}\n${markdownSource}\n({buildMd, flushReferences, refreshReferences, referencePending})`, {
+    el: make, WeakRef,
+    setTimeout: manualTimers ? callback => { timers.push(callback); return timers.length; } : setTimeout,
+    document,
     postJson: (url, body) => new Promise((resolve, reject) => requests.push({ url, body, resolve, reject })),
   });
   const root = make('root');
   root.connected = true;
   const walk = node => [node, ...node.children.flatMap(walk)];
-  return { api, root, requests, walk };
+  return { api, root, requests, walk, timers, setHidden(hidden) {
+    document.hidden = hidden;
+    for (const listener of listeners) listener();
+  } };
 }
 
 test('unlinked transcript Markdown is immediately useful and gains validated links after deferred resolution', async () => {
@@ -1195,4 +1209,122 @@ test('health cancellation releases both an active background read and a conversa
   assert.equal(api.conversationPriority.waiting.length, 0);
   assert.equal(reads.length, 1);
   release();
+});
+
+test('hidden reference bursts schedule no work and visibility resumes bounded batches', async () => {
+  const h = referenceHarness({ hidden: true, manualTimers: true });
+  for (let i = 0; i < 300; i++) {
+    h.root.append(h.api.buildMd({ type: 'paragraph', children: [{ type: 'text', value: `task@${i}` }] }));
+  }
+  const original = h.root.textContent;
+  for (let i = 0; i < 200; i++) h.api.refreshReferences();
+  assert.equal(h.api.referencePending.size, 300);
+  assert.equal(h.timers.length, 0);
+  await h.api.flushReferences();
+  assert.equal(h.requests.length, 0, 'direct flush also respects visibility');
+  h.setHidden(false);
+  h.setHidden(false);
+  assert.equal(h.timers.length, 1, 'visibility bursts share one scheduled consumer');
+  h.timers.shift()();
+  await flush();
+  const done = h.api.flushReferences();
+  let count = 0;
+  let processed = 0;
+  for (let step = 0; step < 100 && (h.api.referencePending.size || processed < h.requests.length || h.timers.length); step++) {
+    while (processed < h.requests.length) {
+      const request = h.requests[processed++];
+      assert.ok(request.body.length <= 64);
+      count += request.body.length;
+      request.resolve(request.body.map(item => ({ watch: true, parts: [{ text: item.text }] })));
+    }
+    await flush();
+    if (h.timers.length) h.timers.shift()();
+    await flush();
+  }
+  await done;
+  assert.equal(h.api.referencePending.size, 0);
+  assert.equal(count, 300);
+  assert.equal(h.root.textContent, original);
+});
+
+test('a reference timer queued before hiding defers until visible again', async () => {
+  const h = referenceHarness({ manualTimers: true });
+  h.root.append(h.api.buildMd({ type: 'paragraph', children: [{ type: 'text', value: 'task@abcd' }] }));
+  assert.equal(h.timers.length, 1);
+  h.setHidden(true);
+  h.timers.shift()();
+  await flush();
+  assert.equal(h.requests.length, 0);
+  assert.equal(h.timers.length, 0, 'hidden completion does not reschedule');
+  h.setHidden(false);
+  assert.equal(h.timers.length, 1);
+  h.timers.shift()();
+  const done = h.api.flushReferences();
+  h.requests[0].resolve([{ watch: true, parts: [{ text: 'task@abcd' }] }]);
+  await done;
+});
+
+test('hiding during reference I/O retains the remaining batch without scheduling more work', async () => {
+  const h = referenceHarness({ manualTimers: true });
+  for (let i = 0; i < 70; i++) {
+    h.root.append(h.api.buildMd({ type: 'paragraph', children: [{ type: 'text', value: `task@${i}` }] }));
+  }
+  h.timers.shift()();
+  const done = h.api.flushReferences();
+  while (!h.requests.length) {
+    h.timers.shift()();
+    await flush();
+  }
+  assert.equal(h.requests[0].body.length, 64);
+  h.setHidden(true);
+  h.requests[0].resolve(h.requests[0].body.map(item => ({ watch: true, parts: [{ text: item.text }] })));
+  await flush();
+  // The existing cooperative yield finishes, then the consumer parks.
+  h.timers.shift()();
+  await done;
+  assert.equal(h.requests.length, 1);
+  assert.equal(h.api.referencePending.size, 6);
+  assert.equal(h.timers.length, 0);
+  h.setHidden(false);
+  h.timers.shift()();
+  const resumed = h.api.flushReferences();
+  assert.equal(h.requests[1].body.length, 6);
+  h.requests[1].resolve(h.requests[1].body.map(item => ({ watch: true, parts: [{ text: item.text }] })));
+  await resumed;
+});
+
+for (const count of [70, 300]) test(`hiding at a cooperative yield retains reference work (${count} ranges)`, async () => {
+  const h = referenceHarness({ manualTimers: true });
+  for (let i = 0; i < count; i++) {
+    h.root.append(h.api.buildMd({ type: 'paragraph', children: [{ type: 'text', value: `task@${i}` }] }));
+  }
+  h.timers.shift()();
+  const done = h.api.flushReferences();
+  h.api.refreshReferences();
+  assert.equal(h.requests.length, 0, 'consumer yields during scanning before transport');
+  h.setHidden(true);
+  h.timers.shift()();
+  await done;
+  assert.equal(h.requests.length, 0);
+  assert.equal(h.api.referencePending.size, count, 'partially collected batches remain pending');
+  assert.equal(h.timers.length, 0);
+  h.setHidden(false);
+  assert.equal(h.timers.length, 1);
+  h.timers.shift()();
+  const resumed = h.api.flushReferences();
+  let processed = 0;
+  let sent = 0;
+  for (let step = 0; step < 100; step++) {
+    while (processed < h.requests.length) {
+      const request = h.requests[processed++];
+      sent += request.body.length;
+      request.resolve(request.body.map(item => ({ watch: true, parts: [{ text: item.text }] })));
+    }
+    await flush();
+    if (h.timers.length) h.timers.shift()();
+    await flush();
+    if (!h.api.referencePending.size && !h.timers.length && processed === h.requests.length) break;
+  }
+  assert.equal(sent, count, 'visibility recovery resolves every range once');
+  await resumed;
 });

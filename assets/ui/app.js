@@ -405,14 +405,17 @@ function currentReference(item) {
     && item.nodes.map((node) => node.textContent).join("") === item.text;
 }
 function scheduleReferences() {
-  if (referenceTimer !== null || referenceFlight) return;
-  // Decoration does not need a paint. rAF can stay suspended across sleep or
-  // hidden tabs, allowing revisions to accumulate without a consumer.
+  if (document.hidden || referenceTimer !== null || referenceFlight) return;
+  if (!referenceRefresh && !referenceSweep && !referencePending.size) return;
+  // Use a task while visible; hidden tabs retain coalesced work until resumed.
   referenceTimer = setTimeout(() => {
     referenceTimer = null;
     flushReferences();
   }, 0);
 }
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) scheduleReferences();
+});
 function queueReference(item) {
   referencePending.set(item.handle, ++item.generation);
   scheduleReferences();
@@ -438,6 +441,7 @@ async function drainReferences() {
   const shouldYield = () => ++scanned >= 128 || now() - started >= 8;
   const pause = async () => { await yieldTask(); scanned = 0; started = now(); };
   while (referenceRefresh || referenceSweep || referencePending.size) {
+    if (document.hidden) return;
     if (referenceRefresh || referenceSweep) {
       const refresh = referenceRefresh;
       referenceRefresh = false;
@@ -450,7 +454,14 @@ async function drainReferences() {
         } else if (refresh) queueReference(item);
         // Dead ranges and stale entries cost time too. Bound all scanning,
         // even when none of it produces a transport batch.
-        if (shouldYield()) await pause();
+        if (shouldYield()) {
+          await pause();
+          if (document.hidden) {
+            referenceRefresh ||= refresh;
+            referenceSweep = true;
+            return;
+          }
+        }
       }
     }
     const batch = [];
@@ -464,7 +475,13 @@ async function drainReferences() {
         batch.push({ item, generation });
       } else referenceRanges.delete(handle);
       if (shouldYield()) await pause();
-      if (batch.length >= 64) break;
+      if (document.hidden || batch.length >= 64) break;
+    }
+    if (document.hidden) {
+      for (const { item, generation } of batch) {
+        if (!referencePending.has(item.handle)) referencePending.set(item.handle, generation);
+      }
+      return;
     }
     if (!batch.length) continue;
     const epoch = referenceEpoch;
