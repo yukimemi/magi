@@ -580,7 +580,29 @@ async fn execute_decision(
         _ => bail!("use a task/run effect command with --decision; routed approvals use decide"),
     }
     let request = serde_json::to_string(&command)?;
-    let decision = inquiry.decision.context("inquiry is informational")?;
+    let mut decision = inquiry.decision.context("inquiry is informational")?;
+    if decision.request.is_some()
+        && decision.status != Status::Resolved
+        && let Operation::Resume { run } = &command
+    {
+        ensure!(
+            decision.request.as_deref() == Some(&request),
+            "decision already binds a different request"
+        );
+        // Queued also includes successfully published resumes. Reconcile under
+        // the execution claim before permitting any retry, even if the run has
+        // since returned to a resumable state. Only proven non-publication may
+        // enter the retry path below.
+        reconcile_resume_claimed(queue, home, &outbox, id, run)?;
+        decision = outbox
+            .get(id)?
+            .decision
+            .context("inquiry is informational")?;
+        ensure!(
+            decision.status == Status::Resolved || decision.retry_safe,
+            "previous resume remains queued or executing; it will not be replayed"
+        );
+    }
     if decision.status == Status::Resolved {
         ensure!(
             decision.request.as_deref() == Some(&request),
@@ -954,6 +976,17 @@ fn reconcile_resume_decision(
     let Ok(_execution) = outbox.execution_claim(id) else {
         return Ok(());
     };
+    reconcile_resume_claimed(queue, home, outbox, id, run)
+}
+
+/// The caller holds this inquiry's execution claim, including on resubmission.
+fn reconcile_resume_claimed(
+    queue: &Queue,
+    home: &Path,
+    outbox: &crate::task_inquiry::Outbox,
+    id: &str,
+    run: &str,
+) -> Result<()> {
     let inquiry = outbox.get(id)?;
     let Ok(_claim) = queue.claim(&inquiry.task) else {
         return Ok(());

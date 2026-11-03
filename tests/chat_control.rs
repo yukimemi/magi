@@ -230,6 +230,134 @@ async fn interrupted_resume_publication_recovers_only_unpublished_requests() {
     }
 }
 
+#[test]
+fn repeated_unpublished_resume_can_retry_after_inline_reconciliation() {
+    use magi::{chat_control::Operation, task_decision::Status, task_inquiry::Outbox};
+
+    let f = Fixture::new();
+    let mut task = f.saved();
+    task.chat = Some(f.talk.clone());
+    f.queue().put(&mut task).unwrap();
+    let outbox = Outbox::at(f.tmp.path());
+    let inquiry = outbox
+        .file(
+            &task,
+            Some(f.run.id.clone()),
+            "resume".into(),
+            "Resume?",
+            "",
+        )
+        .unwrap();
+    outbox.deliver(&f.queue(), &f.talks, &inquiry.id).unwrap();
+    let request = serde_json::to_string(&Operation::Resume {
+        run: f.run.id.clone(),
+    })
+    .unwrap();
+    // Acceptance survived restart, but no queue publication happened.
+    outbox
+        .update_decision(&inquiry.id, |d| d.accept(&request))
+        .unwrap();
+    passed(f.control(&["--decision", &inquiry.id, "resume", &f.run.id]));
+    let task = f.saved();
+    assert!(task.action_applied(&inquiry.id));
+    assert_eq!(task.resume_override.unwrap().question_id, inquiry.id);
+    let decision = outbox.get(&inquiry.id).unwrap().decision.unwrap();
+    assert_eq!(decision.status, Status::Queued);
+    assert!(!decision.retry_safe);
+    assert!(
+        decision
+            .history
+            .iter()
+            .any(|event| event.status == Status::RetryNeeded)
+    );
+}
+
+#[test]
+fn repeated_queued_resume_reconciles_receipts_before_republication() {
+    use magi::{task_decision::Status, task_inquiry::Outbox};
+
+    for boundary in ["published", "dispatched", "started", "superseded"] {
+        let f = Fixture::new();
+        let queue = f.queue();
+        let mut task = f.saved();
+        task.chat = Some(f.talk.clone());
+        queue.put(&mut task).unwrap();
+        let outbox = Outbox::at(f.tmp.path());
+        let inquiry = outbox
+            .file(
+                &task,
+                Some(f.run.id.clone()),
+                "resume".into(),
+                "Resume?",
+                boundary,
+            )
+            .unwrap();
+        outbox.deliver(&queue, &f.talks, &inquiry.id).unwrap();
+        passed(f.control(&["--decision", &inquiry.id, "resume", &f.run.id]));
+        assert_eq!(
+            outbox.get(&inquiry.id).unwrap().decision.unwrap().status,
+            Status::Queued
+        );
+        let mut task = f.saved();
+        let mut run = RunState::load_under(&f.run.id, f.tmp.path()).unwrap();
+        if matches!(boundary, "dispatched" | "started") {
+            task.start(run.id.clone());
+            queue.put(&mut task).unwrap();
+            if boundary == "started" {
+                run.next_pass_inquiries.push(inquiry.id.clone());
+                run.begin_pass();
+                run.status = RunStatus::Blocked;
+                run.driver_exited = true;
+                run.save_under(f.tmp.path()).unwrap();
+            }
+            // The first execution can return to a resumable state before a
+            // reconciliation sweep sees its receipt.
+            task.handed_off("blocked again");
+        } else if boundary == "superseded" {
+            // Replacing a published pin records explicit supersession.
+            task.resume_override = None;
+            task.handed_off("pin no longer present");
+        }
+        queue.put(&mut task).unwrap();
+        let queue_before = std::fs::read(queue.path_of(&task.id)).unwrap();
+        let passes_before = run.passes.len();
+        // A contended queue claim must not permit another publication either.
+        let claim = queue.claim(&task.id).unwrap();
+        refused(f.control(&["--decision", &inquiry.id, "resume", &f.run.id]));
+        drop(claim);
+        let result = f.control(&["--decision", &inquiry.id, "resume", &f.run.id]);
+        if matches!(boundary, "started" | "superseded") {
+            assert!(passed(result).contains("already resolved"));
+            assert_eq!(
+                Outbox::at(f.tmp.path())
+                    .get(&inquiry.id)
+                    .unwrap()
+                    .decision
+                    .unwrap()
+                    .status,
+                Status::Resolved
+            );
+        } else {
+            assert!(refused(result).contains("will not be replayed"));
+            assert_eq!(
+                outbox.get(&inquiry.id).unwrap().decision.unwrap().status,
+                Status::Queued
+            );
+        }
+        assert_eq!(
+            std::fs::read(queue.path_of(&task.id)).unwrap(),
+            queue_before
+        );
+        assert_eq!(
+            RunState::load_under(&f.run.id, f.tmp.path())
+                .unwrap()
+                .passes
+                .len(),
+            passes_before
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn routed_merge_preserves_admission_retries_and_reconciles_refused_receipts() {
