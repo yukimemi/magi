@@ -19,6 +19,19 @@ dep-info-proven artifact bytes measured under locks, not the whole target size.
 This exception can increase both deletion volume and pass duration.
 `worktree_limit_bytes = 0` disables target eviction. The existing
 `fold_grace_secs` (six hours by default) also protects recently used targets.
+Artifact age uses persistent `output_activity_at`, advanced at execution start
+and driver completion (including cancellation/recovery), plus recorded pass times.
+`updated_at` remains the last state flush: unrelated bookkeeping cannot extend
+artifact grace. Legacy records freeze their previous `updated_at` on load/save,
+conservatively preserving their existing grace once. The exclusive output lease
+also checks the last managed borrow/release timestamp, and Cargo identity,
+profile files, artifacts, dep-info and fingerprints are checked for recent writes
+under all locks. Missing/unreadable timestamps and future timestamps retain the
+outputs. A failed lease-release timestamp write poisons the activity witness when
+possible, retaining it until a successful borrower records activity again.
+Empty maintenance-only/legacy output-lock files have no activity witness;
+exclusive janitor acquisition does not refresh it. Folding and empty-worktree
+retirement still use their existing `updated_at` policy.
 Oldest run activity is considered first normally. Under low free space, targets
 are remeasured and considered largest first, with oldest activity breaking ties;
 ineligible targets do not consume the first-deletion exception. Low free space
@@ -28,8 +41,17 @@ Only plain, canonical, registered worktrees are eligible. A legacy `target` must
 be ignored, contain no tracked files, carry Cargo's standard
 [cache directory tag signature](https://bford.info/cachedir/) and rustc identity,
 and have plain canonical directories for any existing `debug` and `release`
-profiles. Unrelated root entries, including logs, `tmp` and `magi-tools`, are
-retained and do not veto artifact eviction. They provide no ownership evidence
+profiles. Artifact-only eviction has one alternative for **NotFound on the tag
+path only**: a plain rustc identity with a numeric fingerprint, a cached successful
+rustc version response and a successes map, plus existing plain profile, `deps`,
+`.fingerprint` directories and `.cargo-lock` files. The nonempty dep-info and
+individual artifact signature/path/name proof remain mandatory. Malformed tags,
+symlinks (including dangling tags), other I/O errors and incomplete layouts retain
+outputs. Cleanup never creates or repairs a tag. The ledger distinguishes
+`cache-tag` from `rustc-profile-dep-info` authority. Tagless eviction never creates
+a residue proof and never authorizes worktree retirement; residue recording and
+verification still require the valid tag. Unrelated root entries, including logs,
+`tmp` and `magi-tools`, are retained and do not veto artifact eviction. They provide no ownership evidence
 and never expand the artifact search. These checks do not authorize recursive
 deletion. Cleanup removes only regular artifact files declared as outputs in
 rustc dep-info (`.d`) records in
@@ -48,7 +70,7 @@ exact contents per worktree in `build-residue/` under the run's reports.
 
 Deletion requires confirmed driver death, no daemon claim, the public-owner lock,
 the execution lease, an exclusive worktree-output lease and the Cargo profile
-locks. Registration and target identity are checked again inside those locks.
+locks (`.cargo-lock`, and existing `.cargo-build-lock` / `.cargo-artifact-lock`). Registration and target identity are checked again inside those locks.
 A blocked or landing status does not prevent output eviction. Source changes,
 branches, commits, run reports and recovery checkpoints remain untouched.
 Unknown ownership closes cleanup. Do not run unmanaged background builds in
@@ -237,11 +259,29 @@ bytes and dep-info outside supported profiles remain untouched. Synthetic fixtur
 continue to cover the other safety protections and the oversized-target budget
 exception.
 
+Cargo's [upstream backup-exclusion test](https://rust.googlesource.com/cargo/+/f8984e1169dc670fd1c002d68c8c5efee63ff514/tests/testsuite/build.rs)
+confirms that builds do not add a tag to a pre-existing target directory or repair
+a removed tag. The isolated real-Cargo fixture reproduces this by creating
+`target/magi-tools` before the first build, then rebuilding. This establishes a
+possible legitimate cause, not the historical creator of any production target.
+The incident's recent run flushes coincided with pass endings; they do not prove
+that bookkeeping alone caused those particular grace holds. The unconditional
+flush-based postponement was independently reproducible and is now covered.
+The launcher supplied fetched base `473914ad`; prior standard-tag and root-leftover
+fixes (`1080e650`, `d4f7971e`) were reviewed as context. The older shared-cache fix
+`968c9ebd` already preserves the root tag during oldest-first pruning and repairs
+known managed shared caches before package cleaning. That repair is not used to
+establish retained-worktree deletion authority. Neither that historical pruning
+bug nor pre-creation is established as the creator of these production targets.
+No production identities,
+run state, worktrees or disk policy were changed by this investigation.
+
 Focused regression verification:
 
 ```sh
 RUSTUP_TOOLCHAIN=stable cargo test --locked --lib retention::tests
-RUSTUP_TOOLCHAIN=stable cargo test --locked --lib cache::tests
+RUSTUP_TOOLCHAIN=stable cargo test --locked --lib -- driver::tests run::tests cache::tests
+RUSTUP_TOOLCHAIN=stable cargo test --locked --lib disk::tests::a_root_cachedir_tag
 RUSTUP_TOOLCHAIN=stable cargo test --locked --lib retained_attempt_bound
 RUSTUP_TOOLCHAIN=stable cargo test --locked --lib preparation_records_creation_intent
 ```

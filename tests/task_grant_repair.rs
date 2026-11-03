@@ -551,6 +551,8 @@ async fn retained_reviewer_descendant_refuses_grant_and_resume_without_mutation(
     let mut after = RunState::load(&request.run).unwrap();
     // Driver cleanup may refresh the timestamp while releasing admission.
     after.updated_at = before.updated_at;
+    // Driver completion is execution activity, so its marker advances too.
+    after.output_activity_at = before.output_activity_at;
     assert_eq!(serde_json::to_value(after).unwrap(), serde_json::to_value(before).unwrap());
     drop(lease);
     let mut resumed = Runner::resume(&request.run).unwrap();

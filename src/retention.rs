@@ -21,6 +21,7 @@ use std::{
 #[derive(Debug)]
 pub(crate) struct OutputLease {
     _file: File,
+    _activity: bool,
 }
 
 impl OutputLease {
@@ -81,7 +82,8 @@ impl OutputLease {
             .truncate(false)
             .read(true)
             .write(true)
-            .open(path)?;
+            .open(path)
+            .with_context(|| format!("output lease: open {}", path.display()))?;
         #[cfg(unix)]
         {
             use std::os::fd::AsRawFd;
@@ -93,18 +95,36 @@ impl OutputLease {
             // SAFETY: live file descriptor, no retained pointers.
             ensure!(
                 unsafe { libc::flock(file.as_raw_fd(), mode | libc::LOCK_NB) } == 0,
-                "worktree outputs are in use or being reclaimed"
+                "output lease: outputs are in use or being reclaimed: {}",
+                path.display()
             );
         }
         #[cfg(not(unix))]
         let _ = exclusive;
-        Ok(Self { _file: file })
+        if !exclusive {
+            // Empty legacy/maintenance-only leases carry no activity witness.
+            file.set_len(1)?;
+            file.set_modified(std::time::SystemTime::now())
+                .with_context(|| format!("record output activity {}", path.display()))?;
+        }
+        Ok(Self {
+            _file: file,
+            _activity: !exclusive,
+        })
     }
 }
 #[cfg(unix)]
 impl Drop for OutputLease {
     fn drop(&mut self) {
         use std::os::fd::AsRawFd;
+        if self._activity
+            && let Err(error) = self._file.set_modified(std::time::SystemTime::now())
+        {
+            // If release time cannot be recorded, retain a nonempty invalid
+            // witness rather than trusting the old acquisition timestamp.
+            let _ = self._file.set_len(2);
+            tracing::warn!("could not record output lease release activity: {error}");
+        }
         // SAFETY: unlock this guard's live descriptor, including inherited copies.
         unsafe {
             libc::flock(self._file.as_raw_fd(), libc::LOCK_UN);
@@ -175,6 +195,10 @@ fn registered_worktrees(state: &RunState, list: &str) -> Result<Vec<PathBuf>> {
 /// Recognize Cargo's generated directory, never merely an ignored directory.
 /// Unknown root entries are retained; cache identity/profile paths fail closed.
 async fn cargo_target(worktree: &Path) -> Result<PathBuf> {
+    validate_cargo_target(worktree, false).await
+}
+
+async fn validate_cargo_target(worktree: &Path, allow_missing_tag: bool) -> Result<PathBuf> {
     let target = worktree.join("target");
     ensure!(plain_dir(&target), "target absent or not a plain directory");
     ensure!(target.canonicalize()? == target, "target path changed");
@@ -190,36 +214,158 @@ async fn cargo_target(worktree: &Path) -> Result<PathBuf> {
             .ok(),
         "target is not ignored"
     );
-    for name in ["CACHEDIR.TAG", ".rustc_info.json"] {
-        let path = target.join(name);
-        ensure!(
-            std::fs::symlink_metadata(&path)?.is_file() && path.canonicalize()? == path,
-            "cache identity is not a plain file"
-        );
-    }
-    let tag = std::fs::read_to_string(target.join("CACHEDIR.TAG"))?;
-    ensure!(
-        tag.starts_with("Signature: 8a477f597d28d172789f06886806bc55"),
-        "unknown Cargo cache tag"
-    );
-    let info: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(target.join(".rustc_info.json"))?)?;
+    cache_tag(&target, allow_missing_tag)?;
+    let path = target.join(".rustc_info.json");
+    plain_file(&path, "rustc identity")?;
+    let info: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&path).with_context(|| format!("read rustc identity {}", path.display()))?,
+    )
+    .with_context(|| format!("parse rustc identity {}", path.display()))?;
     ensure!(
         info.get("rustc_fingerprint").is_some(),
-        "unknown Cargo identity"
+        "unknown Cargo identity {}",
+        path.display()
     );
+    if allow_missing_tag && !target.join("CACHEDIR.TAG").exists() {
+        ensure!(
+            info.get("rustc_fingerprint")
+                .is_some_and(serde_json::Value::is_u64)
+                && info
+                    .get("outputs")
+                    .and_then(serde_json::Value::as_object)
+                    .is_some_and(|outputs| outputs.values().any(|output| {
+                        output.get("success").and_then(serde_json::Value::as_bool) == Some(true)
+                            && output
+                                .get("stdout")
+                                .and_then(serde_json::Value::as_str)
+                                .is_some_and(|stdout| stdout.starts_with("rustc "))
+                            && output
+                                .get("stderr")
+                                .is_some_and(serde_json::Value::is_string)
+                    }))
+                && info
+                    .get("successes")
+                    .is_some_and(serde_json::Value::is_object),
+            "missing-tag rustc identity structure invalid: {}",
+            path.display()
+        );
+        let mut profiles = 0;
+        for profile in ["debug", "release"] {
+            let dir = target.join(profile);
+            if !dir.exists() {
+                continue;
+            }
+            for subdir in [dir.clone(), dir.join("deps"), dir.join(".fingerprint")] {
+                ensure!(
+                    plain_dir(&subdir) && subdir.canonicalize()? == subdir,
+                    "missing-tag profile proof: {} is not a plain directory",
+                    subdir.display()
+                );
+            }
+            plain_file(&dir.join(".cargo-lock"), "missing-tag Cargo lock")?;
+            profiles += 1;
+        }
+        ensure!(
+            profiles > 0,
+            "missing-tag proof: no Cargo profile in {}",
+            target.display()
+        );
+    }
     for name in ["debug", "release"] {
         let path = target.join(name);
         match std::fs::symlink_metadata(&path) {
             Ok(metadata) => ensure!(
                 metadata.is_dir() && path.canonicalize()? == path,
-                "profile is not a plain directory"
+                "profile validation: not a plain directory: {}",
+                path.display()
             ),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error).with_context(|| format!("inspect profile {name}")),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("profile validation: inspect {}", path.display()));
+            }
         }
     }
     Ok(target)
+}
+
+fn plain_file(path: &Path, stage: &str) -> Result<()> {
+    let meta = std::fs::symlink_metadata(path)
+        .with_context(|| format!("{stage}: inspect {}", path.display()))?;
+    ensure!(
+        meta.is_file() && path.canonicalize()? == path,
+        "{stage}: not a plain file: {}",
+        path.display()
+    );
+    Ok(())
+}
+
+fn cache_tag(target: &Path, allow_missing: bool) -> Result<()> {
+    let path = target.join("CACHEDIR.TAG");
+    match std::fs::symlink_metadata(&path) {
+        Err(error) if allow_missing && error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(());
+        }
+        result => {
+            result.with_context(|| format!("cache tag: inspect {}", path.display()))?;
+        }
+    }
+    plain_file(&path, "cache tag")?;
+    let tag = std::fs::read_to_string(&path)
+        .with_context(|| format!("cache tag: read {}", path.display()))?;
+    ensure!(
+        tag.starts_with("Signature: 8a477f597d28d172789f06886806bc55"),
+        "unknown Cargo cache tag: {}",
+        path.display()
+    );
+    Ok(())
+}
+
+/// Observe compiler metadata and artifacts under the output and Cargo locks.
+/// Unknown contents never become deletion authority. Unreadable timestamps or
+/// a future timestamp retain outputs, even when the configured grace is zero.
+fn output_age(target: &Path, now: Timestamp, grace: u64) -> Result<()> {
+    let mut dirs = vec![target.to_owned()];
+    let mut entries = 0;
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir)
+            .with_context(|| format!("output activity: list {}", dir.display()))?
+        {
+            let path = entry?.path();
+            entries += 1;
+            ensure!(
+                entries <= 100_000,
+                "output activity inventory too large: {}",
+                target.display()
+            );
+            let metadata = std::fs::symlink_metadata(&path)
+                .with_context(|| format!("output activity: inspect {}", path.display()))?;
+            if metadata.is_dir() {
+                // Only supported Cargo profiles supply execution evidence.
+                if dir != target
+                    || matches!(
+                        path.file_name().and_then(|s| s.to_str()),
+                        Some("debug" | "release")
+                    )
+                {
+                    dirs.push(path);
+                }
+            } else if metadata.is_file()
+                && (dir != target || path.file_name().is_some_and(|n| n == ".rustc_info.json"))
+            {
+                let at =
+                    Timestamp::try_from(metadata.modified().with_context(|| {
+                        format!("output activity: modified {}", path.display())
+                    })?)?;
+                ensure!(
+                    crate::clean::due(now, at, grace),
+                    "output activity within grace period: {} modified {at} (now {now}, grace {grace}s)",
+                    path.display()
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn artifact_signature(path: &Path) -> Result<bool> {
@@ -404,6 +550,7 @@ fn residue_root(target: &Path) -> Result<()> {
 }
 
 fn record_residue(home: &Path, id: &str, target: &Path, outputs: &[PathBuf]) -> Result<()> {
+    cache_tag(target, false)?;
     residue_root(target)?;
     let files = residue_files(target, outputs)?;
     for (relative, body) in &files {
@@ -457,15 +604,25 @@ pub(crate) async fn verify_residue(home: &Path, id: &str, worktree: &Path) -> Re
 /// Supplemental exclusion for Cargo builds launched outside the managed seats.
 pub(crate) fn cargo_locks(target: &Path) -> Result<Vec<File>> {
     let mut held = Vec::new();
-    for profile in ["debug", "release"] {
-        let lock = target.join(profile).join(".cargo-lock");
-        if lock.exists() {
-            ensure!(
-                std::fs::symlink_metadata(&lock)?.is_file() && lock.canonicalize()? == lock,
-                "Cargo lock is not a plain file"
-            );
-            let file = OpenOptions::new().read(true).write(true).open(lock)?;
-            crate::pr_head::try_lock_file(&file).context("Cargo build is active")?;
+    for (profile, name) in ["debug", "release"].into_iter().flat_map(|profile| {
+        [".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock"].map(|name| (profile, name))
+    }) {
+        let lock = target.join(profile).join(name);
+        match std::fs::symlink_metadata(&lock) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            result => {
+                result.with_context(|| format!("Cargo lock: inspect {}", lock.display()))?;
+            }
+        }
+        {
+            plain_file(&lock, "Cargo lock")?;
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&lock)
+                .with_context(|| format!("Cargo lock: open {}", lock.display()))?;
+            crate::pr_head::try_lock_file(&file)
+                .with_context(|| format!("Cargo build is active: {}", lock.display()))?;
             held.push(file);
         }
     }
@@ -593,7 +750,7 @@ async fn sweep_inner(home: &Path, disk: &crate::config::Disk, now: Timestamp) ->
             }
             let size = measurement.bytes;
             report.measured_bytes = report.measured_bytes.saturating_add(size);
-            targets.push((state.updated_at, id.clone(), path, size));
+            targets.push((state.output_activity(), id.clone(), path, size));
         }
     }
     if under_pressure {
@@ -623,7 +780,7 @@ async fn sweep_inner(home: &Path, disk: &crate::config::Disk, now: Timestamp) ->
         let result = async {
             ensure!(
                 crate::clean::due(now, updated, disk.fold_grace_secs),
-                "within grace period"
+                "execution activity within grace period: {updated} (now {now}, grace {}s)", disk.fold_grace_secs
             );
             let _owner = crate::pr_head::owner_lock(home, &id)?;
             let state = RunState::load_under(&id, home)?;
@@ -632,19 +789,36 @@ async fn sweep_inner(home: &Path, disk: &crate::config::Disk, now: Timestamp) ->
                     == Liveness::Dead,
                 "run live or ownership unknown"
             );
-            ensure!(crate::clean::due(now, state.updated_at, disk.fold_grace_secs), "recently used after inventory");
+            ensure!(crate::clean::due(now, state.output_activity(), disk.fold_grace_secs), "execution activity after inventory: {}", state.output_activity());
             let _driver = crate::driver::maintenance(home, &id)?;
             let _outputs = OutputLease::take(&path, true)?;
             ensure!(
                 worktrees(&state).await?.contains(&path),
                 "worktree registration changed"
             );
-            let target = cargo_target(&path).await?;
-            let _cargo = cargo_locks(&target)?;
-            let outputs = declared_outputs(&target)?;
+            let target = validate_cargo_target(&path, true).await
+                .with_context(|| format!("stage validate-target: {}", path.join("target").display()))?;
+            let _cargo = cargo_locks(&target)
+                .with_context(|| format!("stage cargo-locks: {}", target.display()))?;
+            // Cargo may have finished between identity inspection and locking.
+            // Revalidate the same authority with all writers excluded.
+            validate_cargo_target(&path, true).await
+                .with_context(|| format!("stage validate-target (locked): {}", target.display()))?;
+            let lease_meta = _outputs._file.metadata().context("output lease activity: metadata")?;
+            if lease_meta.len() > 0 {
+                ensure!(lease_meta.len() == 1, "output lease activity witness is unreadable or incomplete for {}", path.display());
+                let lease_at = Timestamp::try_from(lease_meta.modified().context("output lease activity: modified")?)?;
+                ensure!(crate::clean::due(now, lease_at, disk.fold_grace_secs),
+                    "output lease activity within grace period: {lease_at} (now {now}, grace {}s)", disk.fold_grace_secs);
+            }
+            output_age(&target, now, disk.fold_grace_secs)
+                .with_context(|| format!("stage output-age: {}", target.display()))?;
+            let outputs = declared_outputs(&target)
+                .with_context(|| format!("stage declared-outputs: {}", target.display()))?;
             ensure!(!outputs.is_empty(), "no dep-info-proven outputs; unknown files retained");
-            let sizes = outputs.iter().map(|p| std::fs::metadata(p).map(|m| m.len()))
-                .collect::<std::io::Result<Vec<_>>>()?;
+            let sizes = outputs.iter().map(|p| std::fs::metadata(p).map(|m| m.len())
+                .with_context(|| format!("stage measure: {}", p.display())))
+                .collect::<Result<Vec<_>>>()?;
             let current_size = sizes.iter().fold(0u64, |bytes, size| bytes.saturating_add(*size));
             let exceeds_budget = current_size > disk.worktree_reclaim_bytes.saturating_sub(report.freed_bytes);
             // 予算は1回の削除量を抑えるもので、大きな出力を永久に保持するためではない。
@@ -656,11 +830,11 @@ async fn sweep_inner(home: &Path, disk: &crate::config::Disk, now: Timestamp) ->
             // on the next pass. No source file or branch is modified.
             let ledger = home.join("runs").join(&id).join("build-outputs.json");
             std::fs::write(
-                ledger,
+                &ledger,
                 serde_json::to_vec(
-                    &serde_json::json!({"target":target,"bytes":current_size,"at":now,"action":"reclaim-declared-outputs","files":outputs}),
+                    &serde_json::json!({"target":target,"bytes":current_size,"at":now,"action":"reclaim-declared-outputs","identity":if target.join("CACHEDIR.TAG").exists() { "cache-tag" } else { "rustc-profile-dep-info" },"files":outputs}),
                 )?,
-            )?;
+            ).with_context(|| format!("stage ledger: {}", ledger.display()))?;
             // Unknown leftovers still permit artifact-only eviction, but never
             // authorize retirement. Only a complete proven residue is adopted.
             if let Err(error) = record_residue(home, &id, &target, &outputs) {
@@ -670,7 +844,7 @@ async fn sweep_inner(home: &Path, disk: &crate::config::Disk, now: Timestamp) ->
             oversized_started = exceeds_budget;
             measurements.remove(&target);
             for (output, size) in outputs.iter().zip(sizes) {
-                std::fs::remove_file(output)?;
+                std::fs::remove_file(output).with_context(|| format!("stage remove: {}", output.display()))?;
                 // Preserve actual progress even if a later removal fails.
                 report.freed_bytes = report.freed_bytes.saturating_add(size);
                 remaining = remaining.saturating_sub(size);
@@ -1338,6 +1512,15 @@ mod tests {
 
     #[tokio::test]
     async fn sweep_reclaims_real_cargo_outputs_and_preserves_source_and_unknown_files() {
+        real_cargo_fixture(false).await;
+    }
+
+    #[tokio::test]
+    async fn missing_tag_from_precreated_target_reclaims_only_real_cargo_artifacts() {
+        real_cargo_fixture(true).await;
+    }
+
+    async fn real_cargo_fixture(precreate: bool) {
         let f = Fx::new().await;
         let state = f.run("ca00", true).await;
         let wt = &state.candidates[0].worktree;
@@ -1349,6 +1532,9 @@ mod tests {
             "[package]\nname = \"retained-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[workspace]\n",
         )
         .unwrap();
+        if precreate {
+            std::fs::create_dir_all(wt.join("target/magi-tools")).unwrap();
+        }
         let mut cargo = std::process::Command::new("cargo");
         cargo.env_clear();
         for key in ["PATH", "HOME", "RUSTUP_HOME"] {
@@ -1377,6 +1563,18 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&build.stderr)
         );
+        assert_eq!(wt.join("target/CACHEDIR.TAG").exists(), !precreate);
+        if precreate {
+            // Cargo leaves pre-existing target roots untagged on subsequent builds too.
+            let again = cargo.output().unwrap();
+            assert!(
+                again.status.success(),
+                "{}",
+                String::from_utf8_lossy(&again.stderr)
+            );
+            assert!(!wt.join("target/CACHEDIR.TAG").exists());
+            assert!(cargo_target(wt).await.is_err());
+        }
         git::git(wt, &["add", "Cargo.toml", "Cargo.lock", "src"])
             .await
             .unwrap();
@@ -1441,6 +1639,18 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+        assert_eq!(
+            ledger["identity"],
+            if precreate {
+                "rustc-profile-dep-info"
+            } else {
+                "cache-tag"
+            }
+        );
+        if precreate {
+            assert!(!target.join("CACHEDIR.TAG").exists());
+            assert!(verify_residue(&f.home, &state.id, wt).await.is_err());
+        }
         let deleted: Vec<PathBuf> = serde_json::from_value(ledger["files"].clone()).unwrap();
         assert!(deleted.contains(&artifact));
         assert_eq!(deleted, proven);
@@ -1452,6 +1662,235 @@ mod tests {
             );
         }
         assert!(!residue_proof(&f.home, &state.id, wt).unwrap().exists());
+    }
+
+    fn missing_tag_target(wt: &Path) {
+        Fx::target(wt);
+        let target = wt.join("target");
+        std::fs::remove_file(target.join("CACHEDIR.TAG")).unwrap();
+        for subdir in ["debug/deps", "debug/.fingerprint"] {
+            std::fs::create_dir_all(target.join(subdir)).unwrap();
+        }
+        std::fs::write(target.join(".rustc_info.json"),
+            r#"{"rustc_fingerprint":123,"outputs":{"1":{"success":true,"stdout":"rustc fixture","stderr":""}},"successes":{}}"#).unwrap();
+    }
+
+    #[tokio::test]
+    async fn bookkeeping_flushes_do_not_extend_artifact_grace_including_legacy_records() {
+        for legacy in [false, true] {
+            let f = Fx::new().await;
+            let mut state = f.run("ac00", true).await;
+            Fx::target(&state.candidates[0].worktree);
+            let original = state.updated_at;
+            let now = Fx::now() + jiff::SignedDuration::from_secs(7200);
+            if legacy {
+                let path = f.home.join("runs").join(&state.id).join("run.json");
+                let mut value = serde_json::to_value(&state).unwrap();
+                value.as_object_mut().unwrap().remove("output_activity_at");
+                std::fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+                state = RunState::load_under(&state.id, &f.home).unwrap();
+                assert_eq!(state.output_activity(), original);
+            }
+            let age = state.output_activity();
+            for offset in [30, 20, 10] {
+                state
+                    .save_under_at(&f.home, now - jiff::SignedDuration::from_secs(offset))
+                    .unwrap();
+                state = RunState::load_under(&state.id, &f.home).unwrap();
+                assert_eq!(state.output_activity(), age);
+            }
+            let mut disk = Fx::disk();
+            disk.fold_grace_secs = 3600;
+            let report = sweep(&f.home, &disk, now).await;
+            assert_eq!(report.freed_bytes, 200, "legacy={legacy}: {report:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn recent_execution_outputs_and_released_output_leases_retain_artifacts() {
+        for evidence in [
+            "execution",
+            "artifact",
+            "dep-info",
+            "fingerprint",
+            "lease",
+            "future",
+        ] {
+            let f = Fx::new().await;
+            let mut state = f.run("ac01", true).await;
+            let wt = state.candidates[0].worktree.clone();
+            missing_tag_target(&wt);
+            let now = Fx::now() + jiff::SignedDuration::from_secs(7200);
+            let recent = now - jiff::SignedDuration::from_secs(10);
+            match evidence {
+                "execution" => {
+                    state.note_output_activity(recent);
+                    state.save_under_at(&f.home, recent).unwrap();
+                }
+                "lease" => {
+                    let lease = OutputLease::borrow(&wt).unwrap().unwrap();
+                    let file = lease._file.try_clone().unwrap();
+                    drop(lease);
+                    file.set_modified(std::time::SystemTime::from(recent))
+                        .unwrap();
+                }
+                _ => {
+                    let relative = match evidence {
+                        "dep-info" => "debug/output.d",
+                        "fingerprint" => "debug/.fingerprint/invoked.timestamp",
+                        _ => "debug/output",
+                    };
+                    let path = wt.join("target").join(relative);
+                    let file = OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(false)
+                        .open(path)
+                        .unwrap();
+                    let at = if evidence == "future" {
+                        now + jiff::SignedDuration::from_secs(10)
+                    } else {
+                        recent
+                    };
+                    file.set_modified(std::time::SystemTime::from(at)).unwrap();
+                }
+            }
+            let mut disk = Fx::disk();
+            disk.fold_grace_secs = 3600;
+            let report = sweep(&f.home, &disk, now).await;
+            assert_eq!(report.freed_bytes, 0, "{evidence}: {report:?}");
+            assert!(
+                report.retained.iter().any(|s| s.contains("grace period")
+                    || s.contains("execution activity after inventory")),
+                "{evidence}: {report:?}"
+            );
+            let aged = now + jiff::SignedDuration::from_secs(7200);
+            let report = sweep(&f.home, &disk, aged).await;
+            assert_eq!(report.freed_bytes, 200, "{evidence}: {report:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_tag_proof_preserves_locks_unknown_files_and_retirement_boundary() {
+        let f = Fx::new().await;
+        let state = f.run("ac02", true).await;
+        let wt = &state.candidates[0].worktree;
+        missing_tag_target(wt);
+        let target = wt.join("target");
+        let unknown = target.join("debug/notes");
+        std::fs::write(&unknown, "operator data").unwrap();
+        for lock in [".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock"] {
+            let path = target.join("debug").join(lock);
+            let file = OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            crate::pr_head::try_lock_file(&file).unwrap();
+            let report = sweep(&f.home, &Fx::disk(), Fx::now()).await;
+            assert_eq!(report.freed_bytes, 0, "{lock}: {report:?}");
+            assert!(
+                report
+                    .retained
+                    .iter()
+                    .any(|s| s.contains(path.to_str().unwrap())),
+                "{report:?}"
+            );
+        }
+        let owner = crate::pr_head::owner_lock(&f.home, &state.id).unwrap();
+        assert_eq!(sweep(&f.home, &Fx::disk(), Fx::now()).await.freed_bytes, 0);
+        drop(owner);
+        let driver = crate::driver::maintenance(&f.home, &state.id).unwrap();
+        assert_eq!(sweep(&f.home, &Fx::disk(), Fx::now()).await.freed_bytes, 0);
+        drop(driver);
+        let output = OutputLease::borrow(wt).unwrap().unwrap();
+        assert_eq!(sweep(&f.home, &Fx::disk(), Fx::now()).await.freed_bytes, 0);
+        drop(output);
+        let report = sweep(&f.home, &Fx::disk(), Fx::now()).await;
+        assert_eq!(report.freed_bytes, 200, "{report:?}");
+        assert_eq!(std::fs::read_to_string(unknown).unwrap(), "operator data");
+        assert!(!target.join("CACHEDIR.TAG").exists());
+        assert!(!residue_proof(&f.home, &state.id, wt).unwrap().exists());
+        assert!(verify_residue(&f.home, &state.id, wt).await.is_err());
+        assert_eq!(sweep(&f.home, &Fx::disk(), Fx::now()).await.freed_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn missing_tag_partial_reclamation_can_resume_without_adopting_residue() {
+        let f = Fx::new().await;
+        let state = f.run("ac04", true).await;
+        let wt = &state.candidates[0].worktree;
+        missing_tag_target(wt);
+        let target = wt.join("target");
+        let first = target.join("debug/output");
+        let second = target.join("debug/second");
+        std::fs::copy(&first, &second).unwrap();
+        std::fs::write(
+            second.with_extension("d"),
+            format!("{}: source\n", second.display()),
+        )
+        .unwrap();
+        let outputs = declared_outputs(&target).unwrap();
+        assert_eq!(outputs.len(), 2);
+        // Simulate interruption after durable adoption and one successful unlink.
+        std::fs::write(f.home.join("runs").join(&state.id).join("build-outputs.json"),
+            serde_json::to_vec(&serde_json::json!({"target":target,"files":outputs,"action":"reclaim-declared-outputs"})).unwrap()).unwrap();
+        std::fs::remove_file(first).unwrap();
+        let report = sweep(&f.home, &Fx::disk(), Fx::now()).await;
+        assert_eq!(report.freed_bytes, 200, "{report:?}");
+        assert!(!second.exists());
+        assert!(second.with_extension("d").exists());
+        assert!(!residue_proof(&f.home, &state.id, wt).unwrap().exists());
+    }
+
+    #[tokio::test]
+    async fn missing_tag_proof_rejects_invalid_identity_structure_and_symlinks() {
+        for invalid in [
+            "identity",
+            "deps",
+            "fingerprint",
+            "lock",
+            "dep-info",
+            "tag-symlink",
+            "bad-tag",
+        ] {
+            let f = Fx::new().await;
+            let state = f.run("ac03", true).await;
+            let wt = &state.candidates[0].worktree;
+            missing_tag_target(wt);
+            let target = wt.join("target");
+            match invalid {
+                "identity" => std::fs::write(
+                    target.join(".rustc_info.json"),
+                    r#"{"rustc_fingerprint":123}"#,
+                )
+                .unwrap(),
+                "deps" | "fingerprint" => {
+                    let path = target.join("debug").join(if invalid == "deps" {
+                        "deps"
+                    } else {
+                        ".fingerprint"
+                    });
+                    std::fs::remove_dir(&path).unwrap();
+                    std::os::unix::fs::symlink(&f.repo, path).unwrap();
+                }
+                "lock" => {
+                    std::fs::remove_file(target.join("debug/.cargo-lock")).unwrap();
+                }
+                "dep-info" => std::fs::write(target.join("debug/output.d"), "").unwrap(),
+                "tag-symlink" => {
+                    std::os::unix::fs::symlink(target.join("absent"), target.join("CACHEDIR.TAG"))
+                        .unwrap()
+                }
+                "bad-tag" => std::fs::write(target.join("CACHEDIR.TAG"), "unknown").unwrap(),
+                _ => unreachable!(),
+            }
+            let report = sweep(&f.home, &Fx::disk(), Fx::now()).await;
+            assert_eq!(report.freed_bytes, 0, "{invalid}: {report:?}");
+            assert!(target.join("debug/output").is_file());
+        }
     }
 
     #[tokio::test]

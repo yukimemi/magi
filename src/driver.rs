@@ -178,6 +178,7 @@ impl DriverGuard {
 }
 
 fn clear(state: &mut RunState) {
+    state.note_output_activity(jiff::Timestamp::now());
     state.driver_pid = None;
     state.driver_started_at = None;
     state.driver_exited = true;
@@ -337,8 +338,11 @@ mod tests {
                 assert!(DriverGuard::acquire(home.path(), &s).is_err());
                 s.status = status;
                 s.parked = parked;
+                let activity_before = s.output_activity();
                 guard.finish(&mut s).await.unwrap();
                 let disk = RunState::load_under(&s.id, home.path()).unwrap();
+                assert!(disk.output_activity() >= activity_before);
+                assert_eq!(disk.output_activity_at, s.output_activity_at);
                 assert_eq!(disk.status, status);
                 assert_eq!(disk.parked, parked);
                 assert!(disk.driver_exited);
@@ -346,6 +350,26 @@ mod tests {
                 assert_eq!(disk.liveness_under(home.path(), false), Liveness::Dead);
             }
         }
+    }
+
+    #[test]
+    fn driver_completion_and_recovery_advance_artifact_activity_once() {
+        let home = tempfile::tempdir().unwrap();
+        let mut s = state(home.path());
+        let old = jiff::Timestamp::now() - jiff::SignedDuration::from_secs(7200);
+        s.output_activity_at = Some(old);
+        s.passes.clear();
+        clear(&mut s);
+        assert!(s.output_activity() > old);
+        let finished = s.output_activity();
+        s.save_under(home.path()).unwrap();
+        s.save_under(home.path()).unwrap();
+        assert_eq!(
+            RunState::load_under(&s.id, home.path())
+                .unwrap()
+                .output_activity(),
+            finished
+        );
     }
 
     #[test]
