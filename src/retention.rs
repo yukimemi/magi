@@ -797,12 +797,13 @@ async fn sweep_inner(home: &Path, disk: &crate::config::Disk, now: Timestamp) ->
                 "worktree registration changed"
             );
             let target = validate_cargo_target(&path, true).await
-                .with_context(|| format!("validate Cargo target {}", path.join("target").display()))?;
-            let _cargo = cargo_locks(&target)?;
+                .with_context(|| format!("stage validate-target: {}", path.join("target").display()))?;
+            let _cargo = cargo_locks(&target)
+                .with_context(|| format!("stage cargo-locks: {}", target.display()))?;
             // Cargo may have finished between identity inspection and locking.
             // Revalidate the same authority with all writers excluded.
             validate_cargo_target(&path, true).await
-                .with_context(|| format!("validate locked Cargo target {}", target.display()))?;
+                .with_context(|| format!("stage validate-target (locked): {}", target.display()))?;
             let lease_meta = _outputs._file.metadata().context("output lease activity: metadata")?;
             if lease_meta.len() > 0 {
                 ensure!(lease_meta.len() == 1, "output lease activity witness is unreadable or incomplete for {}", path.display());
@@ -810,12 +811,13 @@ async fn sweep_inner(home: &Path, disk: &crate::config::Disk, now: Timestamp) ->
                 ensure!(crate::clean::due(now, lease_at, disk.fold_grace_secs),
                     "output lease activity within grace period: {lease_at} (now {now}, grace {}s)", disk.fold_grace_secs);
             }
-            output_age(&target, now, disk.fold_grace_secs)?;
+            output_age(&target, now, disk.fold_grace_secs)
+                .with_context(|| format!("stage output-age: {}", target.display()))?;
             let outputs = declared_outputs(&target)
-                .with_context(|| format!("dep-info artifact validation {}", target.display()))?;
+                .with_context(|| format!("stage declared-outputs: {}", target.display()))?;
             ensure!(!outputs.is_empty(), "no dep-info-proven outputs; unknown files retained");
             let sizes = outputs.iter().map(|p| std::fs::metadata(p).map(|m| m.len())
-                .with_context(|| format!("measure proven artifact {}", p.display())))
+                .with_context(|| format!("stage measure: {}", p.display())))
                 .collect::<Result<Vec<_>>>()?;
             let current_size = sizes.iter().fold(0u64, |bytes, size| bytes.saturating_add(*size));
             let exceeds_budget = current_size > disk.worktree_reclaim_bytes.saturating_sub(report.freed_bytes);
@@ -832,7 +834,7 @@ async fn sweep_inner(home: &Path, disk: &crate::config::Disk, now: Timestamp) ->
                 serde_json::to_vec(
                     &serde_json::json!({"target":target,"bytes":current_size,"at":now,"action":"reclaim-declared-outputs","identity":if target.join("CACHEDIR.TAG").exists() { "cache-tag" } else { "rustc-profile-dep-info" },"files":outputs}),
                 )?,
-            ).with_context(|| format!("record reclamation ledger {}", ledger.display()))?;
+            ).with_context(|| format!("stage ledger: {}", ledger.display()))?;
             // Unknown leftovers still permit artifact-only eviction, but never
             // authorize retirement. Only a complete proven residue is adopted.
             if let Err(error) = record_residue(home, &id, &target, &outputs) {
@@ -842,7 +844,7 @@ async fn sweep_inner(home: &Path, disk: &crate::config::Disk, now: Timestamp) ->
             oversized_started = exceeds_budget;
             measurements.remove(&target);
             for (output, size) in outputs.iter().zip(sizes) {
-                std::fs::remove_file(output).with_context(|| format!("remove proven artifact {}", output.display()))?;
+                std::fs::remove_file(output).with_context(|| format!("stage remove: {}", output.display()))?;
                 // Preserve actual progress even if a later removal fails.
                 report.freed_bytes = report.freed_bytes.saturating_add(size);
                 remaining = remaining.saturating_sub(size);
