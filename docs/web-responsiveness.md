@@ -394,3 +394,44 @@ RUSTUP_TOOLCHAIN=stable cargo test --locked --lib -- --exact web::tests::questio
 会話の削除や質問の終了を検証する。共有索引の初回構築・メタデータ照合と、
 参照先の会話本文の読み込みは出所の節に残る。この追加修正後のブラウザー実測値は
 取得しておらず、第1ラウンドの計測表を更新後の値として流用していない。
+
+## Live run progress
+
+Run cards and task history share a compact activity description from
+`src/run_progress.rs`. The run's pulse above the detail tabs adds independent
+phase evidence, active seats/tasks, recorded review rounds, and three recent
+records. A phase's position never proves earlier phases succeeded. Recorded
+review rounds retain panel completeness and distinguish deferred verification,
+resource blocks and failures. In-flight round numbers are not guessed.
+
+SSE remains the primary update path. Valid run deltas for unrelated IDs no
+longer reload the open run; queue and question changes still refresh operation
+evidence. A visible, nonterminal detail also observes `/api/runs/{id}/progress`
+every 30 seconds using the health timer, and on reconnect/wake. This small
+response checks driver liveness even when no run file changed. It never replaces
+the detail snapshot used by controls. A changed record returns through the
+existing paired core/evidence loader. Requests coalesce, expire after 15 seconds,
+and reject observations overtaken by navigation or a newer detail request.
+
+Clocks mutate text only. Phase, seat, round and recent-event rows retain stable
+DOM identities; the pipeline keeps its expansion state and focus. The UI never
+auto-scrolls, estimates completion, or uses a repeating animation as liveness.
+Only arriving records briefly highlight, with reduced-motion support. Connection,
+driver confirmation and observation age are separate from time since the latest
+record; a quiet event stream alone does not mean a dead driver.
+
+Focused checks:
+
+```sh
+node --test tests/web_run_progress.mjs tests/web_progressive.mjs
+RUSTUP_TOOLCHAIN=stable cargo test --locked --lib run_progress::
+RUSTUP_TOOLCHAIN=stable cargo test --locked --test web_render run_
+```
+
+The Chrome progress scene exercises 320px, 390px and desktop layouts, both
+themes, reduced motion, parallel seats, review rounds, owner waiting, phase
+changes through SSE, terminal states, and observation-only driver exit/recovery.
+Set `MAGI_PROGRESS_EVIDENCE` to a repository-relative directory to retain CDP PNG
+payloads (`*.png.base64`); decode them to PNG to inspect. Captured fixture views:
+[phone](run-progress-evidence/run-progress-390-light.png) and
+[desktop dark theme](run-progress-evidence/run-progress-1280-dark.png).

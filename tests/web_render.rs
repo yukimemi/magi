@@ -245,7 +245,9 @@ async fn serve_with_client_probe(
         ClientProbe::Questions => Some(
             "state, storeReads, loadQuestionOrigins, shortId, renderQuestions, renderAsks, openPanel, closePanel, focusFirstAsk",
         ),
-        ClientProbe::Run => Some("state, loadRun"),
+        ClientProbe::Run => Some(
+            "state, loadRun, observeRunProgress, renderRunProgress, tickActive, applyRevisions_",
+        ),
         ClientProbe::Upgrade => {
             Some("state, upgrade, renderLoop, renderUpgradeError, loadHealth, ok")
         }
@@ -6030,5 +6032,225 @@ async fn run_landing_renders_when_core_precedes_identical_evidence() {
             "landRendered": true,
         })
     );
+    browser.close_page(&page).await;
+}
+
+#[tokio::test]
+async fn run_progress_live_pipeline_observation_and_phone_layout() {
+    let Some(chrome) = cdp::find_chrome() else {
+        assert!(std::env::var_os("CI").is_none(), "Chrome required in CI");
+        eprintln!("SKIP run progress: no Chrome");
+        return;
+    };
+    let guard = common::home_lock().await;
+    let fx = common::fixture(guard, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("magi-home");
+    let mut run = RunState::new(
+        fx.repo.clone(),
+        "main".into(),
+        "0000000".into(),
+        "Make live run activity easy to follow".into(),
+        fx.config.clone(),
+    );
+    run.status = RunStatus::Implementing;
+    run.config.graph.implementers = 2;
+    run.prep_complete = Some(true);
+    run.driver_pid = Some(std::process::id());
+    run.driver_started_at = magi::proc::process_started_at(std::process::id());
+    for key in ["implement-A", "implement-B"] {
+        run.seat_started("implement", key, Duration::from_secs(600), 0);
+    }
+    run.event("implement", "Two independent implementations dispatched");
+    run.save_under(&home).unwrap();
+    let base = serve_with_client_probe(
+        &home,
+        Queue::at(home.join("queue")),
+        Talks::at(home.join("talks")),
+        home.join("runs"),
+        &fx.repo,
+        ClientProbe::Run,
+    )
+    .await;
+    let mut browser = cdp::Browser::launch(&chrome).await.expect("Chrome");
+    for (width, theme) in [(320, "light"), (390, "light"), (1280, "dark")] {
+        let page = browser
+            .open_page(
+                &format!("{base}#/runs/{}", run.id),
+                width,
+                1000,
+                width <= 390,
+            )
+            .await
+            .unwrap();
+        browser.wait_for(&page, "window.deck && deck.state.detail.evidenceError === false && document.querySelectorAll('#progress-seats li').length === 2", Duration::from_secs(30)).await.unwrap();
+        browser
+            .eval(
+                &page,
+                &format!("document.documentElement.dataset.theme = '{theme}'"),
+            )
+            .await
+            .unwrap();
+        let out = browser.eval(&page, r#"(async () => {
+          await deck.loadRun(deck.state.detail.id);
+          const pipeline = document.getElementById('progress-pipeline');
+          const summary = pipeline.querySelector('summary');
+          const row = document.querySelector('#progress-seats li');
+          const phase = document.querySelector('#progress-phases li');
+          const clock = row.querySelector('[data-progress-start]');
+          const progress = document.getElementById('run-progress');
+          const noOverflow = progress.scrollWidth <= progress.clientWidth + 1;
+          const actual = document.getElementById('progress-activity').textContent;
+          pipeline.open = false; summary.focus({preventScroll: true});
+          const top = summary.getBoundingClientRect().top;
+          deck.tickActive();
+          await deck.observeRunProgress(true);
+          const retained = document.querySelector('#progress-seats li') === row
+            && document.querySelector('#progress-phases li') === phase
+            && row.querySelector('[data-progress-start]') === clock;
+          const stable = !pipeline.open && document.activeElement === summary
+            && Math.abs(summary.getBoundingClientRect().top - top) < 1;
+          pipeline.open = true;
+          return {noOverflow, parallel: actual.includes('implement-A') && actual.includes('implement-B'),
+            retained, stable, observed: !!deck.state.detail.progressObservedAt,
+            complete: document.querySelector('#progress-phases li').dataset.state === 'complete'};
+        })()"#).await.unwrap();
+        assert_eq!(
+            out,
+            serde_json::json!({"noOverflow": true, "parallel": true, "retained": true, "stable": true, "observed": true, "complete": true}),
+            "{width}px"
+        );
+        browser.call(Some(&page.session), "Emulation.setEmulatedMedia", serde_json::json!({"features": [{"name": "prefers-reduced-motion", "value": "reduce"}]})).await.unwrap();
+        assert_eq!(
+            browser
+                .eval(
+                    &page,
+                    "getComputedStyle(document.querySelector('#progress-recent li')).animationName"
+                )
+                .await
+                .unwrap(),
+            "none"
+        );
+        if let Ok(dir) = std::env::var("MAGI_PROGRESS_EVIDENCE") {
+            std::fs::create_dir_all(&dir).unwrap();
+            let shot = browser
+                .call(
+                    Some(&page.session),
+                    "Page.captureScreenshot",
+                    serde_json::json!({"format": "png", "captureBeyondViewport": true}),
+                )
+                .await
+                .unwrap();
+            std::fs::write(
+                std::path::Path::new(&dir).join(format!("run-progress-{width}-{theme}.png.base64")),
+                shot["data"].as_str().unwrap(),
+            )
+            .unwrap();
+        }
+        // Prove a fresh process observation does not mutate the run's control evidence.
+        let out = browser.eval(&page, r#"(async () => {
+          const original = window.fetch;
+          const evidence = deck.state.detail.run;
+          window.fetch = async (...args) => {
+            const response = await original(...args);
+            if (!String(args[0]).endsWith('/progress')) return response;
+            const data = await response.json(); data.live = 'dead';
+            data.progress.activity = 'Driver exited · work preserved';
+            data.progress.phases.forEach(p => { if (p.state === 'current') p.state = 'paused'; });
+            return new Response(JSON.stringify(data), {status: 200, headers: {'content-type': 'application/json'}});
+          };
+          await deck.observeRunProgress(true);
+          const exited = document.getElementById('progress-activity').textContent.includes('Driver exited');
+          const unchangedEvidence = evidence === deck.state.detail.run && evidence.live === 'live';
+          const paused = !!document.querySelector('#progress-phases [data-state="paused"]');
+          window.fetch = original;
+          await deck.observeRunProgress(true);
+          return {exited, unchangedEvidence, paused,
+            recovered: document.getElementById('progress-activity').textContent.includes('implement-A')};
+        })()"#).await.unwrap();
+        assert_eq!(
+            out,
+            serde_json::json!({"exited": true, "unchangedEvidence": true, "paused": true, "recovered": true})
+        );
+        browser.close_page(&page).await;
+    }
+    let page = browser
+        .open_page(&format!("{base}#/runs/{}", run.id), 390, 844, true)
+        .await
+        .unwrap();
+    browser
+        .wait_for(
+            &page,
+            "window.deck && deck.state.detail.evidenceError === false",
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+    // The production SSE revision must carry the changed phase without navigation.
+    run.active.clear();
+    run.status = RunStatus::Reviewing;
+    run.seat_started("review", "review-1", Duration::from_secs(600), 0);
+    run.reviews = vec![1, 2]
+        .into_iter()
+        .map(|round| {
+            serde_json::from_value(serde_json::json!({
+                "round": round, "head": "abc", "reviews": [], "expected": 3, "answered": 1,
+                "e2e_deferred": true
+            }))
+            .unwrap()
+        })
+        .collect();
+    run.event("review", "Review panel dispatched");
+    run.save_under(&home).unwrap();
+    browser.wait_for(&page, "document.getElementById('progress-activity').textContent.includes('review-1') && document.querySelectorAll('#progress-seats li').length === 1", Duration::from_secs(30)).await.unwrap();
+    assert_eq!(
+        browser
+            .eval(
+                &page,
+                "document.querySelectorAll('#progress-rounds li').length"
+            )
+            .await
+            .unwrap(),
+        2
+    );
+    assert_eq!(browser.eval(&page, "document.getElementById('progress-rounds').textContent.includes('1/3 reviewers answered') && document.getElementById('progress-rounds').textContent.includes('verification deferred') && !document.getElementById('progress-activity').textContent.includes('round 3')").await.unwrap(), true);
+    let questions = magi::ask::Questions::at(home.join("questions"));
+    let mut question = magi::ask::Question::new(
+        run.id.clone(),
+        "review".into(),
+        "review-1".into(),
+        "Choose a direction".into(),
+        "Owner input needed".into(),
+        vec![],
+    );
+    questions.put(&mut question).unwrap();
+    browser.wait_for(&page, "document.getElementById('progress-activity').textContent === 'Waiting for your answer'", Duration::from_secs(30)).await.unwrap();
+    question.status = magi::ask::QuestionStatus::Abandoned;
+    questions.put(&mut question).unwrap();
+    run.active.clear();
+    run.status = RunStatus::Blocked;
+    run.event("review", "Review stopped with unresolved findings");
+    run.save_under(&home).unwrap();
+    browser
+        .wait_for(
+            &page,
+            "document.getElementById('progress-activity').textContent === 'blocked'",
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        browser
+            .eval(
+                &page,
+                "document.querySelectorAll('#progress-seats li').length"
+            )
+            .await
+            .unwrap(),
+        0
+    );
+    run.status = RunStatus::Merged;
+    run.event("merge", "Merge confirmed");
+    run.save_under(&home).unwrap();
+    browser.wait_for(&page, "document.getElementById('progress-activity').textContent === 'merged' && !!document.querySelector('#progress-phases li:last-child[data-state=\"complete\"]')", Duration::from_secs(30)).await.unwrap();
     browser.close_page(&page).await;
 }
