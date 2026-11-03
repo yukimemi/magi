@@ -10276,7 +10276,10 @@ async function loadHealthOnce({ applyRevisions = false, explicit = false } = {})
     /* health.questions_needs_owner is the count until /api/questions has
        answered, so the indicator is right on the very first paint. */
     renderAskBar();
-    if (applyRevisions) await applyRevisions_(state.health);
+    // Related reads may remain pending independently of a healthy server.
+    // Do not let them hold the health flight and block future polls or Retry.
+    if (applyRevisions) applyRevisions_(health).catch(error =>
+      failBackground(`Could not refresh data: ${error.message}`, error));
     resetUnreachable();
     ok();
   } catch (error) {

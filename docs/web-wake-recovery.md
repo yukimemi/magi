@@ -110,3 +110,28 @@ Clippy が成功した。全体テストと最終 gate は親グラフが担当�
 追加後の確認では `node --test tests/web*progressive.mjs` の 83 件と、
 `RUSTUP_TOOLCHAIN=stable cargo test --locked --test web_render sleeping_reference_backlog_stays_bounded -- --nocapture`
 の 1 件が成功した。全体テストと最終 gate は親グラフが担当する。
+
+
+## 関連取得の保留と health 復旧
+
+health 取得後の revision 更新には、通知や会話などの独立した要求が含まれる。
+この完了まで health flight を保持すると、関連要求だけが止まっている場合にも、
+定期確認・復帰・Retry が新しい health を取得できなくなる。health 用の 15 秒の
+タイムアウトは、その関連要求を中止するものではない。
+
+health flight は health の取得と適用までで解放し、revision 更新は独立して進める。
+各ローダーの既存のエラー処理を維持し、revision 更新自体の例外にも背景更新の
+エラー処理を付ける。health の成功は関連要求の完了を意味しない。
+
+追加のブラウザ回帰テストは、変更された notifications revision を返し、
+実際の `/api/notifications` 要求を保留する。その間に最初の health 確認、
+定期確認相当の再取得、復帰、明示的な Retry が完了し、4 回の health 取得が
+進むことを検証する。通知要求は 1 回のまま保留され、解放後には通知も反映される。
+
+```sh
+RUSTUP_TOOLCHAIN=stable cargo test --locked --test web_render health_recovery_continues_while_revision_loader_is_pending -- --nocapture
+```
+
+修正前の追加テストでは health 要求数は 1、四つの確認はすべて未完了だった。
+修正後は通知要求数を 1 に保ったまま health 要求数が 4 となり、四つとも完了した。
+この修正の検証では JavaScript 83 件、対象ブラウザテスト 3 件が成功した。

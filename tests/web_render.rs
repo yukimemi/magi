@@ -6509,3 +6509,84 @@ async fn sleeping_reference_backlog_stays_bounded() {
     );
     browser.close_page(&page).await;
 }
+
+#[tokio::test]
+async fn health_recovery_continues_while_revision_loader_is_pending() {
+    let Some(chrome) = cdp::find_chrome() else {
+        assert!(std::env::var_os("CI").is_none(), "Chrome required in CI");
+        eprintln!("SKIP held revision recovery: no Chrome");
+        return;
+    };
+    let guard = common::home_lock().await;
+    let fx = common::fixture(guard, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("magi-home");
+    let base = serve_with_client_probe(
+        &home,
+        Queue::at(home.join("queue")),
+        Talks::at(home.join("talks")),
+        home.join("runs"),
+        &fx.repo,
+        ClientProbe::Connection,
+    )
+    .await;
+    let mut browser = cdp::Browser::launch(&chrome).await.expect("Chrome");
+    let page = browser.open_page(&base, 1280, 900, false).await.unwrap();
+    browser
+        .wait_for(&page, "!!window.deck", Duration::from_secs(30))
+        .await
+        .unwrap();
+    let result = browser.eval(&page, r#"(async () => {
+      const native = window.fetch;
+      const snapshot = await (await native('/api/health')).json();
+      for (const key of Object.keys(deck.state.rev)) deck.state.rev[key] = snapshot[key + '_rev'];
+      let calls = 0, notificationCalls = 0, release, notificationsHeld = true;
+      const held = new Promise(resolve => { release = resolve; });
+      window.fetch = async (url, init) => {
+        if (String(url) === '/api/health') {
+          return new Response(JSON.stringify({...snapshot, notifications_rev: 'held-revision', recoveryMarker: ++calls}));
+        }
+        if (String(url) === '/api/notifications') {
+          notificationCalls++;
+          await held;
+          notificationsHeld = false;
+          return new Response(JSON.stringify({unread: 0, items: []}));
+        }
+        return native(url, init);
+      };
+      const settledWithin = promise => new Promise((resolve, reject) => {
+        const timer = setTimeout(() => resolve(false), 1000);
+        promise.then(() => { clearTimeout(timer); resolve(true); }, error => { clearTimeout(timer); reject(error); });
+      });
+      const requests = [];
+      try {
+        const first = deck.loadHealth({applyRevisions: true}); requests.push(first);
+        const settled = [await settledWithin(first)];
+        for (const start of [() => deck.loadHealth(), () => deck.resumeConnection(), () => deck.loadHealth({explicit: true})]) {
+          const next = start(); requests.push(next);
+          settled.push(await settledWithin(next));
+        }
+        return {settled, calls, notificationCalls, notificationsHeld,
+          notificationsApplied: deck.state.notices !== null, marker: deck.state.health.recoveryMarker};
+      } finally {
+        release(); await Promise.allSettled(requests); window.fetch = native;
+      }
+    })()"#).await.expect("held revision recovery probe");
+    eprintln!("held revision recovery: {result}");
+    assert_eq!(
+        result["settled"],
+        serde_json::json!([true, true, true, true])
+    );
+    assert_eq!(
+        result["calls"], 4,
+        "poll, wake and Retry each read fresh health"
+    );
+    assert_eq!(result["notificationCalls"], 1);
+    assert_eq!(result["notificationsHeld"], true);
+    assert_eq!(result["notificationsApplied"], false);
+    assert_eq!(result["marker"], 4);
+    browser
+        .wait_for(&page, "deck.state.notices !== null", Duration::from_secs(5))
+        .await
+        .expect("held notifications still apply after release");
+    browser.close_page(&page).await;
+}
