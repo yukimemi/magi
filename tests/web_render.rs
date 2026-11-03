@@ -4864,6 +4864,16 @@ async fn avatar_settings_preview_isolation_reload_and_reset_on_phone() {
       if (saved === original || !panel().querySelector('img').getAttribute('src').includes(saved)) throw new Error('saved preview did not refresh');
       const rect = panel().getBoundingClientRect();
       if (rect.right > document.documentElement.clientWidth + 1 || panel().scrollWidth > panel().clientWidth + 1) throw new Error('phone overflow');
+      return saved;
+    })()"#).await.unwrap();
+    browser.eval(&page, &r#"(async () => {
+      const panel = () => document.querySelector('.avatar-settings');
+      const until = async f => { for(let i=0;i<200;i++) { if(f()) return; await new Promise(r=>setTimeout(r,25)); } throw new Error('UI timeout'); };
+      const saved = __SAVED__;
+      const canvas = document.createElement('canvas'); canvas.width = 24; canvas.height = 24;
+      canvas.getContext('2d').fillRect(0, 0, 24, 24);
+      const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
+      const transfer = new DataTransfer(); transfer.items.add(new File([blob], 'phone.png', {type:'image/png'}));
       const select = panel().querySelector('select');
       select.value = 'persona:rei'; select.dispatchEvent(new Event('change'));
       if (!panel().querySelector('button').disabled) throw new Error('operator draft leaked');
@@ -4881,6 +4891,12 @@ async fn avatar_settings_preview_isolation_reload_and_reset_on_phone() {
       await until(() => panel().textContent.includes('Built-in avatar restored.'));
       const reset = await (await fetch('/api/avatar-settings')).json();
       if (reset.personas.find(p => p.id === 'rei').avatar === rei.avatar) throw new Error('reset URL unchanged');
+      return saved;
+    })()"#.replace("__SAVED__", &result.to_string())).await.unwrap();
+    browser.eval(&page, &r#"(async () => {
+      const panel = () => document.querySelector('.avatar-settings');
+      const until = async f => { for(let i=0;i<200;i++) { if(f()) return; await new Promise(r=>setTimeout(r,25)); } throw new Error('UI timeout'); };
+      const saved = __SAVED__;
       const sel = panel().querySelector('select');
       sel.value = 'operator'; sel.dispatchEvent(new Event('change'));
       const invalid = new DataTransfer(); invalid.items.add(new File(['bad'], 'bad.png', {type:'image/png'}));
@@ -4890,7 +4906,7 @@ async fn avatar_settings_preview_isolation_reload_and_reset_on_phone() {
       if ((await (await fetch('/api/avatar-settings')).json()).operator !== saved) throw new Error('invalid image corrupted save');
       for (const button of panel().querySelectorAll('button')) if (button.getBoundingClientRect().height < 44) throw new Error('small touch target');
       return saved;
-    })()"#).await.unwrap();
+    })()"#.replace("__SAVED__", &result.to_string())).await.unwrap();
     browser.close_page(&page).await;
     let page = browser
         .open_page(&format!("{base}#/settings"), 390, 844, true)
