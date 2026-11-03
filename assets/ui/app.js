@@ -7796,12 +7796,45 @@ async function observeRunProgress(force = false) {
     if (progressFlight === flight) progressFlight = null;
   }
 }
+// Presentation only: these symbols never supply approval or liveness evidence.
+function progressOverall(run, live) {
+  const status = displayedRunStatus(run);
+  if (["superseded", "stale"].includes(status)) return [status, "⊘"];
+  if (run.waiting || status === "waiting") return ["waiting", "Ⅱ"];
+  if (run.resource_block || run.parked || ["blocked", "parked"].includes(status)) return ["held", "■"];
+  if (run.resource_wait) return ["waiting", "Ⅱ"];
+  if (["failed", "stalled"].includes(status)) return ["failed", "×"];
+  if (run.done) return ["complete", "✓"];
+  if (live === "dead") return ["exited", "⊘"];
+  if (live !== "live") return ["unknown", "?"];
+  return ["active", "▸"];
+}
+function progressImplementers(run, phase, live) {
+  const seats = new Map(Object.entries(run.active || {}).filter(([, seat]) => seat.node === "implement"));
+  const items = (run.candidates || []).map(c => {
+    const key = `implement-${c.label}`;
+    const seat = seats.get(key);
+    seats.delete(key);
+    const recorded = c.duration_ms > 0 || c.failed != null || c.verified_noop != null;
+    const state = seat ? (phase.state === "current" && live === "live" ? "running" : "paused")
+      : c.failed != null ? "failed" : recorded ? "complete" : "unrecorded";
+    return { key, label: `Candidate ${c.label}`, state, start: seat?.started_at,
+      duration: recorded ? c.duration_ms : null };
+  });
+  for (const [key, seat] of seats) items.push({key, label: key,
+    state: phase.state === "current" && live === "live" ? "running" : "paused", start: seat.started_at});
+  return items;
+}
 function progressRow() {
   const marker = el("span", { class: "progress-marker", "aria-hidden": "true" });
   const title = el("strong");
   const detail = el("span", { class: "progress-detail" });
-  const row = el("li", {}, marker, el("div", {}, title, detail));
-  row.refs = { marker, title, detail };
+  const items = el("ul", { class: "progress-implementers" });
+  const row = el("li", {}, marker, el("div", {}, title, detail, items));
+  row.addEventListener("animationend", event => {
+    if (event.animationName === "progress-step-pop") row.removeAttribute("data-changed");
+  });
+  row.refs = { marker, title, detail, items };
   return row;
 }
 function renderRunProgress(run) {
@@ -7814,6 +7847,19 @@ function renderRunProgress(run) {
   const p = snapshot.progress;
   setText($("progress-activity"), p.activity);
   const live = snapshot.live;
+  const [overall, glyph] = progressOverall(run, live);
+  setAttr(box, "data-state", overall);
+  setText($("progress-state-marker"), glyph);
+  const current = p.phases.filter(p => ["current", "paused", "unconfirmed"].includes(p.state)).map(p => p.label).join(", ");
+  const announcement = JSON.stringify([overall, displayedRunStatus(run), current]);
+  if (box.dataset.run === run.id && box.dataset.announcement !== announcement) {
+    setText($("progress-announcement"), `${run.status} · ${overall}${current ? ` · ${current}` : ""}`);
+  } else if (box.dataset.run !== run.id) {
+    setText($("progress-announcement"), "");
+  }
+  const sameRun = box.dataset.run === run.id;
+  box.dataset.run = run.id;
+  box.dataset.announcement = announcement;
   setAttr($("progress-seats"), "aria-label", run.done || live !== "live" ? "Last recorded activity" : "Activity recorded by driver");
   const active = Object.entries(run.active || {}).sort(([a], [b]) => a.localeCompare(b));
   syncList($("progress-seats"), active, ([key]) => key, () => {
@@ -7829,12 +7875,35 @@ function renderRunProgress(run) {
     setAttr(row, "data-candidate", /^implement-[A-E]$/.test(key) ? key.slice(-1).toLowerCase() : null);
   });
   syncList($("progress-phases"), p.phases, phase => phase.key, progressRow, (row, phase) => {
-    const names = { complete: "Complete", failed: "Failed", unconfirmed: "Last recorded phase", current: "Current", paused: "Paused", recorded: "Recorded", skipped: "Not applicable", upcoming: "Upcoming", unknown: "Unknown" };
+    const names = { complete: "Complete", failed: "Failed", unconfirmed: "Last recorded phase", current: "Current", paused: "Paused", recorded: "Recorded", skipped: "Not applicable", unrecorded: "Unrecorded", upcoming: "Upcoming", unknown: "Unknown" };
+    const previous = row.dataset.state;
+    if (sameRun && previous && previous !== phase.state) setAttr(row, "data-changed", "1");
+    else if (!sameRun) setAttr(row, "data-changed", null);
     setAttr(row, "data-state", phase.state);
     setAttr(row, "aria-current", phase.state === "current" || phase.state === "paused" ? "step" : null);
-    setText(row.refs.marker, { complete: "✓", failed: "!", unconfirmed: "?", recorded: "◆", current: "●", paused: "Ⅱ", skipped: "−", upcoming: "○", unknown: "?" }[phase.state]);
+    setText(row.refs.marker, { complete: "✓", failed: "!", unconfirmed: "?", recorded: "◆", current: "●", paused: "Ⅱ", skipped: "−", unrecorded: "–", upcoming: "○", unknown: "?" }[phase.state]);
     setText(row.refs.title, `${phase.label} · ${names[phase.state] || phase.state}`);
     setText(row.refs.detail, phase.detail);
+    const items = phase.key === "implement" ? progressImplementers(run, phase, live) : [];
+    syncList(row.refs.items, items, item => item.key, () => {
+      const mark = el("span", { "aria-hidden": "true" }), name = el("strong"), status = el("span"), age = el("span", { class: "progress-seat-age" });
+      const child = el("li", {}, mark, name, status, age);
+      child.refs = { mark, name, status, age };
+      return child;
+    }, (child, item) => {
+      setAttr(child, "data-state", item.state);
+      setText(child.refs.mark, {running: "▸", paused: "Ⅱ", failed: "×", complete: "✓", unrecorded: "–"}[item.state]);
+      setText(child.refs.name, item.label);
+      setText(child.refs.status, item.state);
+      if (item.start) {
+        child.refs.age.dataset.progressStart = item.start;
+        child.refs.age.dataset.progressEnd = run.done || live === "dead" ? run.updated_at : "";
+      } else {
+        delete child.refs.age.dataset.progressStart;
+        delete child.refs.age.dataset.progressEnd;
+        setText(child.refs.age, item.duration != null ? `${Math.floor(item.duration / 1000)}s recorded` : "Duration unrecorded");
+      }
+    });
   });
   const rounds = p.rounds || [];
   syncList($("progress-rounds"), rounds, r => String(r.round), progressRow, (row, round) => {

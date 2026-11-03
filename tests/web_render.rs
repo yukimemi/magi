@@ -6092,6 +6092,8 @@ async fn run_progress_live_pipeline_observation_and_phone_layout() {
             .unwrap();
         let out = browser.eval(&page, r#"(async () => {
           await deck.loadRun(deck.state.detail.id);
+          await deck.observeRunProgress(true);
+          await new Promise(resolve => setTimeout(resolve, 600));
           const pipeline = document.getElementById('progress-pipeline');
           const summary = pipeline.querySelector('summary');
           const row = document.querySelector('#progress-seats li');
@@ -6100,6 +6102,7 @@ async fn run_progress_live_pipeline_observation_and_phone_layout() {
           const progress = document.getElementById('run-progress');
           const noOverflow = progress.scrollWidth <= progress.clientWidth + 1;
           const actual = document.getElementById('progress-activity').textContent;
+          const announcement = document.getElementById('progress-announcement').textContent;
           pipeline.open = false; summary.focus({preventScroll: true});
           const top = summary.getBoundingClientRect().top;
           deck.tickActive();
@@ -6112,11 +6115,15 @@ async fn run_progress_live_pipeline_observation_and_phone_layout() {
           pipeline.open = true;
           return {noOverflow, parallel: actual.includes('implement-A') && actual.includes('implement-B'),
             retained, stable, observed: !!deck.state.detail.progressObservedAt,
+            quiet: document.getElementById('progress-announcement').textContent === announcement
+              && !document.querySelector('#progress-phases [data-changed="1"]'),
+            implementers: document.querySelectorAll('.progress-implementers li[data-state="running"]').length,
+            glyph: document.getElementById('progress-state-marker').textContent,
             complete: document.querySelector('#progress-phases li').dataset.state === 'complete'};
         })()"#).await.unwrap();
         assert_eq!(
             out,
-            serde_json::json!({"noOverflow": true, "parallel": true, "retained": true, "stable": true, "observed": true, "complete": true}),
+            serde_json::json!({"noOverflow": true, "parallel": true, "retained": true, "stable": true, "observed": true, "quiet": true, "implementers": 2, "glyph": "▸", "complete": true}),
             "{width}px"
         );
         browser.call(Some(&page.session), "Emulation.setEmulatedMedia", serde_json::json!({"features": [{"name": "prefers-reduced-motion", "value": "reduce"}]})).await.unwrap();
@@ -6124,11 +6131,11 @@ async fn run_progress_live_pipeline_observation_and_phone_layout() {
             browser
                 .eval(
                     &page,
-                    "getComputedStyle(document.querySelector('#progress-recent li')).animationName"
+                    "[document.querySelector('#progress-recent li'), document.querySelector('#progress-phases .progress-marker')].every(node => getComputedStyle(node).animationName === 'none')"
                 )
                 .await
                 .unwrap(),
-            "none"
+            true
         );
         if let Ok(dir) = std::env::var("MAGI_PROGRESS_EVIDENCE") {
             std::fs::create_dir_all(&dir).unwrap();
@@ -6162,14 +6169,18 @@ async fn run_progress_live_pipeline_observation_and_phone_layout() {
           const exited = document.getElementById('progress-activity').textContent.includes('Driver exited');
           const unchangedEvidence = evidence === deck.state.detail.run && evidence.live === 'live';
           const paused = !!document.querySelector('#progress-phases [data-state="paused"]');
+          const announcement = document.getElementById('progress-announcement').textContent;
+          const truthful = document.querySelectorAll('.progress-implementers li[data-state="paused"]').length === 2
+            && document.getElementById('run-progress').dataset.state === 'exited'
+            && getComputedStyle(document.querySelector('#progress-phases [data-state="paused"] .progress-marker')).animationName === 'none';
           window.fetch = original;
           await deck.observeRunProgress(true);
-          return {exited, unchangedEvidence, paused,
+          return {exited, unchangedEvidence, paused, truthful, announced: announcement.includes("exited"),
             recovered: document.getElementById('progress-activity').textContent.includes('implement-A')};
         })()"#).await.unwrap();
         assert_eq!(
             out,
-            serde_json::json!({"exited": true, "unchangedEvidence": true, "paused": true, "recovered": true})
+            serde_json::json!({"exited": true, "unchangedEvidence": true, "paused": true, "truthful": true, "announced": true, "recovered": true})
         );
         browser.close_page(&page).await;
     }

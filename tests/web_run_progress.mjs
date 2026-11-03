@@ -115,3 +115,31 @@ test('stream reconnection observes liveness and failures keep a single fallback 
   callbacks.open();
   assert.deepEqual(observations, [true, true]);
 });
+
+const presentationCode = source.slice(source.indexOf('function progressOverall('), source.indexOf('function progressRow()'));
+const presentation = runInNewContext(`${presentationCode}\n({progressOverall, progressImplementers})`, {
+  displayedRunStatus: run => run.badge_status || run.status,
+});
+test('overall glyphs distinguish waits, holds, exits, failures and completion', () => {
+  for (const [run, live, expected] of [
+    [{status: 'implementing'}, 'live', ['active', '▸']],
+    [{status: 'implementing', waiting: true}, 'live', ['waiting', 'Ⅱ']],
+    [{status: 'blocked', done: true}, 'dead', ['held', '■']],
+    [{status: 'failed', done: true}, 'dead', ['failed', '×']],
+    [{status: 'merged', done: true}, 'dead', ['complete', '✓']],
+    [{status: 'implementing'}, 'dead', ['exited', '⊘']],
+    [{status: 'implementing'}, 'unknown', ['unknown', '?']],
+  ]) assert.deepEqual(Array.from(presentation.progressOverall(run, live)), expected);
+});
+test('implementation rows retain parallel results and never invent success or live activity', () => {
+  const run = {candidates: [
+    {label: 'A', duration_ms: 12000}, {label: 'B', duration_ms: 5000, failed: 'exit'},
+    {label: 'C', duration_ms: 0},
+  ], active: {'implement-D': {node: 'implement', started_at: '2026-01-01'}}};
+  const rows = presentation.progressImplementers(run, {state: 'current'}, 'live');
+  assert.deepEqual(Array.from(rows, r => r.state), ['complete', 'failed', 'unrecorded', 'running']);
+  assert.equal(rows[0].duration, 12000);
+  assert.equal(rows[3].start, '2026-01-01');
+  assert.equal(presentation.progressImplementers(run, {state: 'paused'}, 'dead')[3].state, 'paused');
+  assert.equal(presentation.progressImplementers(run, {state: 'unconfirmed'}, 'unknown')[3].state, 'paused');
+});

@@ -21,7 +21,7 @@ pub struct Phase {
     pub key: &'static str,
     /// Human readable stage name.
     pub label: &'static str,
-    /// Display state: current, paused, complete, failed, recorded, skipped, unknown or upcoming.
+    /// Display state: current, paused, complete, failed, recorded, skipped, unrecorded, unknown or upcoming.
     pub state: &'static str,
     /// Recorded results or active seat names.
     pub detail: String,
@@ -201,8 +201,34 @@ pub fn build(s: &RunState, live: Liveness, waiting: bool) -> Progress {
             "complete"
         } else if evidence.is_some() {
             "recorded"
-        } else if s.status.done() {
-            "unknown"
+        } else if s.status.done()
+            || [
+                "prep",
+                "advice",
+                "implement",
+                "selection",
+                "review",
+                "gate",
+                "land",
+            ]
+            .iter()
+            .position(|p| *p == key)
+            .zip(
+                [
+                    "prep",
+                    "advice",
+                    "implement",
+                    "selection",
+                    "review",
+                    "gate",
+                    "land",
+                ]
+                .iter()
+                .position(|p| *p == current),
+            )
+            .is_some_and(|(step, now)| step < now)
+        {
+            "unrecorded"
         } else {
             "upcoming"
         };
@@ -212,7 +238,7 @@ pub fn build(s: &RunState, live: Liveness, waiting: bool) -> Progress {
             evidence.unwrap_or_else(|| {
                 match state {
                     "skipped" => "Not applicable to this run",
-                    "unknown" => "No result recorded",
+                    "unknown" | "unrecorded" => "No result recorded",
                     "current" => "Current phase",
                     "unconfirmed" => "Driver unconfirmed",
                     "paused" => "Stopped here",
@@ -312,7 +338,28 @@ mod tests {
             "current"
         );
         assert!(!p.phases.iter().any(|p| p.state == "recorded"));
+        assert_eq!(
+            p.phases
+                .iter()
+                .find(|p| p.key == "implement")
+                .unwrap()
+                .state,
+            "unrecorded"
+        );
+        assert_eq!(
+            p.phases.iter().find(|p| p.key == "land").unwrap().state,
+            "upcoming"
+        );
         s.status = RunStatus::Merged;
+        assert_eq!(
+            build(&s, Liveness::Dead, false)
+                .phases
+                .iter()
+                .find(|p| p.key == "implement")
+                .unwrap()
+                .state,
+            "unrecorded"
+        );
         assert!(
             !build(&s, Liveness::Dead, false)
                 .phases

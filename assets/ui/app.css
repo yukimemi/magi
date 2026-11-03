@@ -3080,3 +3080,27 @@ button[aria-busy="true"] {
 }
 #progress-phases > li[data-state="failed"] { color: var(--verdict-failed); background: var(--tint-rust); }
 #progress-phases > li[data-state="complete"] .progress-marker { color: var(--teal); }
+
+/* State stays legible through shape, glyph and text as well as colour. */
+.progress-heading { display: flex; align-items: baseline; gap: var(--s3); }
+#progress-state-marker { display: inline-grid; place-items: center; flex: none; width: 26px; height: 26px; border: 2px solid currentColor; border-radius: 50%; color: var(--teal); font: 600 var(--t3) var(--mono); }
+.run-progress[data-state="waiting"] #progress-state-marker { border-radius: 5px; border-style: double; color: var(--gold-line); }
+.run-progress[data-state="held"] #progress-state-marker,
+.run-progress[data-state="exited"] #progress-state-marker { border-radius: 3px; color: var(--rust); }
+.run-progress[data-state="failed"] #progress-state-marker { border-radius: 0; color: var(--verdict-failed); }
+.run-progress[data-state="unknown"] #progress-state-marker,
+.run-progress[data-state="stale"] #progress-state-marker,
+.run-progress[data-state="superseded"] #progress-state-marker { border-style: dashed; background: transparent; color: var(--ink-3); }
+#progress-phases > li[data-state="unrecorded"] .progress-marker { border-bottom-style: dashed; }
+.progress-implementers { list-style: none; padding: 0; margin: var(--s2) 0 0; display: grid; gap: var(--s1); }
+.progress-implementers li { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--s1) var(--s2); padding: var(--s2); border-left: 2px solid var(--line-2); background: var(--sunk); border-radius: var(--radius-sm); }
+.progress-implementers li[data-state="failed"] { border-color: var(--verdict-failed); }
+.progress-implementers li[data-state="complete"] { border-color: var(--teal); }
+@media (prefers-reduced-motion: no-preference) {
+  .run-progress[data-state="active"]:not([data-observation-old]) #progress-phases > li[data-state="current"]:not([data-changed="1"]) .progress-marker { animation: progress-step-pulse 1.8s ease-in-out infinite; }
+  #progress-phases > li[data-changed="1"] .progress-marker { animation: progress-step-pop .45s ease-out 1; }
+  @keyframes progress-step-pulse { 50% { opacity: .5; } }
+  @keyframes progress-step-pop { 0% { transform: scale(.75); } 70% { transform: scale(1.1); } 100% { transform: scale(1); } }
+}
+
+.progress-implementers:empty { display: none; }

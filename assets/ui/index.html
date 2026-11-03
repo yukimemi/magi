@@ -224,7 +224,8 @@
 
     <section id="run-progress" class="run-progress" aria-label="Live run progress" hidden>
       <div class="progress-eyebrow">RUN PULSE <span id="progress-connection"></span></div>
-      <p id="progress-activity" role="status" aria-live="polite" aria-atomic="true"></p>
+      <div class="progress-heading"><span id="progress-state-marker" aria-hidden="true"></span><p id="progress-activity"></p></div>
+      <p id="progress-announcement" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></p>
       <p id="progress-freshness" class="card-note"></p>
       <ul id="progress-seats" class="progress-seats" aria-label="Current activity"></ul>
       <div class="progress-recent-head">Latest records <a id="progress-timeline" href="#/runs">Full timeline →</a></div>
