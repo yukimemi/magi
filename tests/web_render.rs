@@ -6234,7 +6234,7 @@ async fn run_progress_live_pipeline_observation_and_phone_layout() {
             )
             .await
             .unwrap();
-        browser.wait_for(&page, "window.deck && deck.state.detail.evidenceError === false && document.querySelectorAll('#progress-seats li').length === 2", Duration::from_secs(30)).await.unwrap();
+        browser.wait_for(&page, "window.deck && deck.state.detail.evidenceError === false && document.querySelectorAll('#run-active > li').length === 2 && document.querySelectorAll('#progress-phases .progress-implementers li').length === 2", Duration::from_secs(30)).await.unwrap();
         browser
             .eval(
                 &page,
@@ -6248,18 +6248,24 @@ async fn run_progress_live_pipeline_observation_and_phone_layout() {
           await new Promise(resolve => setTimeout(resolve, 600));
           const pipeline = document.getElementById('progress-pipeline');
           const summary = pipeline.querySelector('summary');
-          const row = document.querySelector('#progress-seats li');
+          const row = document.querySelector('#progress-phases .progress-implementers li');
+          const activeRow = document.querySelector('#run-active > li');
+          const activeClock = activeRow.querySelector('[data-seat-start]');
           const phase = document.querySelector('#progress-phases li');
           const clock = row.querySelector('[data-progress-start]');
           const progress = document.getElementById('run-progress');
-          const noOverflow = progress.scrollWidth <= progress.clientWidth + 1;
+          const noOverflow = progress.scrollWidth <= progress.clientWidth + 1
+            && pipeline.scrollWidth <= pipeline.clientWidth + 1
+            && activeRow.scrollWidth <= activeRow.clientWidth + 1;
           const actual = document.getElementById('progress-activity').textContent;
           const announcement = document.getElementById('progress-announcement').textContent;
           pipeline.open = false; summary.focus({preventScroll: true});
           const top = summary.getBoundingClientRect().top;
           deck.tickActive();
           await deck.observeRunProgress(true);
-          const retained = document.querySelector('#progress-seats li') === row
+          const retained = document.querySelector('#progress-phases .progress-implementers li') === row
+            && document.querySelector('#run-active > li') === activeRow
+            && activeRow.querySelector('[data-seat-start]') === activeClock
             && document.querySelector('#progress-phases li') === phase
             && row.querySelector('[data-progress-start]') === clock;
           const stable = !pipeline.open && document.activeElement === summary
@@ -6364,7 +6370,7 @@ async fn run_progress_live_pipeline_observation_and_phone_layout() {
         .collect();
     run.event("review", "Review panel dispatched");
     run.save_under(&home).unwrap();
-    browser.wait_for(&page, "document.getElementById('progress-activity').textContent.includes('review-1') && document.querySelectorAll('#progress-seats li').length === 1", Duration::from_secs(30)).await.unwrap();
+    browser.wait_for(&page, "document.getElementById('progress-activity').textContent.includes('review-1') && !document.getElementById('run-active-panel').hidden && document.querySelectorAll('#run-active > li').length === 1 && document.querySelector('#run-active .seat').textContent === 'review-1'", Duration::from_secs(30)).await.unwrap();
     assert_eq!(
         browser
             .eval(
@@ -6405,11 +6411,11 @@ async fn run_progress_live_pipeline_observation_and_phone_layout() {
         browser
             .eval(
                 &page,
-                "document.querySelectorAll('#progress-seats li').length"
+                "document.getElementById('run-active-panel').hidden && !document.querySelector('#progress-phases .progress-implementers li[data-state=\"running\"]')"
             )
             .await
             .unwrap(),
-        0
+        true
     );
     run.status = RunStatus::Merged;
     run.event("merge", "Merge confirmed");
