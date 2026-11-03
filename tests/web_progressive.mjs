@@ -1105,3 +1105,26 @@ test('expired chat cursor recovery revalidates retained rows and respects a conc
   assert.equal(h.state.talks.find(row => row.id === 'updated').version, 2);
   assert.equal(new Set(h.state.talks.map(row => row.id)).size, h.state.talks.length);
 });
+
+test('joined conversation reads share enrichment even if it completes before a second paint callback', async () => {
+  const h = harness({ manualPaint: true });
+  const done = Promise.all([h.api.loadTalk('a'), h.api.loadTalk('a')]);
+  assert.equal(h.requests.length, 1);
+  h.requests[0].resolve({id: 'a', updated_at: 'now', turns: []});
+  await flush();
+  let answeredSections = false;
+  // Browser frame callbacks schedule separate tasks. An immediate sections
+  // response may complete between them, before the second joined caller resumes.
+  while (h.frames.length) {
+    h.frames.shift()();
+    await flush();
+    if (!answeredSections && h.requests[1]) {
+      h.requests[1].resolve({context_for: 'now', roster: [], personas: [], tasks: ['related']});
+      answeredSections = true;
+      await flush();
+    }
+  }
+  assert.equal(h.requests.length, 2, 'joined reads must not issue another sections request after enrichment already finished');
+  await done;
+  assert.deepEqual(h.state.talkDetail.talk.tasks, ['related']);
+});

@@ -6193,6 +6193,9 @@ function sectionNotice(anchorId, key, message, retry, { pending = false, snapsho
 }
 
 // A frame callback runs before paint; the following task lets that paint finish.
+// Joined core reads also share that barrier so an immediate sections response
+// cannot finish before a second caller resumes and dispatches duplicate work.
+const talkCorePaints = new WeakMap();
 function afterTalkPaint() {
   return new Promise(resolve => {
     // Hidden tabs suspend animation frames; they still need refreshes to settle,
@@ -6260,7 +6263,10 @@ async function loadTalk(id, { background = false } = {}) {
     // Coalesced reads wait for trailing refreshes but keep the first promise's
     // value. Use the status recorded by the latest core callback instead.
     loaded = detail.coreLoaded;
-    if (loaded && current()) await afterTalkPaint();
+    if (loaded && current()) {
+      if (!talkCorePaints.has(core)) talkCorePaints.set(core, afterTalkPaint());
+      await talkCorePaints.get(core);
+    }
   } finally { release(); }
   if (!loaded || !current()) return;
   sectionNotice("talk-task-progress", "talk-sections-state", "Loading related tasks and choices…", null, { pending: true, snapshot: Boolean(detail.sections) });
