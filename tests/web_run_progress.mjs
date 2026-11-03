@@ -167,3 +167,12 @@ test('phase emphasis expires without animation events and newer transitions repl
   deadline.callback();
   assert.equal(attributes.has('data-changed'), false);
 });
+
+test('skipped implementation and existing-branch reviews do not invent current implementation rows', () => {
+  const run = {candidates: [{label: 'A', duration_ms: 0}, {label: 'B', duration_ms: 12000}]};
+  assert.equal(presentation.progressImplementers(run, {state: 'skipped'}, 'live').length, 0);
+  run.progress = {review_only: true};
+  assert.equal(presentation.progressImplementers(run, {state: 'recorded'}, 'live').length, 0);
+  delete run.progress;
+  assert.deepEqual(Array.from(presentation.progressImplementers(run, {state: 'unrecorded'}, 'unknown'), r => r.state), ['unrecorded', 'complete']);
+});

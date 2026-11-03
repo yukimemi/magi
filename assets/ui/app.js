@@ -7953,6 +7953,7 @@ function progressOverall(run, live) {
   return ["active", "▸"];
 }
 function progressImplementers(run, phase, live) {
+  if (phase.state === "skipped" || run.progress?.review_only) return [];
   const seats = new Map(Object.entries(run.active || {}).filter(([, seat]) => seat.node === "implement"));
   const items = (run.candidates || []).map(c => {
     const key = `implement-${c.label}`;
@@ -7991,6 +7992,7 @@ function renderRunProgress(run) {
   if (!box) return;
   const ready = run && !run.isShell && run.progress;
   show(box, Boolean(ready));
+  show($("progress-pipeline"), Boolean(ready));
   if (!ready) return;
   const snapshot = progressSnapshot(run);
   const p = snapshot.progress;
@@ -8009,20 +8011,6 @@ function renderRunProgress(run) {
   const sameRun = box.dataset.run === run.id;
   box.dataset.run = run.id;
   box.dataset.announcement = announcement;
-  setAttr($("progress-seats"), "aria-label", run.done || live !== "live" ? "Last recorded activity" : "Activity recorded by driver");
-  const active = Object.entries(run.active || {}).sort(([a], [b]) => a.localeCompare(b));
-  syncList($("progress-seats"), active, ([key]) => key, () => {
-    const title = el("strong"), node = el("span"), age = el("span", { class: "progress-seat-age" });
-    const row = el("li", {}, title, node, age);
-    row.refs = { title, node, age };
-    return row;
-  }, (row, [key, seat]) => {
-    setText(row.refs.title, key);
-    setText(row.refs.node, seat.task && seat.index && seat.total ? `${seat.node} · command ${seat.index}/${seat.total}` : seat.node);
-    row.refs.age.dataset.progressStart = seat.started_at;
-    row.refs.age.dataset.progressEnd = run.done || live === "dead" ? run.updated_at : "";
-    setAttr(row, "data-candidate", /^implement-[A-E]$/.test(key) ? key.slice(-1).toLowerCase() : null);
-  });
   syncList($("progress-phases"), p.phases, phase => phase.key, progressRow, (row, phase) => {
     const names = { complete: "Complete", failed: "Failed", unconfirmed: "Last recorded phase", current: "Current", paused: "Paused", recorded: "Recorded", skipped: "Not applicable", unrecorded: "Unrecorded", upcoming: "Upcoming", unknown: "Unknown" };
     const previous = row.dataset.state;
@@ -8060,7 +8048,7 @@ function renderRunProgress(run) {
     setText(row.refs.title, `Review round ${round.round} · recorded`);
     setText(row.refs.detail, round.detail);
   });
-  const events = (run.events || []).slice(-3).reverse();
+  const events = (run.events || []).slice(-1);
   syncList($("progress-recent"), events, e => JSON.stringify([e.at, e.node, e.message]), () => {
     const age = el("time"), node = el("strong"), message = el("span");
     const row = el("li", {}, el("div", {}, node, age), message);
@@ -8089,7 +8077,7 @@ function tickRunProgress() {
   setText($("progress-connection"), state.streamOpen ? "Stream connected" : "Reconnecting · snapshots may be old");
   setText($("progress-freshness"), `${progressElapsed(run.created_at, run.done ? Date.parse(run.updated_at) : Date.now())} ${run.done ? "recorded span" : "since start"} · ${driver} · ${observed ? `checked ${progressElapsed(new Date(observed).toISOString())} ago` : "checking observation"}${old ? " · observation is old" : ""}`);
   setAttr($("run-progress"), "data-observation-old", old ? "true" : null);
-  for (const age of $("run-progress").querySelectorAll("[data-progress-start]")) {
+  for (const age of $("progress-pipeline").querySelectorAll("[data-progress-start]")) {
     setText(age, `${progressElapsed(age.dataset.progressStart, age.dataset.progressEnd ? Date.parse(age.dataset.progressEnd) : Date.now())} ${age.dataset.progressEnd ? "at last record" : "elapsed"}`);
   }
   for (const age of $("run-progress").querySelectorAll("[data-progress-ago]")) setText(age, `${progressElapsed(age.dataset.progressAgo)} ago`);
@@ -9204,6 +9192,9 @@ function convergeDiagram(candidates, winner, decided) {
 
 function renderCandidates(run) {
   const candidates = Array.isArray(run.candidates) ? run.candidates : [];
+  const historical = run.progress?.review_only === true;
+  setText($("cand-title"), historical ? "Reviewed candidate records" : "Candidates");
+  show($("cand-history-note"), historical);
   show($("run-cands-panel"), candidates.length > 0);
   if (candidates.length === 0) return;
 

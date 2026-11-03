@@ -6,6 +6,8 @@ use serde::Serialize;
 #[derive(Debug, Serialize)]
 /// Shared presentation for list cards and run details.
 pub struct Progress {
+    /// Existing-branch review; retained candidates are not this run's implementation.
+    pub review_only: bool,
     /// Current activity, including waits and driver exit.
     pub activity: String,
     /// Ordered phases; ordering implies no success.
@@ -135,13 +137,15 @@ pub fn build(s: &RunState, live: Liveness, waiting: bool) -> Progress {
             "implement",
             "Parallel implementation",
             !review_only,
-            implementation_results(s),
+            (!review_only).then(|| implementation_results(s)).flatten(),
         ),
         (
             "selection",
             "Selection",
             !review_only && s.config.graph.implementers > 1 && !s.judge_skipped,
-            s.tally.as_ref().map(|_| "Decision recorded".to_owned()),
+            (!review_only)
+                .then(|| s.tally.as_ref().map(|_| "Decision recorded".to_owned()))
+                .flatten(),
         ),
         (
             "review",
@@ -307,6 +311,7 @@ pub fn build(s: &RunState, live: Liveness, waiting: bool) -> Progress {
         })
         .collect();
     Progress {
+        review_only,
         activity,
         phases,
         rounds,
@@ -468,8 +473,26 @@ mod tests {
     fn progress_review_only_skips_competition_and_preserves_gate_failure() {
         let mut s = run();
         s.reviewed_commits = Some(vec![]);
+        // Historical implementation results must not become this review's work.
+        s.candidates.push(
+            serde_json::from_value(serde_json::json!({
+                "index": 0, "label": "A", "agent": "existing-branch",
+                "branch": "topic", "worktree": "unused", "duration_ms": 12000
+            }))
+            .unwrap(),
+        );
+        s.tally = Some(
+            serde_json::from_value(serde_json::json!({
+                "first_choice": {}, "borda": {}, "winner": "A",
+                "unanimous_initial": true, "deliberated": false,
+                "changed_votes": 0, "unanimous_final": true,
+                "uncontested": "Existing branch"
+            }))
+            .unwrap(),
+        );
         s.status = RunStatus::Reviewing;
         let p = build(&s, Liveness::Live, false);
+        assert!(p.review_only);
         assert_eq!(
             p.phases
                 .iter()
