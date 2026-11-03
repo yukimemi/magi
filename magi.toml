@@ -71,16 +71,19 @@ base = "main"
 style = "squash"
 
 [graph]
-# Verification includes compilation and the full test command, not one test.
-# Round 2 at e722eb7 spent 273s compiling and 2073s in completed tests
-# before reaching task_grant_repair, with later integration binaries still
-# pending. The 2400s command budget expired without a reported test failure.
-# task_grant_repair passes all 14 tests in 28s in isolation. Allow 3600s for
-# the complete suite and build under load; per-test watchdogs are unchanged.
-# This repository-owned budget applies to both verify.e2e and verify.gate.
-timeout_verify = 3600
+# The serial all-target command has outgrown the former 2400s budget. In
+# run 20261103-175649-ed34, round 1 compiled in 579s and completed 39 test
+# binaries (3076 passing tests) in another 1734s before reaching
+# graph_review_only. The command was still passing tests when the overall
+# deadline expired, with further integration binaries not yet started.
+# Allow two hours for compilation plus the complete suite, retaining a finite
+# deadline and every existing test. This also covers the gate's serial fallback
+# when nextest is unavailable; the reviewer-seat budget stays independent.
+# Repository layers come from the pinned base: this change takes effect for
+# runs whose base includes it, not by rewriting an existing run's saved config.
+timeout_verify = 7200
 
-# The original `timeout_verify = 2400` fixed `verify.gate` / `verify.e2e`, but
+# The former `timeout_verify = 2400` fixed `verify.gate` / `verify.e2e`, but
 # `timeout_review` (the field it was split off from, see its doc comment in
 # `src/config.rs`) was left at its 1200s default. That field is the timeout
 # for the reviewer seat itself — both the ordinary review job
