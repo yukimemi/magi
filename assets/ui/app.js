@@ -7825,15 +7825,21 @@ function progressImplementers(run, phase, live) {
     state: phase.state === "current" && live === "live" ? "running" : "paused", start: seat.started_at});
   return items;
 }
+const PROGRESS_STEP_MS = 450;
+function flashProgressPhase(row) {
+  // CSS animation events may never arrive when folded, hidden or motion is reduced.
+  // Keep the transient state bounded independently of animation delivery.
+  clearTimeout(row.progressChangeTimer);
+  row.style.setProperty("--progress-step-duration", `${PROGRESS_STEP_MS}ms`);
+  setAttr(row, "data-changed", "1");
+  row.progressChangeTimer = setTimeout(() => row.removeAttribute("data-changed"), PROGRESS_STEP_MS);
+}
 function progressRow() {
   const marker = el("span", { class: "progress-marker", "aria-hidden": "true" });
   const title = el("strong");
   const detail = el("span", { class: "progress-detail" });
   const items = el("ul", { class: "progress-implementers" });
   const row = el("li", {}, marker, el("div", {}, title, detail, items));
-  row.addEventListener("animationend", event => {
-    if (event.animationName === "progress-step-pop") row.removeAttribute("data-changed");
-  });
   row.refs = { marker, title, detail, items };
   return row;
 }
@@ -7877,7 +7883,7 @@ function renderRunProgress(run) {
   syncList($("progress-phases"), p.phases, phase => phase.key, progressRow, (row, phase) => {
     const names = { complete: "Complete", failed: "Failed", unconfirmed: "Last recorded phase", current: "Current", paused: "Paused", recorded: "Recorded", skipped: "Not applicable", unrecorded: "Unrecorded", upcoming: "Upcoming", unknown: "Unknown" };
     const previous = row.dataset.state;
-    if (sameRun && previous && previous !== phase.state) setAttr(row, "data-changed", "1");
+    if (sameRun && previous && previous !== phase.state) flashProgressPhase(row);
     else if (!sameRun) setAttr(row, "data-changed", null);
     setAttr(row, "data-state", phase.state);
     setAttr(row, "aria-current", phase.state === "current" || phase.state === "paused" ? "step" : null);

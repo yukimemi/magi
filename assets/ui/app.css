@@ -3098,7 +3098,7 @@ button[aria-busy="true"] {
 .progress-implementers li[data-state="complete"] { border-color: var(--teal); }
 @media (prefers-reduced-motion: no-preference) {
   .run-progress[data-state="active"]:not([data-observation-old]) #progress-phases > li[data-state="current"]:not([data-changed="1"]) .progress-marker { animation: progress-step-pulse 1.8s ease-in-out infinite; }
-  #progress-phases > li[data-changed="1"] .progress-marker { animation: progress-step-pop .45s ease-out 1; }
+  #progress-phases > li[data-changed="1"] .progress-marker { animation: progress-step-pop var(--progress-step-duration) ease-out 1; }
   @keyframes progress-step-pulse { 50% { opacity: .5; } }
   @keyframes progress-step-pop { 0% { transform: scale(.75); } 70% { transform: scale(1.1); } 100% { transform: scale(1); } }
 }

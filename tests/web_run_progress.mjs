@@ -143,3 +143,27 @@ test('implementation rows retain parallel results and never invent success or li
   assert.equal(presentation.progressImplementers(run, {state: 'paused'}, 'dead')[3].state, 'paused');
   assert.equal(presentation.progressImplementers(run, {state: 'unconfirmed'}, 'unknown')[3].state, 'paused');
 });
+
+test('phase emphasis expires without animation events and newer transitions replace its deadline', () => {
+  const timers = new Map(), attributes = new Map(), styles = new Map();
+  let nextTimer = 0;
+  const row = { style: {setProperty: (key, value) => styles.set(key, value)},
+    removeAttribute: key => attributes.delete(key) };
+  const code = source.slice(source.indexOf('const PROGRESS_STEP_MS ='), source.indexOf('function progressRow()'));
+  const {flashProgressPhase} = runInNewContext(`${code}\n({flashProgressPhase})`, {
+    setAttr: (_, key, value) => attributes.set(key, value),
+    setTimeout: (callback, ms) => { const id = ++nextTimer; timers.set(id, {callback, ms}); return id; },
+    clearTimeout: id => timers.delete(id),
+  });
+  flashProgressPhase(row);
+  assert.equal(attributes.get('data-changed'), '1');
+  const previous = row.progressChangeTimer;
+  flashProgressPhase(row);
+  assert.equal(timers.has(previous), false);
+  assert.equal(timers.size, 1);
+  const deadline = timers.get(row.progressChangeTimer);
+  assert.equal(styles.get('--progress-step-duration'), `${deadline.ms}ms`);
+  // No animationend/animationcancel is delivered (collapsed/reduced-motion case).
+  deadline.callback();
+  assert.equal(attributes.has('data-changed'), false);
+});
