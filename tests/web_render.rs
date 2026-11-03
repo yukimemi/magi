@@ -5650,26 +5650,36 @@ async fn chat_task_progress_refreshes_and_survives_operation_races() {
             const snapshot = structuredClone(deck.state.talkDetail.talk);
             const sections = structuredClone(deck.state.talkDetail.sections);
             const pending = [];
-            const next = async () => {
+            const next = async part => {
                 const deadline = performance.now() + 10000;
                 while (!pending.length && performance.now() < deadline) await new Promise(resolve => setTimeout(resolve, 0));
                 if (!pending.length) throw new Error('Expected next conversation request');
-                return pending.shift();
+                const request = pending.shift();
+                if (request.path !== '/api/talks/' + id + '/' + part)
+                    throw new Error('Unexpected conversation request: ' + request.path);
+                return request.resolve;
             };
             const response = body => ({ ok: true, status: 200, headers: new Headers(), json: async () => body });
             const out = {};
-            window.fetch = () => new Promise(resolve => pending.push(resolve));
+            window.fetch = (url, init) => {
+                const path = new URL(typeof url === 'string' ? url : url.url, location.href).pathname;
+                if (path === '/api/talks/' + id + '/core' || path === '/api/talks/' + id + '/sections')
+                    return new Promise(resolve => pending.push({path, resolve}));
+                return native(url, init);
+            };
             try {
                 const old = deck.loadTalk(id), fresh = deck.loadTalk(id);
                 out.coalesced = pending.length === 1;
-                (await next())(response(snapshot));
-                (await next())(response(sections));
+                const health = await (await fetch('/api/health')).json();
+                out.unrelatedRead = Object.hasOwn(health, 'talks_rev') && pending.length === 1;
+                (await next('core'))(response(snapshot));
+                (await next('sections'))(response(sections));
                 await Promise.all([old, fresh]);
                 // Retain a pending sections response, then supersede it with
                 // an operation whose core response is also kept pending.
                 const obsolete = deck.loadTalk(id);
-                (await next())(response(snapshot));
-                const staleSections = await next();
+                (await next('core'))(response(snapshot));
+                const staleSections = await next('sections');
                 deck.acceptTalkUpdate({ id, status: 'closed' });
                 out.preserved = deck.state.talkDetail.talk.task_progress.total === 7
                     && deck.state.talkDetail.talk.tasks.length === 7;
@@ -5677,10 +5687,10 @@ async fn chat_task_progress_refreshes_and_survives_operation_races() {
                 const stale = pending.splice(0);
                 deck.acceptTalkUpdate({ id, status: 'open' });
                 const latest = deck.loadTalk(id);
-                (await next())(response(snapshot));
-                (await next())(response(sections));
+                (await next('core'))(response(snapshot));
+                (await next('sections'))(response(sections));
                 await latest;
-                stale[0]({ ok: false, status: 404, headers: new Headers(), text: async () => '{}' });
+                stale[0].resolve({ ok: false, status: 404, headers: new Headers(), text: async () => '{}' });
                 staleSections(response({ ...sections, tasks: [], task_progress: { state: 'none', total: 0, done: 0, counts: {}, unfinished_ids: [] } }));
                 await obsolete;
                 await new Promise(resolve => setTimeout(resolve, 0));
@@ -5696,6 +5706,7 @@ async fn chat_task_progress_refreshes_and_survives_operation_races() {
         })()"#).await.expect("operation and read races");
         for key in [
             "coalesced",
+            "unrelatedRead",
             "preserved",
             "stale404Ignored",
             "unknown",
