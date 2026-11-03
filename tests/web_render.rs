@@ -208,6 +208,7 @@ enum ClientProbe {
     Connection,
     Run,
     Upgrade,
+    TalkScroll,
 }
 
 // Expose the live module's functions without installing a second client that
@@ -236,6 +237,7 @@ async fn serve_with_client_probe(
         .expect("bind loopback");
     let base = format!("http://{}/", listener.local_addr().unwrap());
     let boot = !matches!(probe, ClientProbe::Connection | ClientProbe::Upgrade);
+    let scroll_probe = matches!(probe, ClientProbe::TalkScroll);
     let exports = match probe {
         ClientProbe::None => None,
         ClientProbe::Queue => Some(
@@ -248,12 +250,24 @@ async fn serve_with_client_probe(
         ClientProbe::Run => Some(
             "state, loadRun, observeRunProgress, renderRunProgress, tickActive, applyRevisions_",
         ),
+        ClientProbe::TalkScroll => Some("state, renderTalk, applyRoute, scheduleTalkPosition"),
         ClientProbe::Upgrade => {
             Some("state, upgrade, renderLoop, renderUpgradeError, loadHealth, ok")
         }
         ClientProbe::Connection => Some(
             "state, loadHealth, loadLoop, loadTalk, tickTalkWaits, loadStats, resumeConnection, onPageShow, unreachable, loadQueue, applyRevisions_, acceptTalkUpdate, renderTalkTasks, applyRoute, subscribe",
         ),
+    };
+    let instrumentation = if scroll_probe {
+        r#"window.scrollCalls = [];
+        const nativeScrollIntoView = Element.prototype.scrollIntoView;
+        Element.prototype.scrollIntoView = function(options) {
+          if (this.parentElement?.id === 'talk-turns')
+            scrollCalls.push({ behavior: options.behavior, id: deck.state.talkDetail.id });
+          return nativeScrollIntoView.call(this, options);
+        };"#
+    } else {
+        ""
     };
     let router = ui.router().layer(axum::middleware::from_fn(
         move |request: axum::extract::Request, next: axum::middleware::Next| async move {
@@ -267,7 +281,7 @@ async fn serve_with_client_probe(
                 return (
                     [(axum::http::header::CONTENT_TYPE, "text/javascript")],
                     format!(
-                        "{source}\nwindow.deck = {{ {exports} }};\n\
+                        "{source}\nwindow.deck = {{ {exports} }};\n{instrumentation}\n\
                          window.queueReady = {};",
                         if boot { "boot()" } else { "Promise.resolve()" }
                     ),
@@ -4850,6 +4864,16 @@ async fn avatar_settings_preview_isolation_reload_and_reset_on_phone() {
       if (saved === original || !panel().querySelector('img').getAttribute('src').includes(saved)) throw new Error('saved preview did not refresh');
       const rect = panel().getBoundingClientRect();
       if (rect.right > document.documentElement.clientWidth + 1 || panel().scrollWidth > panel().clientWidth + 1) throw new Error('phone overflow');
+      return saved;
+    })()"#).await.unwrap();
+    browser.eval(&page, &r#"(async () => {
+      const panel = () => document.querySelector('.avatar-settings');
+      const until = async f => { for(let i=0;i<200;i++) { if(f()) return; await new Promise(r=>setTimeout(r,25)); } throw new Error('UI timeout'); };
+      const saved = __SAVED__;
+      const canvas = document.createElement('canvas'); canvas.width = 24; canvas.height = 24;
+      canvas.getContext('2d').fillRect(0, 0, 24, 24);
+      const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
+      const transfer = new DataTransfer(); transfer.items.add(new File([blob], 'phone.png', {type:'image/png'}));
       const select = panel().querySelector('select');
       select.value = 'persona:rei'; select.dispatchEvent(new Event('change'));
       if (!panel().querySelector('button').disabled) throw new Error('operator draft leaked');
@@ -4867,6 +4891,12 @@ async fn avatar_settings_preview_isolation_reload_and_reset_on_phone() {
       await until(() => panel().textContent.includes('Built-in avatar restored.'));
       const reset = await (await fetch('/api/avatar-settings')).json();
       if (reset.personas.find(p => p.id === 'rei').avatar === rei.avatar) throw new Error('reset URL unchanged');
+      return saved;
+    })()"#.replace("__SAVED__", &result.to_string())).await.unwrap();
+    browser.eval(&page, &r#"(async () => {
+      const panel = () => document.querySelector('.avatar-settings');
+      const until = async f => { for(let i=0;i<200;i++) { if(f()) return; await new Promise(r=>setTimeout(r,25)); } throw new Error('UI timeout'); };
+      const saved = __SAVED__;
       const sel = panel().querySelector('select');
       sel.value = 'operator'; sel.dispatchEvent(new Event('change'));
       const invalid = new DataTransfer(); invalid.items.add(new File(['bad'], 'bad.png', {type:'image/png'}));
@@ -4876,7 +4906,7 @@ async fn avatar_settings_preview_isolation_reload_and_reset_on_phone() {
       if ((await (await fetch('/api/avatar-settings')).json()).operator !== saved) throw new Error('invalid image corrupted save');
       for (const button of panel().querySelectorAll('button')) if (button.getBoundingClientRect().height < 44) throw new Error('small touch target');
       return saved;
-    })()"#).await.unwrap();
+    })()"#.replace("__SAVED__", &result.to_string())).await.unwrap();
     browser.close_page(&page).await;
     let page = browser
         .open_page(&format!("{base}#/settings"), 390, 844, true)
@@ -5620,26 +5650,36 @@ async fn chat_task_progress_refreshes_and_survives_operation_races() {
             const snapshot = structuredClone(deck.state.talkDetail.talk);
             const sections = structuredClone(deck.state.talkDetail.sections);
             const pending = [];
-            const next = async () => {
+            const next = async part => {
                 const deadline = performance.now() + 10000;
                 while (!pending.length && performance.now() < deadline) await new Promise(resolve => setTimeout(resolve, 0));
                 if (!pending.length) throw new Error('Expected next conversation request');
-                return pending.shift();
+                const request = pending.shift();
+                if (request.path !== '/api/talks/' + id + '/' + part)
+                    throw new Error('Unexpected conversation request: ' + request.path);
+                return request.resolve;
             };
             const response = body => ({ ok: true, status: 200, headers: new Headers(), json: async () => body });
             const out = {};
-            window.fetch = () => new Promise(resolve => pending.push(resolve));
+            window.fetch = (url, init) => {
+                const path = new URL(typeof url === 'string' ? url : url.url, location.href).pathname;
+                if (path === '/api/talks/' + id + '/core' || path === '/api/talks/' + id + '/sections')
+                    return new Promise(resolve => pending.push({path, resolve}));
+                return native(url, init);
+            };
             try {
                 const old = deck.loadTalk(id), fresh = deck.loadTalk(id);
                 out.coalesced = pending.length === 1;
-                (await next())(response(snapshot));
-                (await next())(response(sections));
+                const health = await (await fetch('/api/health')).json();
+                out.unrelatedRead = Object.hasOwn(health, 'talks_rev') && pending.length === 1;
+                (await next('core'))(response(snapshot));
+                (await next('sections'))(response(sections));
                 await Promise.all([old, fresh]);
                 // Retain a pending sections response, then supersede it with
                 // an operation whose core response is also kept pending.
                 const obsolete = deck.loadTalk(id);
-                (await next())(response(snapshot));
-                const staleSections = await next();
+                (await next('core'))(response(snapshot));
+                const staleSections = await next('sections');
                 deck.acceptTalkUpdate({ id, status: 'closed' });
                 out.preserved = deck.state.talkDetail.talk.task_progress.total === 7
                     && deck.state.talkDetail.talk.tasks.length === 7;
@@ -5647,10 +5687,10 @@ async fn chat_task_progress_refreshes_and_survives_operation_races() {
                 const stale = pending.splice(0);
                 deck.acceptTalkUpdate({ id, status: 'open' });
                 const latest = deck.loadTalk(id);
-                (await next())(response(snapshot));
-                (await next())(response(sections));
+                (await next('core'))(response(snapshot));
+                (await next('sections'))(response(sections));
                 await latest;
-                stale[0]({ ok: false, status: 404, headers: new Headers(), text: async () => '{}' });
+                stale[0].resolve({ ok: false, status: 404, headers: new Headers(), text: async () => '{}' });
                 staleSections(response({ ...sections, tasks: [], task_progress: { state: 'none', total: 0, done: 0, counts: {}, unfinished_ids: [] } }));
                 await obsolete;
                 await new Promise(resolve => setTimeout(resolve, 0));
@@ -5666,6 +5706,7 @@ async fn chat_task_progress_refreshes_and_survives_operation_races() {
         })()"#).await.expect("operation and read races");
         for key in [
             "coalesced",
+            "unrelatedRead",
             "preserved",
             "stale404Ignored",
             "unknown",
@@ -6589,4 +6630,139 @@ async fn health_recovery_continues_while_revision_loader_is_pending() {
         .await
         .expect("held notifications still apply after release");
     browser.close_page(&page).await;
+}
+
+common::e2e! {
+async fn long_chat_open_and_switch_position_immediately() {
+    let Some(chrome) = cdp::find_chrome() else {
+        assert!(std::env::var_os("CI").is_none(), "CI requires Chrome");
+        eprintln!("SKIP web_render: no Chrome/Chromium found");
+        return;
+    };
+    let guard = common::home_lock().await;
+    let fx = common::fixture(guard, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("magi-home");
+    let talks = Talks::at(home.join("talks"));
+    let mut ids = Vec::new();
+    for topic in ["First", "Second"] {
+        let mut chat = talk::begin(&talks, &fx.config, fx.repo.clone(), None).unwrap();
+        for i in 0..240 {
+            talk::record(&mut chat, &talks, &format!("{topic} question {i}\n\n{}", "Transcript paragraph.\n\n".repeat(4)), Vec::new()).unwrap();
+        }
+        ids.push(chat.id);
+    }
+    let base = serve_with_client_probe(&home, Queue::at(home.join("queue")), talks,
+        home.join("runs"), &fx.repo, ClientProbe::TalkScroll).await;
+    let mut browser = cdp::Browser::launch(&chrome).await.unwrap();
+    for (width, height, mobile) in [(390, 844, true), (1280, 900, false)] {
+        let page = browser.open_page(&format!("{base}#/chat/{}", ids[0]), width, height, mobile).await.unwrap();
+        browser.wait_for(&page, "window.scrollCalls?.length > 0", Duration::from_secs(30)).await.unwrap();
+        browser.call(Some(&page.session), "Emulation.setEmulatedMedia", serde_json::json!({"features": [{"name": "prefers-reduced-motion", "value": "no-preference"}]})).await.unwrap();
+        let script = r##"(async () => {
+          const fails = [], check = (ok, why) => { if (!ok) fails.push(why); };
+          const frame = () => new Promise(requestAnimationFrame);
+          const pane = document.getElementById('view-talk');
+          const split = document.getElementById('main').dataset.split === '1';
+          const position = () => split ? pane.scrollTop : scrollY;
+          const move = top => split ? pane.scrollTo({top, behavior:'instant'}) : window.scrollTo({top, behavior:'instant'});
+          const last = () => document.getElementById('talk-turns').lastElementChild;
+          const aligned = () => {
+            const rect = last().getBoundingClientRect();
+            const gap = Math.ceil(document.querySelector('.top').getBoundingClientRect().height) + 4;
+            return rect.top >= gap - 1 && rect.top < (split ? pane.getBoundingClientRect().bottom : innerHeight);
+          };
+          const stable = async label => {
+            let previous = position(), quiet = 0;
+            // Deferred sections and font layout can move the scroll limit. Require
+            // stability across frames within a fixed budget, without a timed sleep.
+            for (let i = 0; i < 12 && quiet < 4; i++) {
+              await frame();
+              const next = position();
+              quiet = Math.abs(next - previous) <= 1 ? quiet + 1 : 0;
+              previous = next;
+            }
+            check(quiet === 4, label + ': still moving');
+            check(aligned(), label + ': latest turn hidden');
+          };
+          await stable('direct open');
+          check(scrollCalls.length === 1 && scrollCalls[0].behavior === 'instant', 'direct open must place once instantly');
+          // Wait ticks and unchanged transcript refreshes must not reposition.
+          for (let i = 0; i < 3; i++) deck.renderTalk();
+          await frame();
+          check(scrollCalls.length === 1, 'unchanged render repositioned');
+          // Isolate our correction from the browser's native scroll anchoring.
+          pane.style.overflowAnchor = 'none';
+          document.body.style.overflowAnchor = 'none';
+          deck.scheduleTalkPosition(true); await frame();
+          const beforeShift = scrollCalls.length;
+          // A real size change above the anchor is corrected without animation.
+          document.querySelector('#talk-turns > li').style.minHeight = '900px';
+          await frame(); await frame(); await frame();
+          await stable('layout shift');
+          check(scrollCalls.length === beforeShift + 1, 'layout shift was not corrected once');
+          check(scrollCalls.every(c => c.behavior === 'instant'), 'layout shift animated');
+          // Explicit scrolling wins over the temporary layout correction window.
+          window.dispatchEvent(new WheelEvent('wheel'));
+          move(500);
+          await frame();
+          const reading = position(), calls = scrollCalls.length;
+          document.querySelector('#talk-turns > li').style.minHeight = '1200px';
+          deck.state.talkDetail.talk.turns.push({who:'agent', body:'Reply while reading', at:new Date().toISOString()});
+          deck.renderTalk();
+          await frame(); await frame();
+          check(Math.abs(position() - reading) <= 1 && scrollCalls.length === calls, 'history reader moved');
+          const navigate = async id => {
+            location.hash = '#/chat/' + id;
+            for (let i = 0; i < 600; i++) {
+              await frame();
+              if (deck.state.talkDetail.talk?.id === id && scrollCalls.some(c => c.id === id)) return;
+            }
+            throw new Error('conversation did not load');
+          };
+          scrollCalls.length = 0;
+          await navigate('__SECOND__');
+          await stable('switch');
+          check(scrollCalls.length === 1 && scrollCalls[0].behavior === 'instant', 'switch must place once instantly');
+          // Cancel a queued placement even when navigation happens in the same frame.
+          scrollCalls.length = 0;
+          deck.scheduleTalkPosition(true);
+          location.hash = '#/chat/__FIRST__'; deck.applyRoute();
+          location.hash = '#/chat/__SECOND__'; deck.applyRoute();
+          await navigate('__SECOND__');
+          await stable('rapid switch');
+          check(scrollCalls.every(c => c.id === '__SECOND__' && c.behavior === 'instant'), 'stale or animated rapid switch');
+          scrollCalls.length = 0;
+          deck.scheduleTalkPosition(true);
+          window.dispatchEvent(new PointerEvent('pointerdown'));
+          await frame();
+          check(scrollCalls.length === 0, 'input did not cancel queued placement');
+          // Tail following retains gentle motion only for nearby new turns.
+          window.dispatchEvent(new WheelEvent('wheel'));
+          move(split ? pane.scrollHeight : document.documentElement.scrollHeight);
+          await frame();
+          scrollCalls.length = 0;
+          const chat = deck.state.talkDetail.talk;
+          chat.turns.push({who:'agent', body:'New reply', at:new Date().toISOString()});
+          deck.renderTalk(); await frame();
+          check(scrollCalls.length === 1 && scrollCalls[0].behavior === 'smooth', 'nearby new reply did not follow: ' + JSON.stringify({calls: scrollCalls, reduced: matchMedia('(prefers-reduced-motion: reduce)').matches, top: last().getBoundingClientRect().top, position: position(), viewport: innerHeight}));
+          // Reduced motion overrides even an explicit smooth request, with real scrolling.
+          const nativeMatch = window.matchMedia;
+          window.matchMedia = query => query.includes('prefers-reduced-motion') ? {matches:true} : nativeMatch.call(window, query);
+          scrollCalls.length = 0;
+          deck.scheduleTalkPosition(false); await frame();
+          window.matchMedia = nativeMatch;
+          check(scrollCalls.length === 1 && scrollCalls[0].behavior === 'instant', 'reduced motion animated');
+          move(split ? pane.scrollHeight : document.documentElement.scrollHeight);
+          await frame();
+          scrollCalls.length = 0;
+          for (let i = 0; i < 50; i++) chat.turns.push({who:'agent', body:'Bulk reply paragraph.\n\n'.repeat(10), at:new Date().toISOString()});
+          deck.renderTalk(); await frame();
+          check(scrollCalls.length === 1 && scrollCalls[0].behavior === 'instant', 'distant tail follow animated');
+          return fails;
+        })()"##.replace("__FIRST__", &ids[0]).replace("__SECOND__", &ids[1]);
+        let result = browser.eval(&page, &script).await.unwrap();
+        assert_eq!(result, serde_json::json!([]), "@{width}: {result}");
+        browser.close_page(&page).await;
+    }
+}
 }

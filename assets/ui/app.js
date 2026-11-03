@@ -5815,7 +5815,7 @@ let nextLocalAttachmentId = 1;
    set via JS on the target element, using getBoundingClientRect for a
    reliable measurement regardless of safe-area insets or zoom level.
    `containerId` is always "talk-turns", the standing chat's transcript. */
-function scrollToLastTurn(containerId) {
+function scrollToLastTurn(containerId, { smooth = false } = {}) {
   const turns = $(containerId);
   if (!turns.children.length) return;
   const last = turns.lastElementChild;
@@ -5823,7 +5823,66 @@ function scrollToLastTurn(containerId) {
   const gap = header ? Math.ceil(header.getBoundingClientRect().height) + 4 : 0;
   last.style.scrollMarginTop = `${gap}px`;
   const motion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-  last.scrollIntoView({ behavior: motion ? "auto" : "smooth", block: "start" });
+  const pane = $("main").dataset.split === "1" ? $("view-talk") : null;
+  const distance = Math.abs(last.getBoundingClientRect().top - (pane ? pane.getBoundingClientRect().top : 0) - gap);
+  const nearby = distance <= (pane ? pane.clientHeight : window.innerHeight) * 1.5;
+  last.scrollIntoView({ behavior: smooth && !motion && nearby ? "smooth" : "instant", block: "start" });
+}
+
+/* One pending placement for the visible conversation. Initial positioning is
+   immediate after route/layout updates. Briefly correct actual layout shifts
+   (for example an image loading), yielding as soon as the operator intervenes. */
+let cancelTalkPosition = () => {};
+let openingTalkPosition = false;
+function scheduleTalkPosition(initial) {
+  if (!initial && openingTalkPosition) return;
+  cancelTalkPosition();
+  openingTalkPosition = initial;
+  const id = state.talkDetail.id;
+  const pane = $("main").dataset.split === "1" ? $("view-talk") : null;
+  const position = () => pane ? pane.scrollTop : window.scrollY;
+  const current = () => state.route.name === "talk" && state.route.id === id && state.talkDetail.id === id;
+  let frame = 0, timer = 0, observer = null, expected = null, anchorTop = null;
+  const events = ["wheel", "touchstart", "pointerdown", "keydown"];
+  const stop = () => {
+    cancelAnimationFrame(frame);
+    clearTimeout(timer);
+    observer?.disconnect();
+    for (const event of events) window.removeEventListener(event, stop, true);
+    window.removeEventListener("scroll", onScroll, true);
+    openingTalkPosition = false;
+    if (cancelTalkPosition === stop) cancelTalkPosition = () => {};
+  };
+  const onScroll = () => {
+    if (expected !== null && Math.abs(position() - expected) > 1) stop();
+  };
+  cancelTalkPosition = stop;
+  for (const event of events) window.addEventListener(event, stop, { capture: true, passive: true });
+  window.addEventListener("scroll", onScroll, true);
+  frame = requestAnimationFrame(() => {
+    if (!current()) { stop(); return; }
+    openingTalkPosition = false;
+    scrollToLastTurn("talk-turns", { smooth: !initial });
+    if (!initial) { stop(); return; }
+    const last = $("talk-turns").lastElementChild;
+    if (!last) { stop(); return; }
+    const header = document.querySelector(".top");
+    const anchorPosition = () => last.getBoundingClientRect().top
+      - (header ? Math.ceil(header.getBoundingClientRect().height) + 4 : 0);
+    expected = position();
+    anchorTop = anchorPosition();
+    observer = new ResizeObserver(() => {
+      if (!current() || Math.abs(position() - expected) > 1 || last !== $("talk-turns").lastElementChild) { stop(); return; }
+      if (Math.abs(anchorPosition() - anchorTop) > 1) {
+        scrollToLastTurn("talk-turns");
+        expected = position();
+        anchorTop = anchorPosition();
+      }
+    });
+    observer.observe($("talk-turns"));
+    if (header) observer.observe(header);
+    timer = setTimeout(stop, 2000);
+  });
 }
 
 /* ---- standing chat ------------------------------------------------------ *
@@ -6551,10 +6610,6 @@ function renderTalk() {
   const viewportBottom = $("main").dataset.split === "1"
     ? $("view-talk").getBoundingClientRect().bottom : window.innerHeight;
   const followingTail = !previousTail || previousTail.getBoundingClientRect().bottom <= viewportBottom + 80;
-  const shownDetail = state.talkDetail;
-  const scrollCurrentTalk = () => {
-    if (state.talkDetail === shownDetail && state.route.name === "talk") scrollToLastTurn("talk-turns");
-  };
   syncList(
     $("talk-turns"),
     turns.flatMap((turn, i) => {
@@ -6576,9 +6631,9 @@ function renderTalk() {
     && turns[turns.length - 1].body === wait.pending.body;
   if (state.openingTalk) {
     state.openingTalk = false;
-    if (turnCount > 0) requestAnimationFrame(scrollCurrentTalk);
+    if (turnCount > 0) scheduleTalkPosition(true);
   } else if (followingTail && turnCount > state.prevTalkTurnCount && !lastIsPending) {
-    requestAnimationFrame(scrollCurrentTalk);
+    scheduleTalkPosition(false);
   }
   state.prevTalkTurnCount = turnCount;
 
@@ -10788,7 +10843,10 @@ function markSelected() {
 function applyRoute() {
   const route = parseRoute();
   const changed = route.name !== state.route.name || route.id !== state.route.id;
-  if (changed) cancelDetailSections();
+  if (changed) {
+    cancelDetailSections();
+    cancelTalkPosition();
+  }
   state.route = route;
 
   const split = splitPanes(route, Boolean(splitMedia && splitMedia.matches));
