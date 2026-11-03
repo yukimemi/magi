@@ -6657,6 +6657,7 @@ async fn long_chat_open_and_switch_position_immediately() {
     for (width, height, mobile) in [(390, 844, true), (1280, 900, false)] {
         let page = browser.open_page(&format!("{base}#/chat/{}", ids[0]), width, height, mobile).await.unwrap();
         browser.wait_for(&page, "window.scrollCalls?.length > 0", Duration::from_secs(30)).await.unwrap();
+        browser.call(Some(&page.session), "Emulation.setEmulatedMedia", serde_json::json!({"features": [{"name": "prefers-reduced-motion", "value": "no-preference"}]})).await.unwrap();
         let script = r##"(async () => {
           const fails = [], check = (ok, why) => { if (!ok) fails.push(why); };
           const frame = () => new Promise(requestAnimationFrame);
@@ -6743,7 +6744,7 @@ async fn long_chat_open_and_switch_position_immediately() {
           const chat = deck.state.talkDetail.talk;
           chat.turns.push({who:'agent', body:'New reply', at:new Date().toISOString()});
           deck.renderTalk(); await frame();
-          check(scrollCalls.length === 1 && scrollCalls[0].behavior === 'smooth', 'nearby new reply did not follow');
+          check(scrollCalls.length === 1 && scrollCalls[0].behavior === 'smooth', 'nearby new reply did not follow: ' + JSON.stringify({calls: scrollCalls, reduced: matchMedia('(prefers-reduced-motion: reduce)').matches, top: last().getBoundingClientRect().top, position: position(), viewport: innerHeight}));
           // Reduced motion overrides even an explicit smooth request, with real scrolling.
           const nativeMatch = window.matchMedia;
           window.matchMedia = query => query.includes('prefers-reduced-motion') ? {matches:true} : nativeMatch.call(window, query);
