@@ -1178,6 +1178,8 @@ pub fn fixture_that_never_clears(home: HomeGuard, rounds: usize) -> Fixture {
 /// they read.
 pub fn fixture_with_advise(home: HomeGuard, advisors: usize) -> Fixture {
     let mut fx = fixture(home, Judges::Unanimous, false);
+    // Deliberation tests must not interrupt mock agents based on host disk capacity.
+    fx.config.disk.min_free_bytes = 0;
     fx.config.graph.advise = true;
     fx.config.graph.advisors = advisors;
     fx

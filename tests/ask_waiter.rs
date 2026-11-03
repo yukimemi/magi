@@ -35,6 +35,8 @@ fn scene(home: HomeGuard, turns: usize) -> Scene {
         "task".to_owned(),
         fx.config.clone(),
     );
+    // Delivery tests must not interrupt the mock agent based on host disk capacity.
+    state.config.disk.min_free_bytes = 0;
     state.status = RunStatus::Implementing;
     let mut seat = SeatState::new("impl-A", "alpha", 7);
     seat.turns = turns;
