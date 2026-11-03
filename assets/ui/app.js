@@ -5815,7 +5815,7 @@ let nextLocalAttachmentId = 1;
    set via JS on the target element, using getBoundingClientRect for a
    reliable measurement regardless of safe-area insets or zoom level.
    `containerId` is always "talk-turns", the standing chat's transcript. */
-function scrollToLastTurn(containerId, behavior = "instant") {
+function scrollToLastTurn(containerId, { smooth = false } = {}) {
   const turns = $(containerId);
   if (!turns.children.length) return;
   const last = turns.lastElementChild;
@@ -5826,7 +5826,7 @@ function scrollToLastTurn(containerId, behavior = "instant") {
   const pane = $("main").dataset.split === "1" ? $("view-talk") : null;
   const distance = Math.abs(last.getBoundingClientRect().top - (pane ? pane.getBoundingClientRect().top : 0) - gap);
   const nearby = distance <= (pane ? pane.clientHeight : window.innerHeight) * 1.5;
-  last.scrollIntoView({ behavior: motion || !nearby ? "instant" : behavior, block: "start" });
+  last.scrollIntoView({ behavior: smooth && !motion && nearby ? "smooth" : "instant", block: "start" });
 }
 
 /* One pending placement for the visible conversation. Initial positioning is
@@ -5862,7 +5862,7 @@ function scheduleTalkPosition(initial) {
   frame = requestAnimationFrame(() => {
     if (!current()) { stop(); return; }
     openingTalkPosition = false;
-    scrollToLastTurn("talk-turns", initial ? "instant" : "smooth");
+    scrollToLastTurn("talk-turns", { smooth: !initial });
     if (!initial) { stop(); return; }
     const last = $("talk-turns").lastElementChild;
     if (!last) { stop(); return; }
@@ -5874,7 +5874,7 @@ function scheduleTalkPosition(initial) {
     observer = new ResizeObserver(() => {
       if (!current() || Math.abs(position() - expected) > 1 || last !== $("talk-turns").lastElementChild) { stop(); return; }
       if (Math.abs(anchorPosition() - anchorTop) > 1) {
-        scrollToLastTurn("talk-turns", "instant");
+        scrollToLastTurn("talk-turns");
         expected = position();
         anchorTop = anchorPosition();
       }
