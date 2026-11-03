@@ -2222,6 +2222,9 @@ pub struct RunState {
     pub created_at: Timestamp,
     /// Last state flush.
     pub updated_at: Timestamp,
+    /// Execution activity for artifact reclamation; bookkeeping saves do not refresh it.
+    #[serde(default)]
+    pub output_activity_at: Option<Timestamp>,
     /// Current status.
     pub status: RunStatus,
     /// Seed for labels and session ids.
@@ -2745,6 +2748,7 @@ impl RunState {
             task_instruction: None,
             created_at: now,
             updated_at: now,
+            output_activity_at: Some(now),
             status: RunStatus::Prep,
             seed,
             config,
@@ -2946,6 +2950,7 @@ impl RunState {
     /// one that recorded its own end is never touched.
     pub fn begin_pass(&mut self) {
         let now = Timestamp::now();
+        self.note_output_activity(now);
         if let Some(last) = self.passes.last_mut()
             && last.end.is_none()
         {
@@ -3528,6 +3533,20 @@ impl RunState {
         Ok(())
     }
 
+    pub(crate) fn note_output_activity(&mut self, at: Timestamp) {
+        self.output_activity_at = Some(self.output_activity_at.unwrap_or(self.updated_at).max(at));
+    }
+
+    pub(crate) fn output_activity(&self) -> Timestamp {
+        self.passes.iter().fold(
+            self.output_activity_at.unwrap_or(self.updated_at),
+            |at, pass| {
+                at.max(pass.started_at)
+                    .max(pass.ended_at.unwrap_or(pass.started_at))
+            },
+        )
+    }
+
     /// Flush to `run.json`, atomically, under the process-global [`home`].
     pub fn save(&mut self) -> Result<()> {
         let home = home();
@@ -3548,6 +3567,8 @@ impl RunState {
     }
 
     pub(crate) fn save_under_at(&mut self, home: &Path, at: Timestamp) -> Result<()> {
+        // Freeze legacy age before a bookkeeping flush changes updated_at.
+        self.output_activity_at.get_or_insert(self.updated_at);
         self.record_base_interruption();
         self.updated_at = at;
         let dir = home.join("runs").join(&self.id);
@@ -3589,6 +3610,7 @@ impl RunState {
 }
 
 pub(crate) fn migrate_schema(mut state: RunState) -> Result<RunState> {
+    state.output_activity_at.get_or_insert(state.updated_at);
     // Schema 5 predates deferred e2e. Its empty e2e lists therefore mean
     // "not configured", never "deferred"; serde's field defaults retain
     // exactly that representation while this migration permits resumes.
