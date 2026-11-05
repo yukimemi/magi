@@ -69,3 +69,16 @@ Report screenshots accompany the Overview captures.
 フォーカス維持、古い操作の拒否を確認するテストも成功した。
 全スイートと最終ゲートの実行は引き続き親ランが担当する。
 アプリと検証タイムアウトの設定は変更していない。
+
+## レビュー第2ラウンドのテスト隔離修正
+
+`graph_base_sync` の認証エラーテストを単独実行し、期待する
+`agent authentication` の代わりに `disk pressure` が記録される失敗を再現した。
+共有モック設定が本番の既定ディスク閾値を継承しており、ホストの空き容量が
+緊急停止条件に達すると、目的のリベース処理に進む前に実行が止まっていた。
+
+`tests/common/mod.rs` のモック設定で `disk.min_free_bytes = 0` を明示し、
+実行フローのテストをホストの空き容量から独立させた。本番の既定値と保護処理は
+変更していない。修正後は `graph_base_sync` の20件すべてが49.85秒で成功した。
+`disk::tests` の15件、`cargo fmt --all -- --check`、`git diff --check` も成功した。
+Rustの検証には `RUSTUP_TOOLCHAIN=stable` と既存の共有キャッシュを使用した。

@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use magi::config::{
-    AgentKind, AgentSpec, Blind, Config, Graph, Merge, MergeMode, MergeStyle, Roles, Update,
+    AgentKind, AgentSpec, Blind, Config, Disk, Graph, Merge, MergeMode, MergeStyle, Roles, Update,
     UpdateMode, Verify,
 };
 
@@ -864,6 +864,12 @@ pub fn fixture(home: HomeGuard, judges: Judges, require_fix: bool) -> Fixture {
             mode: UpdateMode::Off,
             interval: None,
             auto_restart: false,
+        },
+        // モックの実行フローをホストの空き容量から独立させる。
+        // ディスク保護を検証するテストでは、そのシナリオの閾値を明示する。
+        disk: Disk {
+            min_free_bytes: 0,
+            ..Disk::default()
         },
         ..Config::default()
     };
