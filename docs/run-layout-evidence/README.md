@@ -52,3 +52,20 @@ Validation result: all 10 browser configurations passed, along with 77 focused
 JavaScript tests and all four `run_progress::tests` Rust tests. Tab assertions
 use pointer activation and keyboard arrow navigation; split/phone Timeline and
 Report screenshots accompany the Overview captures.
+
+## レビュー第1ラウンドの検証タイムアウト
+
+`0a6f763` に対する親ランの検証は、テストのアサーション失敗を報告せずに
+2400秒の制限に達した。コンパイルが31分59秒を消費し、統合テストに残ったのは
+約8分だった。最後に報告された対象は `chat_control` であり、このログだけでは
+デッドロックやレイアウトの不具合とは判断できない。
+
+既存の共有ビルドキャッシュと `RUSTUP_TOOLCHAIN=stable` を使用した限定再検証では、
+ビルドは2.90秒で完了した。`chat_control` は有効な10件すべて成功した
+（インストール済みサンドボックスを必要とする1件は明示的スキップ）。
+進捗UIのJavaScriptテストも17件すべて成功した。
+同時に再検証した `web_render` は604.13秒で完了し、52件成功・1件明示的スキップ・
+失敗なしだった。実ルートのレイアウト、ライブ進捗、スマートフォン表示、
+フォーカス維持、古い操作の拒否を確認するテストも成功した。
+全スイートと最終ゲートの実行は引き続き親ランが担当する。
+アプリと検証タイムアウトの設定は変更していない。
