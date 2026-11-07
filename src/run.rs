@@ -2341,6 +2341,9 @@ pub struct RunState {
     /// Resume must reconcile, sync, gate and publish the existing PR head before CI.
     #[serde(default)]
     pub land_sync_pending: bool,
+    /// Base synchronization attempts spent, including across landing resumes.
+    #[serde(default)]
+    pub land_sync_attempts: usize,
     /// Winner tip before a landing rebase, retained until worktree setup finishes.
     #[serde(default)]
     pub land_rebase_from: Option<String>,
@@ -2807,6 +2810,7 @@ impl RunState {
             head_e2e: None,
             verification_history: Vec::new(),
             land_sync_pending: false,
+            land_sync_attempts: 0,
             land_rebase_from: None,
             gate_fixes: Vec::new(),
             gate_repair_e2e: None,
