@@ -6076,6 +6076,117 @@ async fn run_landing_renders_when_core_precedes_identical_evidence() {
     browser.close_page(&page).await;
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn run_detail_pulse_tabs_and_content_share_one_column() {
+    let Some(chrome) = cdp::find_chrome() else {
+        assert!(std::env::var_os("CI").is_none(), "Chrome required in CI");
+        eprintln!("SKIP run layout: no Chrome");
+        return;
+    };
+    let guard = common::home_lock().await;
+    let fx = common::fixture(guard, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("magi-home");
+    let mut run = RunState::new(
+        fx.repo.clone(),
+        "main".into(),
+        "0000000".into(),
+        "Check the run detail layout".into(),
+        fx.config.clone(),
+    );
+    run.status = RunStatus::Implementing;
+    run.prep_complete = Some(true);
+    run.driver_pid = Some(std::process::id());
+    run.driver_started_at = magi::proc::process_started_at(std::process::id());
+    run.seat_started("implement", "implement-A", Duration::from_secs(600), 0);
+    run.event("implement", "Implementation dispatched");
+    run.save_under(&home).unwrap();
+    let base = serve_with_client_probe(
+        &home,
+        Queue::at(home.join("queue")),
+        Talks::at(home.join("talks")),
+        home.join("runs"),
+        &fx.repo,
+        ClientProbe::Run,
+    )
+    .await;
+    let mut browser = cdp::Browser::launch(&chrome).await.expect("Chrome");
+    for (width, height) in [
+        (320, 740),
+        (390, 844),
+        (1079, 900),
+        (1100, 900),
+        (1280, 900),
+        (1531, 1518),
+    ] {
+        let page = browser
+            .open_page(
+                &format!("{base}#/runs/{}", run.id),
+                width,
+                height,
+                width <= 390,
+            )
+            .await
+            .unwrap();
+        browser.wait_for(&page, "window.deck && deck.state.detail.evidenceError === false && !document.getElementById('run-progress').hidden", Duration::from_secs(30)).await.unwrap();
+        let out = browser.eval(&page, r#"(() => {
+          const r = id => document.getElementById(id).getBoundingClientRect();
+          const pulse = r('run-progress'), tabs = r('run-tabs'), active = r('run-active-panel'), pipe = r('progress-pipeline');
+          const view = document.getElementById('view-run');
+          return {
+            stacked: pulse.bottom <= tabs.top + 1 && tabs.bottom <= active.top + 1,
+            sameColumn: Math.abs(pulse.left - tabs.left) < 2 && Math.abs(pulse.width - tabs.width) < 2,
+            fills: pulse.width > view.getBoundingClientRect().width * 0.6,
+            runningNowVisible: !document.getElementById('run-active-panel').hidden && active.height > 0 && active.top < tabs.bottom + 50,
+            correctMode: document.getElementById('main').hasAttribute('data-split') === (innerWidth >= 1080),
+            folded: !document.getElementById('progress-pipeline').open,
+            pipelineAfterActive: pipe.top >= active.bottom - 1,
+            noOverflow: document.documentElement.scrollWidth <= window.innerWidth + 1,
+          };
+        })()"#).await.unwrap();
+        assert_eq!(
+            out,
+            serde_json::json!({"stacked": true, "sameColumn": true, "fills": true, "runningNowVisible": true, "correctMode": true, "folded": true, "pipelineAfterActive": true, "noOverflow": true}),
+            "width {width}"
+        );
+        let out = browser.eval(&page, r#"(async () => {
+          const active = document.getElementById('run-active-panel');
+          const top = active.getBoundingClientRect().top;
+          const pipeline = document.getElementById('progress-pipeline');
+          pipeline.open = true;
+          const expandedStable = Math.abs(active.getBoundingClientRect().top - top) < 1
+            && pipeline.getBoundingClientRect().top >= active.getBoundingClientRect().bottom - 1;
+          const tabs = document.getElementById('run-tabs');
+          const pulse = document.getElementById('run-progress');
+          const pulseHeight = pulse.getBoundingClientRect().height;
+          let selectedVisible = true;
+          for (const tab of ['timeline', 'report', 'overview']) {
+            document.getElementById('run-tab-' + tab).click();
+            await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+            const panel = document.getElementById('run-tabpanel-' + tab);
+            const box = panel.getBoundingClientRect();
+            selectedVisible &&= document.getElementById('run-tab-' + tab).getAttribute('aria-selected') === 'true'
+              && box.height > 0 && box.top >= tabs.getBoundingClientRect().bottom - 1
+              && box.top < tabs.getBoundingClientRect().bottom + 50
+              && Math.abs(pulse.getBoundingClientRect().height - pulseHeight) < 1
+              && ['overview', 'timeline', 'report'].every(name =>
+                document.getElementById('run-tabpanel-' + name).hidden === (name !== tab));
+          }
+          await new Promise(resolve => {
+            pipeline.addEventListener('toggle', resolve, {once: true});
+            pipeline.open = false;
+          });
+          return {expandedStable, selectedVisible,
+            noPaneOverflow: document.getElementById('view-run').scrollWidth <= document.getElementById('view-run').clientWidth + 1};
+        })()"#).await.unwrap();
+        assert_eq!(
+            out,
+            serde_json::json!({"expandedStable": true, "selectedVisible": true, "noPaneOverflow": true}),
+            "width {width}"
+        );
+        browser.close_page(&page).await;
+    }
+}
+
 #[tokio::test]
 async fn run_progress_live_pipeline_observation_and_phone_layout() {
     let Some(chrome) = cdp::find_chrome() else {
@@ -6123,7 +6234,7 @@ async fn run_progress_live_pipeline_observation_and_phone_layout() {
             )
             .await
             .unwrap();
-        browser.wait_for(&page, "window.deck && deck.state.detail.evidenceError === false && document.querySelectorAll('#progress-seats li').length === 2", Duration::from_secs(30)).await.unwrap();
+        browser.wait_for(&page, "window.deck && deck.state.detail.evidenceError === false && document.querySelectorAll('#run-active > li').length === 2 && document.querySelectorAll('#progress-phases .progress-implementers li').length === 2", Duration::from_secs(30)).await.unwrap();
         browser
             .eval(
                 &page,
@@ -6137,18 +6248,24 @@ async fn run_progress_live_pipeline_observation_and_phone_layout() {
           await new Promise(resolve => setTimeout(resolve, 600));
           const pipeline = document.getElementById('progress-pipeline');
           const summary = pipeline.querySelector('summary');
-          const row = document.querySelector('#progress-seats li');
+          const row = document.querySelector('#progress-phases .progress-implementers li');
+          const activeRow = document.querySelector('#run-active > li');
+          const activeClock = activeRow.querySelector('[data-seat-start]');
           const phase = document.querySelector('#progress-phases li');
           const clock = row.querySelector('[data-progress-start]');
           const progress = document.getElementById('run-progress');
-          const noOverflow = progress.scrollWidth <= progress.clientWidth + 1;
+          const noOverflow = progress.scrollWidth <= progress.clientWidth + 1
+            && pipeline.scrollWidth <= pipeline.clientWidth + 1
+            && activeRow.scrollWidth <= activeRow.clientWidth + 1;
           const actual = document.getElementById('progress-activity').textContent;
           const announcement = document.getElementById('progress-announcement').textContent;
           pipeline.open = false; summary.focus({preventScroll: true});
           const top = summary.getBoundingClientRect().top;
           deck.tickActive();
           await deck.observeRunProgress(true);
-          const retained = document.querySelector('#progress-seats li') === row
+          const retained = document.querySelector('#progress-phases .progress-implementers li') === row
+            && document.querySelector('#run-active > li') === activeRow
+            && activeRow.querySelector('[data-seat-start]') === activeClock
             && document.querySelector('#progress-phases li') === phase
             && row.querySelector('[data-progress-start]') === clock;
           const stable = !pipeline.open && document.activeElement === summary
@@ -6253,7 +6370,7 @@ async fn run_progress_live_pipeline_observation_and_phone_layout() {
         .collect();
     run.event("review", "Review panel dispatched");
     run.save_under(&home).unwrap();
-    browser.wait_for(&page, "document.getElementById('progress-activity').textContent.includes('review-1') && document.querySelectorAll('#progress-seats li').length === 1", Duration::from_secs(30)).await.unwrap();
+    browser.wait_for(&page, "document.getElementById('progress-activity').textContent.includes('review-1') && !document.getElementById('run-active-panel').hidden && document.querySelectorAll('#run-active > li').length === 1 && document.querySelector('#run-active .seat').textContent === 'review-1'", Duration::from_secs(30)).await.unwrap();
     assert_eq!(
         browser
             .eval(
@@ -6294,11 +6411,11 @@ async fn run_progress_live_pipeline_observation_and_phone_layout() {
         browser
             .eval(
                 &page,
-                "document.querySelectorAll('#progress-seats li').length"
+                "document.getElementById('run-active-panel').hidden && !document.querySelector('#progress-phases .progress-implementers li[data-state=\"running\"]')"
             )
             .await
             .unwrap(),
-        0
+        true
     );
     run.status = RunStatus::Merged;
     run.event("merge", "Merge confirmed");

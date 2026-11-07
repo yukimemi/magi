@@ -2155,26 +2155,8 @@ details.panel > summary + * { margin-top: var(--s2); }
   .turn { max-width: 80%; }
 }
 
-/* The two run-detail wrappers are inert on a phone: their children flow into
-   the section's single column in source order. */
-.run-main, .run-side { display: contents; }
-
+/* Run detail keeps the same reading order at every pane width. */
 @media (min-width: 1080px) {
-  #view-run {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) minmax(0, 1.05fr);
-    align-items: start;
-    align-content: start;
-    column-gap: var(--s5);
-  }
-  #view-run > .back, #view-run > .view-head { grid-column: 1 / -1; }
-  /* Real columns here, so the report sits level with the verdict instead of
-     being pushed to whatever grid row auto-placement gives it. */
-  .run-main, .run-side {
-    display: flex; flex-direction: column; gap: var(--s5);
-    min-width: 0;
-  }
-  .run-main { grid-column: 1 / -1; }
   .report { max-height: calc(100dvh - 260px); }
   .facts { grid-template-columns: 10rem 1fr; }
 
@@ -2374,14 +2356,7 @@ details.panel > summary + * { margin-top: var(--s2); }
      outside the panes here. */
   main[data-split] * { scroll-margin-top: 0 !important; }
 
-  /* The run detail's two columns follow the viewport elsewhere; in a pane that
-     is a column short, so they stack until the pane itself is wide. */
-  main[data-split] #view-run { display: flex; }
   main[data-split] .report { max-height: 60dvh; }
-  @media (min-width: 1500px) {
-    main[data-split] #view-run { display: grid; }
-    main[data-split] .report { max-height: calc(100dvh - 220px); }
-  }
   main[data-split] #view-talk { max-width: none; }
   main[data-split] .talk-composer { bottom: 0; }
   body[data-split] .run-actions-fab { bottom: var(--s4); }
@@ -2499,7 +2474,7 @@ details.panel > summary + * { margin-top: var(--s2); }
 }
 #view-run .run-tab {
   display: inline-flex; align-items: center; gap: var(--s2);
-  min-height: var(--tap); padding: 0 var(--s4);
+  min-height: var(--tap); padding: 0 var(--s2);
   margin-bottom: -1px;
   border-bottom: 2px solid transparent;
   font: 700 var(--t2)/1 var(--sans); letter-spacing: .08em; text-transform: uppercase;
@@ -3034,8 +3009,8 @@ button[aria-busy="true"] {
 
 /* The pulse is a record, not a completion meter. Only new records animate. */
 .run-progress {
-  margin: 0 0 var(--s5);
-  padding: var(--s4);
+  margin: 0;
+  padding: var(--s3) var(--s4);
   border: 1px solid var(--line-2);
   border-radius: var(--radius);
   background: var(--surface);
@@ -3046,16 +3021,12 @@ button[aria-busy="true"] {
 .progress-eyebrow { display: flex; flex-wrap: wrap; justify-content: space-between; gap: var(--s2); font: 600 var(--t1) var(--mono); letter-spacing: .08em; color: var(--teal); }
 #progress-connection { color: var(--ink-2); font-weight: 400; letter-spacing: 0; }
 #progress-activity { margin: var(--s3) 0 var(--s2); font-size: var(--t6); font-weight: 650; line-height: 1.35; text-transform: capitalize; }
-#progress-freshness { color: var(--ink-2); font-weight: 400; margin-bottom: var(--s4); font-variant-numeric: tabular-nums; }
-.progress-seats { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 145px), 1fr)); gap: var(--s2); list-style: none; padding: 0; margin: 0 0 var(--s3); }
-.progress-seats li { display: flex; flex-direction: column; gap: var(--s1); padding: var(--s3); background: var(--sunk); border-left: 3px solid var(--teal); border-radius: var(--radius-sm); font-size: var(--t2); }
-.progress-seats li[data-candidate="a"] { border-color: var(--cand-a); }
-.progress-seats li[data-candidate="b"] { border-color: var(--cand-b); }
-.progress-seats li[data-candidate="c"] { border-color: var(--cand-c); }
+#progress-freshness { color: var(--ink-2); font-weight: 400; margin-bottom: var(--s1); font-variant-numeric: tabular-nums; }
 .progress-seat-age { color: var(--ink-2); font-variant-numeric: tabular-nums; }
-#progress-pipeline { border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
-#progress-pipeline summary { min-height: var(--tap); cursor: pointer; padding: var(--s3) 0; font-weight: 600; }
-#progress-pipeline summary span { color: var(--ink-2); display: block; padding-left: var(--s4); font-weight: 400; }
+#progress-pipeline { min-width: 0; overflow-wrap: anywhere; }
+#progress-pipeline summary { flex-wrap: wrap; min-height: var(--tap); cursor: pointer; padding: var(--s3) 0; font-weight: 600; }
+#progress-pipeline .pipeline-label { flex: none; }
+#progress-pipeline summary .card-note { flex: 1 1 16rem; color: var(--ink-2); font-weight: 400; }
 #progress-phases, #progress-rounds { list-style: none; padding: 0; margin: 0; }
 #progress-phases > li, #progress-rounds > li { display: grid; grid-template-columns: 24px minmax(0, 1fr); gap: var(--s2); padding: var(--s2); border-radius: var(--radius-sm); font-size: var(--t2); transition: background-color .3s var(--ease); }
 #progress-phases > li > div, #progress-rounds > li > div { padding-bottom: var(--s2); }
@@ -3097,7 +3068,7 @@ button[aria-busy="true"] {
 .progress-implementers li[data-state="failed"] { border-color: var(--verdict-failed); }
 .progress-implementers li[data-state="complete"] { border-color: var(--teal); }
 @media (prefers-reduced-motion: no-preference) {
-  .run-progress[data-state="active"]:not([data-observation-old]) #progress-phases > li[data-state="current"]:not([data-changed="1"]) .progress-marker { animation: progress-step-pulse 1.8s ease-in-out infinite; }
+  #run-progress[data-state="active"]:not([data-observation-old]) ~ .run-main #progress-phases > li[data-state="current"]:not([data-changed="1"]) .progress-marker { animation: progress-step-pulse 1.8s ease-in-out infinite; }
   #progress-phases > li[data-changed="1"] .progress-marker { animation: progress-step-pop var(--progress-step-duration) ease-out 1; }
   @keyframes progress-step-pulse { 50% { opacity: .5; } }
   @keyframes progress-step-pop { 0% { transform: scale(.75); } 70% { transform: scale(1.1); } 100% { transform: scale(1); } }

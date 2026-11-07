@@ -227,15 +227,8 @@
       <div class="progress-heading"><span id="progress-state-marker" aria-hidden="true"></span><p id="progress-activity"></p></div>
       <p id="progress-announcement" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></p>
       <p id="progress-freshness" class="card-note"></p>
-      <ul id="progress-seats" class="progress-seats" aria-label="Current activity"></ul>
-      <div class="progress-recent-head">Latest records <a id="progress-timeline" href="#/runs">Full timeline →</a></div>
+      <div class="progress-recent-head">Latest record <a id="progress-timeline" href="#/runs">Full timeline →</a></div>
       <ol id="progress-recent"></ol>
-      <details id="progress-pipeline" open>
-        <summary>Pipeline <span class="card-note">Recorded results · no estimated progress</span></summary>
-        <ol id="progress-phases"></ol>
-        <ol id="progress-rounds" aria-label="Recorded review rounds"></ol>
-      </details>
-
     </section>
 
     <div class="run-tabs" id="run-tabs" role="tablist" aria-label="Run sections">
@@ -265,6 +258,12 @@
         <ul class="plain" id="run-active"></ul>
       </div>
 
+      <details id="progress-pipeline" class="panel advanced" data-panel="pipeline" hidden>
+        <summary><span class="pipeline-label">Pipeline</span> <span class="card-note">Recorded results · no estimated progress</span></summary>
+        <ol id="progress-phases"></ol>
+        <ol id="progress-rounds" aria-label="Recorded review rounds"></ol>
+      </details>
+
       <div class="panel" id="run-advise-panel" hidden>
         <h2>Design deliberation <span class="count" id="advise-count"></span></h2>
         <p class="panel-note">Advisor seats sketched a design each, read-only, before any implementer began — the record below is what fed the brief they were given.</p>
@@ -287,7 +286,8 @@
       </div>
 
       <div class="panel" id="run-cands-panel" hidden>
-        <h2>Candidates <span class="count" id="cand-count"></span></h2>
+        <h2><span id="cand-title">Candidates</span> <span class="count" id="cand-count"></span></h2>
+        <p class="panel-note" id="cand-history-note" hidden>Candidate records retained for this existing-branch review. They describe the reviewed work, not an implementation stage in this run; missing original results remain unrecorded.</p>
         <ol class="cands" id="run-cands"></ol>
       </div>
 
