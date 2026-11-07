@@ -2488,6 +2488,7 @@ async fn write_release_files(state: &RunState, worktree: &Path, version: &str) -
 async fn sync_lockfile(worktree: &Path, cache_dir: Option<&Path>) -> Result<()> {
     let mut cmd = tokio::process::Command::new("cargo");
     cmd.arg("build").current_dir(worktree).quiet();
+    crate::incremental::configure(&mut cmd, worktree)?;
     if let Some(dir) = cache_dir {
         cmd.env("CARGO_TARGET_DIR", dir);
     }

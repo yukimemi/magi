@@ -55,6 +55,7 @@ pub mod graft_report;
 pub mod graph;
 pub mod handover;
 mod id_reserve;
+pub mod incremental;
 pub mod land;
 pub mod lang;
 mod lock_file;

@@ -63,6 +63,119 @@ impl OutputLease {
             exclusive,
         )
     }
+    /// Reserve headroom once per volume while admitting a managed writer.
+    /// These are estimates, not filesystem quotas. The ordinary emergency
+    /// monitor remains necessary for writes exceeding the reservation.
+    #[cfg(unix)]
+    pub(crate) fn admit(home: &Path, paths: &[PathBuf], min_free: u64) -> Result<Vec<Self>> {
+        Self::admit_with(home, paths, min_free, crate::disk::free_bytes)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn admit_with(
+        home: &Path,
+        paths: &[PathBuf],
+        min_free: u64,
+        free_bytes: impl Fn(&Path) -> Result<u64>,
+    ) -> Result<Vec<Self>> {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        if min_free == 0 {
+            return Ok(Vec::new());
+        }
+        const RESERVE: u64 = 1024 * 1024 * 1024;
+        std::fs::create_dir_all(home)?;
+        let dir = home.canonicalize()?.join("disk-admission");
+        std::fs::create_dir_all(&dir)?;
+        ensure!(
+            plain_dir(&dir) && dir.canonicalize()? == dir,
+            "disk admission directory is not canonical"
+        );
+        let mut devices = std::collections::BTreeSet::new();
+        let mut reservations = Vec::new();
+        for path in paths {
+            let probe = path
+                .ancestors()
+                .find(|p| p.exists())
+                .context("disk admission path missing")?;
+            let device = std::fs::metadata(probe)?.dev();
+            if !devices.insert(device) {
+                continue;
+            }
+            let open = |path: &Path| -> Result<File> {
+                Ok(OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(path)?)
+            };
+            // Explicitly unlock on return. A concurrent fork can briefly
+            // inherit this descriptor before exec closes it; closing only the
+            // parent's copy would leave the namespace spuriously busy.
+            let admission = Self {
+                _file: open(&dir.join(format!("{device}.lock")))?,
+                _activity: false,
+            };
+            let started = std::time::Instant::now();
+            loop {
+                match crate::pr_head::try_lock_file(&admission._file) {
+                    Ok(()) => break,
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                        ) && started.elapsed() < std::time::Duration::from_secs(1) =>
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(error) => {
+                        return Err(error)
+                            .context("disk admission busy or unavailable; retry without dispatch");
+                    }
+                }
+            }
+            let mut active = 0u64;
+            let mut available = None;
+            for slot in 0..1024 {
+                let file = dir.join(format!("{device}-{slot}.reserve"));
+                if !file.exists() {
+                    if available.is_none() {
+                        available = Some(file);
+                    }
+                    continue;
+                }
+                let file = open(&file)?;
+                match crate::pr_head::try_lock_file(&file) {
+                    Ok(()) if available.is_none() => {
+                        available = Some(dir.join(format!("{device}-{slot}.reserve")))
+                    }
+                    Ok(()) => {}
+                    Err(_) => active = active.saturating_add(RESERVE),
+                }
+            }
+            let free = free_bytes(probe)?;
+            let required = min_free.saturating_add(active).saturating_add(RESERVE);
+            ensure!(
+                free >= required,
+                "disk admission blocked: {free} bytes free; floor {min_free}, active writer reservations {active}, next writer reservation {RESERVE} bytes (estimates, not quotas)"
+            );
+            let file = open(&available.context("disk admission reservation slots exhausted")?)?;
+            crate::pr_head::try_lock_file(&file)?;
+            reservations.push(Self {
+                _file: file,
+                _activity: false,
+            });
+        }
+        Ok(reservations)
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn admit(_home: &Path, _paths: &[PathBuf], _min_free: u64) -> Result<Vec<Self>> {
+        // Registered seats already fail closed without Unix containment.
+        Ok(Vec::new())
+    }
+
     pub(crate) fn take(worktree: &Path, exclusive: bool) -> Result<Self> {
         let out = std::process::Command::new("git")
             .args(["rev-parse", "--absolute-git-dir"])
@@ -138,11 +251,124 @@ pub(crate) struct Report {
     pub checked_at: Option<Timestamp>,
     pub limit_bytes: u64,
     pub reclaim_budget_bytes: u64,
+    /// Logical inventory, including protected and unproven data.
     pub measured_bytes: u64,
+    /// Logical bytes unlinked, not a measurement of physical disk recovery.
     pub freed_bytes: u64,
+    pub measured_allocated_file_bytes: Option<u64>,
+    /// Candidates proven under locks in this pass; uninspected data is excluded.
+    pub proven_reclaimable_bytes: u64,
+    /// Estimated allocated blocks recoverable if every proven link is removed.
+    /// Inodes with links outside the candidate set contribute zero.
+    pub proven_reclaimable_allocated_bytes: Option<u64>,
+    pub protected_or_unproven_bytes: u64,
+    /// Deduplicated allocated file blocks whose final link was unlinked. Open
+    /// descriptors and shared extents can prevent an equivalent physical gain.
+    pub estimated_released_allocated_bytes: Option<u64>,
+    /// Observed free-space change on the home volume; concurrent writes, clones
+    /// and deferred reclamation mean this is not attributable to this sweep.
+    pub observed_home_free_change_bytes: Option<i64>,
     pub retired: usize,
     pub retained: Vec<String>,
     pub failures: Vec<String>,
+}
+
+#[cfg(unix)]
+fn allocated_inventory(
+    root: &Path,
+    seen: &mut std::collections::BTreeSet<(u64, u64)>,
+) -> Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+    ensure!(
+        plain_dir(root) && root.canonicalize()? == root,
+        "allocated inventory root is not canonical"
+    );
+    let mut dirs = vec![root.to_owned()];
+    let mut bytes = 0u64;
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(dir)? {
+            let path = entry?.path();
+            let metadata = std::fs::symlink_metadata(&path)?;
+            if metadata.is_dir() {
+                dirs.push(path);
+            } else if metadata.is_file() && seen.insert((metadata.dev(), metadata.ino())) {
+                bytes = bytes.saturating_add(metadata.blocks().saturating_mul(512));
+            }
+        }
+    }
+    Ok(bytes)
+}
+
+#[derive(Default)]
+struct ReleasedAllocation {
+    #[cfg(unix)]
+    files: std::collections::BTreeMap<PathBuf, (u64, u64, u64, u64)>,
+    #[cfg(unix)]
+    removed: std::collections::BTreeMap<(u64, u64), u64>,
+}
+
+impl ReleasedAllocation {
+    fn of(paths: &[PathBuf]) -> Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let mut files = std::collections::BTreeMap::new();
+            for path in paths {
+                let m = std::fs::symlink_metadata(path)?;
+                ensure!(m.is_file(), "allocation candidate is not regular");
+                files.insert(
+                    path.clone(),
+                    (m.dev(), m.ino(), m.nlink(), m.blocks().saturating_mul(512)),
+                );
+            }
+            Ok(Self {
+                files,
+                removed: Default::default(),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = paths;
+            Ok(Self::default())
+        }
+    }
+    fn reclaimable_allocated_bytes(&self) -> Option<u64> {
+        #[cfg(unix)]
+        {
+            let mut inodes = std::collections::BTreeMap::new();
+            for &(device, inode, links, blocks) in self.files.values() {
+                let entry = inodes
+                    .entry((device, inode))
+                    .or_insert((0u64, links, blocks));
+                entry.0 += 1;
+            }
+            Some(
+                inodes
+                    .values()
+                    .filter(|(count, links, _)| count == links)
+                    .fold(0u64, |sum, (_, _, blocks)| sum.saturating_add(*blocks)),
+            )
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
+
+    fn unlinked(&mut self, path: &Path) -> Option<u64> {
+        #[cfg(unix)]
+        {
+            let (device, inode, links, blocks) = self.files[path];
+            let removed = self.removed.entry((device, inode)).or_default();
+            *removed += 1;
+            Some(if *removed == links { blocks } else { 0 })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            None
+        }
+    }
 }
 
 fn plain_dir(path: &Path) -> bool {
@@ -368,7 +594,7 @@ fn output_age(target: &Path, now: Timestamp, grace: u64) -> Result<()> {
     Ok(())
 }
 
-fn artifact_signature(path: &Path) -> Result<bool> {
+pub(crate) fn artifact_signature(path: &Path) -> Result<bool> {
     use std::io::Read as _;
     let mut header = [0; 8];
     let n = File::open(path)?.read(&mut header)?;
@@ -760,7 +986,22 @@ async fn sweep_inner(home: &Path, disk: &crate::config::Disk, now: Timestamp) ->
     } else {
         targets.sort_by_key(|t| t.0);
     }
+    let free_before = crate::disk::free_bytes(home).ok();
+    #[cfg(unix)]
+    {
+        let mut seen = std::collections::BTreeSet::new();
+        report.measured_allocated_file_bytes = Some(0);
+        report.estimated_released_allocated_bytes = Some(0);
+        report.proven_reclaimable_allocated_bytes = Some(0);
+        for (_, _, path, _) in &targets {
+            report.measured_allocated_file_bytes = report
+                .measured_allocated_file_bytes
+                .zip(allocated_inventory(&path.join("target"), &mut seen).ok())
+                .map(|(a, b)| a.saturating_add(b));
+        }
+    }
     let mut remaining = report.measured_bytes;
+    let pressure_paths: Vec<_> = targets.iter().map(|t| t.2.clone()).collect();
     let mut deletion_started = false;
     let mut oversized_started = false;
     for (updated, id, path, _) in targets {
@@ -813,13 +1054,28 @@ async fn sweep_inner(home: &Path, disk: &crate::config::Disk, now: Timestamp) ->
             }
             output_age(&target, now, disk.fold_grace_secs)
                 .with_context(|| format!("stage output-age: {}", target.display()))?;
-            let outputs = declared_outputs(&target)
+            let mut outputs = declared_outputs(&target)
                 .with_context(|| format!("stage declared-outputs: {}", target.display()))?;
-            ensure!(!outputs.is_empty(), "no dep-info-proven outputs; unknown files retained");
+            let incremental = match crate::incremental::candidates(&path) {
+                Ok(candidates) => candidates,
+                Err(error) => {
+                    report.retained.push(format!("{id}: incremental cache retained: {error:#}"));
+                    crate::incremental::Reclaim::default()
+                }
+            };
+            let incremental_files = incremental.files.clone();
+            outputs.extend(incremental_files.iter().cloned());
+            outputs.sort();
+            outputs.dedup();
+            ensure!(!outputs.is_empty(), "no dep-info-proven outputs or provenance-proven incremental caches; legacy incremental/build and unknown files retained");
             let sizes = outputs.iter().map(|p| std::fs::metadata(p).map(|m| m.len())
                 .with_context(|| format!("stage measure: {}", p.display())))
                 .collect::<Result<Vec<_>>>()?;
             let current_size = sizes.iter().fold(0u64, |bytes, size| bytes.saturating_add(*size));
+            report.proven_reclaimable_bytes = report.proven_reclaimable_bytes.saturating_add(current_size);
+            let mut allocation = ReleasedAllocation::of(&outputs)?;
+            report.proven_reclaimable_allocated_bytes = report.proven_reclaimable_allocated_bytes
+                .zip(allocation.reclaimable_allocated_bytes()).map(|(a, b)| a.saturating_add(b));
             let exceeds_budget = current_size > disk.worktree_reclaim_bytes.saturating_sub(report.freed_bytes);
             // 予算は1回の削除量を抑えるもので、大きな出力を永久に保持するためではない。
             // 正の予算では最初の削除対象だけ超過を許し、その後は予算消費済みとする。
@@ -837,18 +1093,25 @@ async fn sweep_inner(home: &Path, disk: &crate::config::Disk, now: Timestamp) ->
             ).with_context(|| format!("stage ledger: {}", ledger.display()))?;
             // Unknown leftovers still permit artifact-only eviction, but never
             // authorize retirement. Only a complete proven residue is adopted.
-            if let Err(error) = record_residue(home, &id, &target, &outputs) {
+            if !incremental_files.is_empty() {
+                report.retained.push(format!("{id}: incremental proof does not authorize retirement"));
+            } else if let Err(error) = record_residue(home, &id, &target, &outputs) {
                 report.retained.push(format!("{id}: residue not adopted for retirement: {error:#}"));
             }
+            ensure!(worktrees(&state).await?.contains(&path),
+                "worktree registration changed before deletion");
             deletion_started = true;
             oversized_started = exceeds_budget;
             measurements.remove(&target);
             for (output, size) in outputs.iter().zip(sizes) {
                 std::fs::remove_file(output).with_context(|| format!("stage remove: {}", output.display()))?;
+                report.estimated_released_allocated_bytes = report.estimated_released_allocated_bytes
+                    .zip(allocation.unlinked(output)).map(|(a, b)| a.saturating_add(b));
                 // Preserve actual progress even if a later removal fails.
                 report.freed_bytes = report.freed_bytes.saturating_add(size);
                 remaining = remaining.saturating_sub(size);
             }
+            incremental.finish().context("finish incremental reclamation")?;
             report.retained.push(format!("{id}: unmanifested files and Cargo metadata retained"));
             Ok::<_, anyhow::Error>(())
         }
@@ -867,19 +1130,53 @@ async fn sweep_inner(home: &Path, disk: &crate::config::Disk, now: Timestamp) ->
         report.failures.push(format!("output measurements: {e}"));
     }
     retire_empty(home, disk, now, &mut report).await;
+    report.protected_or_unproven_bytes = report
+        .measured_bytes
+        .saturating_sub(report.proven_reclaimable_bytes);
+    let pressure_remaining = pressure_paths
+        .iter()
+        .any(|path| crate::disk::free_bytes(path).map_or(true, |free| free < disk.min_free_bytes));
     if !report.failures.is_empty()
         || disk.worktree_limit_bytes > 0
-            && remaining > disk.worktree_limit_bytes
-            && report.freed_bytes == 0
+            && (remaining > disk.worktree_limit_bytes || pressure_remaining)
     {
+        let details = report
+            .retained
+            .iter()
+            .filter(|reason| {
+                !reason.contains("within policy")
+                    && !reason.ends_with("unmanifested files and Cargo metadata retained")
+            })
+            .take(4)
+            .chain(report.failures.iter().take(2))
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("; ");
         crate::notices::raise_in(
             home,
             crate::notices::Notice::warn(
                 "disk:retention",
-                "Retained build outputs could not be brought under the disk cap. Inspect the cleanup report for active owners, retained recovery sources and failures.",
+                format!(
+                    "Retention remains blocked by the disk cap, free-space floor or inspection failures (logical inventory {}B, proven reclaimable {}B, protected or unproven {}B, unlinked {}B). {} Retained/held targets: {details}. Inspect the cleanup report for active owners, retained recovery sources and failures.",
+                    report.measured_bytes,
+                    report.proven_reclaimable_bytes,
+                    report.protected_or_unproven_bytes,
+                    report.freed_bytes,
+                    if report.proven_reclaimable_bytes == 0 {
+                        "No inspected contents have deletion authority."
+                    } else {
+                        "Authorized reclamation was insufficient; remaining protections and budgets still apply."
+                    }
+                ),
             ),
         );
     }
+    report.observed_home_free_change_bytes = free_before
+        .zip(crate::disk::free_bytes(home).ok())
+        .map(|(before, after)| {
+            (i128::from(after) - i128::from(before))
+                .clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
+        });
     let store = home.join("retention.json");
     if let Ok(body) = serde_json::to_vec_pretty(&report) {
         let tmp = home.join("retention.json.tmp");
@@ -1508,6 +1805,402 @@ mod tests {
                 .unwrap();
             task
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn incremental_only_reclamation_preserves_legacy_and_unknown_data() {
+        let f = Fx::new().await;
+        let state = f.run("ca01", true).await;
+        let wt = &state.candidates[0].worktree;
+        let generation = crate::incremental::tests::generate(wt);
+        // Remove dep-info authority: incremental proof must be independent.
+        for dir in [wt.join("target/debug"), wt.join("target/debug/deps")] {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.extension().is_some_and(|x| x == "d") {
+                    std::fs::remove_file(path).unwrap();
+                }
+            }
+        }
+        assert!(declared_outputs(&wt.join("target")).unwrap().is_empty());
+        assert_eq!(
+            sweep(&f.home, &Fx::disk(), Fx::now()).await.freed_bytes,
+            0,
+            "live generation is protected"
+        );
+        drop(generation);
+        let candidates = crate::incremental::candidates(wt).unwrap();
+        let logical: u64 = candidates
+            .files
+            .iter()
+            .map(|p| std::fs::metadata(p).unwrap().len())
+            .sum();
+        let unknown = candidates.files[0].parent().unwrap().join("operator-note");
+        std::fs::write(&unknown, "retain unknown data").unwrap();
+        drop(candidates);
+        let refused = sweep(&f.home, &Fx::disk(), Fx::now()).await;
+        assert_eq!(refused.freed_bytes, 0, "{refused:?}");
+        assert!(
+            refused
+                .retained
+                .iter()
+                .any(|s| s.contains("provenance mismatch"))
+        );
+        std::fs::remove_file(&unknown).unwrap();
+        let legacy = wt.join("target/debug/incremental/legacy-session");
+        std::fs::create_dir(&legacy).unwrap();
+        // Even compiler-authored bytes do not retroactively confer ownership.
+        let candidates = crate::incremental::candidates(wt).unwrap();
+        let bin = candidates
+            .files
+            .iter()
+            .find(|p| p.extension().is_some_and(|x| x == "bin"))
+            .unwrap();
+        std::fs::copy(bin, legacy.join("query-cache.bin")).unwrap();
+        drop(candidates);
+        let cargo = cargo_locks(&wt.join("target")).unwrap();
+        assert_eq!(sweep(&f.home, &Fx::disk(), Fx::now()).await.freed_bytes, 0);
+        drop(cargo);
+        let outputs = OutputLease::borrow(wt).unwrap().unwrap();
+        assert_eq!(sweep(&f.home, &Fx::disk(), Fx::now()).await.freed_bytes, 0);
+        drop(outputs);
+        let report = sweep(&f.home, &Fx::disk(), Fx::now()).await;
+        assert_eq!(report.freed_bytes, logical, "{report:?}");
+        assert_eq!(report.proven_reclaimable_bytes, logical);
+        assert!(report.measured_bytes > logical);
+        assert_eq!(
+            report.protected_or_unproven_bytes,
+            report.measured_bytes - logical
+        );
+        #[cfg(unix)]
+        {
+            assert!(report.estimated_released_allocated_bytes.unwrap() > 0);
+            assert!(
+                report.measured_allocated_file_bytes.unwrap()
+                    >= report.estimated_released_allocated_bytes.unwrap()
+            );
+        }
+        assert!(report.observed_home_free_change_bytes.is_some());
+        assert!(legacy.join("query-cache.bin").is_file());
+        assert!(wt.join("src/lib.rs").is_file());
+        assert_eq!(report.retired, 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn incremental_and_deps_links_account_for_retained_third_link() {
+        use std::os::unix::fs::MetadataExt;
+        let f = Fx::new().await;
+        let state = f.run("ca02", true).await;
+        let wt = &state.candidates[0].worktree;
+        let generation = crate::incremental::tests::generate(wt);
+        drop(generation);
+        let candidates = crate::incremental::candidates(wt).unwrap();
+        let objects = candidates
+            .files
+            .iter()
+            .filter(|p| p.extension().is_some_and(|x| x == "o"))
+            .take(2)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            objects.len(),
+            2,
+            "fixture must produce real incremental objects"
+        );
+        let mut outputs = candidates.files.clone();
+        drop(candidates);
+        let target = wt.join("target");
+        for dir in [target.join("debug"), target.join("debug/deps")] {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.extension().is_some_and(|x| x == "d") {
+                    std::fs::remove_file(path).unwrap();
+                }
+            }
+        }
+        // Cargo also leaves hard-linked object outputs in deps. Remove those
+        // fixture outputs so the only external links are the ones below.
+        for entry in std::fs::read_dir(target.join("debug/deps")).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_file() {
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+        for (index, object) in objects.iter().enumerate() {
+            assert_eq!(std::fs::metadata(object).unwrap().nlink(), 1);
+            let dep = target.join(format!("debug/deps/link{index}"));
+            std::fs::hard_link(object, &dep).unwrap();
+            std::fs::write(
+                dep.with_extension("d"),
+                format!("{}: src/lib.rs\n", dep.display()),
+            )
+            .unwrap();
+            outputs.push(dep);
+        }
+        let retained = wt.join("retained-input");
+        std::fs::hard_link(&objects[1], &retained).unwrap();
+        let sentinel = std::fs::read(&retained).unwrap();
+        let logical: u64 = outputs
+            .iter()
+            .map(|p| std::fs::metadata(p).unwrap().len())
+            .sum();
+        let mut seen = std::collections::BTreeSet::new();
+        let retained_meta = std::fs::metadata(&retained).unwrap();
+        let retained_inode = (retained_meta.dev(), retained_meta.ino());
+        let mut expected = 0u64;
+        for output in &outputs {
+            let m = std::fs::metadata(output).unwrap();
+            let inode = (m.dev(), m.ino());
+            if inode != retained_inode && seen.insert(inode) {
+                expected += m.blocks() * 512;
+            }
+        }
+        assert!(expected > 0);
+        let report = sweep(&f.home, &Fx::disk(), Fx::now()).await;
+        assert_eq!(report.proven_reclaimable_bytes, logical, "{report:?}");
+        assert_eq!(report.freed_bytes, logical, "{report:?}");
+        assert_eq!(report.proven_reclaimable_allocated_bytes, Some(expected));
+        assert_eq!(report.estimated_released_allocated_bytes, Some(expected));
+        assert!(outputs.iter().all(|p| !p.exists()));
+        assert_eq!(std::fs::read(retained).unwrap(), sentinel);
+        assert!(wt.join("src/lib.rs").is_file());
+    }
+
+    #[tokio::test]
+    async fn retention_notice_explains_unproven_inventory_and_live_owner() {
+        let f = Fx::new().await;
+        let state = f.run("ca03", true).await;
+        let wt = &state.candidates[0].worktree;
+        Fx::target(wt);
+        std::fs::remove_file(wt.join("target/debug/output")).unwrap();
+        let unknown = wt.join("target/debug/operator-note");
+        std::fs::write(&unknown, vec![1; 4096]).unwrap();
+        let report = sweep(&f.home, &Fx::disk(), Fx::now()).await;
+        assert_eq!(report.proven_reclaimable_bytes, 0);
+        #[cfg(unix)]
+        assert_eq!(report.proven_reclaimable_allocated_bytes, Some(0));
+        assert!(report.protected_or_unproven_bytes >= 4096);
+        let message = || {
+            crate::notices::Notices::at(f.home.join("notifications"))
+                .list()
+                .into_iter()
+                .find(|n| n.key == "disk:retention")
+                .unwrap()
+                .message
+        };
+        let notice = message();
+        assert!(notice.contains("proven reclaimable 0B"), "{notice}");
+        assert!(notice.contains("protected or unproven"), "{notice}");
+        assert!(
+            notice.contains("legacy incremental/build and unknown files retained"),
+            "{notice}"
+        );
+        let owner = crate::pr_head::owner_lock(&f.home, &state.id).unwrap();
+        let report = sweep(&f.home, &Fx::disk(), Fx::now()).await;
+        assert_eq!(report.freed_bytes, 0);
+        let notice = message();
+        assert!(notice.contains(&state.id), "{notice}");
+        assert!(
+            notice.contains("lock") || notice.contains("owner"),
+            "{notice}"
+        );
+        drop(owner);
+        assert_eq!(std::fs::read(unknown).unwrap(), vec![1; 4096]);
+    }
+
+    #[tokio::test]
+    async fn real_cargo_build_holds_the_target_against_reclamation() {
+        let f = Fx::new().await;
+        let state = f.run("ca02", true).await;
+        let wt = &state.candidates[0].worktree;
+        Fx::target(wt);
+        std::fs::create_dir(wt.join("src")).unwrap();
+        std::fs::write(
+            wt.join("Cargo.toml"),
+            "[package]\nname='live-cache-fixture'\nversion='0.1.0'\nedition='2021'\n[workspace]\n",
+        )
+        .unwrap();
+        std::fs::write(wt.join("src/lib.rs"), "pub fn answer() -> usize { 42 }\n").unwrap();
+        std::fs::write(
+            wt.join("build.rs"),
+            r#"fn main() {
+            let ready = std::env::var("FIXTURE_READY").unwrap();
+            let release = std::env::var("FIXTURE_RELEASE").unwrap();
+            std::fs::write(ready, "ready").unwrap();
+            let start = std::time::Instant::now();
+            while !std::path::Path::new(&release).exists() && start.elapsed().as_secs() < 15 {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }"#,
+        )
+        .unwrap();
+        let ready = wt.join("ready");
+        let release = wt.join("release");
+        let mut cargo = tokio::process::Command::new("cargo");
+        cargo.env_clear();
+        for key in ["PATH", "HOME", "RUSTUP_HOME"] {
+            if let Some(value) = std::env::var_os(key) {
+                cargo.env(key, value);
+            }
+        }
+        let mut child = cargo
+            .current_dir(wt)
+            .env("RUSTUP_TOOLCHAIN", "stable")
+            .env("CARGO_HOME", f._temp.path().join("cargo-home"))
+            .env("CARGO_INCREMENTAL", "1")
+            .env("FIXTURE_READY", &ready)
+            .env("FIXTURE_RELEASE", &release)
+            .args(["build", "--offline", "--jobs", "1", "--target-dir"])
+            .arg(wt.join("target"))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let arrived = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !ready.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_ok();
+        let report = if arrived {
+            Some(sweep(&f.home, &Fx::disk(), Fx::now()).await)
+        } else {
+            None
+        };
+        // Release and join our build before making assertions, including on failure.
+        std::fs::write(release, "release").unwrap();
+        let status = tokio::time::timeout(std::time::Duration::from_secs(10), child.wait()).await;
+        if status.is_err() {
+            child.kill().await.unwrap();
+            child.wait().await.unwrap();
+        }
+        assert!(
+            arrived,
+            "fixture build never reached its active build script"
+        );
+        assert!(status.unwrap().unwrap().success());
+        let report = report.unwrap();
+        assert_eq!(report.freed_bytes, 0, "{report:?}");
+        assert!(
+            report
+                .retained
+                .iter()
+                .any(|s| s.contains("Cargo build is active")),
+            "{report:?}"
+        );
+        assert!(wt.join("target/debug/output").is_file());
+        assert!(crate::disk::dir_size(&wt.join("target/debug/incremental")) > 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn allocated_accounting_deduplicates_links_and_requires_the_last_link() {
+        let temp = tempfile::tempdir().unwrap();
+        let a = temp.path().join("a");
+        let b = temp.path().join("b");
+        let outside = temp.path().join("retained-input");
+        std::fs::write(&a, vec![1; 65536]).unwrap();
+        std::fs::hard_link(&a, &b).unwrap();
+        std::fs::hard_link(&a, &outside).unwrap();
+        let mut seen = Default::default();
+        let blocks = allocated_inventory(&temp.path().canonicalize().unwrap(), &mut seen).unwrap();
+        assert!(blocks > 0);
+        let mut accounting = ReleasedAllocation::of(&[a.clone(), b.clone()]).unwrap();
+        std::fs::remove_file(&a).unwrap();
+        assert_eq!(accounting.unlinked(&a), Some(0));
+        std::fs::remove_file(&b).unwrap();
+        assert_eq!(accounting.unlinked(&b), Some(0));
+        assert_eq!(std::fs::read(&outside).unwrap().len(), 65536);
+        let mut accounting = ReleasedAllocation::of(std::slice::from_ref(&outside)).unwrap();
+        std::fs::remove_file(&outside).unwrap();
+        assert_eq!(accounting.unlinked(&outside), Some(blocks));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relative_admission_home_matches_absolute_home_and_retains_symlink_checks() {
+        let temp = tempfile::tempdir_in(".").unwrap();
+        let home = PathBuf::from(temp.path().file_name().unwrap()).join("state");
+        assert!(home.is_relative());
+        let paths = vec![std::env::current_dir().unwrap()];
+        let gib = 1024 * 1024 * 1024;
+        let reservation = OutputLease::admit_with(&home, &paths, 8 * gib, |_| Ok(9 * gib)).unwrap();
+        assert!(
+            OutputLease::admit_with(&home.canonicalize().unwrap(), &paths, 8 * gib, |_| Ok(
+                9 * gib
+            ))
+            .is_err()
+        );
+        drop(reservation);
+        assert!(OutputLease::admit_with(&home, &paths, 8 * gib, |_| Ok(9 * gib)).is_ok());
+        let bad = temp.path().join("symlink-state");
+        std::fs::create_dir(&bad).unwrap();
+        std::os::unix::fs::symlink(
+            home.canonicalize().unwrap().join("disk-admission"),
+            bad.join("disk-admission"),
+        )
+        .unwrap();
+        assert!(OutputLease::admit_with(&bad, &paths, 8 * gib, |_| Ok(9 * gib)).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_disk_admission_reserves_once_per_volume_until_release() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().canonicalize().unwrap();
+        let paths = vec![home.clone(), home.join("not-created-yet")];
+        let gib = 1024 * 1024 * 1024;
+        let floor = 8 * gib;
+        let first = OutputLease::admit_with(&home, &paths, floor, |_| Ok(floor + gib)).unwrap();
+        assert_eq!(first.len(), 1);
+        let blocked =
+            OutputLease::admit_with(&home, &paths, floor, |_| Ok(floor + gib)).unwrap_err();
+        assert!(blocked.to_string().contains("active writer reservations"));
+        let second =
+            OutputLease::admit_with(&home, &paths, floor, |_| Ok(floor + 2 * gib)).unwrap();
+        drop(first);
+        assert!(OutputLease::admit_with(&home, &paths, floor, |_| Ok(floor + gib)).is_err());
+        drop(second);
+        assert!(OutputLease::admit_with(&home, &paths, floor, |_| Ok(floor + gib)).is_ok());
+        assert!(
+            OutputLease::admit_with(&home, &paths, floor, |_| anyhow::bail!("unmeasured")).is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn simultaneous_writers_cannot_spend_the_same_volume_headroom() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().canonicalize().unwrap();
+        let barrier = std::sync::Barrier::new(2);
+        let gib = 1024 * 1024 * 1024;
+        let results = std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..2)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        OutputLease::admit_with(&home, std::slice::from_ref(&home), 100, |_| {
+                            Ok(100 + gib)
+                        })
+                    })
+                })
+                .collect();
+            threads
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+        assert!(
+            results
+                .iter()
+                .filter_map(|r| r.as_ref().err())
+                .all(|e| e.to_string().contains("active writer reservations"))
+        );
     }
 
     #[tokio::test]
@@ -4011,15 +4704,21 @@ mod tests {
             } else {
                 cmd.env("MAGI_TEST_CLOSE_FDS", "1");
             }
-            let mut running = crate::seat_process::Running::spawn(
-                cmd,
-                None,
-                vec![
-                    OutputLease::borrow(wt).unwrap().unwrap(),
-                    OutputLease::cache(&f.home, &cache, false).unwrap(),
-                ],
-            )
-            .unwrap();
+            let gib = 1024 * 1024 * 1024;
+            let mut leases = vec![
+                OutputLease::borrow(wt).unwrap().unwrap(),
+                OutputLease::cache(&f.home, &cache, false).unwrap(),
+            ];
+            leases.extend(
+                OutputLease::admit_with(
+                    &f.home,
+                    std::slice::from_ref(wt),
+                    8 * gib,
+                    |_| Ok(9 * gib),
+                )
+                .unwrap(),
+            );
+            let mut running = crate::seat_process::Running::spawn(cmd, None, leases).unwrap();
             assert!(
                 tokio::time::timeout(std::time::Duration::from_secs(5), running.child().wait())
                     .await
@@ -4054,6 +4753,13 @@ mod tests {
                 assert!(OutputLease::take(wt, true).is_err(), "cancel={cancel}");
                 assert!(OutputLease::cache(&f.home, &cache, true).is_err());
                 assert!(
+                    OutputLease::admit_with(&f.home, std::slice::from_ref(wt), 8 * gib, |_| Ok(
+                        9 * gib
+                    ))
+                    .is_err(),
+                    "orphan still owns its disk reservation"
+                );
+                assert!(
                     crate::cache::maintenance_prune(&f.home, &cache, 0)
                         .unwrap()
                         .is_none()
@@ -4074,6 +4780,13 @@ mod tests {
                 loop {
                     if OutputLease::take(wt, true).is_ok()
                         && OutputLease::cache(&f.home, &cache, true).is_ok()
+                        && OutputLease::admit_with(
+                            &f.home,
+                            std::slice::from_ref(wt),
+                            8 * gib,
+                            |_| Ok(9 * gib),
+                        )
+                        .is_ok()
                     {
                         // Token-owned orphans must be stopped by cleanup itself.
                         if !clear_owner {

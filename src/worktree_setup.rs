@@ -199,13 +199,14 @@ async fn run_step(shell: &[String], command: &str, wt: &Path, timeout: Duration)
         .stdout(out)
         .stderr(err)
         .kill_on_drop(true);
-    #[cfg(unix)]
-    cmd.process_group(0);
-    let mut child = cmd
-        .spawn()
+    crate::incremental::configure(&mut cmd, wt)?;
+    let mut running = crate::seat_process::Running::spawn_operation(cmd, None, Vec::new())
         .with_context(|| format!("spawn `{}` for `{command}`", shell[0]))?;
-    let pid = child.id();
-    let waited = tokio::time::timeout(timeout, child.wait()).await;
+    let waited = tokio::time::timeout(timeout, running.child().wait()).await;
+    // Compiler wrappers supervise their own process groups. Join cleanup of
+    // the entire setup tree before returning, on success as well as timeout.
+    // Cancellation transfers the same ownership to Running's cleanup thread.
+    running.finish().await;
     let body = || tail(&std::fs::read_to_string(&log).unwrap_or_default()).to_owned();
     let result = match waited {
         Ok(Ok(status)) if status.success() => Ok(()),
@@ -214,31 +215,14 @@ async fn run_step(shell: &[String], command: &str, wt: &Path, timeout: Duration)
             body()
         )),
         Ok(Err(e)) => Err(anyhow::anyhow!("`{command}` could not be awaited: {e}")),
-        Err(_) => {
-            kill_tree(pid, &mut child).await;
-            Err(anyhow::anyhow!(
-                "`{command}` timed out after {}s\n{}",
-                timeout.as_secs(),
-                body()
-            ))
-        }
+        Err(_) => Err(anyhow::anyhow!(
+            "`{command}` timed out after {}s\n{}",
+            timeout.as_secs(),
+            body()
+        )),
     };
     std::fs::remove_file(&log).ok();
     result
-}
-
-/// Stop the command and, on unix, the process group it leads.
-async fn kill_tree(pid: Option<u32>, child: &mut tokio::process::Child) {
-    #[cfg(unix)]
-    if let Some(pid) = pid {
-        let mut kill = tokio::process::Command::new("kill");
-        kill.args(["-KILL", "--", &format!("-{pid}")]);
-        kill.status().await.ok();
-    }
-    #[cfg(not(unix))]
-    let _ = pid;
-    child.start_kill().ok();
-    child.wait().await.ok();
 }
 
 async fn git_dir(wt: &Path) -> Result<PathBuf> {
