@@ -404,19 +404,44 @@ fn machine_cause_resolved(task: &Task, cfg: &Config) -> Option<bool> {
 }
 
 fn machine_cause_resolved_under(task: &Task, cfg: &Config, home: &Path) -> Option<bool> {
+    machine_cause_resolved_with_admission(task, cfg, home, |paths| {
+        crate::retention::OutputLease::admit(home, paths, cfg.disk.min_free_bytes).is_ok()
+    })
+}
+
+fn machine_cause_resolved_with_admission(
+    task: &Task,
+    cfg: &Config,
+    home: &Path,
+    admission_available: impl Fn(&[PathBuf]) -> bool,
+) -> Option<bool> {
     if task
         .hold_reason
         .as_deref()
         .is_some_and(|r| r.starts_with(crate::cache::RESOURCE_HOLD))
     {
-        // A free lease resolves contention, not malformed manifests, failed
-        // metadata writes, cancellation, or unknown infrastructure failures.
         // Require evidence from the exact latest run before auto-releasing.
         let id = task.runs.last()?;
         let state = crate::run::RunState::load_under(id, home).ok()?;
         let block = state.resource_block.as_ref()?;
-        if state.id != *id
-            || block.kind != "shared build cache"
+        if state.id != *id {
+            return None;
+        }
+        if block.kind == "disk admission"
+            && matches!(block.cause, crate::run::ResourceBlockCause::Other)
+        {
+            // Reuse the actual atomic admission validator, not just df: other
+            // writers may still own headroom on either output volume. Include
+            // saved and current cache locations conservatively across resumes.
+            let mut paths = vec![repo_for(task), state.repo.clone(), state.worktree_root()];
+            paths.extend(state.candidates.iter().map(|c| c.worktree.clone()));
+            paths.extend(state.config.cache_dir());
+            paths.extend(cfg.cache_dir());
+            return Some(admission_available(&paths));
+        }
+        // A free cache lease resolves contention, not malformed manifests,
+        // failed writes, cancellation, or unknown infrastructure failures.
+        if block.kind != "shared build cache"
             || !matches!(block.cause, crate::run::ResourceBlockCause::Timeout { .. })
         {
             return None;
@@ -1366,6 +1391,114 @@ mod tests {
         assert_eq!(machine_cause_resolved_under(&task, &cfg, dir.path()), None);
         task.runs = vec!["unreadable-run".into()];
         assert_eq!(machine_cause_resolved_under(&task, &cfg, dir.path()), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn disk_admission_holds_recheck_live_reservations_and_the_floor() {
+        use crate::retention::OutputLease;
+        use crate::run::{ResourceBlock, ResourceBlockCause, RunState};
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().canonicalize().unwrap();
+        let mut cfg = Config::default();
+        cfg.graph.worktree_root = Some(home.join("worktrees"));
+        cfg.disk.min_free_bytes = 100;
+        let cache = home.join("cache");
+        cfg.verify.gate = vec![format!(
+            "CARGO_TARGET_DIR='{}' cargo build",
+            cache.display()
+        )];
+        let mut state = RunState::new(
+            home.clone(),
+            "main".into(),
+            "base".into(),
+            "verify".into(),
+            cfg.clone(),
+        );
+        state.resource_block = Some(ResourceBlock {
+            node: "gate".into(),
+            kind: "disk admission".into(),
+            detail: "writer headroom unavailable".into(),
+            cause: ResourceBlockCause::Other,
+            at: Timestamp::now(),
+        });
+        state.save_under(&home).unwrap();
+        let mut task = task("verify", home.clone());
+        task.runs = vec![state.id.clone()];
+        task.hold_machine(Some("[resource] gate: disk admission: blocked".into()));
+        let gib = 1024 * 1024 * 1024;
+        let free = std::cell::Cell::new(100 + gib - 1);
+        let check = || {
+            machine_cause_resolved_with_admission(&task, &cfg, &home, |paths| {
+                assert!(
+                    paths.contains(&cache),
+                    "the cache volume must also be checked"
+                );
+                assert!(paths.contains(&state.worktree_root()));
+                OutputLease::admit_with(&home, paths, cfg.disk.min_free_bytes, |_| Ok(free.get()))
+                    .is_ok()
+            })
+        };
+        assert_eq!(check(), Some(false), "the unchanged floor still applies");
+        free.set(100 + gib);
+        let writer = OutputLease::admit_with(
+            &home,
+            std::slice::from_ref(&home),
+            cfg.disk.min_free_bytes,
+            |_| Ok(free.get()),
+        )
+        .unwrap();
+        assert_eq!(
+            check(),
+            Some(false),
+            "df alone cannot resolve a live reservation"
+        );
+        drop(writer);
+        assert_eq!(
+            check(),
+            Some(true),
+            "releasing headroom resolves the machine hold"
+        );
+        assert_eq!(
+            check(),
+            Some(true),
+            "the probe must release its temporary reservation"
+        );
+
+        // A broken admission namespace still fails closed after free space recovers.
+        let namespace = home.join("disk-admission");
+        let saved = home.join("saved-admission");
+        std::fs::rename(&namespace, &saved).unwrap();
+        std::os::unix::fs::symlink(&saved, &namespace).unwrap();
+        assert_eq!(check(), Some(false));
+        std::fs::remove_file(&namespace).unwrap();
+        std::fs::rename(saved, namespace).unwrap();
+        assert_eq!(check(), Some(true));
+
+        state.resource_block.as_mut().unwrap().cause = ResourceBlockCause::Cancelled { park: None };
+        state.save_under(&home).unwrap();
+        assert_eq!(
+            machine_cause_resolved_with_admission(&task, &cfg, &home, |_| panic!(
+                "a cancelled operation must remain held"
+            )),
+            None
+        );
+        state.resource_block.as_mut().unwrap().kind = "incremental cache admission".into();
+        state.resource_block.as_mut().unwrap().cause = ResourceBlockCause::Other;
+        state.save_under(&home).unwrap();
+        assert_eq!(
+            machine_cause_resolved_with_admission(&task, &cfg, &home, |_| panic!(
+                "unproven incremental caches must remain held"
+            )),
+            None
+        );
+        task.runs.push("unreadable-run".into());
+        assert_eq!(
+            machine_cause_resolved_with_admission(&task, &cfg, &home, |_| panic!(
+                "missing evidence must not release a hold"
+            )),
+            None
+        );
     }
 
     /// `[disk] min_free_bytes = 0` written next to a fictional repo, so

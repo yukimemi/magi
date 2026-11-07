@@ -72,7 +72,7 @@ impl OutputLease {
     }
 
     #[cfg(unix)]
-    fn admit_with(
+    pub(crate) fn admit_with(
         home: &Path,
         paths: &[PathBuf],
         min_free: u64,

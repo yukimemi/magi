@@ -457,6 +457,8 @@ from budget exhaustion. Each generation has a 128 MiB monitored budget. Sampling
 filesystem quotas. Exceeding the budget stops that invocation's compiler, not
 unrelated jobs. The wrapper uses the existing descendant cleanup supervisor and
 waits for the invocation’s compiler descendants before releasing ownership.
+Setup commands use the same descendant supervisor, so a setup timeout or
+cancellation also owns cleanup of compiler groups created by the wrapper.
 Incomplete, unknown or oversized generations keep their reservations
 and their data; repeated failure therefore closes admission instead of creating
 unlimited new directories. A completed generation is sealed only after checking
@@ -485,6 +487,11 @@ can exceed them and unrelated processes still consume space, so the emergency
 monitor and disk floor remain in force. A reservation/floor blocker is a resource
 hold, not permission to delete unproven data. A zero disk floor retains the
 existing explicit opt-out behavior.
+Triage rechecks a recorded disk-admission machine hold with the reservation
+validator over repository/worktree and saved/current cache locations. It drops
+the probe reservation immediately and requeues only when admission succeeds;
+cancelled operations, missing run evidence and incremental provenance failures
+remain held.
 
 In `retention.json`, `measured_bytes` is logical inventory and `freed_bytes` is
 logical bytes unlinked. Neither means physical disk space recovered.

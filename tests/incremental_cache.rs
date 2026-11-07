@@ -2,6 +2,171 @@
 #![cfg(unix)]
 use std::{fs, os::unix::fs::PermissionsExt, process::Command};
 
+#[tokio::test]
+async fn setup_timeout_joins_compiler_groups_with_and_without_incremental() {
+    use magi::config::{Config, SetupStep};
+    use std::time::Duration;
+    for incremental in ["0", "1"] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let repo = root.join("repo");
+        fs::create_dir(&repo).unwrap();
+        for args in [
+            vec!["init", "-b", "main"],
+            vec![
+                "-c",
+                "user.name=fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "fixture",
+            ],
+        ] {
+            assert!(
+                Command::new("git")
+                    .current_dir(&repo)
+                    .args(args)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            );
+        }
+        let worktree = root.join("worktree");
+        assert!(
+            Command::new("git")
+                .current_dir(&repo)
+                .args(["worktree", "add", "--detach"])
+                .arg(&worktree)
+                .arg("HEAD")
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        fs::create_dir(worktree.join("src")).unwrap();
+        fs::write(worktree.join("Cargo.toml"),
+            "[package]\nname='setup-timeout-fixture'\nversion='0.1.0'\nedition='2021'\n[workspace]\n").unwrap();
+        fs::write(
+            worktree.join("src/lib.rs"),
+            "pub fn answer() -> u32 { 42 }\n",
+        )
+        .unwrap();
+        let quote =
+            |path: &std::path::Path| format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"));
+        fs::write(
+            worktree.join("manager-wrapper.sh"),
+            format!(
+                "#!/bin/sh\nexec {} __magi_incremental \"$@\"\n",
+                quote(std::path::Path::new(env!("CARGO_BIN_EXE_magi")))
+            ),
+        )
+        .unwrap();
+        // Cargo's real version probes run normally. Its compilation enters
+        // this long-lived compiler wrapper in the manager's separate group.
+        fs::write(
+            worktree.join("compiler-delay.sh"),
+            r#"#!/bin/sh
+for argument do
+    if [ "$argument" = --crate-name ]; then
+        echo $$ > "$PWD/compiler.pid"
+        while :; do echo writing >> "$PWD/pulse"; sleep 0.02; done
+    fi
+done
+exec "$@"
+"#,
+        )
+        .unwrap();
+        fs::write(
+            worktree.join("setup-fixture.sh"),
+            format!(
+                r#"#!/bin/sh
+export RUSTUP_TOOLCHAIN=stable
+export CARGO_HOME="$PWD/cargo-home"
+export CARGO_INCREMENTAL={incremental}
+export RUSTC_WRAPPER="$PWD/manager-wrapper.sh"
+export MAGI_INCREMENTAL_WORKTREE="$PWD"
+export MAGI_PREVIOUS_RUSTC_WRAPPER="$PWD/compiler-delay.sh"
+unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS RUSTC_WORKSPACE_WRAPPER
+exec cargo build --offline --jobs 1 --target-dir "$PWD/target"
+"#
+            ),
+        )
+        .unwrap();
+        for name in ["manager-wrapper.sh", "compiler-delay.sh"] {
+            fs::set_permissions(worktree.join(name), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        struct Cleanup {
+            unrelated: std::process::Child,
+            compiler_pid: std::path::PathBuf,
+        }
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                if let Ok(pid) = fs::read_to_string(&self.compiler_pid)
+                    .unwrap_or_default()
+                    .trim()
+                    .parse::<i32>()
+                    && pid > 0
+                    && magi::proc::pid_alive(pid as u32)
+                {
+                    // SAFETY: the private fixture records only its own compiler.
+                    unsafe {
+                        if libc::getpgid(pid) == pid {
+                            libc::kill(-pid, libc::SIGKILL);
+                        }
+                        libc::kill(pid, libc::SIGKILL);
+                    }
+                }
+                self.unrelated.kill().ok();
+                self.unrelated.wait().ok();
+            }
+        }
+        let mut cleanup = Cleanup {
+            unrelated: Command::new("sleep").arg("30").spawn().unwrap(),
+            compiler_pid: worktree.join("compiler.pid"),
+        };
+        let mut cfg = Config::default();
+        cfg.verify.shell = Some(vec!["sh".into(), "-c".into()]);
+        cfg.worktree.setup = vec![SetupStep {
+            run: Some("sh ./setup-fixture.sh".into()),
+            timeout_secs: Some(5),
+            ..Default::default()
+        }];
+        let result = magi::worktree_setup::prepare(&cfg, &repo, &worktree).await;
+        let pid = fs::read_to_string(&cleanup.compiler_pid)
+            .unwrap_or_default()
+            .trim()
+            .parse::<u32>()
+            .ok();
+        let alive = pid.is_some_and(magi::proc::pid_alive);
+        let before = fs::read(worktree.join("pulse")).unwrap_or_default();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let after = fs::read(worktree.join("pulse")).unwrap_or_default();
+        let unrelated_alive = cleanup.unrelated.try_wait().unwrap().is_none();
+        drop(cleanup);
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(error.contains("timed out"), "{error}");
+        assert!(
+            pid.is_some() && !before.is_empty(),
+            "Cargo never reached the compiler wrapper"
+        );
+        assert!(
+            !alive,
+            "setup returned with a live compiler (incremental={incremental})"
+        );
+        assert_eq!(
+            before, after,
+            "compiler writes continued after setup timeout"
+        );
+        assert!(
+            unrelated_alive,
+            "setup cleanup stopped an unrelated process"
+        );
+    }
+}
+
 #[test]
 fn explicit_incremental_uses_proven_generations_and_keeps_existing_wrappers() {
     let temp = tempfile::tempdir().unwrap();
