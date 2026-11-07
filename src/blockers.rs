@@ -34,9 +34,32 @@ const CHAIN_DEPTH: usize = 4;
 #[derive(Debug, Clone, Default)]
 pub struct Inventory {
     tasks: BTreeMap<String, Task>,
-    questions: BTreeMap<String, QuestionStatus>,
+    questions: BTreeMap<String, DecisionRecord>,
     ids: Vec<String>,
     complete: bool,
+}
+
+// Keep only routing metadata, rather than duplicating decision transcripts,
+// panels and answer payloads in a dependency inventory.
+#[derive(Debug, Clone)]
+struct DecisionRecord {
+    id: String,
+    status: QuestionStatus,
+    summary: String,
+    routed_task: Option<String>,
+    routed_chat: Option<String>,
+}
+
+impl From<&Question> for DecisionRecord {
+    fn from(q: &Question) -> Self {
+        Self {
+            id: q.id.clone(),
+            status: q.status,
+            summary: q.summary.clone(),
+            routed_task: q.routed_task.clone(),
+            routed_chat: q.routed_chat.clone(),
+        }
+    }
 }
 
 enum Dep<'a> {
@@ -48,12 +71,92 @@ enum Dep<'a> {
 
 type Roots = Option<BTreeSet<String>>;
 
+/// Read-only dependency presentation. Decision records are interpreted only
+/// here, alongside the compatibility resolver; clients never infer ownership.
+#[derive(Debug, serde::Serialize)]
+pub struct BlockerView {
+    /// Canonical id when readable, otherwise the stored reference.
+    pub id: String,
+    /// Task, decision, or unavailable record.
+    pub kind: &'static str,
+    /// Recorded status and bounded dependency chain.
+    pub state: String,
+    /// Task title or decision summary, when readable.
+    pub reason: Option<String>,
+    /// Explanation of the supported next step.
+    pub next: String,
+    /// Existing read-only page route and record id; never a control endpoint.
+    pub destination: Option<(&'static str, String)>,
+}
+
 /// The last dash-separated part of an id: what `Task::short` shows.
 fn short(id: &str) -> &str {
     id.split('-').next_back().unwrap_or(id)
 }
 
 impl Inventory {
+    /// All direct blockers, including settled and unavailable records. Task
+    /// links let the operator follow chains without hiding sibling blockers.
+    pub fn blocker_views(&self, task: &Task) -> Vec<BlockerView> {
+        if task.status != TaskStatus::Blocked {
+            return Vec::new();
+        }
+        task.blocked_by.iter().map(|id| {
+            let mut view = BlockerView {
+                id: id.clone(), kind: "unavailable", state: self.chain(id, &mut vec![task.id.clone()]),
+                reason: None,
+                next: "Inspect the dependency reference with magi task triage; unavailable or ambiguous records cannot safely be treated as resolved.".into(),
+                destination: None,
+            };
+            match self.dep(id) {
+                Dep::Task(t) => {
+                    view.id = t.id.clone();
+                    view.kind = "task";
+                    view.reason = Some(t.title.clone());
+                    view.next = if t.status == TaskStatus::Done {
+                        "Completed; waiting for the scheduler to reconcile this dependency."
+                    } else if view.state.contains("cycle") {
+                        "Dependency cycle: inspect the linked task and use task triage or its owning chat to correct the wait. A cycle cannot complete on its own."
+                    } else {
+                        "Open the dependency task to inspect its status, blockers and recovery controls. It must complete before this dependency resolves."
+                    }.into();
+                    view.destination = Some(("tasks", t.id.clone()));
+                }
+                Dep::Question(status) => {
+                    // Compatibility with existing decision outbox records;
+                    // do not create a decision or derive a chat from ancestry.
+                    let full = match crate::queue::resolve_reference(id, self.ids.iter().map(String::as_str)) {
+                        crate::queue::Reference::Found(full) => full,
+                        _ => id.clone(),
+                    };
+                    if let Some(q) = self.questions.get(&full) {
+                        view.id = q.id.clone();
+                        view.kind = "decision";
+                        view.state = status.as_str().into();
+                        view.reason = Some(q.summary.clone());
+                        view.next = match status {
+                            QuestionStatus::Answered => "Decision recorded; waiting for the scheduler to reconcile this dependency.",
+                            QuestionStatus::Abandoned => "This record no longer accepts answers. If forwarded, continue in its owning task chat; otherwise inspect magi task triage for recovery. The record does not prove the dependency completed.",
+                            QuestionStatus::Open if q.routed_task.is_some() && q.routed_chat.is_none() => "Waiting for delivery to the owning task chat. The scheduler must deliver the decision before it can be handled there.",
+                            QuestionStatus::Open if q.routed_task.is_some() => "Open the owning task chat to review and resolve this decision through its existing controls. Availability and approval are checked there.",
+                            QuestionStatus::Open => "Open the existing decision to inspect its context and available controls. A historical or unavailable waiter may no longer accept an answer.",
+                        }.into();
+                        view.destination = if q.routed_task.is_some() {
+                            q.routed_chat.clone().map(|id| ("chat", id))
+                        } else if status == QuestionStatus::Open {
+                            Some(("questions", q.id.clone()))
+                        } else {
+                            None
+                        };
+                    }
+                }
+                Dep::Missing => view.state = "missing".into(),
+                Dep::Unknown => {},
+            }
+            view
+        }).collect()
+    }
+
     /// Build the snapshot. Callers take `queue.list()` and `questions.list()`
     /// once, so a listing over many tasks never rescans the disk per task.
     pub fn new(tasks: Vec<Task>, questions: &[Question]) -> Self {
@@ -66,7 +169,10 @@ impl Inventory {
             ids,
             complete: true,
             tasks: tasks.into_iter().map(|t| (t.id.clone(), t)).collect(),
-            questions: questions.iter().map(|q| (q.id.clone(), q.status)).collect(),
+            questions: questions
+                .iter()
+                .map(|q| (q.id.clone(), DecisionRecord::from(q)))
+                .collect(),
         }
     }
 
@@ -164,7 +270,7 @@ impl Inventory {
             if questions.path_of(&full).is_file()
                 && let Ok(q) = questions.get(&full)
             {
-                inventory.questions.insert(full, q.status);
+                inventory.questions.insert(full, DecisionRecord::from(&q));
             }
         }
         inventory
@@ -177,7 +283,7 @@ impl Inventory {
             return Dep::Task(t);
         }
         if let Some(s) = self.questions.get(id) {
-            return Dep::Question(*s);
+            return Dep::Question(s.status);
         }
         if !self.complete {
             return Dep::Unknown;
@@ -187,7 +293,7 @@ impl Inventory {
                 if let Some(t) = self.tasks.get(&full) {
                     Dep::Task(t)
                 } else if let Some(s) = self.questions.get(&full) {
-                    Dep::Question(*s)
+                    Dep::Question(s.status)
                 } else {
                     Dep::Unknown
                 }
@@ -361,6 +467,83 @@ mod tests {
 
     fn inv(tasks: Vec<Task>) -> Inventory {
         Inventory::new(tasks, &[])
+    }
+
+    #[test]
+    fn blocker_views_preserve_all_dependencies_and_decision_delivery_states() {
+        let held = t("held", TaskStatus::Held, &[]);
+        let done = t("done", TaskStatus::Done, &[]);
+        let mut decision = Question::new(
+            "run".into(),
+            "node".into(),
+            "seat".into(),
+            "Choose recovery".into(),
+            "Context".into(),
+            vec![],
+        );
+        decision.routed_task = Some(held.id.clone());
+        let mut waiting = t("waiting", TaskStatus::Blocked, &["held", "done", "missing"]);
+        waiting.blocked_by.push(decision.id.clone());
+        let inventory = Inventory::new(
+            vec![held.clone(), done, waiting.clone()],
+            std::slice::from_ref(&decision),
+        );
+        let views = inventory.blocker_views(&waiting);
+        assert_eq!(views.len(), 4);
+        assert_eq!(views[0].destination, Some(("tasks", held.id.clone())));
+        assert!(views[1].next.contains("reconcile"));
+        assert_eq!(views[2].state, "missing");
+        assert!(views[2].destination.is_none());
+        assert!(views[3].next.contains("delivery"));
+        assert!(views[3].destination.is_none());
+        assert!(inventory.blocker_views(&held).is_empty());
+        for status in [
+            QuestionStatus::Open,
+            QuestionStatus::Answered,
+            QuestionStatus::Abandoned,
+        ] {
+            decision.status = status;
+            decision.routed_chat = Some("owning-chat".into());
+            let inventory = Inventory::new(vec![waiting.clone()], std::slice::from_ref(&decision));
+            let views = inventory.blocker_views(&waiting);
+            assert_eq!(views[3].id, decision.id);
+            assert_eq!(views[3].destination, Some(("chat", "owning-chat".into())));
+            assert_eq!(views[3].reason.as_deref(), Some("Choose recovery"));
+        }
+        decision.routed_task = None;
+        decision.routed_chat = None;
+        decision.status = QuestionStatus::Open;
+        let inventory = Inventory::new(vec![waiting.clone()], std::slice::from_ref(&decision));
+        assert_eq!(
+            inventory.blocker_views(&waiting)[3].destination,
+            Some(("questions", decision.id))
+        );
+    }
+
+    #[test]
+    fn blocker_views_do_not_link_ambiguous_unreadable_or_removed_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = crate::queue::Queue::at(dir.path().join("queue"));
+        let questions = crate::ask::Questions::at(dir.path().join("questions"));
+        let mut waiting = t("waiting", TaskStatus::Blocked, &[]);
+        waiting.blocked_by = vec!["collision".into(), "broken".into(), "removed".into()];
+        queue.put(&mut waiting).unwrap();
+        for name in [
+            "a-collision.json",
+            "b-collision.removed",
+            "broken.json",
+            "removed.removed",
+        ] {
+            std::fs::write(queue.root().join(name), "unreadable").unwrap();
+        }
+        let inventory = Inventory::load_for(&queue, &questions, &waiting);
+        let views = inventory.blocker_views(&waiting);
+        assert_eq!(views.len(), 3);
+        assert!(
+            views
+                .iter()
+                .all(|view| view.destination.is_none() && view.state == "unavailable or ambiguous")
+        );
     }
 
     #[test]

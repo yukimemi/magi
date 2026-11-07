@@ -5014,6 +5014,8 @@ struct TaskView {
     /// Short ids of the held (or cyclic) tasks a blocked task is frozen
     /// behind - non-empty means nothing in the loop will ever run it.
     stuck_roots: Vec<String>,
+    blockers: Vec<crate::blockers::BlockerView>,
+    recovery: Option<String>,
 }
 
 impl From<Task> for TaskView {
@@ -5025,6 +5027,8 @@ impl From<Task> for TaskView {
             instruction_md: md::to_nodes(&task.instruction, &md::ImageBase::None),
             waits_on: Vec::new(),
             stuck_roots: Vec::new(),
+            blockers: Vec::new(),
+            recovery: task_recovery(&task),
             task,
         }
     }
@@ -5039,11 +5043,44 @@ impl TaskView {
             .map(|r| r.rsplit('-').next().unwrap_or(r).to_owned())
             .collect();
         Self {
+            blockers: inv.blocker_views(&task),
             waits_on,
             stuck_roots,
             ..Self::from(task)
         }
     }
+}
+
+fn task_recovery(task: &Task) -> Option<String> {
+    use crate::queue::{HoldSource, TaskStatus};
+    if !matches!(task.status, TaskStatus::Blocked | TaskStatus::Held) {
+        return None;
+    }
+    let mut text = String::new();
+    if task.status == TaskStatus::Blocked {
+        text.push_str("Resolve each dependency below through its supported controls. Hold replaces this wait with a manual hold; it does not complete the dependencies. ");
+        let restored = match task.blocked_from {
+            Some(TaskStatus::Running) => TaskStatus::Queued,
+            Some(status) => status,
+            None if task.hold_reason.is_some() || task.hold_source.is_some() => TaskStatus::Held,
+            None => TaskStatus::Queued,
+        };
+        text.push_str(&format!(
+            "After all dependencies resolve, the scheduler restores {}. ",
+            restored.as_str()
+        ));
+        if restored != TaskStatus::Held {
+            return Some(text);
+        }
+    }
+    text.push_str(match task.hold_source {
+        Some(HoldSource::Manual) => "Manual hold: an operator must explicitly Release when ready.",
+        Some(HoldSource::Machine) if task.hold_reason.as_deref().is_some_and(crate::disk::is_gate_reason) =>
+            "Machine disk hold: free disk space or restore measurement. Recorded disk figures describe the hold time, not current capacity. Once held, triage rechecks the disk gate and automatically queues only after recovery is verified; disk admission checks still apply.",
+        Some(HoldSource::Machine) => "Machine hold: triage rechecks supported recovery conditions; otherwise resolve the recovery decision in the owning task chat.",
+        None => "Hold origin unknown: inspect the recorded reason and task chat before explicitly releasing.",
+    });
+    Some(text)
 }
 
 /// `?refresh=1` forces a re-scan even inside the TTL. Any other value, or
@@ -21703,6 +21740,41 @@ mod tests {
         assert_eq!(held["blocked_by"], serde_json::json!([]));
         assert!(held["block_reason"].is_null());
         assert_eq!(held["answers"][0]["answer"], "SQLite");
+    }
+
+    #[test]
+    fn task_recovery_distinguishes_dependency_restoration_and_hold_ownership() {
+        use crate::queue::HoldSource;
+        let mut task = Task::new(
+            "Recovery".into(),
+            "Inspect".into(),
+            PathBuf::from("/repo"),
+            Source::Human,
+        );
+        assert!(task_recovery(&task).is_none());
+        task.hold_manual(Some("Operator paused".into()));
+        assert!(task_recovery(&task).unwrap().contains("explicitly Release"));
+        task.block(vec!["dependency".into()], Some("Decision needed".into()));
+        let text = task_recovery(&task).unwrap();
+        assert!(text.contains("restores held"));
+        assert!(text.contains("does not complete the dependencies"));
+        task.hold_source = Some(HoldSource::Machine);
+        task.hold_reason = crate::disk::gate(2_667_941_888, 3_221_225_472);
+        let view = TaskView::with_inventory(
+            task.clone(),
+            &crate::blockers::Inventory::new(vec![task.clone()], &[]),
+        );
+        let json = serde_json::to_value(view).unwrap();
+        assert_eq!(json["block_reason"], "Decision needed");
+        assert!(json["hold_reason"].as_str().unwrap().contains("2667941888"));
+        let recovery = json["recovery"].as_str().unwrap();
+        assert!(recovery.contains("not current capacity"));
+        assert!(recovery.contains("triage rechecks"));
+        assert_eq!(json["blockers"][0]["state"], "missing");
+        task.blocked_from = Some(TaskStatus::Queued);
+        assert!(!task_recovery(&task).unwrap().contains("triage rechecks"));
+        task.blocked_from = None;
+        assert!(task_recovery(&task).unwrap().contains("restores held"));
     }
 
     #[tokio::test]
