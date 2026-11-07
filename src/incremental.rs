@@ -19,6 +19,31 @@ const SLOTS: usize = 4;
 const GENERATION_BYTES: u64 = 128 * 1024 * 1024;
 const STORE: &str = "magi-incremental";
 
+/// Forked subprocesses can retain a copy until exec closes it. Explicitly
+/// release our flock at the ownership boundary rather than waiting for every
+/// inherited descriptor to close. Session acquisition queries POSIX locks and
+/// then holds flock, so all these guards use the same release protocol.
+#[derive(Debug)]
+struct FileLease(File);
+
+impl std::ops::Deref for FileLease {
+    type Target = File;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[cfg(unix)]
+impl Drop for FileLease {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        // SAFETY: the guard retains its live descriptor through unlock.
+        unsafe {
+            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
 pub(crate) fn default_environment(command: &mut tokio::process::Command) {
     let explicit = command
         .as_std()
@@ -193,7 +218,7 @@ pub(crate) struct Generation {
     path: PathBuf,
     record: PathBuf,
     // The session lock is outside the cache, and lives through compiler exit.
-    _lock: File,
+    _lock: FileLease,
 }
 
 impl Generation {
@@ -241,12 +266,14 @@ impl Generation {
             use std::os::unix::fs::OpenOptionsExt;
             options.custom_flags(libc::O_NOFOLLOW);
         }
-        let admission = options
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(store.join("admission.lock"))?;
+        let admission = FileLease(
+            options
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(store.join("admission.lock"))?,
+        );
         wait_for_admission(&admission, std::time::Duration::from_secs(30))?;
         // Reset/clean can remove sealed cache data without its Git-side proof.
         // Forget only completed, absent generations, never unsealed attempts.
@@ -271,7 +298,7 @@ impl Generation {
                     plain(&owner)?.is_file() && fs::metadata(&owner)?.len() == 0,
                     "invalid incremental owner"
                 );
-                let lock = OpenOptions::new().read(true).write(true).open(&owner)?;
+                let lock = FileLease(OpenOptions::new().read(true).write(true).open(&owner)?);
                 crate::pr_head::try_lock_file(&lock)?;
                 fs::remove_file(&record)?;
                 fs::remove_file(owner)?;
@@ -304,11 +331,13 @@ impl Generation {
         );
         let token = crate::rng::SplitMix64::new(crate::rng::entropy()).uuid_v4();
         let record = store.join(format!("{token}.json"));
-        let lock = OpenOptions::new()
-            .create_new(true)
-            .read(true)
-            .write(true)
-            .open(record.with_extension("owner"))?;
+        let lock = FileLease(
+            OpenOptions::new()
+                .create_new(true)
+                .read(true)
+                .write(true)
+                .open(record.with_extension("owner"))?,
+        );
         crate::pr_head::try_lock_file(&lock)?;
         let path = parent.join(format!("magi-{token}"));
         fs::create_dir(&path)?;
@@ -463,7 +492,7 @@ fn lock_for_accounting(file: &File) -> std::io::Result<()> {
 
 // Accounting grants no deletion authority. A shared owner guard and an exact
 // completion proof may reduce the conservative full-generation reservation.
-fn completed_charge(worktree: &Path, owner: &Path) -> Result<(u64, File)> {
+fn completed_charge(worktree: &Path, owner: &Path) -> Result<(u64, FileLease)> {
     ensure!(
         plain(owner)?.is_file() && fs::metadata(owner)?.len() == 0,
         "invalid incremental owner"
@@ -475,7 +504,7 @@ fn completed_charge(worktree: &Path, owner: &Path) -> Result<(u64, File)> {
         plain(&record)?.is_file() && fs::metadata(&record)?.len() < 4 * 1024 * 1024,
         "invalid incremental proof"
     );
-    let lock = OpenOptions::new().read(true).write(true).open(owner)?;
+    let lock = FileLease(OpenOptions::new().read(true).write(true).open(owner)?);
     lock_for_accounting(&lock)?;
     let proof: Proof = serde_json::from_slice(&fs::read(record)?)?;
     validate_proof(worktree, &owner.with_extension("json"), &proof)?;
@@ -707,7 +736,7 @@ async fn wrapper_inner(args: Vec<OsString>) -> Result<i32> {
 #[derive(Default)]
 pub(crate) struct Reclaim {
     pub(crate) files: Vec<PathBuf>,
-    _locks: Vec<File>,
+    _locks: Vec<FileLease>,
     finished: Vec<(PathBuf, PathBuf, std::collections::BTreeSet<PathBuf>)>,
 }
 
@@ -806,7 +835,7 @@ pub(crate) fn candidates(worktree: &Path) -> Result<Reclaim> {
             owner_metadata.is_file() && owner_metadata.len() == 0,
             "incremental owner is missing or changed"
         );
-        let owner = OpenOptions::new().read(true).write(true).open(lock_path)?;
+        let owner = FileLease(OpenOptions::new().read(true).write(true).open(lock_path)?);
         crate::pr_head::try_lock_file(&owner).context("incremental compiler is live")?;
         locks.push(owner);
         finished.push((
@@ -833,7 +862,7 @@ pub(crate) fn candidates(worktree: &Path) -> Result<Reclaim> {
             if path.extension().is_some_and(|x| x == "lock") {
                 let file = OpenOptions::new().read(true).write(true).open(&path)?;
                 lock_session(&file).context("incremental session is live")?;
-                locks.push(file);
+                locks.push(FileLease(file));
             }
             outputs.push(path);
         }
@@ -914,23 +943,27 @@ pub(crate) mod tests {
         use std::time::Duration;
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("admission.lock");
-        let held = OpenOptions::new()
-            .create_new(true)
-            .read(true)
-            .write(true)
-            .open(&path)
-            .unwrap();
+        let held = FileLease(
+            OpenOptions::new()
+                .create_new(true)
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap(),
+        );
         crate::pr_head::try_lock_file(&held).unwrap();
         std::thread::scope(|scope| {
             let (ready_tx, ready_rx) = std::sync::mpsc::channel();
             let (done_tx, done_rx) = std::sync::mpsc::channel();
             let path = path.clone();
             scope.spawn(move || {
-                let waiting = OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(&path)
-                    .unwrap();
+                let waiting = FileLease(
+                    OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(&path)
+                        .unwrap(),
+                );
                 ready_tx.send(()).unwrap();
                 let result = wait_for_admission(&waiting, Duration::from_secs(5));
                 done_tx.send(result).unwrap();
@@ -943,11 +976,13 @@ pub(crate) mod tests {
                 .unwrap()
                 .unwrap();
         });
-        let held = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .unwrap();
+        let held = FileLease(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap(),
+        );
         crate::pr_head::try_lock_file(&held).unwrap();
         let waiting = OpenOptions::new()
             .read(true)
@@ -970,11 +1005,13 @@ pub(crate) mod tests {
         let second = completed_charge(&worktree, &owner).unwrap();
         assert!(first.0 > 0);
         assert_eq!(first.0, second.0);
-        let exclusive = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&owner)
-            .unwrap();
+        let exclusive = FileLease(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&owner)
+                .unwrap(),
+        );
         assert!(crate::pr_head::try_lock_file(&exclusive).is_err());
         let parent = worktree.join("target/debug/incremental");
         let fresh = Generation::create(&worktree, &parent).unwrap();
@@ -982,6 +1019,63 @@ pub(crate) mod tests {
         drop(first);
         drop(second);
         assert!(crate::pr_head::try_lock_file(&exclusive).is_ok());
+    }
+
+    #[test]
+    fn ownership_release_is_not_delayed_by_descriptor_copies() {
+        let (_temp, worktree, generation) = cargo_generation();
+        let store = git_dir(&worktree).unwrap().join(STORE);
+        let open = |path: &Path| {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .unwrap()
+        };
+        let admission_path = store.join("admission.lock");
+        let admission = FileLease(open(&admission_path));
+        crate::pr_head::try_lock_file(&admission).unwrap();
+        // dup and fork share the same open-file description. Keep a copy open
+        // deterministically, without depending on another test's fork timing.
+        let inherited_admission = admission.try_clone().unwrap();
+        let next = FileLease(open(&admission_path));
+        assert!(crate::pr_head::try_lock_file(&next).is_err());
+        drop(admission);
+        crate::pr_head::try_lock_file(&next).unwrap();
+        drop(next);
+        drop(inherited_admission);
+
+        let owner = generation.record.with_extension("owner");
+        let inherited_generation = generation._lock.try_clone().unwrap();
+        assert!(completed_charge(&worktree, &owner).is_err());
+        drop(generation);
+        let first = completed_charge(&worktree, &owner).unwrap();
+        let second = completed_charge(&worktree, &owner).unwrap();
+        let inherited_first = first.1.try_clone().unwrap();
+        let inherited_second = second.1.try_clone().unwrap();
+        let exclusive = FileLease(open(&owner));
+        drop(first);
+        assert!(
+            crate::pr_head::try_lock_file(&exclusive).is_err(),
+            "another actual accounting owner still excludes reclamation"
+        );
+        drop(second);
+        crate::pr_head::try_lock_file(&exclusive).unwrap();
+        drop(exclusive);
+        drop((inherited_generation, inherited_first, inherited_second));
+
+        let reclaim = candidates(&worktree).unwrap();
+        let inherited_reclaim: Vec<_> = reclaim
+            ._locks
+            .iter()
+            .map(|lock| lock.try_clone().unwrap())
+            .collect();
+        assert!(candidates(&worktree).is_err());
+        drop(reclaim);
+        let retry = candidates(&worktree).unwrap();
+        assert!(!retry.files.is_empty());
+        drop(retry);
+        drop(inherited_reclaim);
     }
 
     #[test]
@@ -1164,11 +1258,13 @@ pub(crate) mod tests {
             .unwrap()
             .clone();
         drop(reclaim);
-        let live_session = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(session)
-            .unwrap();
+        let live_session = FileLease(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(session)
+                .unwrap(),
+        );
         crate::pr_head::try_lock_file(&live_session).unwrap();
         assert!(
             candidates(&worktree)

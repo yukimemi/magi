@@ -641,6 +641,8 @@ pub async fn invoke(
     let min_free = crate::run::RunState::load_under(inv.run, &crate::run::home())
         .ok()
         .map_or(0, |state| state.config.disk.min_free_bytes);
+    #[cfg(test)]
+    let min_free = test_watchdog::floor(inv.run, min_free);
     let mut paths = vec![inv.cwd.to_owned()];
     if let Some(cache) = inv.cache_dir {
         paths.push(cache.to_owned());
@@ -1990,6 +1992,42 @@ fn ids(agents: &[AgentSpec]) -> String {
         .map(|a| a.id.clone())
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// Isolate post-spawn pressure injection from real admission policy and from
+/// other concurrent runs. This hook never exists in the shipped executable.
+#[cfg(test)]
+pub(crate) mod test_watchdog {
+    use super::*;
+    static FLOORS: Mutex<BTreeMap<String, u64>> = Mutex::new(BTreeMap::new());
+
+    pub(crate) struct Guard(String);
+
+    pub(crate) fn set(run: &str, floor: u64) -> Guard {
+        assert!(
+            FLOORS
+                .lock()
+                .unwrap()
+                .insert(run.to_owned(), floor)
+                .is_none()
+        );
+        Guard(run.to_owned())
+    }
+
+    pub(super) fn floor(run: &str, configured: u64) -> u64 {
+        FLOORS
+            .lock()
+            .unwrap()
+            .get(run)
+            .copied()
+            .unwrap_or(configured)
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            FLOORS.lock().unwrap().remove(&self.0);
+        }
+    }
 }
 
 #[cfg(test)]

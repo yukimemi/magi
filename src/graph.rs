@@ -15738,7 +15738,7 @@ mod tests {
             runner.state.tally = None;
             runner.state.judge_skipped = false;
             runner.state.status = RunStatus::Implementing;
-            runner.state.config.disk.min_free_bytes = u64::MAX;
+            let pressure = agent::test_watchdog::set(&runner.state.id, u64::MAX);
             let mut implementer = spec("alpha");
             implementer.command = vec!["sh".into(), "-c".into(), "exec sleep 30".into()];
             runner.roles.implementers = vec![implementer];
@@ -15748,6 +15748,7 @@ mod tests {
             }
             runner.state.save().unwrap();
             assert_eq!(runner.implement().await.is_err(), failed_checkpoint);
+            drop(pressure);
             runner.state = RunState::load(&runner.state.id).unwrap();
             assert_eq!(runner.state.status, RunStatus::Blocked);
             assert!(runner.state.interrupted_implementations.contains(&'A'));
@@ -15792,9 +15793,9 @@ mod tests {
             runner.state.tally = None;
             runner.state.judge_skipped = false;
             runner.state.status = RunStatus::Implementing;
-            // Force the real post-spawn watchdog, independently of available
-            // disk space. Dirty/committed work predates its first measurement.
-            runner.state.config.disk.min_free_bytes = u64::MAX;
+            // Force only the real post-spawn watchdog, without failing the
+            // separate admission check. Existing edits predate its measurement.
+            let pressure = agent::test_watchdog::set(&runner.state.id, u64::MAX);
             let wt = runner.state.candidates[0].worktree.clone();
             std::fs::write(
                 wt.join("interrupted-source"),
@@ -15825,6 +15826,7 @@ mod tests {
             runner.roles.implementers = vec![implementer];
             runner.state.save().unwrap();
             let result = runner.implement().await;
+            drop(pressure);
             assert_eq!(result.is_err(), block_rescue);
             assert_eq!(
                 runner.state.resource_block.as_ref().unwrap().kind,
