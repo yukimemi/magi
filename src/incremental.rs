@@ -568,24 +568,38 @@ fn recognized(path: &Path) -> Result<bool> {
     Ok(false)
 }
 
-/// Match rustc: flock on Linux, fcntl on other Unix platforms. Combining both
-/// can conflict even within one process on BSD. Retain through unlink.
+/// Check both Unix lock protocols used by compilers. Query the POSIX lock
+/// without acquiring it: holding both protocols can conflict on BSD. Retain
+/// the flock guard through unlink, alongside the caller's output/Cargo locks.
 /// See https://doc.rust-lang.org/stable/nightly-rustc/rustc_data_structures/flock/.
 #[cfg(unix)]
 fn lock_session(file: &File) -> std::io::Result<()> {
-    #[cfg(target_os = "linux")]
-    {
-        crate::pr_head::try_lock_file(file)
+    use std::os::fd::AsRawFd;
+    // SAFETY: the descriptor is live and the initialized record covers the
+    // whole file. F_GETLK only inspects locks; it does not change them.
+    let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+    lock.l_type = libc::F_WRLCK as _;
+    lock.l_whence = libc::SEEK_SET as _;
+    lock.l_start = 0;
+    lock.l_len = 0;
+    if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETLK, &mut lock) } == -1 {
+        return Err(std::io::Error::last_os_error());
     }
-    #[cfg(not(target_os = "linux"))]
-    lock_posix_session(file)
+    let unlocked: libc::c_short = libc::F_UNLCK as _;
+    if lock.l_type != unlocked {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "incremental session has a POSIX record lock",
+        ));
+    }
+    crate::pr_head::try_lock_file(file)
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+#[cfg(all(unix, test))]
 fn lock_posix_session(file: &File) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
     // SAFETY: zero initializes reserved fields; fcntl borrows the lock record
-    // only during this call and the live descriptor is retained by Reclaim.
+    // only during this call and the test helper retains the live descriptor.
     let mut lock: libc::flock = unsafe { std::mem::zeroed() };
     lock.l_type = libc::F_WRLCK as _;
     lock.l_whence = libc::SEEK_SET as _;
@@ -1063,7 +1077,6 @@ pub(crate) mod tests {
         assert!(!path.exists());
     }
 
-    #[cfg(not(target_os = "linux"))]
     #[test]
     fn fcntl_session_lock_is_respected_across_processes() {
         use std::io::{Read, Write};
@@ -1074,8 +1087,8 @@ pub(crate) mod tests {
                 .write(true)
                 .open(path)
                 .unwrap();
-            // Deliberately do not take flock: this emulates rustc's non-Linux
-            // Unix protocol and detects implementations checking only flock.
+            // Deliberately do not take flock: both compiler protocols must
+            // exclude reclamation, even on hosts where they are independent.
             lock_posix_session(&file).unwrap();
             fs::write(
                 std::env::var_os("MAGI_TEST_SESSION_READY").unwrap(),
