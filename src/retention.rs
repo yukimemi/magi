@@ -2140,11 +2140,13 @@ mod tests {
         std::fs::write(
             wt.join("build.rs"),
             r#"fn main() {
-            let ready = std::env::var("FIXTURE_READY").unwrap();
+            println!("cargo:rerun-if-env-changed=FIXTURE_READY");
+            let Ok(ready) = std::env::var("FIXTURE_READY") else { return };
             let release = std::env::var("FIXTURE_RELEASE").unwrap();
             std::fs::write(ready, "ready").unwrap();
             let start = std::time::Instant::now();
-            while !std::path::Path::new(&release).exists() && start.elapsed().as_secs() < 15 {
+            while !std::path::Path::new(&release).exists() {
+                assert!(start.elapsed().as_secs() < 120, "fixture was not released");
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
         }"#,
@@ -2159,27 +2161,42 @@ mod tests {
                 cargo.env(key, value);
             }
         }
-        let mut child = cargo
+        cargo
             .current_dir(wt)
             .env("RUSTUP_TOOLCHAIN", "stable")
             .env("CARGO_HOME", f._temp.path().join("cargo-home"))
             .env("CARGO_INCREMENTAL", "1")
+            .args(["build", "--offline", "--jobs", "1", "--target-dir"])
+            .arg(wt.join("target"));
+        // Compile before timing the active-build handshake. Under a parallel
+        // gate, even this tiny fixture's first compiler startup can exceed the
+        // readiness window; compilation speed is not what this test verifies.
+        let warm = cargo.output().await.unwrap();
+        assert!(
+            warm.status.success(),
+            "fixture compilation failed: {}",
+            String::from_utf8_lossy(&warm.stderr)
+        );
+        let log_path = f._temp.path().join("live-cargo.stderr");
+        let mut child = cargo
             .env("FIXTURE_READY", &ready)
             .env("FIXTURE_RELEASE", &release)
-            .args(["build", "--offline", "--jobs", "1", "--target-dir"])
-            .arg(wt.join("target"))
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::fs::File::create(&log_path).unwrap())
             .kill_on_drop(true)
             .spawn()
             .unwrap();
-        let arrived = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let readiness = tokio::time::timeout(std::time::Duration::from_secs(60), async {
             while !ready.exists() {
+                if let Some(status) = child.try_wait().unwrap() {
+                    return Err(format!("fixture exited before readiness: {status}"));
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
+            Ok(())
         })
-        .await
-        .is_ok();
+        .await;
+        let arrived = matches!(readiness, Ok(Ok(())));
         let report = if arrived {
             Some(sweep(&f.home, &Fx::disk(), Fx::now()).await)
         } else {
@@ -2187,16 +2204,21 @@ mod tests {
         };
         // Release and join our build before making assertions, including on failure.
         std::fs::write(release, "release").unwrap();
-        let status = tokio::time::timeout(std::time::Duration::from_secs(10), child.wait()).await;
+        let status = tokio::time::timeout(std::time::Duration::from_secs(60), child.wait()).await;
         if status.is_err() {
             child.kill().await.unwrap();
             child.wait().await.unwrap();
         }
         assert!(
             arrived,
-            "fixture build never reached its active build script"
+            "fixture build never reached its active build script: {readiness:?}\n{}",
+            std::fs::read_to_string(&log_path).unwrap()
         );
-        assert!(status.unwrap().unwrap().success());
+        assert!(
+            status.unwrap().unwrap().success(),
+            "fixture build failed: {}",
+            std::fs::read_to_string(&log_path).unwrap()
+        );
         let report = report.unwrap();
         assert_eq!(report.freed_bytes, 0, "{report:?}");
         assert!(
