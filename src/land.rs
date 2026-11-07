@@ -4057,7 +4057,9 @@ async fn resume_landing_head<F: Forge>(
     );
     let onto = format!("{remote}/{base}");
     let tip = git::rev_parse(&state.repo, &onto).await?;
-    let contains_base = git::is_ancestor(&state.repo, &tip, &local).await;
+    let contains_base = git::ancestry(&state.repo, &tip, &local)
+        .await
+        .context("could not determine whether the landing head contains the fetched base")?;
     anyhow::ensure!(
         reason != Some(Blocking::Behind) || !contains_base,
         "BEHIND reported but the fetched base is already included; synchronization made no progress"
@@ -10252,6 +10254,85 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
                 Some(head.as_str())
             );
         }
+    }
+
+    #[tokio::test]
+    async fn behind_refusal_remains_actionable_when_the_next_view_is_clean() {
+        let (_tmp, mut state, old) = landing_git_fixture().await;
+        state.land_sync_pending = false;
+        state.config.graph.land_approval = false;
+        state.config.verify.gate = vec!["test -f advance && test -f change".into()];
+        advance_landing_base(&state).await;
+        let mut forge = Scripted::new(
+            vec![
+                seen(&old, Checks::Green, "CLEAN", false),
+                seen(&old, Checks::Green, "CLEAN", false),
+                seen(&old, Checks::Green, "BEHIND", false),
+                // The next observation is the publication lease check. The
+                // refusal's evidence still applies to exactly this old head.
+                seen(&old, Checks::Green, "CLEAN", false),
+                seen("@published", Checks::Green, "CLEAN", false),
+            ],
+            vec![(false, REFUSED), (true, "")],
+        );
+        forge.public_repo = Some(state.repo.clone());
+        land_with(&mut state, URL, &forge).await.unwrap();
+        let head = state.pr_pushed_head.as_deref().unwrap();
+        assert_ne!(head, old);
+        assert_eq!(state.land_sync_attempts, 1);
+        assert_eq!(state.gate_head.as_deref(), Some(head));
+        assert_eq!(state.status, RunStatus::Merged);
+        let requests = forge.argvs();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            value_of(&requests[0], "--match-head-commit"),
+            Some(old.as_str())
+        );
+        assert_eq!(value_of(&requests[1], "--match-head-commit"), Some(head));
+    }
+
+    #[tokio::test]
+    async fn behind_ancestry_failure_stops_without_rebasing_or_publishing() {
+        let (tmp, mut state, old) = landing_git_fixture().await;
+        state.land_sync_pending = false;
+        // A damaged history must not be interpreted as a missing base. Keep
+        // the head's tree intact so worktree restoration itself can succeed.
+        let tree = git::rev_parse(&state.repo, "HEAD^{tree}").await.unwrap();
+        let commit = tmp.path().join("broken-commit");
+        std::fs::write(
+            &commit,
+            format!(
+                "tree {tree}\nparent {}\nauthor Test <test@example.test> 1 +0000\ncommitter Test <test@example.test> 1 +0000\n\nbroken history\n",
+                "f".repeat(40)
+            ),
+        )
+        .unwrap();
+        let replacement = git::git(
+            &state.repo,
+            &[
+                "hash-object",
+                "-t",
+                "commit",
+                "-w",
+                commit.to_str().unwrap(),
+            ],
+        )
+        .await
+        .unwrap();
+        git::git(&state.repo, &["replace", &old, replacement.trim()])
+            .await
+            .unwrap();
+        let forge = Scripted::new(vec![seen(&old, Checks::Green, "BEHIND", false)], vec![]);
+        land_with(&mut state, URL, &forge).await.unwrap();
+        assert_eq!(state.land_sync_attempts, 0);
+        assert_eq!(state.pr_pushed_head.as_deref(), Some(old.as_str()));
+        assert_eq!(git::rev_parse(&state.repo, "HEAD").await.unwrap(), old);
+        assert!(forge.argvs().is_empty());
+        assert!(
+            state.events.iter().any(|e| e.message.contains(
+                "could not determine whether the landing head contains the fetched base"
+            ))
+        );
     }
 
     #[tokio::test]
