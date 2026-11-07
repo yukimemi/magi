@@ -429,3 +429,75 @@ or service changes, or merging/closing unrelated PRs. Do not run it while the
 backlog still exceeds the configured bound, and do not use `release` to bypass
 that bound. If the public head moved, inspect its ownership and source lineage
 before making a new explicit selection.
+
+### Incremental cache growth and admission
+
+Managed agent seats, verification commands, worktree setup and release builds
+now default to `CARGO_INCREMENTAL=0`. This takes precedence over Cargo profile
+settings; an explicit environment assignment can opt in. Reusing ordinary
+non-incremental Cargo artifacts remains unchanged.
+
+On Unix linked worktrees the launcher installs a compiler wrapper in the
+worktree Git directory. It preserves an existing `RUSTC_WRAPPER` and Cargo's
+`RUSTC_WORKSPACE_WRAPPER` chain. Explicit incremental builds must use the local
+`target/debug/incremental` or `target/release/incremental` root. Shared/custom
+incremental targets are refused; use non-incremental builds there. Replacing the
+wrapper inside a command opts out of this management and supplies no cleanup
+provenance.
+
+Each incremental compiler invocation gets a fresh generation within a 512 MiB
+worktree budget. Live and unproven generations reserve 128 MiB each; completed,
+unchanged generations charge their actual logical bytes. A separate limit of
+1024 provenance records bounds metadata growth. Admission waits up to 30 seconds
+for the namespace lock instead of rejecting temporary contention. Completed
+cache hashes are verified before that lock is taken, under shared owner guards
+retained through the atomic reservation check. Newly appearing or unverified
+owners still receive full reservations. A lock-wait timeout is reported separately
+from budget exhaustion. Each generation has a 128 MiB monitored budget. Sampling can overshoot; these are admission and growth controls, not
+filesystem quotas. Exceeding the budget stops that invocation's compiler, not
+unrelated jobs. The wrapper uses the existing descendant cleanup supervisor and
+waits for the invocation’s compiler descendants before releasing ownership.
+Incomplete, unknown or oversized generations keep their reservations
+and their data; repeated failure therefore closes admission instead of creating
+unlimited new directories. A completed generation is sealed only after checking
+compiler file signatures and recording exact paths, hashes and Unix inode
+identity. This deliberately gives up incremental reuse across invocations.
+Unfinished session directories and unknown directory structures cannot be sealed.
+Compiler wrapper scripts are published atomically so concurrent command setup
+cannot observe a partially written wrapper.
+
+Reclamation checks this proof independently of dep-info. It requires the existing
+registration, dead run/driver, activity/output grace, canonical target boundary,
+owner, maintenance, output and Cargo locks. Generation and rustc session locks
+stay held through deletion. Added files/directories, replaced files, symlinks or
+changed bytes refuse reclamation. Partial deletion can be revalidated on retry.
+Only matching regular files are unlinked and empty recorded directories removed.
+This proof never authorizes worktree retirement. Legacy incremental caches and
+build-script output are not adopted, even if their bytes look compiler-authored.
+A cache tag, target name, output lease or ignored status is insufficient.
+
+Managed editing/verification admission also reserves 1 GiB per writer per volume
+under one magi home, in addition to `min_free_bytes`. Admission is serialized per
+volume, deduplicates paths on that volume, and includes other live reservations.
+Reservations follow the existing process cleanup owner and inherited descriptors
+until tool descendants terminate. They are conservative estimates: active writes
+can exceed them and unrelated processes still consume space, so the emergency
+monitor and disk floor remain in force. A reservation/floor blocker is a resource
+hold, not permission to delete unproven data. A zero disk floor retains the
+existing explicit opt-out behavior.
+
+In `retention.json`, `measured_bytes` is logical inventory and `freed_bytes` is
+logical bytes unlinked. Neither means physical disk space recovered.
+`measured_allocated_file_bytes` deduplicates Unix device/inode file allocations;
+it excludes directory blocks. `proven_reclaimable_bytes` counts candidates
+inspected under locks during this pass; protected, unproven and uninspected data
+remain in `protected_or_unproven_bytes`. The cap describes total logical
+inventory, not how much cleanup is authorized to reclaim.
+`estimated_released_allocated_bytes` counts allocated blocks only when all
+observed hard links have been removed. Open descriptors, shared extents and
+filesystem behavior can reduce actual recovery. `observed_home_free_change_bytes`
+is a separate signed observation on the home volume and includes concurrent
+activity; it is not attributed to cleanup. Capacity warnings remain visible
+when either pressure or excess inventory persists, including after partial
+progress. Inspect retained reasons instead of assuming the old cache can be
+removed automatically.

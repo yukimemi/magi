@@ -1393,6 +1393,7 @@ impl CommandOutcome {
     /// is not a verdict on the patch under review.
     pub fn build_failed(&self) -> bool {
         !self.ok()
+            && !self.resource_blocked
             && BUILD_FAILURE_MARKERS
                 .iter()
                 .any(|m| self.output_tail.contains(m))
@@ -5223,6 +5224,12 @@ mod tests {
         };
         assert!(!link_race.ok());
         assert!(link_race.build_failed());
+        let mut resource_hold = link_race.clone();
+        resource_hold.resource_blocked = true;
+        assert!(
+            !resource_hold.build_failed(),
+            "disk admission must not spend a build retry"
+        );
 
         let failing_test = CommandOutcome {
             command: "cargo test".to_owned(),

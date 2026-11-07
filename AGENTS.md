@@ -3461,7 +3461,8 @@ resumes must perform the same join before clearing it.
 `src/retention.rs` normally visits targets by oldest activity; under free-space
 pressure it remeasures and visits largest targets first (oldest breaks ties).
 Inventory sizes only prioritize targets. Budget decisions use dep-info-proven
-outputs measured under all ownership, registration, lease and Cargo locks.
+outputs and independently proven incremental generations measured under all
+ownership, registration, lease and Cargo locks.
 `[disk] worktree_reclaim_bytes = 0` disables output deletion. A positive budget
 allows the first target whose deletion starts to exceed it, preventing permanent
 retention of oversized outputs; this can increase deletion volume and duration.
@@ -3469,3 +3470,22 @@ That exception is consumed at deletion start even on partial failure, and stops
 further deletions in that pass. Successful removals are counted even on failure.
 Other targets must fit the remaining budget; safety refusals consume no exception.
 See `docs/retained-worktrees.md` for the complete retention policy.
+
+### Managed incremental caches
+
+`src/incremental.rs` defaults managed command environments to
+`CARGO_INCREMENTAL=0`. Unix linked-worktree opt-ins use fresh compiler
+generations and per-file completion proofs in the worktree Git directory;
+legacy caches never acquire ownership retroactively. The 512 MiB worktree budget
+charges actual bytes for validated completed generations and reserves 128 MiB
+for each live/unproven generation, with at most 1024 provenance records. These
+are conservative growth controls, not filesystem quotas. Generation admission
+waits up to 30 seconds for its namespace lock; hash completed generations before
+that lock and retain shared owner guards through the reservation check.
+Keep wrapper chaining, unknown-data refusal and generation/session locks intact.
+Incremental proof is never a retirement proof. `src/retention.rs` reserves
+1 GiB per admitted editing/verification writer per volume under one home;
+these output leases follow `seat_process::Running` through descendant cleanup.
+Logical inventory/deletion, deduplicated file allocations, estimated released
+allocations and observed free-space change are separate report quantities.
+See `docs/retained-worktrees.md` for the policy and its deliberate limitations.

@@ -10529,6 +10529,10 @@ fn record_repository_block(state: &mut RunState, error: &anyhow::Error) {
             node: "repository".into(),
             kind: if error.to_string().contains("disk pressure") {
                 "disk pressure"
+            } else if error.to_string().contains("disk admission") {
+                "disk admission"
+            } else if error.to_string().contains(crate::incremental::BLOCKED) {
+                "incremental cache admission"
             } else {
                 "repository coordination"
             }
@@ -10849,6 +10853,10 @@ async fn wave(
                 node: node.to_owned(),
                 kind: if why.contains("disk pressure") {
                     "disk pressure"
+                } else if why.contains("disk admission") {
+                    "disk admission"
+                } else if why.contains(crate::incremental::BLOCKED) {
+                    "incremental cache admission"
                 } else if why.contains("repository coordination") {
                     "repository coordination"
                 } else {
@@ -11987,6 +11995,16 @@ async fn run_commands(
             .kill_on_drop(true);
         let mut outputs = Vec::new();
         let protected = (|| -> Result<()> {
+            crate::incremental::configure(&mut cmd, cwd)?;
+            let mut paths = vec![cwd.to_owned()];
+            if let Some(cache) = state.config.cache_dir() {
+                paths.push(cache);
+            }
+            outputs.extend(crate::retention::OutputLease::admit(
+                &crate::run::home(),
+                &paths,
+                state.config.disk.min_free_bytes,
+            )?);
             if let Some(guard) = crate::retention::OutputLease::borrow(cwd)? {
                 outputs.push(guard);
             }
@@ -12000,14 +12018,27 @@ async fn run_commands(
             Ok(())
         })();
         if let Err(e) = protected {
+            let detail = format!("execution admission unavailable: {e:#}");
+            state.resource_block = Some(crate::run::ResourceBlock {
+                cause: crate::run::ResourceBlockCause::Other,
+                node: node.to_owned(),
+                kind: if detail.contains("disk admission") {
+                    "disk admission"
+                } else {
+                    "output ownership"
+                }
+                .to_owned(),
+                detail: detail.clone(),
+                at: Timestamp::now(),
+            });
             out.push(CommandOutcome {
                 command: command.clone(),
                 code: None,
-                output_tail: format!("output ownership unavailable: {e:#}"),
+                output_tail: detail,
                 duration_ms: 0,
                 resource_blocked: true,
             });
-            continue;
+            break;
         }
         let spawned = crate::seat_process::Running::spawn(cmd, None, outputs);
         let (code, body) = match spawned {
@@ -12101,13 +12132,24 @@ async fn run_commands(
                 }
             }
         }
+        let resource_blocked = code != Some(0) && body.contains(crate::incremental::BLOCKED);
         out.push(CommandOutcome {
             command: command.clone(),
             code,
             output_tail: summary,
             duration_ms: started.elapsed().as_millis() as u64,
-            resource_blocked: false,
+            resource_blocked,
         });
+        if resource_blocked {
+            state.resource_block = Some(crate::run::ResourceBlock {
+                cause: crate::run::ResourceBlockCause::Other,
+                node: node.to_owned(),
+                kind: "incremental cache admission".into(),
+                detail: body,
+                at: Timestamp::now(),
+            });
+            break;
+        }
     }
     state.task_finished(task);
     if let Err(e) = state.save() {
@@ -13990,6 +14032,38 @@ mod tests {
             duration_ms: 0,
             resource_blocked,
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn incremental_admission_is_a_resource_hold_without_a_build_retry() {
+        ask_test_home();
+        let temp = tempfile::tempdir().unwrap();
+        let mut runner = runner_at(RunStatus::Gating);
+        let shell = vec!["sh".to_owned(), "-c".to_owned()];
+        let commands = vec![
+            "printf '%s\\n' 'incremental cache admission blocked: budget exhausted' 'error: could not compile fixture'; exit 101".to_owned(),
+            "touch must-not-run".to_owned(),
+        ];
+        let (outcomes, retried, pids) = run_e2e_with_retry(
+            &mut runner.state,
+            &shell,
+            &commands,
+            temp.path(),
+            Duration::from_secs(5),
+            "fixture",
+        )
+        .await;
+        assert_eq!(outcomes.len(), 1);
+        assert!(outcomes[0].resource_blocked);
+        assert!(!outcomes[0].build_failed());
+        assert!(!retried);
+        assert!(pids.is_empty());
+        assert!(!temp.path().join("must-not-run").exists());
+        assert_eq!(
+            runner.state.resource_block.as_ref().unwrap().kind,
+            "incremental cache admission"
+        );
     }
 
     #[test]

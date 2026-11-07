@@ -199,6 +199,7 @@ async fn run_step(shell: &[String], command: &str, wt: &Path, timeout: Duration)
         .stdout(out)
         .stderr(err)
         .kill_on_drop(true);
+    crate::incremental::configure(&mut cmd, wt)?;
     #[cfg(unix)]
     cmd.process_group(0);
     let mut child = cmd

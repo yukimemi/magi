@@ -1108,6 +1108,15 @@ enum CacheCmd {
 const STACK_SIZE: usize = 32 * 1024 * 1024;
 
 fn main() -> Result<()> {
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|s| s == "__magi_incremental")
+    {
+        std::process::exit(
+            magi::incremental::wrapper(std::env::args_os().skip(2).collect())
+                .context(magi::incremental::BLOCKED)?,
+        );
+    }
     std::thread::Builder::new()
         .stack_size(STACK_SIZE)
         .spawn(run)
@@ -2205,6 +2214,31 @@ fn cache(command: CacheCmd) -> Result<()> {
                 "retained worktree cleanup\n{}",
                 String::from_utf8_lossy(&body)
             );
+            if let Ok(report) = serde_json::from_slice::<serde_json::Value>(&body) {
+                let quantity = |key: &str| {
+                    report
+                        .get(key)
+                        .and_then(serde_json::Value::as_u64)
+                        .map(bytes)
+                        .unwrap_or_else(|| "unavailable".to_owned())
+                };
+                println!(
+                    "inventory   logical {} / deduplicated allocated {}",
+                    quantity("measured_bytes"),
+                    quantity("measured_allocated_file_bytes")
+                );
+                println!(
+                    "authority   proven reclaimable logical {} / estimated allocated {} / protected or unproven logical {}",
+                    quantity("proven_reclaimable_bytes"),
+                    quantity("proven_reclaimable_allocated_bytes"),
+                    quantity("protected_or_unproven_bytes")
+                );
+                println!(
+                    "reclaimed   unlinked logical {} / estimated released allocated {}",
+                    quantity("freed_bytes"),
+                    quantity("estimated_released_allocated_bytes")
+                );
+            }
         }
         println!(
             "worktree cap {} / per-pass reclamation {}",

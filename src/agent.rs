@@ -440,6 +440,18 @@ pub async fn invoke(
         ..inv.clone()
     };
     let mut outputs = Vec::new();
+    if repository_writer(inv) {
+        let min_free = crate::run::RunState::load_under(inv.run, &crate::run::home())
+            .map_or(0, |state| state.config.disk.min_free_bytes);
+        let mut paths = vec![inv.cwd.to_owned()];
+        if let Some(cache) = inv.cache_dir {
+            paths.push(cache.to_owned());
+        }
+        outputs.extend(
+            crate::retention::OutputLease::admit(&crate::run::home(), &paths, min_free)
+                .map_err(|e| crate::repo_lock::ResourceBlocked(format!("disk admission: {e:#}")))?,
+        );
+    }
     if repository_seat(inv) {
         if let Some(guard) = crate::retention::OutputLease::borrow(inv.cwd).map_err(|e| {
             crate::repo_lock::ResourceBlocked(format!("worktree output ownership: {e:#}"))
@@ -544,6 +556,10 @@ pub async fn invoke(
         // No console window. `magi web` has no console of its own, so Windows
         // would give each agent a fresh one - and draw it. See `crate::proc`.
         .quiet();
+    crate::incremental::default_environment(&mut cmd);
+    if repository_writer(inv) {
+        crate::incremental::configure(&mut cmd, inv.cwd)?;
+    }
     if let Some(home) = home {
         // Match the control-plane store we granted, even with a relative
         // MAGI_HOME or a per-agent environment override.
@@ -677,6 +693,18 @@ pub async fn invoke(
             anyhow::Error::new(crate::repo_lock::ResourceBlocked(reason.clone()))
                 .context(ExecutionInterrupted(reason)),
         );
+    }
+
+    if code != Some(0)
+        && (stdout.contains(crate::incremental::BLOCKED)
+            || stderr.contains(crate::incremental::BLOCKED))
+    {
+        let detail = if stderr.contains(crate::incremental::BLOCKED) {
+            &stderr
+        } else {
+            &stdout
+        };
+        return Err(crate::repo_lock::ResourceBlocked(tail_chars(detail, 2000)).into());
     }
 
     let mut extracted = extract(spec.kind, &stdout);
