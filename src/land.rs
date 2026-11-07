@@ -3994,16 +3994,35 @@ async fn rebase_landing_worktree(
 ) -> Result<crate::rebase::Rebased> {
     restore_landing_worktree(state).await?;
     let winner = state.winner().cloned().context("landing has no winner")?;
-    anyhow::ensure!(
-        state.land_sync_attempts < state.config.graph.land_rounds,
-        "landing base synchronization budget exhausted"
-    );
-    state.land_sync_attempts += 1;
+    let scratch = state.dir().join("rebase");
+    let target = match state.land_sync_target.clone() {
+        Some(target) => target,
+        // Older records lack the target checkpoint, but Git retains the
+        // exact target of an interrupted operation. It is a continuation too.
+        None if git::rebase_in_progress(&scratch).await => {
+            crate::rebase::rebase_target(&scratch).await?
+        }
+        None => {
+            anyhow::ensure!(
+                state.land_sync_attempts < state.config.graph.land_rounds,
+                "landing base synchronization budget exhausted"
+            );
+            let target = git::rev_parse(&state.repo, onto).await?;
+            state.land_sync_attempts += 1;
+            state.land_sync_target = Some(target.clone());
+            target
+        }
+    };
+    state.land_sync_target = Some(target.clone());
     state.land_sync_pending = true;
     state.land_rebase_from = Some(git::rev_parse(&winner.worktree, "HEAD").await?);
     state.save()?;
-    let scratch = state.dir().join("rebase");
-    let result = crate::rebase::rebase_with_fixer(state, &scratch, &winner.branch, onto).await?;
+    // A continuation owns the attempt already charged above, including a
+    // crash before the scratch rebase started. Finish its pinned base first;
+    // a newer base must use another attempt on the next observation.
+    let result = crate::rebase::rebase_with_fixer(state, &scratch, &winner.branch, &target).await?;
+    state.land_sync_target = None;
+    state.save()?;
     if result == crate::rebase::Rebased::Applied {
         restore_landing_worktree(state).await?;
     }
@@ -4043,6 +4062,15 @@ async fn resume_landing_head<F: Forge>(
     state.pr_pushed_head = Some(observed.to_owned());
     state.save()?;
     restore_landing_worktree(state).await?;
+    // Recover a rebase that finished before its completion checkpoint was
+    // saved. Restoration above has already reconciled its files and ancestry.
+    if let Some(target) = &state.land_sync_target
+        && !git::rebase_in_progress(&state.dir().join("rebase")).await
+        && git::ancestry(&winner.worktree, target, &local).await?
+    {
+        state.land_sync_target = None;
+        state.save()?;
+    }
     let remote = state.config.merge.remote.clone();
     let base = state.base_branch.clone();
     let fetched = git::fetch(&state.repo, &remote, &base).await?;
@@ -7486,6 +7514,66 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         assert_eq!(state.gate_head.as_deref(), Some(head.as_str()));
         assert!(git::is_ancestor(&state.repo, "origin/main", &head).await);
         assert!(git::is_clean(&path).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn landing_resume_completes_the_last_charged_sync_attempt() {
+        for (scratch_started, saved_target) in [(false, true), (true, true), (true, false)] {
+            let (_tmp, mut state, old) = landing_git_fixture().await;
+            git::git(&state.repo, &["checkout", "main"]).await.unwrap();
+            std::fs::write(state.repo.join("change"), "conflicting base change").unwrap();
+            git::commit_all(&state.repo, "conflicting base")
+                .await
+                .unwrap();
+            git::git(&state.repo, &["push", "origin", "main"])
+                .await
+                .unwrap();
+            git::git(&state.repo, &["checkout", "winner"])
+                .await
+                .unwrap();
+            let target = git::rev_parse(&state.repo, "origin/main").await.unwrap();
+            state.config.graph.land_rounds = 1;
+            state.land_sync_attempts = 1;
+            state.land_sync_target = saved_target.then(|| target.clone());
+            state.land_rebase_from = Some(old.clone());
+            landing_gate_fixer(
+                &mut state,
+                "cat >/dev/null; printf resolved > change; printf '{\"addressed\":[],\"rejected\":[],\"notes\":\"resolved\"}'",
+            );
+            state.config.verify.gate = vec!["grep -q resolved change".into()];
+            state.save().unwrap();
+            // Simulate interruption before the scratch start and at a conflict.
+            if scratch_started {
+                assert!(matches!(
+                    git::rebase_start(&state.repo, &state.dir().join("rebase"), "winner", &target)
+                        .await
+                        .unwrap(),
+                    git::RebaseStart::Conflicted(_)
+                ));
+            }
+            state = RunState::load(&state.id).unwrap();
+            let head = resume_observed_head(&mut state, &old).await.unwrap();
+            assert_ne!(head, old);
+            assert_eq!(state.land_sync_attempts, 1);
+            assert!(state.land_sync_target.is_none());
+            assert!(state.land_rebase_from.is_none());
+            assert!(!state.land_sync_pending);
+            assert_eq!(state.gate_head.as_deref(), Some(head.as_str()));
+            assert!(state.gate_allows_progress());
+            assert_eq!(
+                git::remote_head(&state.repo, "origin", "task-head")
+                    .await
+                    .unwrap(),
+                Some(head)
+            );
+            assert!(
+                rebase_landing_worktree(&mut state, "origin/main")
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("budget exhausted")
+            );
+        }
     }
 
     #[tokio::test]
