@@ -641,7 +641,7 @@ pub async fn invoke(
     let min_free = crate::run::RunState::load_under(inv.run, &crate::run::home())
         .ok()
         .map_or(0, |state| state.config.disk.min_free_bytes);
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     let min_free = test_watchdog::floor(inv.run, min_free);
     let mut paths = vec![inv.cwd.to_owned()];
     if let Some(cache) = inv.cache_dir {
@@ -1996,7 +1996,7 @@ fn ids(agents: &[AgentSpec]) -> String {
 
 /// Isolate post-spawn pressure injection from real admission policy and from
 /// other concurrent runs. This hook never exists in the shipped executable.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) mod test_watchdog {
     use super::*;
     static FLOORS: Mutex<BTreeMap<String, u64>> = Mutex::new(BTreeMap::new());
