@@ -234,6 +234,14 @@ enum RunCmd {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Validate and display archived checkout evidence, or restore it for inspection.
+    SourceEvidence {
+        /// Immutable archive directory from the run's eviction record.
+        evidence: PathBuf,
+        /// Create a new inspection repository; never changes run/public authority.
+        #[arg(long)]
+        restore: Option<PathBuf>,
+    },
     /// Run a competition for one task.
     ///
     /// Every run is a task: this files one in the queue (like `magi task add`)
@@ -1396,6 +1404,18 @@ fn exit_status(result: Result<()>, status: RunStatus, left_pr: bool) -> Result<(
 
 async fn dispatch(command: Command) -> Result<()> {
     match command {
+        Command::SourceEvidence { evidence, restore } => {
+            let evidence = evidence
+                .canonicalize()
+                .context("resolve source evidence directory")?;
+            if let Some(destination) = restore {
+                magi::retention::restore_source(&evidence, &destination).await
+            } else {
+                let patch = magi::retention::source_diff(&evidence).await?;
+                std::io::Write::write_all(&mut std::io::stdout(), &patch)?;
+                Ok(())
+            }
+        }
         Command::Worker { home, id } => magi::worker::run(&home, &id).await,
         Command::Run {
             command,

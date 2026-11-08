@@ -3489,3 +3489,15 @@ these output leases follow `seat_process::Running` through descendant cleanup.
 Logical inventory/deletion, deduplicated file allocations, estimated released
 allocations and observed free-space change are separate report quantities.
 See `docs/retained-worktrees.md` for the policy and its deliberate limitations.
+
+### Checkout evidence and eviction
+
+`retention::copies` evicts proved inactive reviewer, judge and advisor copies
+and empty superseded candidate checkouts independently of run folding/retirement. It must keep task
+lineage, candidate branches, review history and selected/public recovery sources.
+`fold_evidence` snapshots preserve complete base/source trees plus original tip
+metadata without requiring their parent history to survive Git GC. Pending
+checkout intents retain raw administration and every admitted reflog/ORIG_HEAD
+tip; changed or unknown contents must block retries. `source-evidence --restore`
+creates an inspection repository only and must never transfer recovery/public
+authority or approval. See `docs/checkout-eviction.md` for limits and accounting.

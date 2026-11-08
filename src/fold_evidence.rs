@@ -71,22 +71,7 @@ pub(crate) async fn preserve(
     for head in &unincorporated {
         let key = format!("head-{head}");
         let patch = source_patch(&state.repo, &state.base_commit, head).await?;
-        let index = capture(
-            &state.repo,
-            &[
-                "diff",
-                "--raw",
-                "--no-ext-diff",
-                "--no-textconv",
-                "--no-abbrev",
-                "--no-renames",
-                "-z",
-                &state.base_commit,
-                head,
-                "--",
-            ],
-        )
-        .await?;
+        let index = source_index(&state.repo, &state.base_commit, head).await?;
         let mut blobs = BTreeSet::new();
         // --raw -z emits pairs: a metadata header, then the exact pathname.
         let mut records = index.split(|b| *b == 0);
@@ -269,6 +254,25 @@ async fn source_patch(repo: &Path, from: &str, to: &str) -> Result<Vec<u8>> {
     .await
 }
 
+async fn source_index(repo: &Path, from: &str, to: &str) -> Result<Vec<u8>> {
+    capture(
+        repo,
+        &[
+            "diff",
+            "--raw",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-abbrev",
+            "--no-renames",
+            "-z",
+            from,
+            to,
+            "--",
+        ],
+    )
+    .await
+}
+
 async fn capture(repo: &Path, args: &[&str]) -> Result<Vec<u8>> {
     let mut child = tokio::process::Command::new("git")
         .quiet()
@@ -317,26 +321,41 @@ fn store(dir: &Path, name: &str, data: &[u8], bytes: &mut u64, files: &mut usize
     Ok(())
 }
 
-fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
+pub(crate) fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
     let tmp = path.with_file_name(format!(
         "{}.pending",
         path.file_name().context("artifact name")?.to_string_lossy()
     ));
+    let mut opened = false;
     let result = (|| {
-        let mut file = std::fs::File::create(&tmp)?;
+        if let Ok(meta) = std::fs::symlink_metadata(&tmp) {
+            ensure!(
+                meta.is_file() && !meta.file_type().is_symlink(),
+                "non-file evidence staging path"
+            );
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut file = options.open(&tmp)?;
+        opened = true;
         file.write_all(data)?;
         file.sync_all()?;
         std::fs::rename(&tmp, path)?;
         sync_directory(path.parent().context("artifact parent")?)?;
         Ok(())
     })();
-    if result.is_err() {
+    if result.is_err() && opened {
         let _ = std::fs::remove_file(&tmp);
     }
     result
 }
 
-fn sync_directory(_path: &Path) -> Result<()> {
+pub(crate) fn sync_directory(_path: &Path) -> Result<()> {
     // Normal directory handles cannot be opened/synced this way on Windows.
     // Keep file syncing and atomic publication on every platform, and persist
     // directory entries on Unix, as in retention::reconcile::durable_new_with.
@@ -348,6 +367,25 @@ fn sync_directory(_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn evidence_staging_preserves_unknown_symlinks() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let target = temp.path().join("operator-file");
+        std::fs::write(&target, "keep")?;
+        let artifact = temp.path().join("artifact");
+        let pending = temp.path().join("artifact.pending");
+        std::os::unix::fs::symlink(&target, &pending)?;
+        assert!(atomic_write(&artifact, b"new evidence").is_err());
+        assert!(
+            std::fs::symlink_metadata(&pending)?
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read(&target)?, b"keep");
+        Ok(())
+    }
 
     #[test]
     fn evidence_publication_syncs_supported_directories() -> Result<()> {
@@ -364,4 +402,459 @@ mod tests {
         assert!(!evidence.join("manifest.json.pending").exists());
         Ok(())
     }
+}
+
+/// A bounded, history-independent tree archive. Pack input is an explicit set
+/// of tree/blob objects, never a revision walk through the repository history.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Snapshot {
+    version: u32,
+    head: String,
+    base: String,
+    head_tree: String,
+    head_commit: Vec<u8>,
+    base_commit: Vec<u8>,
+    base_tree: String,
+    pack_hash: String,
+    patch_hash: String,
+    index_hash: String,
+}
+
+async fn input(repo: &Path, args: &[&str], data: Vec<u8>) -> Result<Vec<u8>> {
+    use tokio::io::AsyncWriteExt as _;
+    let mut child = tokio::process::Command::new("git")
+        .quiet()
+        .args(args)
+        .current_dir(repo)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()?;
+    let mut stdin = child.stdin.take().context("git stdin")?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .context("git stdout")?
+        .take(MAX_BYTES + 1);
+    let mut output = Vec::new();
+    let (write, read) = tokio::join!(
+        async move { stdin.write_all(&data).await },
+        stdout.read_to_end(&mut output)
+    );
+    write?;
+    read?;
+    ensure!(
+        output.len() as u64 <= MAX_BYTES,
+        "snapshot byte limit exceeded"
+    );
+    ensure!(
+        child.wait().await?.success(),
+        "snapshot git command failed: {args:?}"
+    );
+    Ok(output)
+}
+
+async fn digest(repo: &Path, bytes: Vec<u8>) -> Result<String> {
+    Ok(
+        String::from_utf8(input(repo, &["hash-object", "--stdin"], bytes).await?)?
+            .trim()
+            .to_owned(),
+    )
+}
+
+fn plain(path: &Path) -> Result<()> {
+    let meta = std::fs::symlink_metadata(path)?;
+    ensure!(
+        (meta.is_file() || meta.is_dir())
+            && !meta.file_type().is_symlink()
+            && path.canonicalize()? == path,
+        "noncanonical source evidence"
+    );
+    Ok(())
+}
+
+/// Publish an immutable source snapshot alongside the existing fold artifacts.
+/// It includes both complete trees, binary patch and raw mode/path index, so
+/// reading/restoring it never depends on refs, reflogs or future object GC.
+pub(crate) async fn snapshot(
+    state: &RunState,
+    home: &Path,
+    head: &str,
+    budget: u64,
+) -> Result<std::path::PathBuf> {
+    let parent = home
+        .join("runs")
+        .join(&state.id)
+        .join("artifacts/source-evidence");
+    let artifacts = parent.parent().context("artifacts")?;
+    plain(artifacts.parent().context("run")?)?;
+    create_plain_dir(artifacts)?;
+    create_plain_dir(&parent)?;
+    sync_directory(parent.parent().context("artifacts")?)?;
+    sync_directory(parent.parent().and_then(Path::parent).context("run")?)?;
+    let dir = parent.join(format!("{head}-{}", state.base_commit));
+    if dir.try_exists()? {
+        validate_snapshot(&dir).await?;
+        let manifest: Snapshot =
+            serde_json::from_slice(&std::fs::read(dir.join("manifest.json"))?)?;
+        ensure!(
+            manifest.head == head && manifest.base == state.base_commit,
+            "snapshot identity mismatch"
+        );
+        return Ok(dir);
+    }
+    let base_tree = git::rev_parse(&state.repo, &format!("{}^{{tree}}", state.base_commit)).await?;
+    let head_tree = git::rev_parse(&state.repo, &format!("{head}^{{tree}}")).await?;
+    let mut objects = BTreeSet::from([base_tree.clone(), head_tree.clone()]);
+    for tree in [&base_tree, &head_tree] {
+        let entries = capture(&state.repo, &["ls-tree", "-r", "-t", "-z", tree]).await?;
+        for entry in entries.split(|b| *b == 0).filter(|e| !e.is_empty()) {
+            let header =
+                std::str::from_utf8(entry.split(|b| *b == b'\t').next().context("tree entry")?)?;
+            let fields: Vec<_> = header.split_whitespace().collect();
+            ensure!(
+                fields.len() == 3 && matches!(fields[1], "tree" | "blob"),
+                "unsupported snapshot object"
+            );
+            objects.insert(fields[2].to_owned());
+            ensure!(objects.len() <= MAX_FILES, "snapshot object limit exceeded");
+        }
+    }
+    let object_list = objects
+        .iter()
+        .map(|s| s.to_owned() + "\n")
+        .collect::<String>()
+        .into_bytes();
+    let sizes = input(
+        &state.repo,
+        &["cat-file", "--batch-check=%(objectsize)"],
+        object_list.clone(),
+    )
+    .await?;
+    let total =
+        std::str::from_utf8(&sizes)?
+            .lines()
+            .try_fold(0u64, |sum, size| -> Result<u64> {
+                let sum = sum
+                    .checked_add(size.parse::<u64>()?)
+                    .context("object size overflow")?;
+                ensure!(sum <= MAX_BYTES, "snapshot expanded object limit exceeded");
+                Ok(sum)
+            })?;
+    ensure!(
+        total <= MAX_BYTES,
+        "snapshot expanded object limit exceeded"
+    );
+    let pack = input(&state.repo, &["pack-objects", "--stdout"], object_list).await?;
+    let patch = source_patch(&state.repo, &state.base_commit, head).await?;
+    let index = source_index(&state.repo, &state.base_commit, head).await?;
+    ensure!(
+        pack.len() + patch.len() + index.len() <= MAX_BYTES.min(budget) as usize,
+        "snapshot storage limit exceeded"
+    );
+    let head_commit = capture(&state.repo, &["cat-file", "commit", head]).await?;
+    let base_commit = capture(&state.repo, &["cat-file", "commit", &state.base_commit]).await?;
+    ensure!(
+        head_commit.len() + base_commit.len() <= 1024 * 1024,
+        "snapshot commit metadata limit exceeded"
+    );
+    let manifest = Snapshot {
+        version: 1,
+        head: head.to_owned(),
+        base: state.base_commit.clone(),
+        base_tree,
+        head_tree,
+        head_commit,
+        base_commit,
+        pack_hash: digest(&state.repo, pack.clone()).await?,
+        patch_hash: digest(&state.repo, patch.clone()).await?,
+        index_hash: digest(&state.repo, index.clone()).await?,
+    };
+    let manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
+    ensure!(
+        pack.len() + patch.len() + index.len() + manifest_bytes.len()
+            <= MAX_BYTES.min(budget) as usize,
+        "snapshot publication budget exceeded"
+    );
+    let pending = dir.with_extension("pending");
+    let existing = snapshot_storage(&parent)?;
+    let staged = if pending.try_exists()? {
+        snapshot_storage(&pending)?
+    } else {
+        0
+    };
+    ensure!(
+        existing
+            .saturating_sub(staged)
+            .saturating_add((pack.len() + patch.len() + index.len() + manifest_bytes.len()) as u64)
+            <= MAX_BYTES,
+        "source evidence per-run storage limit exceeded"
+    );
+    create_plain_dir(&pending)?;
+    for entry in std::fs::read_dir(&pending)? {
+        let path = entry?.path();
+        plain(&path)?;
+        ensure!(
+            matches!(
+                path.file_name().and_then(|s| s.to_str()),
+                Some(
+                    "objects.pack"
+                        | "change.patch"
+                        | "change.index"
+                        | "manifest.json"
+                        | "objects.pack.pending"
+                        | "change.patch.pending"
+                        | "change.index.pending"
+                        | "manifest.json.pending"
+                )
+            ),
+            "unknown pending archive content"
+        );
+    }
+    sync_directory(&parent)?;
+    let mut bytes = 0;
+    let mut files = 0;
+    store(&pending, "objects.pack", &pack, &mut bytes, &mut files)?;
+    store(&pending, "change.patch", &patch, &mut bytes, &mut files)?;
+    store(&pending, "change.index", &index, &mut bytes, &mut files)?;
+    store(
+        &pending,
+        "manifest.json",
+        &manifest_bytes,
+        &mut bytes,
+        &mut files,
+    )?;
+    validate_snapshot(&pending).await?;
+    std::fs::rename(&pending, &dir)?;
+    sync_directory(&parent)?;
+    Ok(dir)
+}
+
+async fn load_snapshot(dir: &Path, repo: &Path) -> Result<Snapshot> {
+    plain(dir)?;
+    plain(&dir.join("manifest.json"))?;
+    ensure!(
+        std::fs::metadata(dir.join("manifest.json"))?.len() <= 8 * 1024 * 1024,
+        "snapshot manifest limit exceeded"
+    );
+    let manifest: Snapshot = serde_json::from_slice(&std::fs::read(dir.join("manifest.json"))?)?;
+    ensure!(manifest.version == 1, "unsupported snapshot version");
+    for oid in [
+        &manifest.head,
+        &manifest.base,
+        &manifest.head_tree,
+        &manifest.base_tree,
+    ] {
+        ensure!(
+            matches!(oid.len(), 40 | 64) && oid.bytes().all(|b| b.is_ascii_hexdigit()),
+            "invalid snapshot object ID"
+        );
+    }
+    for (oid, tree, commit) in [
+        (&manifest.head, &manifest.head_tree, &manifest.head_commit),
+        (&manifest.base, &manifest.base_tree, &manifest.base_commit),
+    ] {
+        ensure!(
+            commit.starts_with(format!("tree {tree}\n").as_bytes()),
+            "snapshot commit/tree mismatch"
+        );
+        let actual = input(
+            repo,
+            &["hash-object", "-t", "commit", "--stdin"],
+            commit.clone(),
+        )
+        .await?;
+        ensure!(
+            std::str::from_utf8(&actual)?.trim() == oid,
+            "snapshot commit identity mismatch"
+        );
+    }
+    let mut total = 0;
+    for (name, hash) in [
+        ("objects.pack", &manifest.pack_hash),
+        ("change.patch", &manifest.patch_hash),
+        ("change.index", &manifest.index_hash),
+    ] {
+        let path = dir.join(name);
+        plain(&path)?;
+        total += std::fs::metadata(&path)?.len();
+        ensure!(total <= MAX_BYTES, "snapshot storage limit exceeded");
+        ensure!(
+            digest(repo, std::fs::read(path)?).await? == *hash,
+            "corrupt snapshot: {name}"
+        );
+    }
+    input(
+        repo,
+        &["unpack-objects", "-r"],
+        std::fs::read(dir.join("objects.pack"))?,
+    )
+    .await?;
+    for tree in [&manifest.base_tree, &manifest.head_tree] {
+        capture(repo, &["read-tree", tree]).await?;
+        // write-tree traverses the index and rejects missing tree/blob objects.
+        ensure!(
+            git::git(repo, &["write-tree"]).await? == *tree,
+            "incomplete snapshot tree"
+        );
+    }
+    ensure!(
+        source_patch(repo, &manifest.base_tree, &manifest.head_tree).await?
+            == std::fs::read(dir.join("change.patch"))?,
+        "snapshot patch mismatch"
+    );
+    let index = source_index(repo, &manifest.base_tree, &manifest.head_tree).await?;
+    ensure!(
+        index == std::fs::read(dir.join("change.index"))?,
+        "snapshot index mismatch"
+    );
+    Ok(manifest)
+}
+
+pub(crate) async fn validate_identity(dir: &Path, head: &str, base: &str) -> Result<()> {
+    validate_snapshot(dir).await?;
+    let manifest: Snapshot = serde_json::from_slice(&std::fs::read(dir.join("manifest.json"))?)?;
+    ensure!(
+        manifest.head == head && manifest.base == base,
+        "snapshot identity mismatch"
+    );
+    Ok(())
+}
+
+pub(crate) async fn validate_snapshot(dir: &Path) -> Result<()> {
+    let temp = Inspection::new(&std::env::temp_dir())?;
+    let repo = temp.0.clone();
+    git::git(&repo, &["init", "--quiet", "--template="]).await?;
+    ensure!(
+        git::git(&repo, &["rev-parse", "--show-toplevel"]).await?
+            == repo.to_str().context("inspection path")?,
+        "inspection worktree redirected by Git configuration"
+    );
+    let manifest = load_snapshot(dir, &repo).await?;
+    capture(&repo, &["checkout-index", "--all", "--force"]).await?;
+    // A cached tree/index alone does not prove that every blob is present.
+    for tree in [&manifest.head_tree, &manifest.base_tree] {
+        capture(&repo, &["read-tree", "--reset", "-u", tree]).await?;
+        super::retention::tracked_base(&repo, tree).await?;
+    }
+    Ok(())
+}
+
+/// Restore an archived source into a NEW inspection repository. This does not
+/// transfer public/recovery authority or change any task/run record.
+pub async fn restore_snapshot(dir: &Path, destination: &Path) -> Result<()> {
+    ensure!(
+        !destination.try_exists()?,
+        "restore destination already exists"
+    );
+    validate_snapshot(dir).await?;
+    let parent = destination
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .canonicalize()?;
+    let destination = parent.join(destination.file_name().context("restore directory name")?);
+    ensure!(
+        matches!(std::fs::symlink_metadata(&destination), Err(e) if e.kind() == std::io::ErrorKind::NotFound),
+        "restore destination already exists or is inaccessible"
+    );
+    let temp = Inspection::new(&parent)?;
+    let repo = temp.0.clone();
+    git::git(&repo, &["init", "--quiet", "--template="]).await?;
+    ensure!(
+        git::git(&repo, &["rev-parse", "--show-toplevel"]).await?
+            == repo.to_str().context("inspection path")?,
+        "inspection worktree redirected by Git configuration"
+    );
+    let manifest = load_snapshot(dir, &repo).await?;
+    capture(&repo, &["checkout-index", "--all"]).await?;
+    super::retention::tracked_base(&repo, &manifest.head_tree).await?;
+    std::fs::rename(&temp.0, destination)?;
+    sync_directory(&parent)?;
+    Ok(())
+}
+
+struct Inspection(std::path::PathBuf);
+impl Inspection {
+    fn new(parent: &Path) -> Result<Self> {
+        for name in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_COMMON_DIR",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG",
+        ] {
+            ensure!(
+                std::env::var_os(name).is_none(),
+                "inspection refuses Git environment override: {name}"
+            );
+        }
+        let path = parent.canonicalize()?.join(format!(
+            "magi-source-inspection-{:016x}",
+            crate::rng::entropy()
+        ));
+        std::fs::create_dir(&path)?;
+        Ok(Self(path))
+    }
+}
+impl Drop for Inspection {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn create_plain_dir(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => plain(path)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            plain(path.parent().context("evidence parent")?)?;
+            std::fs::create_dir(path)?;
+        }
+        Err(e) => return Err(e.into()),
+    }
+    ensure!(
+        std::fs::symlink_metadata(path)?.is_dir(),
+        "evidence directory is not a directory"
+    );
+    plain(path)
+}
+
+// Include incomplete publication products in the same per-run bound. This
+// inventory never follows symlinks or adopts unknown artifact kinds.
+fn snapshot_storage(root: &Path) -> Result<u64> {
+    plain(root)?;
+    let mut dirs = vec![(root.to_owned(), 0usize)];
+    let mut files = 0usize;
+    let mut bytes = 0u64;
+    let mut entries = 0usize;
+    while let Some((dir, depth)) = dirs.pop() {
+        for entry in std::fs::read_dir(dir)? {
+            let path = entry?.path();
+            plain(&path)?;
+            entries += 1;
+            ensure!(entries <= MAX_FILES, "source evidence entry limit exceeded");
+            let meta = std::fs::symlink_metadata(&path)?;
+            if meta.is_dir() {
+                ensure!(
+                    depth == 0 && dirs.len() < MAX_HEADS,
+                    "unknown nested source evidence directory"
+                );
+                dirs.push((path, depth + 1));
+            } else {
+                files += 1;
+                bytes = bytes.saturating_add(meta.len());
+                ensure!(
+                    files <= MAX_FILES && bytes <= MAX_BYTES,
+                    "source evidence storage limit exceeded"
+                );
+            }
+        }
+    }
+    Ok(bytes)
 }
