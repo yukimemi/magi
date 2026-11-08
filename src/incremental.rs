@@ -78,7 +78,6 @@ pub(crate) fn configure(command: &mut tokio::process::Command, worktree: &Path) 
     };
     #[cfg(unix)]
     if worktree.join(".git").is_file() {
-        use std::os::unix::fs::PermissionsExt;
         let git = git_dir(worktree)?;
         let executable = std::env::current_exe()?;
         // A stable script name per executable also handles worker generations.
@@ -93,35 +92,16 @@ pub(crate) fn configure(command: &mut tokio::process::Command, worktree: &Path) 
             "#!/bin/sh\nexec {} __magi_incremental \"$@\"\n",
             quote(&executable)
         );
-        let temporary = git.join(format!(
-            "magi-rustc-{}.tmp",
-            crate::rng::SplitMix64::new(crate::rng::entropy()).uuid_v4()
-        ));
-        let publish = || -> Result<()> {
-            use std::io::Write;
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temporary)?;
-            file.write_all(body.as_bytes())?;
-            file.set_permissions(fs::Permissions::from_mode(0o700))?;
-            // Link only a complete script, without replacing an existing path.
-            // Concurrent command preparation must never observe a partial body.
-            match fs::hard_link(&temporary, &script) {
-                Ok(()) => Ok(()),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    ensure!(
-                        plain(&script)?.is_file() && fs::read(&script)? == body.as_bytes(),
-                        "incremental wrapper changed"
-                    );
-                    Ok(())
-                }
-                Err(e) => Err(e.into()),
-            }
-        };
-        let published = publish();
-        let _ = fs::remove_file(&temporary);
-        published?;
+        publish_wrapper(&script, &body, || {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            git.join(format!(
+                "magi-rustc-{}-{}-{}.tmp",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed),
+                crate::rng::SplitMix64::new(crate::rng::entropy()).uuid_v4()
+            ))
+        })?;
         let previous = value("RUSTC_WRAPPER");
         let previous = if previous.is_some() && previous == value("MAGI_INCREMENTAL_WRAPPER") {
             value("MAGI_PREVIOUS_RUSTC_WRAPPER")
@@ -141,6 +121,63 @@ pub(crate) fn configure(command: &mut tokio::process::Command, worktree: &Path) 
             .env("RUSTC_WRAPPER", script);
     }
     Ok(())
+}
+
+/// Only a successfully reserved path belongs to this invocation. In particular,
+/// a failed create_new must never remove another publisher's temporary file.
+#[cfg(unix)]
+struct WrapperTemporary {
+    path: PathBuf,
+    file: File,
+}
+
+#[cfg(unix)]
+impl WrapperTemporary {
+    fn create(mut candidate: impl FnMut() -> PathBuf) -> std::io::Result<Self> {
+        for _ in 0..128 {
+            let path = candidate();
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(file) => return Ok(Self { path, file }),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not reserve an incremental wrapper temporary file",
+        ))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for WrapperTemporary {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(unix)]
+fn publish_wrapper(script: &Path, body: &str, candidate: impl FnMut() -> PathBuf) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    let mut temporary = WrapperTemporary::create(candidate)?;
+    temporary.file.write_all(body.as_bytes())?;
+    temporary
+        .file
+        .set_permissions(fs::Permissions::from_mode(0o700))?;
+    // Link only a complete script, without replacing an existing path.
+    // Concurrent command preparation must never observe a partial body.
+    match fs::hard_link(&temporary.path, script) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            ensure!(
+                plain(script)?.is_file() && fs::read(script)? == body.as_bytes(),
+                "incremental wrapper changed"
+            );
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn git_dir(worktree: &Path) -> Result<PathBuf> {
@@ -1099,6 +1136,102 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn wrapper_temporary_collision_preserves_the_other_publisher() {
+        use std::io::Write;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let occupied = root.join("occupied.tmp");
+        let fresh = root.join("fresh.tmp");
+        let script = root.join("wrapper.sh");
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let mut owner = WrapperTemporary::create(|| occupied.clone()).unwrap();
+                owner.file.write_all(b"other publisher").unwrap();
+                barrier.wait();
+                barrier.wait();
+                // The competing publisher must not unlink our reserved path.
+                assert_eq!(fs::read(&occupied).unwrap(), b"other publisher");
+            });
+            barrier.wait();
+            let mut attempts = 0;
+            let result = publish_wrapper(&script, "complete wrapper", || {
+                attempts += 1;
+                if attempts == 1 {
+                    occupied.clone()
+                } else {
+                    fresh.clone()
+                }
+            });
+            // Always release the owner, even if publication regresses.
+            barrier.wait();
+            result.unwrap();
+            assert_eq!(attempts, 2);
+            assert_eq!(fs::read(&script).unwrap(), b"complete wrapper");
+            assert!(!fresh.exists());
+        });
+        assert!(!occupied.exists());
+    }
+
+    #[test]
+    fn wrapper_temporary_retries_only_collisions_and_leaves_them_intact() {
+        let temp = tempfile::tempdir().unwrap();
+        let occupied = temp.path().join("occupied.tmp");
+        fs::write(&occupied, b"reserved").unwrap();
+        let mut attempts = 0;
+        let error = WrapperTemporary::create(|| {
+            attempts += 1;
+            occupied.clone()
+        })
+        .err()
+        .unwrap();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(attempts, 128);
+        assert_eq!(fs::read(&occupied).unwrap(), b"reserved");
+        attempts = 0;
+        let error = WrapperTemporary::create(|| {
+            attempts += 1;
+            temp.path().join("missing/temporary")
+        })
+        .err()
+        .unwrap();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn wrapper_publication_preserves_existing_destinations() {
+        use std::os::unix::fs::{MetadataExt, symlink};
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let script = root.join("wrapper.sh");
+        let temporary = root.join("temporary");
+        let body = "#!/bin/sh\nexit 0\n";
+        fs::write(&script, body).unwrap();
+        let inode = fs::metadata(&script).unwrap().ino();
+        publish_wrapper(&script, body, || temporary.clone()).unwrap();
+        assert_eq!(fs::metadata(&script).unwrap().ino(), inode);
+        assert!(!temporary.exists());
+        fs::write(&script, "different").unwrap();
+        assert!(publish_wrapper(&script, body, || temporary.clone()).is_err());
+        assert_eq!(fs::read_to_string(&script).unwrap(), "different");
+        assert!(!temporary.exists());
+        fs::remove_file(&script).unwrap();
+        fs::create_dir(&script).unwrap();
+        assert!(publish_wrapper(&script, body, || temporary.clone()).is_err());
+        assert!(script.is_dir());
+        assert!(!temporary.exists());
+        fs::remove_dir(&script).unwrap();
+        let target = root.join("target");
+        fs::write(&target, body).unwrap();
+        symlink(&target, &script).unwrap();
+        assert!(publish_wrapper(&script, body, || temporary.clone()).is_err());
+        assert_eq!(fs::read_link(&script).unwrap(), target);
+        assert_eq!(fs::read_to_string(&target).unwrap(), body);
+        assert!(!temporary.exists());
+    }
+
+    #[test]
     fn concurrent_configuration_publishes_complete_wrappers() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
@@ -1113,23 +1246,53 @@ pub(crate) mod tests {
                 .status
                 .success()
         );
-        std::thread::scope(|scope| {
+        use std::os::unix::fs::PermissionsExt;
+        let executable = std::env::current_exe().unwrap();
+        let quoted = executable.to_string_lossy().replace('\'', "'\\''");
+        let body = format!("#!/bin/sh\nexec '{quoted}' __magi_incremental \"$@\"\n");
+        let barrier = std::sync::Barrier::new(8);
+        let wrappers = std::thread::scope(|scope| {
             let handles: Vec<_> = (0..8)
                 .map(|_| {
                     scope.spawn(|| {
-                        let mut command = tokio::process::Command::new("cargo");
-                        configure(&mut command, &worktree).unwrap();
-                        let env: BTreeMap<_, _> = command.as_std().get_envs().collect();
-                        let wrapper =
-                            PathBuf::from(env[std::ffi::OsStr::new("RUSTC_WRAPPER")].unwrap());
-                        assert!(fs::read_to_string(wrapper).unwrap().ends_with("\"$@\"\n"));
+                        let mut last = None;
+                        barrier.wait();
+                        for _ in 0..16 {
+                            let mut command = tokio::process::Command::new("cargo");
+                            configure(&mut command, &worktree).unwrap();
+                            let env: BTreeMap<_, _> = command.as_std().get_envs().collect();
+                            let wrapper =
+                                PathBuf::from(env[std::ffi::OsStr::new("RUSTC_WRAPPER")].unwrap());
+                            assert_eq!(fs::read_to_string(&wrapper).unwrap(), body);
+                            assert_eq!(
+                                fs::metadata(&wrapper).unwrap().permissions().mode() & 0o777,
+                                0o700
+                            );
+                            if let Some(previous) = last.replace(wrapper.clone()) {
+                                assert_eq!(previous, wrapper);
+                            }
+                        }
+                        last.unwrap()
                     })
                 })
                 .collect();
-            for handle in handles {
-                handle.join().unwrap();
-            }
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
         });
+        assert!(wrappers.iter().all(|path| path == &wrappers[0]));
+        assert!(
+            fs::read_dir(git_dir(&worktree).unwrap())
+                .unwrap()
+                .all(|entry| {
+                    !entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .ends_with(".tmp")
+                })
+        );
     }
 
     #[test]
