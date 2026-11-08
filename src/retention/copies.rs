@@ -1,4 +1,6 @@
 //! Checkout eviction does not retire a run or alter task/recovery lineage.
+mod schema;
+
 use super::*;
 use std::collections::BTreeMap;
 
@@ -32,25 +34,6 @@ fn read_record(path: &Path) -> Result<serde_json::Value> {
     Ok(serde_json::from_slice(&std::fs::read(path)?)?)
 }
 
-// Supported migrations may add defaults or normalize scalar values. They must
-// not silently discard a future source/authority field, including nested ones.
-fn known_shape(raw: &serde_json::Value, known: &serde_json::Value) -> bool {
-    match raw {
-        serde_json::Value::Object(fields) => known.as_object().is_some_and(|object| {
-            fields
-                .iter()
-                .all(|(key, value)| object.get(key).is_some_and(|k| known_shape(value, k)))
-        }),
-        serde_json::Value::Array(values) => known.as_array().is_some_and(|array| {
-            values
-                .iter()
-                .enumerate()
-                .all(|(i, value)| array.get(i).is_some_and(|k| known_shape(value, k)))
-        }),
-        _ => true,
-    }
-}
-
 fn history(home: &Path) -> Result<Vec<RunState>> {
     let mut states = Vec::new();
     let mut bytes = 0u64;
@@ -69,7 +52,7 @@ fn history(home: &Path) -> Result<Vec<RunState>> {
         let raw = read_record(&path)?;
         let state = RunState::load_under(&id, home)?;
         ensure!(
-            known_shape(&raw, &serde_json::to_value(&state)?),
+            schema::known(&raw, &state)?,
             "unknown source/authority fields in run {id}"
         );
         states.push(state);
@@ -104,7 +87,7 @@ fn tasks(home: &Path) -> Result<Vec<crate::queue::Task>> {
     for task in &tasks {
         let raw = read_record(&queue.path_of(&task.id))?;
         ensure!(
-            known_shape(&raw, &serde_json::to_value(task)?),
+            schema::known(&raw, task)?,
             "unknown source/authority fields in task {}",
             task.id
         );
@@ -157,20 +140,24 @@ fn unborrowed(home: &Path, state: &RunState, path: &Path) -> Result<()> {
     Ok(())
 }
 
+// The owner lock and a full Dead judgment precede maintenance acquisition.
+// Its exclusive lease then prevents driver starts; judging that same lease
+// again would mistake this janitor for a live driver. Recheck daemon claims
+// and all selection/activity protections while the caller holds the witness.
 fn eligible(
     home: &Path,
     state: &RunState,
     now: Timestamp,
     disk: &crate::config::Disk,
+    _maintenance: &crate::driver::ExecutionLease,
 ) -> Result<()> {
     ensure!(
         !state.status.resumable(),
         "resumable run retains materialized seat checkouts"
     );
     ensure!(
-        state.liveness_under(home, crate::daemon::is_working_on(home, &state.id, now))
-            == Liveness::Dead,
-        "run live or ownership unknown"
+        !crate::daemon::is_working_on(home, &state.id, now),
+        "run acquired a daemon claim during maintenance"
     );
     ensure!(
         crate::clean::due(now, state.output_activity(), disk.fold_grace_secs),
@@ -487,7 +474,7 @@ pub(super) async fn evict_with(
                 &wait,
             )
             .await?;
-            reconcile_pending(home, &state, disk, now).await?;
+            reconcile_pending(home, &state, disk, now, &_driver).await?;
             if !root.try_exists()? {
                 return Ok(());
             }
@@ -505,7 +492,7 @@ pub(super) async fn evict_with(
                 report.removed_empty_roots += 1;
                 return Ok(());
             }
-            eligible(home, &state, now, disk)?;
+            eligible(home, &state, now, disk, &_driver)?;
             for path in paths.iter().filter(|p| disposable(&state, p)) {
                 if attempted >= LIMIT
                     || unlinked >= disk.worktree_reclaim_bytes
@@ -546,12 +533,7 @@ pub(super) async fn evict_with(
                         }
                     }
                     let mut history = BTreeMap::new();
-                    let mut heads: std::collections::BTreeSet<String> =
-                        git::git(path, &["reflog", "show", "--format=%H", "HEAD"])
-                            .await?
-                            .lines()
-                            .map(str::to_owned)
-                            .collect();
+                    let mut heads = reflog_heads(&admin_contents)?;
                     let git_dir =
                         PathBuf::from(git::git(path, &["rev-parse", "--absolute-git-dir"]).await?);
                     match std::fs::symlink_metadata(git_dir.join("ORIG_HEAD")) {
@@ -616,7 +598,13 @@ pub(super) async fn evict_with(
                             "source differs from pending eviction"
                         );
                     }
-                    eligible(home, &RunState::load_under(&state.id, home)?, now, disk)?;
+                    eligible(
+                        home,
+                        &RunState::load_under(&state.id, home)?,
+                        now,
+                        disk,
+                        &_driver,
+                    )?;
                     ensure!(
                         proof(home, &state, path, now, disk).await? == head,
                         "source HEAD changed during archival"
@@ -652,7 +640,13 @@ pub(super) async fn evict_with(
                             "task changed during source archival"
                         );
                     }
-                    eligible(home, &RunState::load_under(&state.id, home)?, now, disk)?;
+                    eligible(
+                        home,
+                        &RunState::load_under(&state.id, home)?,
+                        now,
+                        disk,
+                        &_driver,
+                    )?;
                     unborrowed(home, &state, path)?;
                     let pending = serde_json::to_vec_pretty(&record)?;
                     ensure!(
@@ -741,6 +735,7 @@ async fn reconcile_pending(
     state: &RunState,
     disk: &crate::config::Disk,
     now: Timestamp,
+    maintenance: &crate::driver::ExecutionLease,
 ) -> Result<()> {
     let artifacts = home.join("runs").join(&state.id).join("artifacts");
     if !artifacts.try_exists()? {
@@ -772,7 +767,7 @@ async fn reconcile_pending(
                 .filter_map(|l| l.strip_prefix("worktree "))
                 .any(|p| Path::new(p) == record.source)
             {
-                eligible(home, state, now, disk)?;
+                eligible(home, state, now, disk, maintenance)?;
                 unborrowed(home, state, &record.source)?;
                 remove_missing_registration(state, &record).await?;
             }
@@ -880,6 +875,12 @@ async fn validate_record(state: &RunState, artifacts: &Path, record: &Eviction) 
         record.history.get(&record.head) == Some(&record.evidence) && record.history.len() <= 128,
         "incomplete checkpoint inventory"
     );
+    ensure!(
+        reflog_heads(&record.admin_contents)?
+            .iter()
+            .all(|oid| record.history.contains_key(oid)),
+        "incomplete reflog checkpoint inventory"
+    );
     for (head, evidence) in &record.history {
         ensure!(
             evidence
@@ -961,4 +962,31 @@ pub(super) async fn restore_seat(
         .find_map(|r| r.history.get(head))
         .context("head not found in archived checkout evidence")?;
     crate::fold_evidence::restore_snapshot(archive, destination).await
+}
+
+// `reflog show %H` exposes only new OIDs. A non-rewritten deletion can
+// leave an otherwise unreachable source exclusively on the old side.
+fn reflog_heads(admin: &BTreeMap<PathBuf, Vec<u8>>) -> Result<std::collections::BTreeSet<String>> {
+    let mut heads = std::collections::BTreeSet::new();
+    let mut logs = 0;
+    for (path, bytes) in admin.iter().filter(|(p, _)| p.ends_with("logs/HEAD")) {
+        logs += 1;
+        for line in bytes.split(|b| *b == b'\n').filter(|line| !line.is_empty()) {
+            let mut fields = line.split(|b| *b == b' ');
+            for _ in 0..2 {
+                let oid = std::str::from_utf8(fields.next().context("missing reflog OID")?)?;
+                ensure!(
+                    matches!(oid.len(), 40 | 64) && oid.bytes().all(|b| b.is_ascii_hexdigit()),
+                    "invalid raw reflog OID: {}",
+                    path.display()
+                );
+                if !oid.bytes().all(|b| b == b'0') {
+                    heads.insert(oid.to_owned());
+                }
+                ensure!(heads.len() <= 128, "source checkpoint limit exceeded");
+            }
+        }
+    }
+    ensure!(logs == 1, "missing or ambiguous raw HEAD reflog");
+    Ok(heads)
 }
