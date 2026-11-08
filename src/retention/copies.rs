@@ -129,9 +129,19 @@ fn unborrowed(home: &Path, state: &RunState, path: &Path) -> Result<()> {
                 "run root shared with {}",
                 other.id
             );
+            // Lineage IDs alone do not borrow files. Explicit source
+            // selections and concrete paths still retain their authority.
             ensure!(
-                !mentions(&serde_json::to_value(&other)?, path)
-                    && !mentions(&serde_json::to_value(&other)?, Path::new(&state.id)),
+                !other
+                    .pr_recovery
+                    .as_ref()
+                    .is_some_and(|p| p.source_run.as_ref() == Some(&state.id)
+                        || p.source_proof.as_ref().is_some_and(|p| p.run == state.id)),
+                "selected recovery source for run {}",
+                other.id
+            );
+            ensure!(
+                !mentions(&serde_json::to_value(&other)?, path),
                 "source referenced by run {}",
                 other.id
             );
@@ -312,24 +322,6 @@ async fn proof(
                 ),
         "recent or unreadable output activity"
     );
-    for checkpoint in ["ORIG_HEAD", "HEAD"] {
-        let heads = if checkpoint == "HEAD" {
-            git::git(path, &["reflog", "show", "--format=%H", "HEAD"]).await?
-        } else {
-            match std::fs::symlink_metadata(admin.join(checkpoint)) {
-                Ok(_) => git::rev_parse(path, checkpoint).await?,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(e.into()),
-            }
-        };
-        for old in heads.lines() {
-            ensure!(
-                git::ancestry(path, old, &head).await?
-                    || git::ancestry(path, old, &state.base_commit).await?,
-                "unique {checkpoint} recovery history"
-            );
-        }
-    }
     Ok(head)
 }
 
@@ -560,8 +552,14 @@ pub(super) async fn evict_with(
                             .lines()
                             .map(str::to_owned)
                             .collect();
-                    if let Ok(original) = git::rev_parse(path, "ORIG_HEAD").await {
-                        heads.insert(original);
+                    let git_dir =
+                        PathBuf::from(git::git(path, &["rev-parse", "--absolute-git-dir"]).await?);
+                    match std::fs::symlink_metadata(git_dir.join("ORIG_HEAD")) {
+                        Ok(_) => {
+                            heads.insert(git::rev_parse(path, "ORIG_HEAD").await?);
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(e.into()),
                     }
                     heads.insert(head.clone());
                     ensure!(heads.len() <= 128, "source checkpoint limit exceeded");
@@ -667,6 +665,12 @@ pub(super) async fn evict_with(
                     );
                     crate::fold_evidence::atomic_write(&ledger, &pending)?;
                     before_unlink(path)?;
+                    // Rebuild every recorded patch in an independent index at
+                    // the last boundary before removing its materialized source.
+                    for (tip, archive) in &record.history {
+                        crate::fold_evidence::validate_identity(archive, tip, &state.base_commit)
+                            .await?;
+                    }
                     ensure!(
                         git::worktree_remove_clean(&state.repo, path).await?,
                         "Git refused clean checkout eviction"
@@ -760,37 +764,7 @@ async fn reconcile_pending(
             "noncanonical eviction record"
         );
         let mut record: Eviction = serde_json::from_slice(&std::fs::read(&path)?)?;
-        ensure!(
-            record.version == 1
-                && record.run == state.id
-                && record.source.parent() == Some(state.worktree_root().as_path())
-                && (read_seat(&record.source)
-                    || state.candidates.iter().any(|c| c.worktree == record.source))
-                && record.evidence
-                    == artifacts
-                        .join("source-evidence")
-                        .join(format!("{}-{}", record.head, state.base_commit)),
-            "eviction record identity mismatch"
-        );
-        ensure!(
-            matches!(record.phase.as_str(), "pending" | "evicted"),
-            "unknown eviction phase"
-        );
-        ensure!(
-            record.history.get(&record.head) == Some(&record.evidence)
-                && record.history.len() <= 128,
-            "incomplete checkpoint inventory"
-        );
-        for (head, evidence) in &record.history {
-            ensure!(
-                evidence
-                    == &artifacts
-                        .join("source-evidence")
-                        .join(format!("{head}-{}", state.base_commit)),
-                "checkpoint identity mismatch"
-            );
-            crate::fold_evidence::validate_identity(evidence, head, &state.base_commit).await?;
-        }
+        validate_record(state, &artifacts, &record).await?;
         if record.phase == "pending" && !record.source.try_exists()? {
             let list = git::git(&state.repo, &["worktree", "list", "--porcelain"]).await?;
             if list
@@ -883,4 +857,108 @@ async fn remove_missing_registration(state: &RunState, record: &Eviction) -> Res
         "missing checkout remains registered"
     );
     Ok(())
+}
+
+async fn validate_record(state: &RunState, artifacts: &Path, record: &Eviction) -> Result<()> {
+    ensure!(
+        record.version == 1
+            && record.run == state.id
+            && record.source.parent() == Some(state.worktree_root().as_path())
+            && (read_seat(&record.source)
+                || state.candidates.iter().any(|c| c.worktree == record.source))
+            && record.evidence
+                == artifacts
+                    .join("source-evidence")
+                    .join(format!("{}-{}", record.head, state.base_commit)),
+        "eviction record identity mismatch"
+    );
+    ensure!(
+        matches!(record.phase.as_str(), "pending" | "evicted"),
+        "unknown eviction phase"
+    );
+    ensure!(
+        record.history.get(&record.head) == Some(&record.evidence) && record.history.len() <= 128,
+        "incomplete checkpoint inventory"
+    );
+    for (head, evidence) in &record.history {
+        ensure!(
+            evidence
+                == &artifacts
+                    .join("source-evidence")
+                    .join(format!("{head}-{}", state.base_commit)),
+            "checkpoint identity mismatch"
+        );
+        crate::fold_evidence::validate_identity(evidence, head, &state.base_commit).await?;
+    }
+    Ok(())
+}
+
+/// Read validated eviction records without requiring the original repository.
+async fn archived_records(home: &Path, id: &str) -> Result<Vec<Eviction>> {
+    ensure!(crate::run::is_run_id(id), "invalid run id");
+    let run = home.join("runs").join(id);
+    ensure!(
+        plain_dir(&run) && run.canonicalize()? == run,
+        "noncanonical run ownership"
+    );
+    let state = RunState::load_under(id, home)?;
+    let artifacts = run.join("artifacts");
+    if !artifacts.try_exists()? {
+        return Ok(Vec::new());
+    }
+    ensure!(
+        plain_dir(&artifacts) && artifacts.canonicalize()? == artifacts,
+        "noncanonical artifacts"
+    );
+    let mut records = Vec::new();
+    for entry in std::fs::read_dir(&artifacts)? {
+        let path = entry?.path();
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .context("artifact name")?;
+        if name.starts_with("eviction-") && name.ends_with(".json") {
+            let record: Eviction = serde_json::from_value(read_record(&path)?)?;
+            validate_record(&state, &artifacts, &record).await?;
+            records.push(record);
+        }
+    }
+    records.sort_by(|a, b| a.source.cmp(&b.source));
+    Ok(records)
+}
+
+pub(super) async fn seat_evidence(home: &Path, id: &str) -> Result<Vec<String>> {
+    let mut shown = Vec::new();
+    for record in archived_records(home, id).await? {
+        for (head, archive) in record.history {
+            let manifest: serde_json::Value = read_record(&archive.join("manifest.json"))?;
+            shown.push(format!(
+                "{} head={} tree={} patch_bytes={} phase={}",
+                record
+                    .source
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy(),
+                head,
+                manifest["head_tree"].as_str().context("snapshot tree")?,
+                std::fs::metadata(archive.join("change.patch"))?.len(),
+                record.phase
+            ));
+        }
+    }
+    Ok(shown)
+}
+
+pub(super) async fn restore_seat(
+    home: &Path,
+    id: &str,
+    head: &str,
+    destination: &Path,
+) -> Result<()> {
+    let records = archived_records(home, id).await?;
+    let archive = records
+        .iter()
+        .find_map(|r| r.history.get(head))
+        .context("head not found in archived checkout evidence")?;
+    crate::fold_evidence::restore_snapshot(archive, destination).await
 }

@@ -3498,6 +3498,9 @@ lineage, candidate branches, review history and selected/public recovery sources
 `fold_evidence` snapshots preserve complete base/source trees plus original tip
 metadata without requiring their parent history to survive Git GC. Pending
 checkout intents retain raw administration and every admitted reflog/ORIG_HEAD
-tip; changed or unknown contents must block retries. `source-evidence --restore`
+tip, including unrelated earlier tips; changed or unknown contents must block retries.
+Validation applies each archived binary patch in a private index again before
+unlink. `fold --show-seats` and `fold --restore-seat <head> --dest <new-path>`
+inspect/restore recorded tips without the original repository. `source-evidence --restore`
 creates an inspection repository only and must never transfer recovery/public
 authority or approval. See `docs/checkout-eviction.md` for limits and accounting.

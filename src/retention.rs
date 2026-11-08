@@ -14,6 +14,16 @@ pub async fn restore_source(evidence: &Path, destination: &Path) -> Result<()> {
     crate::fold_evidence::restore_snapshot(evidence, destination).await
 }
 
+/// List archived checkout tips for a run, validating their durable evidence.
+pub async fn seat_evidence(home: &Path, id: &str) -> Result<Vec<String>> {
+    copies::seat_evidence(home, id).await
+}
+
+/// Restore a recorded checkout tip without changing run or recovery authority.
+pub async fn restore_seat(home: &Path, id: &str, head: &str, destination: &Path) -> Result<()> {
+    copies::restore_seat(home, id, head, destination).await
+}
+
 use crate::{
     git,
     proc::Quiet as _,
@@ -5102,6 +5112,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn source_eviction_archives_unrelated_tips_and_allows_lineage_references() {
+        let f = Fx::new().await;
+        let state = inactive_source(&f, "ec10", true).await;
+        let review = reviewer(&f, &state, &f.base).await;
+        let mut successor = inactive_source(&f, "ec11", true).await;
+        successor.retired_to = Some(state.id.clone());
+        successor.save_under(&f.home).unwrap();
+        f.task(&[state.clone(), successor]);
+
+        let mut tips = Vec::new();
+        for contents in ["reflog-only evidence", "ORIG_HEAD-only evidence"] {
+            std::fs::write(review.join("source"), contents).unwrap();
+            git::git(&review, &["add", "."]).await.unwrap();
+            let tree = git::git(&review, &["write-tree"]).await.unwrap();
+            let tip = git::git(
+                &review,
+                &["commit-tree", &tree, "-p", &f.base, "-m", contents],
+            )
+            .await
+            .unwrap();
+            git::git(&review, &["reset", "--hard", &tip]).await.unwrap();
+            tips.push(tip);
+            git::git(&review, &["reset", "--hard", &f.base])
+                .await
+                .unwrap();
+        }
+        // Keep one tip exclusively in ORIG_HEAD, the other in the HEAD log.
+        git::git(&review, &["reflog", "delete", "--rewrite", "HEAD@{1}"])
+            .await
+            .unwrap();
+        git::git(&review, &["update-ref", "ORIG_HEAD", &tips[1]])
+            .await
+            .unwrap();
+        let mut report = Report::default();
+        copies::evict(&f.home, &Fx::disk(), Fx::now(), &mut report).await;
+        assert_eq!(report.evicted_copies, 1, "{report:?}");
+        assert!(!review.exists());
+        git::git(&f.repo, &["reflog", "expire", "--expire=now", "--all"])
+            .await
+            .unwrap();
+        git::git(&f.repo, &["gc", "--prune=now"]).await.unwrap();
+        for tip in &tips {
+            assert!(
+                !git::git_raw(&f.repo, &["cat-file", "-e", tip])
+                    .await
+                    .unwrap()
+                    .ok()
+            );
+        }
+        // The run-oriented interface also works without the source object store.
+        std::fs::remove_dir_all(&f.repo).unwrap();
+        let shown = seat_evidence(&f.home, &state.id).await.unwrap();
+        for (i, tip) in tips.iter().enumerate() {
+            assert!(
+                shown
+                    .iter()
+                    .any(|row| row.contains(tip) && row.contains("patch_bytes="))
+            );
+            let destination = f._temp.path().join(format!("restore-history-{i}"));
+            restore_seat(&f.home, &state.id, tip, &destination)
+                .await
+                .unwrap();
+            assert_eq!(
+                std::fs::read_to_string(destination.join("source")).unwrap(),
+                ["reflog-only evidence", "ORIG_HEAD-only evidence"][i]
+            );
+        }
+        assert!(
+            restore_seat(
+                &f.home,
+                &state.id,
+                "unknown",
+                &f._temp.path().join("missing")
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn source_eviction_revalidates_archive_immediately_before_unlink() {
+        fn corrupt(path: &Path) -> Result<()> {
+            let root = path.parent().unwrap();
+            // Locate the fixture's durable artifact store through its run record
+            // path supplied below by a test-only hook in the artifact tree.
+            let marker = root.join("archive-to-corrupt");
+            let archive = std::fs::read_to_string(&marker)?;
+            std::fs::write(Path::new(&archive).join("change.patch"), "corrupt")?;
+            Ok(())
+        }
+        let f = Fx::new().await;
+        let state = inactive_source(&f, "ec12", true).await;
+        let review = reviewer(&f, &state, &f.base).await;
+        let archive = f
+            .home
+            .join("runs")
+            .join(&state.id)
+            .join("artifacts/source-evidence")
+            .join(format!("{}-{}", f.base, f.base));
+        std::fs::write(
+            state.worktree_root().join("archive-to-corrupt"),
+            archive.to_str().unwrap(),
+        )
+        .unwrap();
+        let mut report = Report::default();
+        copies::evict_with(&f.home, &Fx::disk(), Fx::now(), &mut report, corrupt).await;
+        assert_eq!(report.evicted_copies, 0, "{report:?}");
+        assert!(review.exists());
+        assert!(
+            report
+                .retained
+                .iter()
+                .any(|r| r.contains("corrupt snapshot")),
+            "{report:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn source_eviction_fails_closed_for_dirty_ignored_borrowed_and_authoritative_copies() {
         for kind in [
             "dirty",
@@ -5114,9 +5242,10 @@ mod tests {
             "owner",
             "driver",
             "task-pin",
+            "task-replacement",
+            "malformed-orig-head",
             "grace",
             "resumable",
-            "unique-reflog",
             "archive-symlink",
             "root-symlink",
             "public",
@@ -5173,18 +5302,28 @@ mod tests {
                         .put(&mut task)
                         .unwrap();
                 }
-                "grace" => disk.fold_grace_secs = 3600,
-                "resumable" => state.status = RunStatus::Blocked,
-                "unique-reflog" => {
-                    std::fs::write(review.join("source"), "private recovery checkpoint").unwrap();
-                    git::git(&review, &["add", "."]).await.unwrap();
-                    git::git(&review, &["commit", "-m", "private checkpoint"])
-                        .await
-                        .unwrap();
-                    git::git(&review, &["reset", "--hard", &head])
-                        .await
+                "task-replacement" => {
+                    let mut task = f.task(std::slice::from_ref(&state));
+                    task.replacement = Some(crate::merge_decision::Replacement {
+                        question: "fixture-replacement".into(),
+                        run: state.id.clone(),
+                        pr: "https://example.invalid/pull/1".into(),
+                        agent: "worker".into(),
+                        context: String::new(),
+                    });
+                    crate::queue::Queue::at(f.home.join("queue"))
+                        .put(&mut task)
                         .unwrap();
                 }
+                "malformed-orig-head" => {
+                    let admin = git::git(&review, &["rev-parse", "--absolute-git-dir"])
+                        .await
+                        .unwrap();
+                    std::fs::write(Path::new(&admin).join("ORIG_HEAD"), "not-an-object-id")
+                        .unwrap();
+                }
+                "grace" => disk.fold_grace_secs = 3600,
+                "resumable" => state.status = RunStatus::Blocked,
                 "archive-symlink" => {
                     let artifacts = f.home.join("runs").join(&state.id).join("artifacts");
                     std::fs::create_dir_all(&artifacts).unwrap();

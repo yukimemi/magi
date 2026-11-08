@@ -11,9 +11,9 @@ recorded base/review HEADs, plus empty Superseded candidate attempts whose actua
 branch, HEAD, index and files still equal their original base. Changed
 implementation candidates and resumable runs remain materialized. Public, selected recovery,
 approval and explicit source-retention authority blocks eviction. Unknown run
-or task records, cross-run references, live owners/drivers, borrowed output
+or task records, cross-run source path references, live owners/drivers, borrowed output
 leases, recent activity, Git operations/local refs, unknown administration,
-unique recovery history, dirty/index-hidden edits, ignored/untracked entries,
+unarchivable recovery history, dirty/index-hidden edits, ignored/untracked entries,
 symlinks and even unknown empty directories block deletion. Build outputs are
 never archived; a copy containing any such leftovers is retained.
 
@@ -32,10 +32,13 @@ copy can exceed the remaining budget, after which the pass stops).
 Each `artifacts/source-evidence/<head>-<base>/` contains complete base and source
 trees/blobs in a non-thin pack, original commit metadata, the same binary diff
 format used by fold evidence, and a raw NUL-delimited path/mode/blob index.
-All HEAD reflog and ORIG_HEAD tips admitted by preflight are independently
+All HEAD reflog and ORIG_HEAD tips, including unrelated earlier tips, are independently
 archived, without walking or bundling the repository's entire history. The
 archive is checked in a separate repository without alternates: both trees
-must materialize and hash correctly, and their diff/index must match. Publication
+must materialize and hash correctly, and their diff/index must match. Applying the
+archived binary patch to the base in the inspection repository's private index
+must reconstruct the recorded source tree. Every checkpoint archive is validated
+again immediately before source removal. Publication
 syncs files and directories before an atomic rename. Existing evidence is
 immutable and revalidated, including after Git garbage collection.
 
@@ -50,6 +53,23 @@ exclusive output lease. Missing/corrupt evidence or changed/unknown
 administration remains a reported blocker. A changed or recreated checkout is not silently adopted.
 Truly empty, inactive, unborrowed roots without Git registrations are removed
 with `remove_dir`, without retiring the run or deleting any records.
+
+A successor's lineage ID reference alone does not borrow a checkout. Explicit
+recovery selections, task pins/replacements, concrete path references and output
+leases continue to block eviction. Unreadable ownership records still block
+source eviction because they may hide a borrower; other housekeeping continues.
+
+To list archived seat tips or reconstruct one by its full recorded head:
+
+```sh
+magi fold <run-id> --show-seats
+magi fold <run-id> --restore-seat <head> --dest <new-inspection-directory>
+```
+
+The list includes the source name, head, tree, patch bytes and eviction phase,
+including independently archived historical tips. Both operations validate
+record identities and every referenced archive, and work after the original
+repository has disappeared. They do not run folding or retire the run.
 
 To inspect or reconstruct a specific archive from an eviction record:
 

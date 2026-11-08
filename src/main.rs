@@ -414,6 +414,15 @@ enum Command {
         /// version of the same pass on its own.
         #[arg(long, conflicts_with_all = ["id", "all", "merged"])]
         repair_prs: bool,
+        /// List validated archived seat heads, trees and patch sizes.
+        #[arg(long, requires = "id", conflicts_with_all = ["all", "merged", "restore_seat", "repair_prs"])]
+        show_seats: bool,
+        /// Restore an archived head to a new independent inspection repository.
+        #[arg(long, value_name = "HEAD", requires_all = ["id", "dest"], conflicts_with_all = ["all", "merged", "repair_prs"])]
+        restore_seat: Option<String>,
+        /// New destination for --restore-seat; must not already exist.
+        #[arg(long, value_name = "PATH", requires = "restore_seat")]
+        dest: Option<PathBuf>,
     },
     /// Inspect and shrink the shared build cache.
     ///
@@ -1785,6 +1794,30 @@ async fn dispatch(command: Command) -> Result<()> {
                     "{failed} pull request(s) could not be read from the forge; left as recorded"
                 );
             }
+            Ok(())
+        }
+
+        Command::Fold {
+            id: Some(id),
+            show_seats: true,
+            ..
+        } => {
+            let id = resolve_id(&id)?;
+            for record in magi::retention::seat_evidence(&magi::run::home(), &id).await? {
+                println!("{record}");
+            }
+            Ok(())
+        }
+
+        Command::Fold {
+            id: Some(id),
+            restore_seat: Some(head),
+            dest: Some(dest),
+            ..
+        } => {
+            let id = resolve_id(&id)?;
+            magi::retention::restore_seat(&magi::run::home(), &id, &head, &dest).await?;
+            println!("restored {head} of run {id} at {}", dest.display());
             Ok(())
         }
 
@@ -5396,6 +5429,41 @@ mod tests {
                 assert_eq!(merged.as_deref(), Some("https://github.com/o/r/pull/1"));
             }
             other => panic!("expected Command::Fold, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn archived_seat_commands_require_explicit_run_and_new_destination() {
+        let id = "20260901-000000-aaaa";
+        assert!(Cli::try_parse_from(["magi", "fold", "--show-seats"]).is_err());
+        assert!(Cli::try_parse_from(["magi", "fold", id, "--show-seats"]).is_ok());
+        assert!(Cli::try_parse_from(["magi", "fold", id, "--restore-seat", "head"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "magi",
+                "fold",
+                id,
+                "--restore-seat",
+                "head",
+                "--dest",
+                "new"
+            ])
+            .is_ok()
+        );
+        for option in ["--all", "--repair-prs", "--show-seats"] {
+            assert!(
+                Cli::try_parse_from([
+                    "magi",
+                    "fold",
+                    id,
+                    "--restore-seat",
+                    "head",
+                    "--dest",
+                    "new",
+                    option
+                ])
+                .is_err()
+            );
         }
     }
 

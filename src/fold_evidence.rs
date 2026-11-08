@@ -733,6 +733,18 @@ pub(crate) async fn validate_snapshot(dir: &Path) -> Result<()> {
         "inspection worktree redirected by Git configuration"
     );
     let manifest = load_snapshot(dir, &repo).await?;
+    // The archive must reproduce its source through the displayed binary
+    // patch, not just contain two individually valid trees. This repository
+    // and its index are private and have no alternates to the source store.
+    capture(&repo, &["read-tree", &manifest.base_tree]).await?;
+    let patch = std::fs::read(dir.join("change.patch"))?;
+    if !patch.is_empty() {
+        input(&repo, &["apply", "--cached", "--binary", "-"], patch).await?;
+    }
+    ensure!(
+        git::git(&repo, &["write-tree"]).await? == manifest.head_tree,
+        "archived patch does not reconstruct the source tree"
+    );
     capture(&repo, &["checkout-index", "--all", "--force"]).await?;
     // A cached tree/index alone does not prove that every blob is present.
     for tree in [&manifest.head_tree, &manifest.base_tree] {
