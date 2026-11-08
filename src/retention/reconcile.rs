@@ -597,7 +597,8 @@ pub async fn run(
     authority: &str,
     apply: Option<&str>,
 ) -> Result<PathBuf> {
-    run_inner(home, task_id, authority, apply, None).await
+    // Keep the large proof frame out of callers' pre-allocation temporaries.
+    Box::pin(run_inner(home, task_id, authority, apply, None)).await
 }
 
 pub(crate) async fn run_chat(
@@ -607,7 +608,7 @@ pub(crate) async fn run_chat(
     apply: Option<&str>,
     chat: ChatRequest<'_>,
 ) -> Result<PathBuf> {
-    run_inner(home, task, authority, apply, Some(chat)).await
+    Box::pin(run_inner(home, task, authority, apply, Some(chat))).await
 }
 
 async fn run_inner(

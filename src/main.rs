@@ -3187,7 +3187,13 @@ async fn task_cmd(command: TaskCmd) -> Result<()> {
 /// `Queue::open` reads, which only the first caller in the binary may do (see
 /// `run::set_home`'s doc and `run_rm_cmd_guards_and_removes`, the test that
 /// already claims that spot).
-async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
+fn task_cmd_on(command: TaskCmd, q: Queue) -> impl std::future::Future<Output = Result<()>> {
+    // Callers may retain several commands. Allocate their state here so debug
+    // builds do not copy every command frame through the caller and executor.
+    Box::pin(task_cmd_inner(command, q))
+}
+
+async fn task_cmd_inner(command: TaskCmd, q: Queue) -> Result<()> {
     match command {
         TaskCmd::Add {
             sources,
@@ -7708,10 +7714,13 @@ command = ['sh', '-c', 'cat >/dev/null; printf "%s" "{\"duplicate\":true,\"reaso
             Queue::at(PathBuf::from("unused-queue")),
         );
         let bytes = std::mem::size_of_val(&command);
-        assert!(
-            bytes < 64 * 1024,
-            "task command future occupies {bytes} bytes"
-        );
+        assert!(bytes < 1024, "task command future occupies {bytes} bytes");
+        // Boxing at the dispatcher still constructs its argument on the stack.
+        // The reconciliation entry must defer its large proof frame too.
+        let reconciliation =
+            magi::retention::reconcile::run(Path::new("unused-home"), "task", "run", None);
+        let bytes = std::mem::size_of_val(&reconciliation);
+        assert!(bytes < 1024, "reconciliation entry occupies {bytes} bytes");
     }
 
     #[tokio::test]
