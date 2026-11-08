@@ -968,19 +968,18 @@ lock_file = "kanade-sync.lock"
         assert!(out.usable(), "{out:?}");
         assert!(questions.join("control-plane").exists());
         drop(reader);
-        let out = tokio::time::timeout(Duration::from_secs(10), &mut editor)
-            .await
-            .unwrap()
-            .unwrap();
+        // Keep both admitted invocations progressing. Their asynchronous Git
+        // setup can reach the gate in a different order under load; leaving
+        // the later reader unpolled could strand its lease and block the editor.
+        let (out, later_out) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(&mut editor, &mut later_reader)
+        })
+        .await
+        .unwrap();
+        let out = out.unwrap();
         assert!(out.usable(), "{out:?}");
         assert!(fx.seat.join("editor").exists());
-        assert!(
-            tokio::time::timeout(Duration::from_secs(10), &mut later_reader)
-                .await
-                .unwrap()
-                .unwrap()
-                .usable()
-        );
+        assert!(later_out.unwrap().usable());
         drop(editor);
         assert_eq!(editor_seat.turns, 1);
     }

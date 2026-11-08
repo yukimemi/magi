@@ -234,6 +234,14 @@ enum RunCmd {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Validate and display archived checkout evidence, or restore it for inspection.
+    SourceEvidence {
+        /// Immutable archive directory from the run's eviction record.
+        evidence: PathBuf,
+        /// Create a new inspection repository; never changes run/public authority.
+        #[arg(long)]
+        restore: Option<PathBuf>,
+    },
     /// Run a competition for one task.
     ///
     /// Every run is a task: this files one in the queue (like `magi task add`)
@@ -406,6 +414,15 @@ enum Command {
         /// version of the same pass on its own.
         #[arg(long, conflicts_with_all = ["id", "all", "merged"])]
         repair_prs: bool,
+        /// List validated archived seat heads, trees and patch sizes.
+        #[arg(long, requires = "id", conflicts_with_all = ["all", "merged", "restore_seat", "repair_prs"])]
+        show_seats: bool,
+        /// Restore an archived head to a new independent inspection repository.
+        #[arg(long, value_name = "HEAD", requires_all = ["id", "dest"], conflicts_with_all = ["all", "merged", "repair_prs"])]
+        restore_seat: Option<String>,
+        /// New destination for --restore-seat; must not already exist.
+        #[arg(long, value_name = "PATH", requires = "restore_seat")]
+        dest: Option<PathBuf>,
     },
     /// Inspect and shrink the shared build cache.
     ///
@@ -1396,6 +1413,18 @@ fn exit_status(result: Result<()>, status: RunStatus, left_pr: bool) -> Result<(
 
 async fn dispatch(command: Command) -> Result<()> {
     match command {
+        Command::SourceEvidence { evidence, restore } => {
+            let evidence = evidence
+                .canonicalize()
+                .context("resolve source evidence directory")?;
+            if let Some(destination) = restore {
+                magi::retention::restore_source(&evidence, &destination).await
+            } else {
+                let patch = magi::retention::source_diff(&evidence).await?;
+                std::io::Write::write_all(&mut std::io::stdout(), &patch)?;
+                Ok(())
+            }
+        }
         Command::Worker { home, id } => magi::worker::run(&home, &id).await,
         Command::Run {
             command,
@@ -1765,6 +1794,30 @@ async fn dispatch(command: Command) -> Result<()> {
                     "{failed} pull request(s) could not be read from the forge; left as recorded"
                 );
             }
+            Ok(())
+        }
+
+        Command::Fold {
+            id: Some(id),
+            show_seats: true,
+            ..
+        } => {
+            let id = resolve_id(&id)?;
+            for record in magi::retention::seat_evidence(&magi::run::home(), &id).await? {
+                println!("{record}");
+            }
+            Ok(())
+        }
+
+        Command::Fold {
+            id: Some(id),
+            restore_seat: Some(head),
+            dest: Some(dest),
+            ..
+        } => {
+            let id = resolve_id(&id)?;
+            magi::retention::restore_seat(&magi::run::home(), &id, &head, &dest).await?;
+            println!("restored {head} of run {id} at {}", dest.display());
             Ok(())
         }
 
@@ -3134,7 +3187,13 @@ async fn task_cmd(command: TaskCmd) -> Result<()> {
 /// `Queue::open` reads, which only the first caller in the binary may do (see
 /// `run::set_home`'s doc and `run_rm_cmd_guards_and_removes`, the test that
 /// already claims that spot).
-async fn task_cmd_on(command: TaskCmd, q: Queue) -> Result<()> {
+fn task_cmd_on(command: TaskCmd, q: Queue) -> impl std::future::Future<Output = Result<()>> {
+    // Callers may retain several commands. Allocate their state here so debug
+    // builds do not copy every command frame through the caller and executor.
+    Box::pin(task_cmd_inner(command, q))
+}
+
+async fn task_cmd_inner(command: TaskCmd, q: Queue) -> Result<()> {
     match command {
         TaskCmd::Add {
             sources,
@@ -5380,6 +5439,41 @@ mod tests {
     }
 
     #[test]
+    fn archived_seat_commands_require_explicit_run_and_new_destination() {
+        let id = "20260901-000000-aaaa";
+        assert!(Cli::try_parse_from(["magi", "fold", "--show-seats"]).is_err());
+        assert!(Cli::try_parse_from(["magi", "fold", id, "--show-seats"]).is_ok());
+        assert!(Cli::try_parse_from(["magi", "fold", id, "--restore-seat", "head"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "magi",
+                "fold",
+                id,
+                "--restore-seat",
+                "head",
+                "--dest",
+                "new"
+            ])
+            .is_ok()
+        );
+        for option in ["--all", "--repair-prs", "--show-seats"] {
+            assert!(
+                Cli::try_parse_from([
+                    "magi",
+                    "fold",
+                    id,
+                    "--restore-seat",
+                    "head",
+                    "--dest",
+                    "new",
+                    option
+                ])
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn plain_fold_still_allows_an_omitted_run_id() {
         let bare = Cli::try_parse_from(["magi", "fold"]).unwrap();
         match bare.command {
@@ -7620,10 +7714,13 @@ command = ['sh', '-c', 'cat >/dev/null; printf "%s" "{\"duplicate\":true,\"reaso
             Queue::at(PathBuf::from("unused-queue")),
         );
         let bytes = std::mem::size_of_val(&command);
-        assert!(
-            bytes < 64 * 1024,
-            "task command future occupies {bytes} bytes"
-        );
+        assert!(bytes < 1024, "task command future occupies {bytes} bytes");
+        // Boxing at the dispatcher still constructs its argument on the stack.
+        // The reconciliation entry must defer its large proof frame too.
+        let reconciliation =
+            magi::retention::reconcile::run(Path::new("unused-home"), "task", "run", None);
+        let bytes = std::mem::size_of_val(&reconciliation);
+        assert!(bytes < 1024, "reconciliation entry occupies {bytes} bytes");
     }
 
     #[tokio::test]

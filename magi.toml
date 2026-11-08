@@ -71,23 +71,16 @@ base = "main"
 style = "squash"
 
 [graph]
-# `cargo make check` on this repository takes ~1450s on a warm cache on this
-# machine — measured, not guessed — against a `timeout_review` default of
-# 1200s, which `timeout_verify` inherits when it is unset. That made the gate
-# fail structurally rather than because anything was wrong: run
-# 20260915-215701-c1c0 and run 20260915-225246-6805 both reached
-# `verify.gate` with two approvals and a green e2e, then timed out at 1200s.
-# The e2e leg has the same problem for a different reason: `verify.e2e` is
-# `cargo test --all-targets`, which is the same build plus the same suite.
-#
-# Stated here rather than on the machine layer on purpose: how long this
-# repository's own gate takes is a fact about this repository (a Windows box
-# building several agent worktrees at once), not about the operator's
-# preferences. 2400s is ~1.6x the measured time, which is headroom for a
-# busier machine rather than a licence to hang.
-timeout_verify = 2400
+# Verification includes compilation and the full test command, not one test.
+# Round 2 at e722eb7 spent 273s compiling and 2073s in completed tests
+# before reaching task_grant_repair, with later integration binaries still
+# pending. The 2400s command budget expired without a reported test failure.
+# task_grant_repair passes all 14 tests in 28s in isolation. Allow 3600s for
+# the complete suite and build under load; per-test watchdogs are unchanged.
+# This repository-owned budget applies to both verify.e2e and verify.gate.
+timeout_verify = 3600
 
-# `timeout_verify = 2400` above fixed `verify.gate` / `verify.e2e`, but
+# The original `timeout_verify = 2400` fixed `verify.gate` / `verify.e2e`, but
 # `timeout_review` (the field it was split off from, see its doc comment in
 # `src/config.rs`) was left at its 1200s default. That field is the timeout
 # for the reviewer seat itself — both the ordinary review job
@@ -98,10 +91,9 @@ timeout_verify = 2400
 # budget: `review-1` kept timing out every round on this machine, e.g. runs
 # 20260919-213057-71fd, 20260919-152903-01b7 and 20260919-072215-fa6e.
 #
-# Set to the same 2400s as `timeout_verify` because both seats run on the same
-# machine under the same load, not because the two fields are linked —
-# `timeout_verify` still won't follow `timeout_review` if this changes again
-# (that independence is the point of splitting them, see `src/config.rs`).
+# Keep the reviewer-seat budget at 2400s independently of the full-suite
+# verification budget above. `timeout_verify` does not follow `timeout_review`
+# when set explicitly (see `src/config.rs`).
 # 1200s was failing structurally every round, so the accepted cost here is the
 # same one already paid above: up to 20 extra minutes to reclaim a reviewer
 # that has actually hung, in exchange for one that hasn't finishing normally.
