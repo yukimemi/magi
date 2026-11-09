@@ -5236,6 +5236,256 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn source_eviction_retains_borrowed_or_promisor_anchor_stores() {
+        for kind in [
+            "alternates",
+            "promisor-config",
+            "promisor-pack",
+            "objects-symlink",
+        ] {
+            let f = Fx::new().await;
+            let state = inactive_source(&f, "ef11", true).await;
+            let review = reviewer(&f, &state, &f.base).await;
+            let common = crate::repo_lock::common_dir(&f.repo)
+                .await
+                .unwrap()
+                .unwrap();
+            match kind {
+                "alternates" => {
+                    let borrowed = f._temp.path().join("borrowed-objects");
+                    std::fs::create_dir(&borrowed).unwrap();
+                    std::fs::write(
+                        common.join("objects/info/alternates"),
+                        format!("{}\n", borrowed.display()),
+                    )
+                    .unwrap();
+                }
+                "promisor-config" => {
+                    git::git(&f.repo, &["config", "remote.origin.promisor", "true"])
+                        .await
+                        .unwrap();
+                }
+                "promisor-pack" => {
+                    std::fs::write(common.join("objects/pack/fixture.promisor"), "").unwrap();
+                }
+                _ => {
+                    let borrowed = f._temp.path().join("borrowed-objects");
+                    std::fs::rename(common.join("objects"), &borrowed).unwrap();
+                    std::os::unix::fs::symlink(borrowed, common.join("objects")).unwrap();
+                }
+            }
+            let mut report = Report::default();
+            copies::evict(&f.home, &Fx::disk(), Fx::now(), &mut report).await;
+            assert_eq!(report.evicted_copies, 0, "{kind}: {report:?}");
+            assert!(review.exists());
+            assert!(
+                report.retained.iter().any(|r| r.contains("source anchor")),
+                "{kind}: {report:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn source_eviction_bounds_long_shared_history_and_requires_its_retained_anchor() {
+        let mut f = Fx::new().await;
+        crate::fold_evidence::fixtures::shared_history(&f.repo, &f.base, 5000).await;
+        f.base = git::rev_parse(&f.repo, "HEAD").await.unwrap();
+        assert_eq!(
+            git::git(&f.repo, &["rev-list", "--count", &f.base])
+                .await
+                .unwrap(),
+            "5001"
+        );
+        let state = inactive_source(&f, "ef10", true).await;
+        let review = reviewer(&f, &state, &f.base).await;
+        std::fs::write(review.join("source"), "bounded review delta").unwrap();
+        git::git(&review, &["add", "."]).await.unwrap();
+        let tree = git::git(&review, &["write-tree"]).await.unwrap();
+        let head = git::git(
+            &review,
+            &["commit-tree", &tree, "-p", &f.base, "-m", "review delta"],
+        )
+        .await
+        .unwrap();
+        git::git(&review, &["checkout", "--detach", &head])
+            .await
+            .unwrap();
+        let run_file = f.home.join("runs").join(&state.id).join("run.json");
+        let run_before = std::fs::read(&run_file).unwrap();
+        let mut report = Report::default();
+        copies::evict(&f.home, &Fx::disk(), Fx::now(), &mut report).await;
+        assert_eq!(report.evicted_copies, 1, "{report:?}");
+        assert!(!review.exists());
+        assert!(state.candidates[0].worktree.exists());
+        assert!(
+            git::branch_exists(&f.repo, &state.candidates[0].branch)
+                .await
+                .unwrap()
+        );
+        assert_eq!(std::fs::read(&run_file).unwrap(), run_before);
+        let archive = f
+            .home
+            .join("runs")
+            .join(&state.id)
+            .join("artifacts/source-evidence")
+            .join(format!("{head}-{}", f.base));
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(archive.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(manifest["anchor"], f.base);
+        assert!(
+            std::fs::metadata(archive.join("objects.pack"))
+                .unwrap()
+                .len()
+                < 16 * 1024
+        );
+        let pin = format!("refs/magi/source-anchors/{}", f.base);
+        assert_eq!(git::rev_parse(&f.repo, &pin).await.unwrap(), f.base);
+        git::git(&f.repo, &["reflog", "expire", "--expire=now", "--all"])
+            .await
+            .unwrap();
+        git::git(&f.repo, &["gc", "--prune=now"]).await.unwrap();
+        assert!(
+            !git::git_raw(&f.repo, &["cat-file", "-e", &head])
+                .await
+                .unwrap()
+                .ok()
+        );
+        let other = git::rev_parse(&state.candidates[0].worktree, "HEAD")
+            .await
+            .unwrap();
+        // Missing, moved, symbolic and symlink pins cannot authorize import.
+        for kind in ["missing", "moved", "symbolic", "symlink"] {
+            git::git(&f.repo, &["update-ref", "--no-deref", "-d", &pin])
+                .await
+                .unwrap();
+            match kind {
+                "moved" => {
+                    git::git(&f.repo, &["update-ref", &pin, &other])
+                        .await
+                        .unwrap();
+                }
+                "symbolic" => {
+                    git::git(&f.repo, &["symbolic-ref", &pin, "refs/heads/main"])
+                        .await
+                        .unwrap();
+                }
+                "symlink" => {
+                    let common = crate::repo_lock::common_dir(&f.repo)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let target = f._temp.path().join("operator-anchor");
+                    std::fs::write(&target, format!("{}\n", f.base)).unwrap();
+                    let file = common.join(&pin);
+                    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+                    std::os::unix::fs::symlink(target, file).unwrap();
+                }
+                _ => {}
+            }
+            assert!(
+                restore_execution_seats(&f.home, &state).await.is_err(),
+                "{kind}"
+            );
+            assert!(!review.exists());
+            assert!(
+                !git::git_raw(&f.repo, &["cat-file", "-e", &head])
+                    .await
+                    .unwrap()
+                    .ok()
+            );
+            if kind == "symlink" {
+                let common = crate::repo_lock::common_dir(&f.repo)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                std::fs::remove_file(common.join(&pin)).unwrap();
+            } else {
+                git::git(&f.repo, &["update-ref", "--no-deref", "-d", &pin])
+                    .await
+                    .unwrap();
+            }
+            git::git(&f.repo, &["update-ref", &pin, &f.base])
+                .await
+                .unwrap();
+        }
+        // Fixture-only ref deletion proves the pin, rather than an incidental
+        // main/candidate branch, keeps all shared ancestors through GC.
+        assert!(
+            git::worktree_remove_clean(&f.repo, &state.candidates[0].worktree)
+                .await
+                .unwrap()
+        );
+        git::git(
+            &f.repo,
+            &[
+                "update-ref",
+                "-d",
+                &format!("refs/heads/{}", state.candidates[0].branch),
+            ],
+        )
+        .await
+        .unwrap();
+        git::git(&f.repo, &["update-ref", "-d", "refs/heads/main"])
+            .await
+            .unwrap();
+        git::git(&f.repo, &["reflog", "expire", "--expire=now", "--all"])
+            .await
+            .unwrap();
+        git::git(&f.repo, &["gc", "--prune=now"]).await.unwrap();
+        assert_eq!(
+            git::git(&f.repo, &["for-each-ref", "--format=%(refname)"])
+                .await
+                .unwrap(),
+            pin
+        );
+        assert_eq!(
+            git::git(&f.repo, &["rev-list", "--count", &f.base])
+                .await
+                .unwrap(),
+            "5001"
+        );
+        restore_execution_seats(&f.home, &state).await.unwrap();
+        assert_eq!(
+            git::git(&review, &["rev-list", "--count", "HEAD"])
+                .await
+                .unwrap(),
+            "5002"
+        );
+        assert_eq!(
+            git::git(&f.repo, &["rev-parse", "--is-shallow-repository"])
+                .await
+                .unwrap(),
+            "false"
+        );
+        git::git(&f.repo, &["fsck", "--full"]).await.unwrap();
+        git::git(&f.repo, &["gc", "--prune=now"]).await.unwrap();
+        let patch = seat_diff(&f.home, &state.id, &head).await.unwrap();
+        assert!(String::from_utf8_lossy(&patch).contains("bounded review delta"));
+        std::fs::remove_dir_all(&f.repo).unwrap();
+        assert_eq!(seat_diff(&f.home, &state.id, &head).await.unwrap(), patch);
+        let inspection = f._temp.path().join("shared-history-inspection");
+        restore_seat(&f.home, &state.id, &head, &inspection)
+            .await
+            .unwrap();
+        assert_eq!(git::rev_parse(&inspection, "HEAD").await.unwrap(), head);
+        assert_eq!(
+            git::git(&inspection, &["rev-parse", "--is-shallow-repository"])
+                .await
+                .unwrap(),
+            "true"
+        );
+        assert_eq!(
+            git::git(&inspection, &["log", "--format=%H"])
+                .await
+                .unwrap(),
+            format!("{head}\n{}", f.base)
+        );
+        assert!(!inspection.join(".git/objects/info/alternates").exists());
+        git::git(&inspection, &["fsck", "--full"]).await.unwrap();
+        git::git(&inspection, &["gc", "--prune=now"]).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn source_eviction_retains_tree_only_archives_and_rejects_import_before_writes() {
         let f = Fx::new().await;
         let state = inactive_source(&f, "ef08", true).await;

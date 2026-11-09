@@ -404,12 +404,14 @@ mod tests {
     }
 }
 
-/// A bounded source archive. New packs include the HEAD's complete object
-/// closure; legacy packs may contain only the two endpoint trees and blobs.
+/// A bounded source archive. An anchored pack closes HEAD down to a retained
+/// base; independent heads carry their full closure. Endpoint trees are complete.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Snapshot {
     version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    anchor: Option<String>,
     head: String,
     base: String,
     head_tree: String,
@@ -522,22 +524,29 @@ pub(crate) async fn snapshot(
             ensure!(objects.len() <= MAX_FILES, "snapshot object limit exceeded");
         }
     }
-    // A restored HEAD becomes a root in the shared repository. Preserve its
-    // entire reachable closure, not just its final tree. One extra commit
-    // beyond the object bound makes truncation fail rather than look complete.
+    // Pin the shared base before excluding its closure. The immutable ref is
+    // independent of operator/candidate branches and survives ordinary Git GC.
+    let anchor = if is_ancestor(&state.repo, &state.base_commit, head).await? {
+        retained_anchor(&state.repo, &state.base_commit, true).await?;
+        Some(state.base_commit.clone())
+    } else {
+        None
+    };
     let commit_limit = format!("--max-count={}", MAX_FILES + 1);
-    let ancestry = capture(
-        &state.repo,
-        &[
-            "rev-list",
-            "--objects",
-            "--no-object-names",
-            &commit_limit,
-            head,
-        ],
-    )
-    .await
-    .context("cannot enumerate snapshot commit ancestry")?;
+    let excluded = anchor.as_ref().map(|base| format!("^{base}"));
+    let mut revisions = vec![
+        "rev-list",
+        "--objects",
+        "--no-object-names",
+        &commit_limit,
+        head,
+    ];
+    if let Some(excluded) = &excluded {
+        revisions.push(excluded);
+    }
+    let ancestry = capture(&state.repo, &revisions)
+        .await
+        .context("cannot enumerate snapshot commit ancestry")?;
     for oid in std::str::from_utf8(&ancestry)?.lines() {
         ensure!(
             matches!(oid.len(), 40 | 64) && oid.bytes().all(|b| b.is_ascii_hexdigit()),
@@ -588,7 +597,8 @@ pub(crate) async fn snapshot(
         "snapshot commit metadata limit exceeded"
     );
     let manifest = Snapshot {
-        version: 1,
+        version: 2,
+        anchor,
         head: head.to_owned(),
         base: state.base_commit.clone(),
         base_tree,
@@ -653,7 +663,7 @@ pub(crate) async fn snapshot(
         &mut bytes,
         &mut files,
     )?;
-    validate_execution_snapshot(&pending).await?;
+    validate_execution_snapshot_for(&pending, &state.repo).await?;
     std::fs::rename(&pending, &dir)?;
     sync_directory(&parent)?;
     Ok(dir)
@@ -667,7 +677,17 @@ async fn load_snapshot(dir: &Path, repo: &Path) -> Result<Snapshot> {
         "snapshot manifest limit exceeded"
     );
     let manifest: Snapshot = serde_json::from_slice(&std::fs::read(dir.join("manifest.json"))?)?;
-    ensure!(manifest.version == 1, "unsupported snapshot version");
+    ensure!(
+        matches!(manifest.version, 1 | 2),
+        "unsupported snapshot version"
+    );
+    ensure!(
+        manifest
+            .anchor
+            .as_ref()
+            .is_none_or(|anchor| manifest.version == 2 && anchor == &manifest.base),
+        "invalid snapshot anchor"
+    );
     for oid in [
         &manifest.head,
         &manifest.base,
@@ -781,6 +801,131 @@ pub(crate) async fn validate_snapshot(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+// Only this namespace is managed by evidence publication. Never move an
+// existing pin, adopt a symbolic/symlink ref, or write through aliased parents.
+async fn retained_anchor(repo: &Path, base: &str, create: bool) -> Result<()> {
+    ensure!(
+        matches!(base.len(), 40 | 64) && base.bytes().all(|b| b.is_ascii_hexdigit()),
+        "invalid source anchor ID"
+    );
+    ensure!(
+        git::git(repo, &["rev-parse", "--is-shallow-repository"]).await? == "false",
+        "source anchor requires a complete shared repository"
+    );
+    let common = crate::repo_lock::common_dir(repo)
+        .await?
+        .context("missing shared repository")?;
+    // A local ref cannot protect objects owned by an alternate or promisor.
+    let objects = common.join("objects");
+    plain(&objects).context("source anchor object store is not canonical")?;
+    for name in ["alternates", "http-alternates"] {
+        let path = objects.join("info").join(name);
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) => {
+                plain(&path)?;
+                ensure!(
+                    meta.is_file() && meta.len() == 0,
+                    "source anchor cannot depend on borrowed objects: {name}"
+                );
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let promisor = git::git_raw(
+        repo,
+        &[
+            "config",
+            "--get-regexp",
+            r"^(extensions\.partialclone|remote\..*\.promisor)$",
+        ],
+    )
+    .await?;
+    ensure!(
+        promisor.code == Some(1),
+        "source anchor cannot depend on promisor objects or unreadable configuration"
+    );
+    let packs = objects.join("pack");
+    if packs.try_exists()? {
+        plain(&packs)?;
+        for (count, entry) in std::fs::read_dir(&packs)?.enumerate() {
+            ensure!(
+                count < MAX_FILES,
+                "source anchor pack inspection limit exceeded"
+            );
+            ensure!(
+                !entry?.path().extension().is_some_and(|s| s == "promisor"),
+                "source anchor cannot depend on promisor packs"
+            );
+        }
+    }
+    let name = format!("refs/magi/source-anchors/{base}");
+    let mut file = common.clone();
+    for part in name.split('/') {
+        file.push(part);
+        match std::fs::symlink_metadata(&file) {
+            Ok(_) => plain(&file).context("noncanonical source anchor")?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    ensure!(
+        !git::git_raw(repo, &["symbolic-ref", "-q", &name])
+            .await?
+            .ok(),
+        "symbolic source anchor retained"
+    );
+    let existing = git::git_raw(repo, &["rev-parse", "--verify", &name]).await?;
+    if !existing.ok() {
+        ensure!(create, "retained source anchor missing: {name}");
+        // Certify the existing history once before publishing its immutable pin.
+        capture(
+            repo,
+            &[
+                "fsck",
+                "--connectivity-only",
+                "--no-reflogs",
+                "--no-dangling",
+                base,
+            ],
+        )
+        .await
+        .context("incomplete shared source anchor ancestry")?;
+        let absent = "0".repeat(base.len());
+        git::git(repo, &["update-ref", "--no-deref", &name, base, &absent]).await?;
+    }
+    ensure!(
+        git::rev_parse(repo, &name).await? == base,
+        "retained source anchor changed: {name}"
+    );
+    Ok(())
+}
+
+// Shallow boundaries are confined to independent inspection repositories.
+// The shared repository is never made shallow and must retain the real base.
+async fn inspection_anchor(repo: &Path, manifest: &Snapshot) -> Result<()> {
+    if let Some(anchor) = &manifest.anchor {
+        input(
+            repo,
+            &["hash-object", "-w", "-t", "commit", "--stdin"],
+            manifest.base_commit.clone(),
+        )
+        .await?;
+        std::fs::write(repo.join(".git/shallow"), format!("{anchor}\n"))?;
+    }
+    Ok(())
+}
+
+/// Verify the retained boundary as well as the archive's relative closure.
+pub(crate) async fn validate_execution_snapshot_for(dir: &Path, repo: &Path) -> Result<()> {
+    validate_execution_snapshot(dir).await?;
+    let manifest: Snapshot = serde_json::from_slice(&std::fs::read(dir.join("manifest.json"))?)?;
+    if let Some(anchor) = &manifest.anchor {
+        retained_anchor(repo, anchor, false).await?;
+    }
+    Ok(())
+}
+
 /// Prove a HEAD can become reachable without adding missing-parent history.
 /// Older tree-only snapshots remain useful for diffs and index restoration,
 /// but must pass this independent check before any shared-store import.
@@ -789,6 +934,7 @@ pub(crate) async fn validate_execution_snapshot(dir: &Path) -> Result<()> {
     let temp = Inspection::new(&std::env::temp_dir())?;
     git::git(&temp.0, &["init", "--quiet", "--template="]).await?;
     let manifest = load_snapshot(dir, &temp.0).await?;
+    inspection_anchor(&temp.0, &manifest).await?;
     input(
         &temp.0,
         &["hash-object", "-w", "-t", "commit", "--stdin"],
@@ -841,7 +987,13 @@ pub async fn restore_snapshot(dir: &Path, destination: &Path) -> Result<()> {
     super::retention::tracked_base(&repo, &manifest.head_tree).await?;
     // Legacy archives may contain only trees. Keep those inspections unborn
     // rather than manufacture a reachable commit with missing parents.
-    if validate_execution_snapshot(dir).await.is_ok() {
+    let executable = match validate_execution_snapshot(dir).await {
+        Ok(()) => true,
+        Err(error) if manifest.version == 2 => return Err(error),
+        Err(_) => false,
+    };
+    if executable {
+        inspection_anchor(&repo, &manifest).await?;
         input(
             &repo,
             &["hash-object", "-w", "-t", "commit", "--stdin"],
@@ -859,8 +1011,22 @@ pub async fn restore_snapshot(dir: &Path, destination: &Path) -> Result<()> {
 /// index, refs or working tree. Execution restoration holds repository coordination.
 pub(crate) async fn import_snapshot(dir: &Path, repo: &Path) -> Result<()> {
     // Validate in isolation before introducing any commit into the shared store.
-    validate_execution_snapshot(dir).await?;
+    validate_execution_snapshot_for(dir, repo).await?;
     let manifest: Snapshot = serde_json::from_slice(&std::fs::read(dir.join("manifest.json"))?)?;
+    if let Some(anchor) = &manifest.anchor {
+        capture(
+            repo,
+            &[
+                "fsck",
+                "--connectivity-only",
+                "--no-reflogs",
+                "--no-dangling",
+                anchor,
+            ],
+        )
+        .await
+        .context("incomplete shared source anchor ancestry")?;
+    }
     input(
         repo,
         &["unpack-objects", "-r"],
@@ -965,6 +1131,21 @@ pub(crate) fn snapshot_storage(root: &Path) -> Result<u64> {
 pub(crate) mod fixtures {
     use super::*;
 
+    pub(crate) async fn shared_history(repo: &Path, parent: &str, count: usize) {
+        let mut stream = String::new();
+        for i in 1..=count {
+            let from = if i == 1 {
+                parent.to_owned()
+            } else {
+                format!(":{}", i - 1)
+            };
+            stream.push_str(&format!("commit refs/heads/main\nmark :{i}\ncommitter Fixture <fixture@example.invalid> {i} +0000\ndata 1\nx\nfrom {from}\n\n"));
+        }
+        input(repo, &["fast-import", "--quiet"], stream.into_bytes())
+            .await
+            .unwrap();
+    }
+
     // Reproduce the old writer, which stored complete endpoint trees but no
     // commit ancestry. This modifies only isolated fixture evidence.
     pub(crate) async fn tree_only_archive(
@@ -975,6 +1156,8 @@ pub(crate) mod fixtures {
         let archive = snapshot(state, home, head, MAX_BYTES).await.unwrap();
         let mut manifest: Snapshot =
             serde_json::from_slice(&std::fs::read(archive.join("manifest.json")).unwrap()).unwrap();
+        manifest.version = 1;
+        manifest.anchor = None;
         let mut objects = BTreeSet::from([manifest.base_tree.clone(), manifest.head_tree.clone()]);
         for tree in [&manifest.base_tree, &manifest.head_tree] {
             for oid in git::git(

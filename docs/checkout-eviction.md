@@ -38,9 +38,17 @@ Each `artifacts/source-evidence/<head>-<base>/` contains complete base and sourc
 trees/blobs in a non-thin pack, original commit metadata, the same binary diff
 format used by fold evidence, and a raw NUL-delimited path/mode/blob index.
 All HEAD reflog and ORIG_HEAD tips, including unrelated earlier tips, are independently
-archived with the complete reachable commit/tree/blob closure of each tip.
-Closure enumeration and expanded objects share the existing 4,096-object and
-64 MiB limits; ancestry exceeding either limit retains the checkout. The
+archived with the required commit/tree/blob closure of each tip. When HEAD
+descends from the run base, an immutable `refs/magi/source-anchors/<base>` pin
+retains the shared base history through GC. Version 2 snapshots exclude that
+history with `^<base>` and record the boundary; unrelated heads still require
+their complete independent closure. The pin never moves or replaces an existing
+ref and is not removed while archives may depend on it. Shallow, borrowed
+alternate, promisor and noncanonical object stores cannot authorize a pin.
+Candidate/operator
+branches and run/task records are unchanged. Closure enumeration and expanded
+objects share the existing 4,096-object and 64 MiB limits; history beyond the
+retained boundary exceeding either limit retains the checkout. The
 archive is checked in a separate repository without alternates: both trees
 must materialize and hash correctly, and their diff/index must match. Applying the
 archived binary patch to the base in the inspection repository's private index
@@ -97,7 +105,12 @@ and produces an independent inspection repository with the source index and
 files. Original commit metadata and complete base/source trees remain in the
 archive; restoring does not select a recovery source, resume a task, change a
 public branch, or grant approval. Inspection restoration also reinstalls the
-original HEAD and its complete ancestry, then points detached HEAD at that tip.
+original HEAD. An anchored independent inspection explicitly declares its base
+as a shallow boundary; it has no alternates or dependency on the original repo.
+Execution import requires the exact retained pin and complete shared base ancestry
+before writing objects, and never changes the shared repository's shallow state.
+A missing, moved, symbolic or symlink pin fails closed before import. Full
+independent snapshots still restore complete ancestry through the original tip.
 Legacy tree-only archives still restore files/index and expose diffs; when their
 commit ancestry is incomplete, inspection HEAD remains unborn and execution
 import is rejected before writing into the shared repository. The original base
