@@ -368,6 +368,43 @@ pub(crate) fn sync_directory(_path: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn inspection_initialization_preserves_original_blob_line_endings() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().canonicalize().unwrap();
+        init_inspection(&repo).await.unwrap();
+        git::git(&repo, &["config", "core.autocrlf", "true"])
+            .await
+            .unwrap();
+        git::git(&repo, &["config", "core.eol", "crlf"])
+            .await
+            .unwrap();
+        init_inspection(&repo).await.unwrap();
+        let object = input(
+            &repo,
+            &["hash-object", "-w", "--stdin"],
+            b"original\n".to_vec(),
+        )
+        .await
+        .unwrap();
+        let object = String::from_utf8(object).unwrap();
+        git::git(
+            &repo,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "100644",
+                object.trim(),
+                "line.txt",
+            ],
+        )
+        .await
+        .unwrap();
+        git::git(&repo, &["checkout-index", "--all"]).await.unwrap();
+        assert_eq!(std::fs::read(repo.join("line.txt")).unwrap(), b"original\n");
+    }
+
     #[cfg(unix)]
     #[test]
     fn evidence_staging_preserves_unknown_symlinks() -> Result<()> {
@@ -770,15 +807,24 @@ pub(crate) async fn validate_identity(dir: &Path, head: &str, base: &str) -> Res
     Ok(())
 }
 
+async fn init_inspection(repo: &Path) -> Result<()> {
+    git::git(repo, &["init", "--quiet", "--template="]).await?;
+    let top = git::git(repo, &["rev-parse", "--show-toplevel"]).await?;
+    ensure!(
+        git::canonical_output_path(&top)? == repo,
+        "inspection worktree redirected by Git configuration"
+    );
+    // Inspection materializes original blob bytes, independent of host EOL
+    // defaults (notably Git for Windows' core.autocrlf setting).
+    git::git(repo, &["config", "core.autocrlf", "false"]).await?;
+    git::git(repo, &["config", "core.eol", "lf"]).await?;
+    Ok(())
+}
+
 pub(crate) async fn validate_snapshot(dir: &Path) -> Result<()> {
     let temp = Inspection::new(&std::env::temp_dir())?;
     let repo = temp.0.clone();
-    git::git(&repo, &["init", "--quiet", "--template="]).await?;
-    ensure!(
-        git::git(&repo, &["rev-parse", "--show-toplevel"]).await?
-            == repo.to_str().context("inspection path")?,
-        "inspection worktree redirected by Git configuration"
-    );
+    init_inspection(&repo).await?;
     let manifest = load_snapshot(dir, &repo).await?;
     // The archive must reproduce its source through the displayed binary
     // patch, not just contain two individually valid trees. This repository
@@ -932,7 +978,7 @@ pub(crate) async fn validate_execution_snapshot_for(dir: &Path, repo: &Path) -> 
 pub(crate) async fn validate_execution_snapshot(dir: &Path) -> Result<()> {
     validate_snapshot(dir).await?;
     let temp = Inspection::new(&std::env::temp_dir())?;
-    git::git(&temp.0, &["init", "--quiet", "--template="]).await?;
+    init_inspection(&temp.0).await?;
     let manifest = load_snapshot(dir, &temp.0).await?;
     inspection_anchor(&temp.0, &manifest).await?;
     input(
@@ -976,12 +1022,7 @@ pub async fn restore_snapshot(dir: &Path, destination: &Path) -> Result<()> {
     );
     let temp = Inspection::new(&parent)?;
     let repo = temp.0.clone();
-    git::git(&repo, &["init", "--quiet", "--template="]).await?;
-    ensure!(
-        git::git(&repo, &["rev-parse", "--show-toplevel"]).await?
-            == repo.to_str().context("inspection path")?,
-        "inspection worktree redirected by Git configuration"
-    );
+    init_inspection(&repo).await?;
     let manifest = load_snapshot(dir, &repo).await?;
     capture(&repo, &["checkout-index", "--all"]).await?;
     super::retention::tracked_base(&repo, &manifest.head_tree).await?;
@@ -1127,7 +1168,7 @@ pub(crate) fn snapshot_storage(root: &Path) -> Result<u64> {
     Ok(bytes)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) mod fixtures {
     use super::*;
 

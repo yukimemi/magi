@@ -18215,14 +18215,31 @@ esac
         let repo = root.join("repo");
         std::fs::create_dir(&repo).unwrap();
         init_repo(&repo);
+        git::git(&repo, &["config", "core.autocrlf", "false"])
+            .await
+            .unwrap();
         let mut runner = runner_at(RunStatus::Blocked);
         runner.state.repo = repo.clone();
         runner.state.base_commit = git::rev_parse(&repo, "HEAD").await.unwrap();
         runner.state.config.agents = vec![conductor()];
         runner.state.config.graph.selected_implementer = Some("conductor".into());
         runner.state.config.graph.worktree_root = Some(root.join("worktrees"));
+        let (shell, command, setup_output) = if cfg!(windows) {
+            (
+                vec!["cmd".into(), "/C".into()],
+                "echo ready>seat-ready",
+                "ready\r\n",
+            )
+        } else {
+            (
+                vec!["sh".into(), "-c".into()],
+                "printf ready > seat-ready",
+                "ready",
+            )
+        };
+        runner.state.config.verify.shell = Some(shell);
         runner.state.config.worktree.setup = vec![crate::config::SetupStep {
-            run: Some("printf ready > seat-ready".into()),
+            run: Some(command.into()),
             ..Default::default()
         }];
         runner.state.save().unwrap();
@@ -18284,7 +18301,7 @@ esac
         assert_eq!(git::rev_parse(&path, "HEAD").await.unwrap(), head);
         assert_eq!(
             std::fs::read_to_string(path.join("seat-ready")).unwrap(),
-            "ready"
+            setup_output
         );
         assert_eq!(
             std::fs::read_to_string(path.join("checkpoint")).unwrap(),

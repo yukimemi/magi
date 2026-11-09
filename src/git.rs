@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use crate::proc::Quiet as _;
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result, bail, ensure};
 use tokio::process::Command;
 
 /// Output of a completed `git` invocation.
@@ -50,6 +50,73 @@ pub async fn git_raw(cwd: &Path, args: &[&str]) -> Result<GitOut> {
         stdout: String::from_utf8_lossy(&out.stdout).trim_end().to_owned(),
         stderr: String::from_utf8_lossy(&out.stderr).trim_end().to_owned(),
     })
+}
+
+/// Native filesystem paths stay canonical internally; Git for Windows needs
+/// conventional drive/UNC spelling for path arguments instead of `\\?\`.
+pub(crate) fn path_arg(path: &Path) -> String {
+    #[cfg(windows)]
+    let unicode = path.to_str().is_some();
+    let path = path.to_string_lossy();
+    #[cfg(windows)]
+    {
+        if unicode {
+            windows_cli_path(&path)
+        } else {
+            path.into_owned()
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        path.into_owned()
+    }
+}
+
+#[cfg(any(windows, test))]
+fn windows_cli_path(path: &str) -> String {
+    let path = path.replace('\\', "/");
+    if path.starts_with("//?/")
+        && path[4..].split('/').any(|part| {
+            let name = part.split('.').next().unwrap_or("").to_ascii_uppercase();
+            part.ends_with(['.', ' '])
+                || matches!(
+                    name.as_str(),
+                    "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+                )
+                || (name.len() == 4
+                    && (name.starts_with("COM") || name.starts_with("LPT"))
+                    && matches!(name.as_bytes()[3], b'1'..=b'9'))
+        })
+    {
+        // These names need the native namespace; stripping it can select a
+        // different file. Leave them unsupported by Git rather than alias them.
+        return path;
+    }
+    if let Some(unc) = path.strip_prefix("//?/UNC/") {
+        return format!("//{unc}");
+    }
+    if let Some(drive) = path.strip_prefix("//?/")
+        && drive.as_bytes().get(1) == Some(&b':')
+        && drive.as_bytes().get(2) == Some(&b'/')
+        && drive.as_bytes()[0].is_ascii_alphabetic()
+    {
+        return drive.to_owned();
+    }
+    path
+}
+
+/// Accept Git's platform spelling only when it names a canonical filesystem
+/// path. Symlink aliases and redirects still fail this comparison.
+pub(crate) fn canonical_output_path(value: &str) -> Result<PathBuf> {
+    let path = PathBuf::from(value);
+    let canonical = path.canonicalize()?;
+    #[cfg(windows)]
+    let same_path = windows_cli_path(path.to_str().context("non UTF-8 Git path")?)
+        == windows_cli_path(canonical.to_str().context("non UTF-8 canonical Git path")?);
+    #[cfg(not(windows))]
+    let same_path = path == canonical;
+    ensure!(same_path, "noncanonical Git path: {}", path.display());
+    Ok(canonical)
 }
 
 /// Fetch `origin`'s branches into `refs/remotes/origin/*` in `cwd`, bounded by
@@ -256,7 +323,7 @@ pub async fn worktree_add_detached(repo: &Path, path: &Path, rev: &str) -> Resul
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await.ok();
     }
-    let path_s = path.to_string_lossy().to_string();
+    let path_s = path_arg(path);
     git(repo, &["worktree", "add", "--detach", &path_s, rev])
         .await
         .map(|_| ())
@@ -312,7 +379,7 @@ pub async fn worktree_remove(repo: &Path, path: &Path) -> Result<bool> {
 /// made after the caller last looked is refused rather than thrown away.
 /// Ignored files (`target/`) do not count as changes and go with it.
 pub async fn worktree_remove_clean(repo: &Path, path: &Path) -> Result<bool> {
-    let path_s = path.to_string_lossy().to_string();
+    let path_s = path_arg(path);
     Ok(git_raw(repo, &["worktree", "remove", &path_s]).await?.ok())
 }
 
@@ -1399,6 +1466,59 @@ pub async fn rev_exists(repo: &Path, rev: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn git_cli_path_spelling_handles_windows_canonical_prefixes() {
+        for (native, expected) in [
+            (r"\\?\C:\temp\work tree", "C:/temp/work tree"),
+            (
+                r"\\?\UNC\server\share\work tree",
+                "//server/share/work tree",
+            ),
+            (r"C:\temp\work tree", "C:/temp/work tree"),
+            ("C:/temp/work tree", "C:/temp/work tree"),
+        ] {
+            assert_eq!(super::windows_cli_path(native), expected);
+        }
+    }
+
+    #[test]
+    fn git_cli_path_spelling_does_not_alias_extended_only_names() {
+        for path in [
+            r"\\?\C:\temp.\copy",
+            r"\\?\C:\temp \copy",
+            r"\\?\C:\NUL.txt\copy",
+            r"\\?\C:\COM1\copy",
+        ] {
+            assert!(super::windows_cli_path(path).starts_with("//?/"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_cli_path_spelling_preserves_native_paths_on_unix() {
+        assert_eq!(
+            super::path_arg(std::path::Path::new(r"/tmp/back\slash")),
+            r"/tmp/back\slash"
+        );
+    }
+
+    #[test]
+    fn git_cli_canonical_output_accepts_platform_spelling_and_rejects_aliases() {
+        let temp = tempfile::tempdir().unwrap();
+        let canonical = temp.path().canonicalize().unwrap();
+        let printed = super::path_arg(&canonical);
+        assert_eq!(super::canonical_output_path(&printed).unwrap(), canonical);
+        let noncanonical = canonical.join("child").join("..");
+        std::fs::create_dir(canonical.join("child")).unwrap();
+        assert!(super::canonical_output_path(&super::path_arg(&noncanonical)).is_err());
+        #[cfg(unix)]
+        {
+            let alias = canonical.join("alias");
+            std::os::unix::fs::symlink(canonical.join("child"), &alias).unwrap();
+            assert!(super::canonical_output_path(alias.to_str().unwrap()).is_err());
+        }
+    }
+
     use super::*;
 
     #[test]

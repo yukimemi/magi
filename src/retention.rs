@@ -474,6 +474,12 @@ fn registered_worktrees(state: &RunState, list: &str) -> Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
     for path in list.lines().filter_map(|l| l.strip_prefix("worktree ")) {
         let path = PathBuf::from(path);
+        #[cfg(windows)]
+        let path = if plain_dir(&path) {
+            git::canonical_output_path(path.to_str().context("non UTF-8 registration")?)?
+        } else {
+            continue;
+        };
         if plain_dir(&path)
             && path.parent() == Some(root.as_path())
             && path.canonicalize()? == path
@@ -1460,7 +1466,8 @@ pub(crate) async fn tracked_base(worktree: &Path, base: &str) -> Result<()> {
                 "tracked executable mode differs from original base"
             );
         }
-        files.push(path.to_str().context("non UTF-8 source")?.to_owned());
+        path.to_str().context("non UTF-8 source")?;
+        files.push(git::path_arg(&path));
         blobs.push(parts[2].to_owned());
     }
     for (paths, expected) in files.chunks(64).zip(blobs.chunks(64)) {
