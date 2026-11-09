@@ -1508,9 +1508,11 @@ mod tests {
         let canonical = temp.path().canonicalize().unwrap();
         let printed = super::path_arg(&canonical);
         assert_eq!(super::canonical_output_path(&printed).unwrap(), canonical);
-        let noncanonical = canonical.join("child").join("..");
+        // Joining onto a Windows verbatim path normalizes parent components.
+        // Preserve the spelling so the boundary, rather than PathBuf, rejects it.
+        let noncanonical = format!("{printed}/child/..");
         std::fs::create_dir(canonical.join("child")).unwrap();
-        assert!(super::canonical_output_path(&super::path_arg(&noncanonical)).is_err());
+        assert!(super::canonical_output_path(&noncanonical).is_err());
         #[cfg(unix)]
         {
             let alias = canonical.join("alias");

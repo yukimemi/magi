@@ -6259,8 +6259,16 @@ async fn run_progress_live_pipeline_observation_and_phone_layout() {
             && activeRow.scrollWidth <= activeRow.clientWidth + 1;
           const actual = document.getElementById('progress-activity').textContent;
           const announcement = document.getElementById('progress-announcement').textContent;
-          pipeline.open = false; summary.focus({preventScroll: true});
+          // A previous viewport can leave this persisted panel open. Finish
+          // closing it before measuring updates, including browser scroll anchoring.
+          if (pipeline.open) await new Promise(resolve => {
+            pipeline.addEventListener('toggle', resolve, {once: true});
+            pipeline.open = false;
+          });
+          await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+          summary.focus({preventScroll: true});
           const top = summary.getBoundingClientRect().top;
+          const beforeFreshness = document.getElementById("progress-freshness").textContent;
           deck.tickActive();
           await deck.observeRunProgress(true);
           const retained = document.querySelector('#progress-phases .progress-implementers li') === row
@@ -6270,9 +6278,12 @@ async fn run_progress_live_pipeline_observation_and_phone_layout() {
             && row.querySelector('[data-progress-start]') === clock;
           const stable = !pipeline.open && document.activeElement === summary
             && Math.abs(summary.getBoundingClientRect().top - top) < 1;
+          const stability = stable || {closed: !pipeline.open, focused: document.activeElement === summary,
+            top, after: summary.getBoundingClientRect().top, beforeFreshness,
+            freshness: document.getElementById("progress-freshness").textContent};
           pipeline.open = true;
           return {noOverflow, parallel: actual.includes('implement-A') && actual.includes('implement-B'),
-            retained, stable, observed: !!deck.state.detail.progressObservedAt,
+            retained, stable: stability, observed: !!deck.state.detail.progressObservedAt,
             quiet: document.getElementById('progress-announcement').textContent === announcement
               && !document.querySelector('#progress-phases [data-changed="1"]'),
             implementers: document.querySelectorAll('.progress-implementers li[data-state="running"]').length,
