@@ -42,7 +42,7 @@ pub(crate) async fn inspect(repo: &Path, branch: &str, path: &Path) -> Result<Fo
 }
 
 impl ForeignCheckout {
-    async fn validate(&self, repo: &Path) -> Result<()> {
+    pub(crate) async fn validate(&self, repo: &Path) -> Result<()> {
         ensure!(
             administration(&self.path).await? == self.git_dir,
             "checkout was replaced"
@@ -67,11 +67,14 @@ impl ForeignCheckout {
                 == format!("refs/heads/{}", self.branch),
             "checkout switched branches"
         );
+        let checkout_head = git::rev_parse(&self.path, "HEAD").await?;
+        let branch_head = git::rev_parse(repo, &format!("refs/heads/{}", self.branch)).await?;
         ensure!(
-            git::rev_parse(&self.path, "HEAD").await? == self.synced_head
-                && git::rev_parse(repo, &format!("refs/heads/{}", self.branch)).await?
-                    == self.synced_head,
-            "branch moved since the last synchronization"
+            checkout_head == self.synced_head && branch_head == self.synced_head,
+            "branch moved since the last synchronization (expected {}, checkout {}, branch {})",
+            self.synced_head,
+            checkout_head,
+            branch_head
         );
         for name in [
             "locked",

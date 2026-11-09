@@ -230,6 +230,11 @@ only() {
   return 0
 }
 
+if [ "$MAGI_NODE" = "conduct" ] && [ -n "$MOCK_CONDUCT_NOOP" ]; then
+  printf '{"decisions":[]}\n'
+  exit 0
+fi
+
 # The conductor (`conduct::NODE`). With `MOCK_CONDUCT_LOG` set it records that
 # it was consulted and answers the worst case: hold every task id it was shown.
 # A test that must keep the conductor away from a task asserts on the log.
@@ -253,6 +258,17 @@ if has "Your patch is open as a pull request and it is not landing"; then
   git add -A >/dev/null 2>&1
   git commit -q -m "fix the failing check" >/dev/null 2>&1
   printf '{"addressed":[],"rejected":[],"notes":"committed landfix.txt"}\n'
+  exit 0
+fi
+
+# Owner-approved merge repair leaves metadata to the launcher.
+if has "Resolve the owner-authorized retained base merge conflict"; then
+  echo "$seat" >> "$artifacts/base-conflict.log"
+  has "Choose 7200 and preserve history" || exit 9
+  if [ -n "$MOCK_BASE_CONFLICT_NOOP" ]; then exit 0; fi
+  printf 'timeout = 7200\n' > README.md
+  if [ -n "$MOCK_BASE_CONFLICT_STRAY" ]; then echo unauthorized > stray.txt; fi
+  printf '{"addressed":[],"rejected":[],"notes":"resolved approved timeout"}\n'
   exit 0
 fi
 
