@@ -1604,6 +1604,8 @@ impl Ui {
             .route("/api/runs/{id}/report", get(run_report))
             .route("/api/runs/{id}/report.json", get(run_report_json))
             .route("/api/runs/{id}/graft.diff", get(run_graft_diff))
+            .route("/api/runs/{id}/seat-evidence", get(run_seat_evidence))
+            .route("/api/runs/{id}/seat-evidence/{head}", get(run_seat_diff))
             .route("/api/runs/{id}/fold", post(run_fold))
             .route("/api/runs/{id}/fold-merged", post(run_fold_merged))
             .route("/api/runs/{id}/resume", post(run_resume))
@@ -4888,6 +4890,35 @@ async fn run_report_json(
     })
     .await?;
     Ok(Json(view))
+}
+
+/// Archive access uses validated run-owned records, never a request-supplied path.
+async fn run_seat_evidence(
+    State(ui): State<Arc<Ui>>,
+    Path(id): Path<String>,
+) -> ApiResult<impl IntoResponse> {
+    let id = resolve_run(&ui.runs, &id)?;
+    let heads = crate::retention::seat_heads(&ui.home, &id)
+        .await
+        .map_err(|e| ApiError::not_found(format!("seat evidence unavailable: {e:#}")))?;
+    Ok(Json(heads))
+}
+
+async fn run_seat_diff(
+    State(ui): State<Arc<Ui>>,
+    Path((id, head)): Path<(String, String)>,
+) -> ApiResult<impl IntoResponse> {
+    let id = resolve_run(&ui.runs, &id)?;
+    let patch = crate::retention::seat_diff(&ui.home, &id, &head)
+        .await
+        .map_err(|e| ApiError::not_found(format!("seat evidence unavailable: {e:#}")))?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        patch,
+    ))
 }
 
 /// Most of a graft diff the route returns.
@@ -11329,6 +11360,89 @@ mod tests {
                 .len(),
             items.min(crate::notices::CAP)
         );
+    }
+
+    #[tokio::test]
+    async fn source_eviction_web_diffs_survive_repository_removal_and_reject_corruption() {
+        let home = TempDir::new().unwrap();
+        let root = home.path().canonicalize().unwrap();
+        let addr = Fixture::serve(&root, root.join("repo"), launch_idle, None).await;
+        let fx = Fixture { home, addr };
+        let repo = root.as_path().join("archive-repo");
+        std::fs::create_dir(&repo).unwrap();
+        crate::git::git(&repo, &["init", "-b", "main"])
+            .await
+            .unwrap();
+        crate::git::git(&repo, &["config", "user.name", "Fixture"])
+            .await
+            .unwrap();
+        crate::git::git(&repo, &["config", "user.email", "fixture@example.invalid"])
+            .await
+            .unwrap();
+        crate::git::git(&repo, &["config", "commit.gpgsign", "false"])
+            .await
+            .unwrap();
+        std::fs::write(repo.join("source"), "base").unwrap();
+        crate::git::git(&repo, &["add", "."]).await.unwrap();
+        crate::git::git(&repo, &["commit", "-m", "base"])
+            .await
+            .unwrap();
+        let base = crate::git::rev_parse(&repo, "HEAD").await.unwrap();
+        std::fs::write(repo.join("source"), "archived review").unwrap();
+        crate::git::git(&repo, &["commit", "-am", "review"])
+            .await
+            .unwrap();
+        let head = crate::git::rev_parse(&repo, "HEAD").await.unwrap();
+        let mut config = Config::default();
+        config.graph.worktree_root = Some(root.as_path().join("copies"));
+        let mut state = RunState::new(
+            repo.clone(),
+            "main".into(),
+            base.clone(),
+            "archive".into(),
+            config,
+        );
+        state.id = "20260101-000000-ef05".into();
+        state.status = RunStatus::Ready;
+        state.save_under(root.as_path()).unwrap();
+        let evidence =
+            crate::fold_evidence::snapshot(&state, root.as_path(), &head, 64 * 1024 * 1024)
+                .await
+                .unwrap();
+        let base_evidence =
+            crate::fold_evidence::snapshot(&state, root.as_path(), &base, 64 * 1024 * 1024)
+                .await
+                .unwrap();
+        let source = state.worktree_root().join("review-1");
+        let mut contents = std::collections::BTreeMap::new();
+        contents.insert(
+            repo.join("logs/HEAD"),
+            format!("{base} {head} fixture\n").into_bytes(),
+        );
+        let record = serde_json::json!({
+            "version":1, "run":state.id, "source":source, "head":head,
+            "evidence":evidence, "admin":{}, "admin_contents":contents,
+            "history":{base:base_evidence, head.clone():evidence}, "phase":"evicted"
+        });
+        std::fs::write(
+            fx.runs()
+                .join(&state.id)
+                .join("artifacts/eviction-review-1.json"),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        std::fs::remove_dir_all(&repo).unwrap();
+        let url = format!("/api/runs/{}/seat-evidence", state.id);
+        let list = fx.get(&url).await;
+        assert_eq!(list.status, 200, "{}", list.body);
+        assert_eq!(list.json()[&head], "review-1");
+        let patch = fx.get(&format!("{url}/{head}")).await;
+        assert_eq!(patch.status, 200, "{}", patch.body);
+        assert!(patch.body.contains("+archived review"));
+        assert_eq!(fx.get(&format!("{url}/unknown")).await.status, 404);
+        std::fs::write(evidence.join("objects.pack"), "corrupt").unwrap();
+        assert_eq!(fx.get(&url).await.status, 404);
+        assert_eq!(fx.get(&format!("{url}/{head}")).await.status, 404);
     }
 
     fn request_counts(res: &Res) -> (usize, usize) {

@@ -783,8 +783,41 @@ pub async fn restore_snapshot(dir: &Path, destination: &Path) -> Result<()> {
     let manifest = load_snapshot(dir, &repo).await?;
     capture(&repo, &["checkout-index", "--all"]).await?;
     super::retention::tracked_base(&repo, &manifest.head_tree).await?;
+    // Reinstall original commit bytes as well as trees. The archive need not
+    // contain ancestors, so never ask Git to traverse their history here.
+    for commit in [&manifest.base_commit, &manifest.head_commit] {
+        input(
+            &repo,
+            &["hash-object", "-w", "-t", "commit", "--stdin"],
+            commit.clone(),
+        )
+        .await?;
+    }
+    capture(&repo, &["update-ref", "--no-deref", "HEAD", &manifest.head]).await?;
     std::fs::rename(&temp.0, destination)?;
     sync_directory(&parent)?;
+    Ok(())
+}
+
+/// Import only validated archived objects, without changing the repository's
+/// index, refs or working tree. Execution restoration holds repository coordination.
+pub(crate) async fn import_snapshot(dir: &Path, repo: &Path) -> Result<()> {
+    validate_snapshot(dir).await?;
+    let manifest: Snapshot = serde_json::from_slice(&std::fs::read(dir.join("manifest.json"))?)?;
+    input(
+        repo,
+        &["unpack-objects", "-r"],
+        std::fs::read(dir.join("objects.pack"))?,
+    )
+    .await?;
+    for commit in [&manifest.base_commit, &manifest.head_commit] {
+        input(
+            repo,
+            &["hash-object", "-w", "-t", "commit", "--stdin"],
+            commit.clone(),
+        )
+        .await?;
+    }
     Ok(())
 }
 
@@ -839,7 +872,7 @@ fn create_plain_dir(path: &Path) -> Result<()> {
 
 // Include incomplete publication products in the same per-run bound. This
 // inventory never follows symlinks or adopts unknown artifact kinds.
-fn snapshot_storage(root: &Path) -> Result<u64> {
+pub(crate) fn snapshot_storage(root: &Path) -> Result<u64> {
     plain(root)?;
     let mut dirs = vec![(root.to_owned(), 0usize)];
     let mut files = 0usize;

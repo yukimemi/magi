@@ -431,6 +431,21 @@ pub(super) async fn evidence(
     state: &RunState,
     paths: &[PathBuf],
 ) -> Result<BTreeMap<PathBuf, String>> {
+    evidence_with(state, paths, false).await
+}
+
+pub(super) async fn execution_evidence(
+    state: &RunState,
+    paths: &[PathBuf],
+) -> Result<BTreeMap<PathBuf, String>> {
+    evidence_with(state, paths, true).await
+}
+
+async fn evidence_with(
+    state: &RunState,
+    paths: &[PathBuf],
+    executing: bool,
+) -> Result<BTreeMap<PathBuf, String>> {
     let mut result = BTreeMap::new();
     for path in paths {
         let admin = git::git(path, &["rev-parse", "--absolute-git-dir"]).await?;
@@ -487,7 +502,7 @@ pub(super) async fn evidence(
                                 | "magi-setup-paths"
                                 | "magi-setup-exclude"
                         )
-                    ),
+                    ) || executing && crate::incremental::current_wrapper(&entry.path())?,
                     "unknown Git administration artifact: {}",
                     name.to_string_lossy()
                 );

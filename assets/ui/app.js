@@ -27,6 +27,8 @@ const API = {
   resumeRun: (id) => `/api/runs/${encodeURIComponent(id)}/resume`,
   report: (id) => `/api/runs/${encodeURIComponent(id)}/report`,
   graftDiff: (id) => `/api/runs/${encodeURIComponent(id)}/graft.diff`,
+  seatEvidence: (id) => `/api/runs/${encodeURIComponent(id)}/seat-evidence`,
+  seatDiff: (id, head) => `/api/runs/${encodeURIComponent(id)}/seat-evidence/${encodeURIComponent(head)}`,
   reportJson: (id) => `/api/runs/${encodeURIComponent(id)}/report.json`,
   queue: "/api/queue",
   search: (scope, q) => `/api/search?scope=${scope}&q=${encodeURIComponent(q)}`,
@@ -7834,6 +7836,33 @@ function renderSection(runId, s) {
   }
 }
 
+function archivedSeatEvidence(runId) {
+  const body = el("div", { class: "rmeta", text: "Open to load archived diffs." });
+  const details = el("details", { class: "rout" },
+    el("summary", { text: "archived seat diffs" }), body);
+  details.addEventListener("toggle", async () => {
+    if (!details.open || details.dataset.loaded) return;
+    details.dataset.loaded = "true";
+    try {
+      const response = await fetch(API.seatEvidence(runId));
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const heads = await response.json();
+      clear(body);
+      for (const [head, seat] of Object.entries(heads)) {
+        append(body, [el("div", {}, el("a", {
+          href: API.seatDiff(runId, head),
+          target: "_blank", rel: "noopener", text: `${seat} ${head}`,
+        }))]);
+      }
+      if (!Object.keys(heads).length) body.textContent = "No archived seat diffs.";
+    } catch (error) {
+      body.textContent = `Archived evidence unavailable: ${error.message}`;
+      delete details.dataset.loaded;
+    }
+  });
+  return details;
+}
+
 function renderReportCards() {
   const view = state.detail.reportView;
   const box = $("run-report-cards");
@@ -7887,6 +7916,7 @@ function renderReportCards() {
       h.origin ? el("div", { class: "rmeta", text: h.origin }) : null),
     view.active_seats ? el("details", { class: "rout" }, el("summary", { text: "active seats" }), el("pre", { class: "rpre", text: view.active_seats })) : null,
     view.sections.map((s) => renderSection(runId, s)),
+    archivedSeatEvidence(runId),
   ]);
 }
 

@@ -6,12 +6,17 @@ inactive, non-resumable source copies when `disk.auto_fold` and a positive
 folding, task retirement, and incremental cache reclamation. Task history,
 review rounds, retention markers, candidate branches and run records remain.
 
-The initial scope is detached `review-N`, `judge-N`, and `advisor-N` copies with
-recorded base/review HEADs, plus empty Superseded candidate attempts whose actual
-branch, HEAD, index and files still equal their original base. Changed
-implementation candidates and resumable runs remain materialized. Public, selected recovery,
-approval and explicit source-retention authority blocks eviction. Unknown run
-or task records, cross-run source path references, live owners/drivers, borrowed output
+The scope is registered detached `review-N`, `judge-N`, and `advisor-N` copies,
+plus empty Superseded candidate attempts whose actual branch, HEAD, index and
+files still equal their original base. Complete snapshots prove detached seat
+HEADs, including tips unrelated to the base or absent from review rounds.
+Changed implementation candidates and resumable runs remain materialized.
+Public/merged, approval, interrupted-preservation and recovery metadata retain
+implementation authority independently of disposable read seats. Run IDs in
+recovery selections alone do not borrow a read seat. Explicit source-retention
+markers, owner questions, task resume pins/replacements and unfinished seat
+answers still block eviction. Unknown run
+or task records, concrete path references (including the owning run), live owners/drivers, borrowed output
 leases, recent activity, Git operations/local refs, unknown administration,
 unarchivable recovery history, dirty/index-hidden edits, ignored/untracked entries,
 symlinks and even unknown empty directories block deletion. Build outputs are
@@ -51,12 +56,19 @@ absent. A missing-but-registered checkout can finish only when its entire
 remaining Git administration exactly matches the archived contents under an
 exclusive output lease. Missing/corrupt evidence or changed/unknown
 administration remains a reported blocker. A changed or recreated checkout is not silently adopted.
+Re-materialized seats use subsequent `eviction-<seat>-<generation>.json` records,
+up to 128 generations; completed generations are never overwritten. Version 2
+records pin their original base independently of later run base updates;
+version 1 records infer and validate it from their immutable evidence identity.
+Existing restored seats may follow recorded review/base checkpoints, while
+unrecorded heads and unknown working files stop execution.
 Truly empty, inactive, unborrowed roots without Git registrations are removed
 with `remove_dir`, without retiring the run or deleting any records.
 
 A successor's lineage ID reference alone does not borrow a checkout. Explicit
-recovery selections, task pins/replacements, concrete path references and output
-leases continue to block eviction. Unreadable ownership records still block
+implementation recovery selections still protect implementation checkouts.
+Concrete path references name the owning run/task and field in retention reasons;
+continuation leases and resume contracts have separate reasons. Unreadable ownership records still block
 source eviction because they may hide a borrower; other housekeeping continues.
 
 To list archived seat tips or reconstruct one by its full recorded head:
@@ -82,8 +94,25 @@ Both commands validate the archive first. Restore requires a new destination
 and produces an independent inspection repository with the source index and
 files. Original commit metadata and complete base/source trees remain in the
 archive; restoring does not select a recovery source, resume a task, change a
-public branch, or grant approval. Implementation sources requiring automatic
-resumption remain protected.
+public branch, or grant approval. Inspection restoration also reinstalls the
+original base/head commit objects and points detached HEAD at the original tip.
+
+Execution has a separate restoration contract before graph dispatch, prep shortcuts
+or continuation delivery: under owner/driver and repository coordination leases,
+validate the latest generation, import complete objects without touching the
+repository index or refs, recreate the original detached worktree, and run its
+normal setup. This covers explicit reentry of terminal runs after GC. Resumable
+runs remain protected rather than relying on this to recover persistent sessions.
+An existing changed/unregistered/noncanonical entity, pending eviction, corrupted
+archive or interrupted setup stops execution for inspection. A durable
+`restore-<seat>.pending` marker fences incomplete restoration; it is removed only
+after setup succeeds. Restoration never selects an implementation or changes
+recovery/approval authority.
+
+The structured run report has an “archived seat diffs” section. Its run-scoped
+`seat-evidence` API lists validated heads and serves their archived binary diffs;
+no repository, checkout or live Git object lookup is needed. Unknown heads and
+corrupt archives fail closed.
 
 `retention.json` distinguishes source logical bytes unlinked, estimated
 allocated file blocks unlinked, evidence logical/allocated growth, copies
