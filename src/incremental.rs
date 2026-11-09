@@ -79,19 +79,8 @@ pub(crate) fn configure(command: &mut tokio::process::Command, worktree: &Path) 
     #[cfg(unix)]
     if worktree.join(".git").is_file() {
         let git = git_dir(worktree)?;
-        let executable = std::env::current_exe()?;
-        // A stable script name per executable also handles worker generations.
-        let hash: String = Sha256::digest(executable.as_os_str().as_encoded_bytes())
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
-        let name = format!("magi-rustc-{hash}.sh");
+        let (name, body) = wrapper_spec()?;
         let script = git.join(name);
-        let quote = |p: &Path| format!("'{}'", p.to_string_lossy().replace('\'', "'\\''"));
-        let body = format!(
-            "#!/bin/sh\nexec {} __magi_incremental \"$@\"\n",
-            quote(&executable)
-        );
         publish_wrapper(&script, &body, || {
             use std::sync::atomic::{AtomicU64, Ordering};
             static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -153,6 +142,40 @@ impl WrapperTemporary {
 impl Drop for WrapperTemporary {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
+    }
+}
+
+#[cfg(unix)]
+fn wrapper_spec() -> Result<(String, String)> {
+    let executable = std::env::current_exe()?;
+    let hash: String = Sha256::digest(executable.as_os_str().as_encoded_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let name = format!("magi-rustc-{hash}.sh");
+    let quote = |p: &Path| format!("'{}'", p.to_string_lossy().replace('\'', "'\\''"));
+    let body = format!(
+        "#!/bin/sh\nexec {} __magi_incremental \"$@\"\n",
+        quote(&executable)
+    );
+    Ok((name, body))
+}
+
+/// Execution may encounter the exact compiler wrapper its own setup created.
+/// This is not an exemption for arbitrary administration during eviction.
+pub(crate) fn current_wrapper(path: &Path) -> Result<bool> {
+    #[cfg(unix)]
+    {
+        let (name, body) = wrapper_spec()?;
+        if path.file_name() != Some(std::ffi::OsStr::new(&name)) {
+            return Ok(false);
+        }
+        Ok(plain(path)?.is_file() && fs::read(path)? == body.as_bytes())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(false)
     }
 }
 
@@ -1197,6 +1220,24 @@ pub(crate) mod tests {
         .unwrap();
         assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
         assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn execution_wrapper_identity_rejects_changed_unknown_and_symlink_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let (name, body) = wrapper_spec().unwrap();
+        let script = root.join(name);
+        fs::write(&script, &body).unwrap();
+        assert!(current_wrapper(&script).unwrap());
+        let unknown = root.join("operator-checkpoint");
+        fs::write(&unknown, &body).unwrap();
+        assert!(!current_wrapper(&unknown).unwrap());
+        fs::write(&script, "changed").unwrap();
+        assert!(!current_wrapper(&script).unwrap());
+        fs::remove_file(&script).unwrap();
+        std::os::unix::fs::symlink(&unknown, &script).unwrap();
+        assert!(current_wrapper(&script).is_err());
     }
 
     #[test]

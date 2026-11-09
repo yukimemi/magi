@@ -1925,6 +1925,16 @@ impl Runner {
     }
 
     async fn execute_graph(&mut self) -> Result<()> {
+        // Even a terminal run may reenter through an explicit recovery action.
+        // Restore before prep shortcuts, saved conversations or graph nodes use
+        // a disposable path; GC may already have removed its original objects.
+        let archive_home = crate::run::home().canonicalize()?;
+        if crate::retention::has_archived_seats(&archive_home, &self.state)? {
+            let repo = self.state.repo.clone();
+            let _coordination = self.coordinate(&repo).await?;
+            ensure_setup_config(&mut self.state, &repo).await?;
+            crate::retention::restore_execution_seats(&archive_home, &self.state).await?;
+        }
         self.state.configure_recovery_resume()?;
         if self
             .state
@@ -18195,6 +18205,149 @@ esac
             pause: Pause::new(),
             interrupt: Pause::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn source_eviction_resume_restores_before_graph_shortcuts_and_setup() {
+        crate::run::pin_test_home();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let repo = root.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo);
+        git::git(&repo, &["config", "core.autocrlf", "false"])
+            .await
+            .unwrap();
+        let mut runner = runner_at(RunStatus::Blocked);
+        runner.state.repo = repo.clone();
+        runner.state.base_commit = git::rev_parse(&repo, "HEAD").await.unwrap();
+        runner.state.config.agents = vec![conductor()];
+        runner.state.config.graph.selected_implementer = Some("conductor".into());
+        runner.state.config.graph.worktree_root = Some(root.join("worktrees"));
+        let (shell, command, setup_output) = if cfg!(windows) {
+            (
+                vec!["cmd".into(), "/C".into()],
+                "echo ready>seat-ready",
+                "ready\r\n",
+            )
+        } else {
+            (
+                vec!["sh".into(), "-c".into()],
+                "printf ready > seat-ready",
+                "ready",
+            )
+        };
+        runner.state.config.verify.shell = Some(shell);
+        runner.state.config.worktree.setup = vec![crate::config::SetupStep {
+            run: Some(command.into()),
+            ..Default::default()
+        }];
+        runner.state.save().unwrap();
+        let path = runner.state.worktree_root().join("judge-1");
+        git::worktree_add_detached(&repo, &path, &runner.state.base_commit)
+            .await
+            .unwrap();
+        std::fs::write(path.join("checkpoint"), "unrelated seat").unwrap();
+        git::git(&path, &["add", "."]).await.unwrap();
+        let tree = git::git(&path, &["write-tree"]).await.unwrap();
+        let head = git::git(&path, &["commit-tree", &tree, "-m", "seat checkpoint"])
+            .await
+            .unwrap();
+        git::git(&path, &["checkout", "--detach", &head])
+            .await
+            .unwrap();
+        let evidence = crate::fold_evidence::snapshot(
+            &runner.state,
+            &crate::run::home().canonicalize().unwrap(),
+            &head,
+            64 * 1024 * 1024,
+        )
+        .await
+        .unwrap();
+        let mut contents = BTreeMap::new();
+        contents.insert(
+            repo.join("logs/HEAD"),
+            format!("{head} {head} fixture\n").into_bytes(),
+        );
+        let record = serde_json::json!({
+            "version":1, "run":runner.state.id, "source":path, "head":head,
+            "evidence":evidence, "admin":{}, "admin_contents":contents,
+            "history":{head.clone():evidence}, "phase":"evicted"
+        });
+        std::fs::write(
+            runner.state.dir().join("artifacts/eviction-judge-1.json"),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        assert!(git::worktree_remove_clean(&repo, &path).await.unwrap());
+        git::git(&repo, &["reflog", "expire", "--expire=now", "--all"])
+            .await
+            .unwrap();
+        git::git(&repo, &["gc", "--prune=now"]).await.unwrap();
+        assert!(
+            !git::git_raw(&repo, &["cat-file", "-e", &head])
+                .await
+                .unwrap()
+                .ok()
+        );
+        let mut resumed = Runner::resume(&runner.state.id).unwrap();
+        let error = resumed.execute().await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("selected implementation is held"),
+            "{error:#}"
+        );
+        assert_eq!(git::rev_parse(&path, "HEAD").await.unwrap(), head);
+        assert_eq!(
+            std::fs::read_to_string(path.join("seat-ready")).unwrap(),
+            setup_output
+        );
+        assert_eq!(
+            std::fs::read_to_string(path.join("checkpoint")).unwrap(),
+            "unrelated seat"
+        );
+        let error = resumed.execute().await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("selected implementation is held"),
+            "{error:#}"
+        );
+        std::fs::write(path.join("checkpoint"), "next recorded review").unwrap();
+        git::git(&path, &["add", "."]).await.unwrap();
+        let next_tree = git::git(&path, &["write-tree"]).await.unwrap();
+        let next = git::git(
+            &path,
+            &[
+                "commit-tree",
+                &next_tree,
+                "-p",
+                &head,
+                "-m",
+                "next review checkpoint",
+            ],
+        )
+        .await
+        .unwrap();
+        git::git(&path, &["checkout", "--detach", &next])
+            .await
+            .unwrap();
+        resumed.state.reviews.push(
+            serde_json::from_value(serde_json::json!({
+                "round":1, "head":next, "reviews":[]
+            }))
+            .unwrap(),
+        );
+        resumed.state.save().unwrap();
+        let error = resumed.execute().await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("selected implementation is held"),
+            "{error:#}"
+        );
+        assert_eq!(git::rev_parse(&path, "HEAD").await.unwrap(), next);
     }
 
     #[tokio::test]

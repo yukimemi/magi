@@ -368,6 +368,43 @@ pub(crate) fn sync_directory(_path: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn inspection_initialization_preserves_original_blob_line_endings() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().canonicalize().unwrap();
+        init_inspection(&repo).await.unwrap();
+        git::git(&repo, &["config", "core.autocrlf", "true"])
+            .await
+            .unwrap();
+        git::git(&repo, &["config", "core.eol", "crlf"])
+            .await
+            .unwrap();
+        init_inspection(&repo).await.unwrap();
+        let object = input(
+            &repo,
+            &["hash-object", "-w", "--stdin"],
+            b"original\n".to_vec(),
+        )
+        .await
+        .unwrap();
+        let object = String::from_utf8(object).unwrap();
+        git::git(
+            &repo,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                "100644",
+                object.trim(),
+                "line.txt",
+            ],
+        )
+        .await
+        .unwrap();
+        git::git(&repo, &["checkout-index", "--all"]).await.unwrap();
+        assert_eq!(std::fs::read(repo.join("line.txt")).unwrap(), b"original\n");
+    }
+
     #[cfg(unix)]
     #[test]
     fn evidence_staging_preserves_unknown_symlinks() -> Result<()> {
@@ -404,12 +441,14 @@ mod tests {
     }
 }
 
-/// A bounded, history-independent tree archive. Pack input is an explicit set
-/// of tree/blob objects, never a revision walk through the repository history.
+/// A bounded source archive. An anchored pack closes HEAD down to a retained
+/// base; independent heads carry their full closure. Endpoint trees are complete.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Snapshot {
     version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    anchor: Option<String>,
     head: String,
     base: String,
     head_tree: String,
@@ -522,6 +561,40 @@ pub(crate) async fn snapshot(
             ensure!(objects.len() <= MAX_FILES, "snapshot object limit exceeded");
         }
     }
+    // Pin the shared base before excluding its closure. The immutable ref is
+    // independent of operator/candidate branches and survives ordinary Git GC.
+    let anchor = if is_ancestor(&state.repo, &state.base_commit, head).await? {
+        retained_anchor(&state.repo, &state.base_commit, true).await?;
+        Some(state.base_commit.clone())
+    } else {
+        None
+    };
+    let commit_limit = format!("--max-count={}", MAX_FILES + 1);
+    let excluded = anchor.as_ref().map(|base| format!("^{base}"));
+    let mut revisions = vec![
+        "rev-list",
+        "--objects",
+        "--no-object-names",
+        &commit_limit,
+        head,
+    ];
+    if let Some(excluded) = &excluded {
+        revisions.push(excluded);
+    }
+    let ancestry = capture(&state.repo, &revisions)
+        .await
+        .context("cannot enumerate snapshot commit ancestry")?;
+    for oid in std::str::from_utf8(&ancestry)?.lines() {
+        ensure!(
+            matches!(oid.len(), 40 | 64) && oid.bytes().all(|b| b.is_ascii_hexdigit()),
+            "invalid ancestry object identity"
+        );
+        objects.insert(oid.to_owned());
+        ensure!(
+            objects.len() <= MAX_FILES,
+            "snapshot ancestry/object limit exceeded"
+        );
+    }
     let object_list = objects
         .iter()
         .map(|s| s.to_owned() + "\n")
@@ -561,7 +634,8 @@ pub(crate) async fn snapshot(
         "snapshot commit metadata limit exceeded"
     );
     let manifest = Snapshot {
-        version: 1,
+        version: 2,
+        anchor,
         head: head.to_owned(),
         base: state.base_commit.clone(),
         base_tree,
@@ -626,7 +700,7 @@ pub(crate) async fn snapshot(
         &mut bytes,
         &mut files,
     )?;
-    validate_snapshot(&pending).await?;
+    validate_execution_snapshot_for(&pending, &state.repo).await?;
     std::fs::rename(&pending, &dir)?;
     sync_directory(&parent)?;
     Ok(dir)
@@ -640,7 +714,17 @@ async fn load_snapshot(dir: &Path, repo: &Path) -> Result<Snapshot> {
         "snapshot manifest limit exceeded"
     );
     let manifest: Snapshot = serde_json::from_slice(&std::fs::read(dir.join("manifest.json"))?)?;
-    ensure!(manifest.version == 1, "unsupported snapshot version");
+    ensure!(
+        matches!(manifest.version, 1 | 2),
+        "unsupported snapshot version"
+    );
+    ensure!(
+        manifest
+            .anchor
+            .as_ref()
+            .is_none_or(|anchor| manifest.version == 2 && anchor == &manifest.base),
+        "invalid snapshot anchor"
+    );
     for oid in [
         &manifest.head,
         &manifest.base,
@@ -723,15 +807,24 @@ pub(crate) async fn validate_identity(dir: &Path, head: &str, base: &str) -> Res
     Ok(())
 }
 
+async fn init_inspection(repo: &Path) -> Result<()> {
+    git::git(repo, &["init", "--quiet", "--template="]).await?;
+    let top = git::git(repo, &["rev-parse", "--show-toplevel"]).await?;
+    ensure!(
+        git::canonical_output_path(&top)? == repo,
+        "inspection worktree redirected by Git configuration"
+    );
+    // Inspection materializes original blob bytes, independent of host EOL
+    // defaults (notably Git for Windows' core.autocrlf setting).
+    git::git(repo, &["config", "core.autocrlf", "false"]).await?;
+    git::git(repo, &["config", "core.eol", "lf"]).await?;
+    Ok(())
+}
+
 pub(crate) async fn validate_snapshot(dir: &Path) -> Result<()> {
     let temp = Inspection::new(&std::env::temp_dir())?;
     let repo = temp.0.clone();
-    git::git(&repo, &["init", "--quiet", "--template="]).await?;
-    ensure!(
-        git::git(&repo, &["rev-parse", "--show-toplevel"]).await?
-            == repo.to_str().context("inspection path")?,
-        "inspection worktree redirected by Git configuration"
-    );
+    init_inspection(&repo).await?;
     let manifest = load_snapshot(dir, &repo).await?;
     // The archive must reproduce its source through the displayed binary
     // patch, not just contain two individually valid trees. This repository
@@ -751,6 +844,161 @@ pub(crate) async fn validate_snapshot(dir: &Path) -> Result<()> {
         capture(&repo, &["read-tree", "--reset", "-u", tree]).await?;
         super::retention::tracked_base(&repo, tree).await?;
     }
+    Ok(())
+}
+
+// Only this namespace is managed by evidence publication. Never move an
+// existing pin, adopt a symbolic/symlink ref, or write through aliased parents.
+async fn retained_anchor(repo: &Path, base: &str, create: bool) -> Result<()> {
+    ensure!(
+        matches!(base.len(), 40 | 64) && base.bytes().all(|b| b.is_ascii_hexdigit()),
+        "invalid source anchor ID"
+    );
+    ensure!(
+        git::git(repo, &["rev-parse", "--is-shallow-repository"]).await? == "false",
+        "source anchor requires a complete shared repository"
+    );
+    let common = crate::repo_lock::common_dir(repo)
+        .await?
+        .context("missing shared repository")?;
+    // A local ref cannot protect objects owned by an alternate or promisor.
+    let objects = common.join("objects");
+    plain(&objects).context("source anchor object store is not canonical")?;
+    for name in ["alternates", "http-alternates"] {
+        let path = objects.join("info").join(name);
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) => {
+                plain(&path)?;
+                ensure!(
+                    meta.is_file() && meta.len() == 0,
+                    "source anchor cannot depend on borrowed objects: {name}"
+                );
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let promisor = git::git_raw(
+        repo,
+        &[
+            "config",
+            "--get-regexp",
+            r"^(extensions\.partialclone|remote\..*\.promisor)$",
+        ],
+    )
+    .await?;
+    ensure!(
+        promisor.code == Some(1),
+        "source anchor cannot depend on promisor objects or unreadable configuration"
+    );
+    let packs = objects.join("pack");
+    if packs.try_exists()? {
+        plain(&packs)?;
+        for (count, entry) in std::fs::read_dir(&packs)?.enumerate() {
+            ensure!(
+                count < MAX_FILES,
+                "source anchor pack inspection limit exceeded"
+            );
+            ensure!(
+                !entry?.path().extension().is_some_and(|s| s == "promisor"),
+                "source anchor cannot depend on promisor packs"
+            );
+        }
+    }
+    let name = format!("refs/magi/source-anchors/{base}");
+    let mut file = common.clone();
+    for part in name.split('/') {
+        file.push(part);
+        match std::fs::symlink_metadata(&file) {
+            Ok(_) => plain(&file).context("noncanonical source anchor")?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    ensure!(
+        !git::git_raw(repo, &["symbolic-ref", "-q", &name])
+            .await?
+            .ok(),
+        "symbolic source anchor retained"
+    );
+    let existing = git::git_raw(repo, &["rev-parse", "--verify", &name]).await?;
+    if !existing.ok() {
+        ensure!(create, "retained source anchor missing: {name}");
+        // Certify the existing history once before publishing its immutable pin.
+        capture(
+            repo,
+            &[
+                "fsck",
+                "--connectivity-only",
+                "--no-reflogs",
+                "--no-dangling",
+                base,
+            ],
+        )
+        .await
+        .context("incomplete shared source anchor ancestry")?;
+        let absent = "0".repeat(base.len());
+        git::git(repo, &["update-ref", "--no-deref", &name, base, &absent]).await?;
+    }
+    ensure!(
+        git::rev_parse(repo, &name).await? == base,
+        "retained source anchor changed: {name}"
+    );
+    Ok(())
+}
+
+// Shallow boundaries are confined to independent inspection repositories.
+// The shared repository is never made shallow and must retain the real base.
+async fn inspection_anchor(repo: &Path, manifest: &Snapshot) -> Result<()> {
+    if let Some(anchor) = &manifest.anchor {
+        input(
+            repo,
+            &["hash-object", "-w", "-t", "commit", "--stdin"],
+            manifest.base_commit.clone(),
+        )
+        .await?;
+        std::fs::write(repo.join(".git/shallow"), format!("{anchor}\n"))?;
+    }
+    Ok(())
+}
+
+/// Verify the retained boundary as well as the archive's relative closure.
+pub(crate) async fn validate_execution_snapshot_for(dir: &Path, repo: &Path) -> Result<()> {
+    validate_execution_snapshot(dir).await?;
+    let manifest: Snapshot = serde_json::from_slice(&std::fs::read(dir.join("manifest.json"))?)?;
+    if let Some(anchor) = &manifest.anchor {
+        retained_anchor(repo, anchor, false).await?;
+    }
+    Ok(())
+}
+
+/// Prove a HEAD can become reachable without adding missing-parent history.
+/// Older tree-only snapshots remain useful for diffs and index restoration,
+/// but must pass this independent check before any shared-store import.
+pub(crate) async fn validate_execution_snapshot(dir: &Path) -> Result<()> {
+    validate_snapshot(dir).await?;
+    let temp = Inspection::new(&std::env::temp_dir())?;
+    init_inspection(&temp.0).await?;
+    let manifest = load_snapshot(dir, &temp.0).await?;
+    inspection_anchor(&temp.0, &manifest).await?;
+    input(
+        &temp.0,
+        &["hash-object", "-w", "-t", "commit", "--stdin"],
+        manifest.head_commit,
+    )
+    .await?;
+    capture(
+        &temp.0,
+        &[
+            "fsck",
+            "--connectivity-only",
+            "--no-reflogs",
+            "--no-dangling",
+            &manifest.head,
+        ],
+    )
+    .await
+    .context("incomplete archived commit ancestry")?;
     Ok(())
 }
 
@@ -774,17 +1022,66 @@ pub async fn restore_snapshot(dir: &Path, destination: &Path) -> Result<()> {
     );
     let temp = Inspection::new(&parent)?;
     let repo = temp.0.clone();
-    git::git(&repo, &["init", "--quiet", "--template="]).await?;
-    ensure!(
-        git::git(&repo, &["rev-parse", "--show-toplevel"]).await?
-            == repo.to_str().context("inspection path")?,
-        "inspection worktree redirected by Git configuration"
-    );
+    init_inspection(&repo).await?;
     let manifest = load_snapshot(dir, &repo).await?;
     capture(&repo, &["checkout-index", "--all"]).await?;
     super::retention::tracked_base(&repo, &manifest.head_tree).await?;
+    // Legacy archives may contain only trees. Keep those inspections unborn
+    // rather than manufacture a reachable commit with missing parents.
+    let executable = match validate_execution_snapshot(dir).await {
+        Ok(()) => true,
+        Err(error) if manifest.version == 2 => return Err(error),
+        Err(_) => false,
+    };
+    if executable {
+        inspection_anchor(&repo, &manifest).await?;
+        input(
+            &repo,
+            &["hash-object", "-w", "-t", "commit", "--stdin"],
+            manifest.head_commit,
+        )
+        .await?;
+        capture(&repo, &["update-ref", "--no-deref", "HEAD", &manifest.head]).await?;
+    }
     std::fs::rename(&temp.0, destination)?;
     sync_directory(&parent)?;
+    Ok(())
+}
+
+/// Import only validated archived objects, without changing the repository's
+/// index, refs or working tree. Execution restoration holds repository coordination.
+pub(crate) async fn import_snapshot(dir: &Path, repo: &Path) -> Result<()> {
+    // Validate in isolation before introducing any commit into the shared store.
+    validate_execution_snapshot_for(dir, repo).await?;
+    let manifest: Snapshot = serde_json::from_slice(&std::fs::read(dir.join("manifest.json"))?)?;
+    if let Some(anchor) = &manifest.anchor {
+        capture(
+            repo,
+            &[
+                "fsck",
+                "--connectivity-only",
+                "--no-reflogs",
+                "--no-dangling",
+                anchor,
+            ],
+        )
+        .await
+        .context("incomplete shared source anchor ancestry")?;
+    }
+    input(
+        repo,
+        &["unpack-objects", "-r"],
+        std::fs::read(dir.join("objects.pack"))?,
+    )
+    .await?;
+    // The base commit is metadata, not necessarily an ancestor of this HEAD.
+    // Only the proved HEAD closure may become commit objects in this store.
+    input(
+        repo,
+        &["hash-object", "-w", "-t", "commit", "--stdin"],
+        manifest.head_commit,
+    )
+    .await?;
     Ok(())
 }
 
@@ -839,7 +1136,7 @@ fn create_plain_dir(path: &Path) -> Result<()> {
 
 // Include incomplete publication products in the same per-run bound. This
 // inventory never follows symlinks or adopts unknown artifact kinds.
-fn snapshot_storage(root: &Path) -> Result<u64> {
+pub(crate) fn snapshot_storage(root: &Path) -> Result<u64> {
     plain(root)?;
     let mut dirs = vec![(root.to_owned(), 0usize)];
     let mut files = 0usize;
@@ -869,4 +1166,71 @@ fn snapshot_storage(root: &Path) -> Result<u64> {
         }
     }
     Ok(bytes)
+}
+
+#[cfg(all(test, unix))]
+pub(crate) mod fixtures {
+    use super::*;
+
+    pub(crate) async fn shared_history(repo: &Path, parent: &str, count: usize) {
+        let mut stream = String::new();
+        for i in 1..=count {
+            let from = if i == 1 {
+                parent.to_owned()
+            } else {
+                format!(":{}", i - 1)
+            };
+            stream.push_str(&format!("commit refs/heads/main\nmark :{i}\ncommitter Fixture <fixture@example.invalid> {i} +0000\ndata 1\nx\nfrom {from}\n\n"));
+        }
+        input(repo, &["fast-import", "--quiet"], stream.into_bytes())
+            .await
+            .unwrap();
+    }
+
+    // Reproduce the old writer, which stored complete endpoint trees but no
+    // commit ancestry. This modifies only isolated fixture evidence.
+    pub(crate) async fn tree_only_archive(
+        state: &RunState,
+        home: &Path,
+        head: &str,
+    ) -> std::path::PathBuf {
+        let archive = snapshot(state, home, head, MAX_BYTES).await.unwrap();
+        let mut manifest: Snapshot =
+            serde_json::from_slice(&std::fs::read(archive.join("manifest.json")).unwrap()).unwrap();
+        manifest.version = 1;
+        manifest.anchor = None;
+        let mut objects = BTreeSet::from([manifest.base_tree.clone(), manifest.head_tree.clone()]);
+        for tree in [&manifest.base_tree, &manifest.head_tree] {
+            for oid in git::git(
+                &state.repo,
+                &["ls-tree", "-r", "-t", "--format=%(objectname)", tree],
+            )
+            .await
+            .unwrap()
+            .lines()
+            {
+                objects.insert(oid.to_owned());
+            }
+        }
+        let pack = input(
+            &state.repo,
+            &["pack-objects", "--stdout"],
+            objects
+                .iter()
+                .map(|s| s.to_owned() + "\n")
+                .collect::<String>()
+                .into_bytes(),
+        )
+        .await
+        .unwrap();
+        manifest.pack_hash = digest(&state.repo, pack.clone()).await.unwrap();
+        std::fs::write(archive.join("objects.pack"), pack).unwrap();
+        std::fs::write(
+            archive.join("manifest.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        validate_snapshot(&archive).await.unwrap();
+        archive
+    }
 }

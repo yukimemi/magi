@@ -3,6 +3,32 @@
 mod copies;
 pub mod reconcile;
 
+pub(crate) fn has_archived_seats(home: &Path, state: &RunState) -> Result<bool> {
+    let artifacts = home.join("runs").join(&state.id).join("artifacts");
+    if !artifacts.try_exists()? {
+        return Ok(false);
+    }
+    ensure!(
+        plain_dir(&artifacts) && artifacts.canonicalize()? == artifacts,
+        "noncanonical artifacts"
+    );
+    for (i, entry) in std::fs::read_dir(artifacts)?.enumerate() {
+        ensure!(i < 4096, "eviction record inspection limit exceeded");
+        let name = entry?.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("eviction-") && name.ends_with(".json") {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Re-materialize evicted read seats before execution can consume their paths.
+/// Caller owns the run's driver/owner leases and repository coordination.
+pub(crate) async fn restore_execution_seats(home: &Path, state: &RunState) -> Result<()> {
+    copies::restore_execution_seats(home, state).await
+}
+
 /// Read the binary diff after verifying its independent source archive.
 pub async fn source_diff(evidence: &Path) -> Result<Vec<u8>> {
     crate::fold_evidence::validate_snapshot(evidence).await?;
@@ -17,6 +43,19 @@ pub async fn restore_source(evidence: &Path, destination: &Path) -> Result<()> {
 /// List archived checkout tips for a run, validating their durable evidence.
 pub async fn seat_evidence(home: &Path, id: &str) -> Result<Vec<String>> {
     copies::seat_evidence(home, id).await
+}
+
+/// Validated archived heads and seat labels for the run's evidence browser.
+pub async fn seat_heads(
+    home: &Path,
+    id: &str,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    copies::seat_heads(home, id).await
+}
+
+/// Read a recorded seat's diff without relying on its checkout or Git objects.
+pub async fn seat_diff(home: &Path, id: &str, head: &str) -> Result<Vec<u8>> {
+    copies::seat_diff(home, id, head).await
 }
 
 /// Restore a recorded checkout tip without changing run or recovery authority.
@@ -435,6 +474,12 @@ fn registered_worktrees(state: &RunState, list: &str) -> Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
     for path in list.lines().filter_map(|l| l.strip_prefix("worktree ")) {
         let path = PathBuf::from(path);
+        #[cfg(windows)]
+        let path = if plain_dir(&path) {
+            git::canonical_output_path(path.to_str().context("non UTF-8 registration")?)?
+        } else {
+            continue;
+        };
         if plain_dir(&path)
             && path.parent() == Some(root.as_path())
             && path.canonicalize()? == path
@@ -1421,7 +1466,8 @@ pub(crate) async fn tracked_base(worktree: &Path, base: &str) -> Result<()> {
                 "tracked executable mode differs from original base"
             );
         }
-        files.push(path.to_str().context("non UTF-8 source")?.to_owned());
+        path.to_str().context("non UTF-8 source")?;
+        files.push(git::path_arg(&path));
         blobs.push(parts[2].to_owned());
     }
     for (paths, expected) in files.chunks(64).zip(blobs.chunks(64)) {
@@ -4986,6 +5032,730 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn source_eviction_separates_run_authority_from_read_seats() {
+        for status in [RunStatus::Superseded, RunStatus::Ready, RunStatus::Merged] {
+            let f = Fx::new().await;
+            let mut state = inactive_source(&f, "ef01", true).await;
+            state.status = status;
+            state.pr = Some(
+                serde_json::from_value(serde_json::json!({
+                    "url":"https://example.invalid/pull/1", "number":1, "state":"merged",
+                    "checks":"green", "round":1, "rounds":1
+                }))
+                .unwrap(),
+            );
+            state.pr_head = Some(state.candidates[0].branch.clone());
+            state.pr_merged_head = Some(f.base.clone());
+            state.recovery = Some(
+                serde_json::from_value(serde_json::json!({
+                    "from_run": "20260101-000000-abcd", "generation": 1,
+                    "mode": "full-review"
+                }))
+                .unwrap(),
+            );
+            state.pr_recovery = Some(
+                serde_json::from_value(serde_json::json!({
+                    "url": "https://example.invalid/pull/1", "branch": "public",
+                    "head": f.base, "source_run": state.id,
+                    "instruction": "keep implementation", "approved_at": Fx::now()
+                }))
+                .unwrap(),
+            );
+            state.save_under(&f.home).unwrap();
+            let review = reviewer(&f, &state, &f.base).await;
+            let mut other = inactive_source(&f, "ef02", true).await;
+            other.pr_recovery = state.pr_recovery.clone();
+            other.save_under(&f.home).unwrap();
+            let mut task = f.task(&[state.clone(), other]);
+            task.pr_recovery = state.pr_recovery.clone();
+            crate::queue::Queue::at(f.home.join("queue"))
+                .put(&mut task)
+                .unwrap();
+            let run_path = f.home.join("runs").join(&state.id).join("run.json");
+            let before = std::fs::read(&run_path).unwrap();
+            let task_before = serde_json::to_value(&task).unwrap();
+            let mut report = Report::default();
+            copies::evict(&f.home, &Fx::disk(), Fx::now(), &mut report).await;
+            assert_eq!(report.evicted_copies, 1, "{status:?}: {report:?}");
+            assert!(!review.exists());
+            assert!(state.candidates[0].worktree.exists());
+            assert!(
+                git::branch_exists(&f.repo, &state.candidates[0].branch)
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(std::fs::read(&run_path).unwrap(), before);
+            assert_eq!(
+                serde_json::to_value(
+                    crate::queue::Queue::at(f.home.join("queue"))
+                        .get(&task.id)
+                        .unwrap()
+                )
+                .unwrap(),
+                task_before
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn source_eviction_retains_own_paths_and_unfinished_continuations() {
+        for kind in ["own-path", "active-seat", "paused-session"] {
+            let f = Fx::new().await;
+            let mut state = inactive_source(&f, "ef03", true).await;
+            let review = reviewer(&f, &state, &f.base).await;
+            let expected = match kind {
+                "own-path" => {
+                    state.attachments.push(review.join("source"));
+                    "run.attachments[0]"
+                }
+                "active-seat" => {
+                    state.active.insert(
+                        "review-1".into(),
+                        serde_json::from_value(serde_json::json!({
+                            "node":"review", "started_at":Fx::now(), "timeout_secs":60
+                        }))
+                        .unwrap(),
+                    );
+                    "continuation lease"
+                }
+                _ => {
+                    state.status = RunStatus::Blocked;
+                    state.parked = true;
+                    let mut seat = crate::agent::SeatState::new("review-1", "fixture", 1);
+                    seat.turns = 2;
+                    seat.captured_session = Some("saved-session".into());
+                    state.seats.insert("review-1".into(), seat);
+                    "resume contract"
+                }
+            };
+            state.save_under(&f.home).unwrap();
+            let mut report = Report::default();
+            copies::evict(&f.home, &Fx::disk(), Fx::now(), &mut report).await;
+            assert_eq!(report.evicted_copies, 0, "{kind}: {report:?}");
+            assert!(review.exists());
+            assert!(
+                report.retained.iter().any(|r| r.contains(expected)),
+                "{kind}: {report:?}"
+            );
+            // The execution restoration boundary leaves protected existing
+            // seats and their sessions untouched; prep need not recreate them.
+            restore_execution_seats(&f.home, &state).await.unwrap();
+            assert_eq!(git::rev_parse(&review, "HEAD").await.unwrap(), f.base);
+        }
+    }
+
+    #[tokio::test]
+    async fn source_eviction_distinguishes_historical_cwd_from_question_dependencies() {
+        for kind in ["waiting", "lease", "historical", "unknown"] {
+            let f = Fx::new().await;
+            let state = inactive_source(&f, "ef06", true).await;
+            let review = reviewer(&f, &state, &f.base).await;
+            let store = crate::ask::Questions::at(f.home.join("questions"));
+            let mut question = crate::ask::Question::new(
+                "20260101-000000-ffff".into(),
+                "review".into(),
+                "review-1".into(),
+                "fixture".into(),
+                "fixture".into(),
+                Vec::new(),
+            );
+            question.cwd = Some(review.to_string_lossy().into_owned());
+            if kind != "waiting" {
+                question.status = crate::ask::QuestionStatus::Abandoned;
+            }
+            store.put(&mut question).unwrap();
+            if kind == "lease" {
+                store.beat(&question.id, crate::ask::WaiterKind::Daemon);
+            }
+            if kind == "unknown" {
+                let path = store.path_of(&question.id);
+                let mut raw: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                raw["future_cwd_authority"] = serde_json::Value::Null;
+                std::fs::write(path, serde_json::to_vec(&raw).unwrap()).unwrap();
+            }
+            let mut report = Report::default();
+            copies::evict(&f.home, &Fx::disk(), Fx::now(), &mut report).await;
+            assert_eq!(
+                report.evicted_copies,
+                usize::from(kind == "historical"),
+                "{kind}: {report:?}"
+            );
+            assert_eq!(review.exists(), kind != "historical");
+            if kind == "waiting" || kind == "lease" {
+                assert!(
+                    report
+                        .retained
+                        .iter()
+                        .any(|r| r.contains("question") && r.contains("cwd")),
+                    "{report:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn source_eviction_failed_execution_setup_keeps_its_checkpoint() {
+        let f = Fx::new().await;
+        let mut state = inactive_source(&f, "ef07", true).await;
+        let review = reviewer(&f, &state, &f.base).await;
+        let mut report = Report::default();
+        copies::evict(&f.home, &Fx::disk(), Fx::now(), &mut report).await;
+        assert_eq!(report.evicted_copies, 1, "{report:?}");
+        state.config.worktree.setup = vec![crate::config::SetupStep {
+            run: Some("printf preserved > source; exit 1".into()),
+            ..Default::default()
+        }];
+        state.save_under(&f.home).unwrap();
+        assert!(restore_execution_seats(&f.home, &state).await.is_err());
+        let marker = f
+            .home
+            .join("runs")
+            .join(&state.id)
+            .join("artifacts/restore-review-1.pending");
+        assert!(marker.exists());
+        assert_eq!(
+            std::fs::read_to_string(review.join("source")).unwrap(),
+            "preserved"
+        );
+        assert!(
+            restore_execution_seats(&f.home, &state)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("interrupted execution restoration")
+        );
+        let mut retry = Report::default();
+        copies::evict(&f.home, &Fx::disk(), Fx::now(), &mut retry).await;
+        assert_eq!(retry.evicted_copies, 0, "{retry:?}");
+        assert!(
+            retry
+                .retained
+                .iter()
+                .any(|r| r.contains("restoration checkpoint")),
+            "{retry:?}"
+        );
+        assert!(marker.exists());
+        assert_eq!(
+            std::fs::read_to_string(review.join("source")).unwrap(),
+            "preserved"
+        );
+    }
+
+    #[tokio::test]
+    async fn source_eviction_retains_borrowed_or_promisor_anchor_stores() {
+        for kind in [
+            "alternates",
+            "promisor-config",
+            "promisor-pack",
+            "objects-symlink",
+        ] {
+            let f = Fx::new().await;
+            let state = inactive_source(&f, "ef11", true).await;
+            let review = reviewer(&f, &state, &f.base).await;
+            let common = crate::repo_lock::common_dir(&f.repo)
+                .await
+                .unwrap()
+                .unwrap();
+            match kind {
+                "alternates" => {
+                    let borrowed = f._temp.path().join("borrowed-objects");
+                    std::fs::create_dir(&borrowed).unwrap();
+                    std::fs::write(
+                        common.join("objects/info/alternates"),
+                        format!("{}\n", borrowed.display()),
+                    )
+                    .unwrap();
+                }
+                "promisor-config" => {
+                    git::git(&f.repo, &["config", "remote.origin.promisor", "true"])
+                        .await
+                        .unwrap();
+                }
+                "promisor-pack" => {
+                    std::fs::write(common.join("objects/pack/fixture.promisor"), "").unwrap();
+                }
+                _ => {
+                    let borrowed = f._temp.path().join("borrowed-objects");
+                    std::fs::rename(common.join("objects"), &borrowed).unwrap();
+                    std::os::unix::fs::symlink(borrowed, common.join("objects")).unwrap();
+                }
+            }
+            let mut report = Report::default();
+            copies::evict(&f.home, &Fx::disk(), Fx::now(), &mut report).await;
+            assert_eq!(report.evicted_copies, 0, "{kind}: {report:?}");
+            assert!(review.exists());
+            assert!(
+                report.retained.iter().any(|r| r.contains("source anchor")),
+                "{kind}: {report:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn source_eviction_bounds_long_shared_history_and_requires_its_retained_anchor() {
+        let mut f = Fx::new().await;
+        crate::fold_evidence::fixtures::shared_history(&f.repo, &f.base, 5000).await;
+        f.base = git::rev_parse(&f.repo, "HEAD").await.unwrap();
+        assert_eq!(
+            git::git(&f.repo, &["rev-list", "--count", &f.base])
+                .await
+                .unwrap(),
+            "5001"
+        );
+        let state = inactive_source(&f, "ef10", true).await;
+        let review = reviewer(&f, &state, &f.base).await;
+        std::fs::write(review.join("source"), "bounded review delta").unwrap();
+        git::git(&review, &["add", "."]).await.unwrap();
+        let tree = git::git(&review, &["write-tree"]).await.unwrap();
+        let head = git::git(
+            &review,
+            &["commit-tree", &tree, "-p", &f.base, "-m", "review delta"],
+        )
+        .await
+        .unwrap();
+        git::git(&review, &["checkout", "--detach", &head])
+            .await
+            .unwrap();
+        let run_file = f.home.join("runs").join(&state.id).join("run.json");
+        let run_before = std::fs::read(&run_file).unwrap();
+        let mut report = Report::default();
+        copies::evict(&f.home, &Fx::disk(), Fx::now(), &mut report).await;
+        assert_eq!(report.evicted_copies, 1, "{report:?}");
+        assert!(!review.exists());
+        assert!(state.candidates[0].worktree.exists());
+        assert!(
+            git::branch_exists(&f.repo, &state.candidates[0].branch)
+                .await
+                .unwrap()
+        );
+        assert_eq!(std::fs::read(&run_file).unwrap(), run_before);
+        let archive = f
+            .home
+            .join("runs")
+            .join(&state.id)
+            .join("artifacts/source-evidence")
+            .join(format!("{head}-{}", f.base));
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(archive.join("manifest.json")).unwrap()).unwrap();
+        assert_eq!(manifest["anchor"], f.base);
+        assert!(
+            std::fs::metadata(archive.join("objects.pack"))
+                .unwrap()
+                .len()
+                < 16 * 1024
+        );
+        let pin = format!("refs/magi/source-anchors/{}", f.base);
+        assert_eq!(git::rev_parse(&f.repo, &pin).await.unwrap(), f.base);
+        git::git(&f.repo, &["reflog", "expire", "--expire=now", "--all"])
+            .await
+            .unwrap();
+        git::git(&f.repo, &["gc", "--prune=now"]).await.unwrap();
+        assert!(
+            !git::git_raw(&f.repo, &["cat-file", "-e", &head])
+                .await
+                .unwrap()
+                .ok()
+        );
+        let other = git::rev_parse(&state.candidates[0].worktree, "HEAD")
+            .await
+            .unwrap();
+        // Missing, moved, symbolic and symlink pins cannot authorize import.
+        for kind in ["missing", "moved", "symbolic", "symlink"] {
+            git::git(&f.repo, &["update-ref", "--no-deref", "-d", &pin])
+                .await
+                .unwrap();
+            match kind {
+                "moved" => {
+                    git::git(&f.repo, &["update-ref", &pin, &other])
+                        .await
+                        .unwrap();
+                }
+                "symbolic" => {
+                    git::git(&f.repo, &["symbolic-ref", &pin, "refs/heads/main"])
+                        .await
+                        .unwrap();
+                }
+                "symlink" => {
+                    let common = crate::repo_lock::common_dir(&f.repo)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let target = f._temp.path().join("operator-anchor");
+                    std::fs::write(&target, format!("{}\n", f.base)).unwrap();
+                    let file = common.join(&pin);
+                    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+                    std::os::unix::fs::symlink(target, file).unwrap();
+                }
+                _ => {}
+            }
+            assert!(
+                restore_execution_seats(&f.home, &state).await.is_err(),
+                "{kind}"
+            );
+            assert!(!review.exists());
+            assert!(
+                !git::git_raw(&f.repo, &["cat-file", "-e", &head])
+                    .await
+                    .unwrap()
+                    .ok()
+            );
+            if kind == "symlink" {
+                let common = crate::repo_lock::common_dir(&f.repo)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                std::fs::remove_file(common.join(&pin)).unwrap();
+            } else {
+                git::git(&f.repo, &["update-ref", "--no-deref", "-d", &pin])
+                    .await
+                    .unwrap();
+            }
+            git::git(&f.repo, &["update-ref", &pin, &f.base])
+                .await
+                .unwrap();
+        }
+        // Fixture-only ref deletion proves the pin, rather than an incidental
+        // main/candidate branch, keeps all shared ancestors through GC.
+        assert!(
+            git::worktree_remove_clean(&f.repo, &state.candidates[0].worktree)
+                .await
+                .unwrap()
+        );
+        git::git(
+            &f.repo,
+            &[
+                "update-ref",
+                "-d",
+                &format!("refs/heads/{}", state.candidates[0].branch),
+            ],
+        )
+        .await
+        .unwrap();
+        git::git(&f.repo, &["update-ref", "-d", "refs/heads/main"])
+            .await
+            .unwrap();
+        git::git(&f.repo, &["reflog", "expire", "--expire=now", "--all"])
+            .await
+            .unwrap();
+        git::git(&f.repo, &["gc", "--prune=now"]).await.unwrap();
+        assert_eq!(
+            git::git(&f.repo, &["for-each-ref", "--format=%(refname)"])
+                .await
+                .unwrap(),
+            pin
+        );
+        assert_eq!(
+            git::git(&f.repo, &["rev-list", "--count", &f.base])
+                .await
+                .unwrap(),
+            "5001"
+        );
+        restore_execution_seats(&f.home, &state).await.unwrap();
+        assert_eq!(
+            git::git(&review, &["rev-list", "--count", "HEAD"])
+                .await
+                .unwrap(),
+            "5002"
+        );
+        assert_eq!(
+            git::git(&f.repo, &["rev-parse", "--is-shallow-repository"])
+                .await
+                .unwrap(),
+            "false"
+        );
+        git::git(&f.repo, &["fsck", "--full"]).await.unwrap();
+        git::git(&f.repo, &["gc", "--prune=now"]).await.unwrap();
+        let patch = seat_diff(&f.home, &state.id, &head).await.unwrap();
+        assert!(String::from_utf8_lossy(&patch).contains("bounded review delta"));
+        std::fs::remove_dir_all(&f.repo).unwrap();
+        assert_eq!(seat_diff(&f.home, &state.id, &head).await.unwrap(), patch);
+        let inspection = f._temp.path().join("shared-history-inspection");
+        restore_seat(&f.home, &state.id, &head, &inspection)
+            .await
+            .unwrap();
+        assert_eq!(git::rev_parse(&inspection, "HEAD").await.unwrap(), head);
+        assert_eq!(
+            git::git(&inspection, &["rev-parse", "--is-shallow-repository"])
+                .await
+                .unwrap(),
+            "true"
+        );
+        assert_eq!(
+            git::git(&inspection, &["log", "--format=%H"])
+                .await
+                .unwrap(),
+            format!("{head}\n{}", f.base)
+        );
+        assert!(!inspection.join(".git/objects/info/alternates").exists());
+        git::git(&inspection, &["fsck", "--full"]).await.unwrap();
+        git::git(&inspection, &["gc", "--prune=now"]).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn source_eviction_retains_tree_only_archives_and_rejects_import_before_writes() {
+        let f = Fx::new().await;
+        let state = inactive_source(&f, "ef08", true).await;
+        let review = reviewer(&f, &state, &f.base).await;
+        let tree = git::rev_parse(&review, "HEAD^{tree}").await.unwrap();
+        let parent = git::git(&review, &["commit-tree", &tree, "-m", "U0"])
+            .await
+            .unwrap();
+        let head = git::git(&review, &["commit-tree", &tree, "-p", &parent, "-m", "U1"])
+            .await
+            .unwrap();
+        git::git(&review, &["checkout", "--detach", &head])
+            .await
+            .unwrap();
+        let archive =
+            crate::fold_evidence::fixtures::tree_only_archive(&state, &f.home, &head).await;
+        let mut report = Report::default();
+        copies::evict(&f.home, &Fx::disk(), Fx::now(), &mut report).await;
+        assert_eq!(report.evicted_copies, 0, "{report:?}");
+        assert!(review.exists());
+        assert!(
+            report
+                .retained
+                .iter()
+                .any(|r| r.contains("incomplete archived commit ancestry")),
+            "{report:?}"
+        );
+        // Simulate a historical checkout already removed by the old writer.
+        assert!(git::worktree_remove_clean(&f.repo, &review).await.unwrap());
+        git::git(&f.repo, &["reflog", "expire", "--expire=now", "--all"])
+            .await
+            .unwrap();
+        git::git(&f.repo, &["gc", "--prune=now"]).await.unwrap();
+        for oid in [&parent, &head] {
+            assert!(
+                !git::git_raw(&f.repo, &["cat-file", "-e", oid])
+                    .await
+                    .unwrap()
+                    .ok()
+            );
+        }
+        let patch = source_diff(&archive).await.unwrap();
+        assert!(
+            crate::fold_evidence::import_snapshot(&archive, &f.repo)
+                .await
+                .is_err()
+        );
+        assert!(
+            !git::git_raw(&f.repo, &["cat-file", "-e", &head])
+                .await
+                .unwrap()
+                .ok()
+        );
+        git::git(&f.repo, &["fsck", "--full"]).await.unwrap();
+        git::git(&f.repo, &["gc", "--prune=now"]).await.unwrap();
+        let inspection = f._temp.path().join("legacy-tree-inspection");
+        restore_source(&archive, &inspection).await.unwrap();
+        assert_eq!(git::git(&inspection, &["write-tree"]).await.unwrap(), tree);
+        assert!(
+            !git::git_raw(&inspection, &["rev-parse", "--verify", "HEAD"])
+                .await
+                .unwrap()
+                .ok()
+        );
+        git::git(&inspection, &["fsck", "--full"]).await.unwrap();
+        git::git(&inspection, &["gc", "--prune=now"]).await.unwrap();
+        assert_eq!(source_diff(&archive).await.unwrap(), patch);
+        assert!(state.candidates[0].worktree.exists());
+    }
+
+    #[tokio::test]
+    async fn source_eviction_retains_ancestry_above_expanded_budget() {
+        let f = Fx::new().await;
+        let state = inactive_source(&f, "ef09", true).await;
+        let review = reviewer(&f, &state, &f.base).await;
+        std::fs::File::create(review.join("ancestor-only"))
+            .unwrap()
+            .set_len(64 * 1024 * 1024 + 1)
+            .unwrap();
+        git::git(&review, &["add", "."]).await.unwrap();
+        let parent_tree = git::git(&review, &["write-tree"]).await.unwrap();
+        let parent = git::git(
+            &review,
+            &["commit-tree", &parent_tree, "-m", "large ancestor"],
+        )
+        .await
+        .unwrap();
+        std::fs::remove_file(review.join("ancestor-only")).unwrap();
+        git::git(&review, &["add", "."]).await.unwrap();
+        let tree = git::git(&review, &["write-tree"]).await.unwrap();
+        let head = git::git(
+            &review,
+            &[
+                "commit-tree",
+                &tree,
+                "-p",
+                &parent,
+                "-m",
+                "small final tree",
+            ],
+        )
+        .await
+        .unwrap();
+        git::git(&review, &["checkout", "--detach", &head])
+            .await
+            .unwrap();
+        let mut report = Report::default();
+        copies::evict(&f.home, &Fx::disk(), Fx::now(), &mut report).await;
+        assert_eq!(report.evicted_copies, 0, "{report:?}");
+        assert!(
+            report
+                .retained
+                .iter()
+                .any(|r| r.contains("expanded object limit exceeded")),
+            "{report:?}"
+        );
+        assert!(review.exists());
+        assert!(state.candidates[0].worktree.exists());
+    }
+
+    #[tokio::test]
+    async fn source_eviction_restores_execution_after_gc_and_preserves_generations() {
+        let f = Fx::new().await;
+        let state = inactive_source(&f, "ef04", true).await;
+        let review = reviewer(&f, &state, &f.base).await;
+        std::fs::write(review.join("ancestor-only"), "ancestral content").unwrap();
+        git::git(&review, &["add", "."]).await.unwrap();
+        let parent_tree = git::git(&review, &["write-tree"]).await.unwrap();
+        let parent = git::git(
+            &review,
+            &["commit-tree", &parent_tree, "-m", "unrelated parent"],
+        )
+        .await
+        .unwrap();
+        std::fs::remove_file(review.join("ancestor-only")).unwrap();
+        std::fs::write(review.join("source"), "unrelated review checkpoint").unwrap();
+        git::git(&review, &["add", "."]).await.unwrap();
+        let tree = git::git(&review, &["write-tree"]).await.unwrap();
+        let head = git::git(
+            &review,
+            &[
+                "commit-tree",
+                &tree,
+                "-p",
+                &parent,
+                "-m",
+                "unrelated review checkpoint",
+            ],
+        )
+        .await
+        .unwrap();
+        git::git(&review, &["checkout", "--detach", &head])
+            .await
+            .unwrap();
+        let mut report = Report::default();
+        copies::evict(&f.home, &Fx::disk(), Fx::now(), &mut report).await;
+        assert_eq!(report.evicted_copies, 1, "{report:?}");
+        let ledger = f
+            .home
+            .join("runs")
+            .join(&state.id)
+            .join("artifacts/eviction-review-1.json");
+        let original = std::fs::read(&ledger).unwrap();
+        let diff = seat_diff(&f.home, &state.id, &head).await.unwrap();
+        assert!(String::from_utf8_lossy(&diff).contains("unrelated review checkpoint"));
+        git::git(&f.repo, &["reflog", "expire", "--expire=now", "--all"])
+            .await
+            .unwrap();
+        git::git(&f.repo, &["gc", "--prune=now"]).await.unwrap();
+        assert!(
+            !git::git_raw(&f.repo, &["cat-file", "-e", &head])
+                .await
+                .unwrap()
+                .ok()
+        );
+        assert!(
+            !git::git_raw(&f.repo, &["cat-file", "-e", &parent])
+                .await
+                .unwrap()
+                .ok()
+        );
+        assert_eq!(seat_diff(&f.home, &state.id, &head).await.unwrap(), diff);
+        assert!(
+            seat_heads(&f.home, &state.id)
+                .await
+                .unwrap()
+                .contains_key(&head)
+        );
+        restore_execution_seats(&f.home, &state).await.unwrap();
+        assert_eq!(git::rev_parse(&review, "HEAD").await.unwrap(), head);
+        assert_eq!(
+            git::git(&review, &["log", "--format=%H"]).await.unwrap(),
+            format!("{head}\n{parent}")
+        );
+        git::git(&f.repo, &["fsck", "--full"]).await.unwrap();
+        git::git(&f.repo, &["gc", "--prune=now"]).await.unwrap();
+        let inspection = f._temp.path().join("complete-history-inspection");
+        restore_seat(&f.home, &state.id, &head, &inspection)
+            .await
+            .unwrap();
+        assert_eq!(
+            git::git(&inspection, &["log", "--format=%H"])
+                .await
+                .unwrap(),
+            format!("{head}\n{parent}")
+        );
+        git::git(&inspection, &["fsck", "--full"]).await.unwrap();
+        git::git(&inspection, &["gc", "--prune=now"]).await.unwrap();
+
+        assert_eq!(git::git(&review, &["write-tree"]).await.unwrap(), tree);
+        assert!(
+            !git::git_raw(&review, &["symbolic-ref", "-q", "HEAD"])
+                .await
+                .unwrap()
+                .ok()
+        );
+        assert_eq!(
+            std::fs::read_to_string(review.join("source")).unwrap(),
+            "unrelated review checkpoint"
+        );
+        std::fs::write(review.join("operator-notes"), "keep").unwrap();
+        assert!(restore_execution_seats(&f.home, &state).await.is_err());
+        assert_eq!(
+            std::fs::read_to_string(review.join("operator-notes")).unwrap(),
+            "keep"
+        );
+        std::fs::remove_file(review.join("operator-notes")).unwrap();
+        restore_execution_seats(&f.home, &state).await.unwrap();
+        let mut second = Report::default();
+        copies::evict(&f.home, &Fx::disk(), Fx::now(), &mut second).await;
+        assert_eq!(second.evicted_copies, 1, "{second:?}");
+        assert_eq!(std::fs::read(&ledger).unwrap(), original);
+        assert!(ledger.with_file_name("eviction-review-1-2.json").exists());
+        // A historical v1 fixture has no explicit base field. Neither schema
+        // may reinterpret its immutable archive when the owning run advances.
+        let mut legacy: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        legacy["version"] = 1.into();
+        legacy.as_object_mut().unwrap().remove("base");
+        std::fs::write(&ledger, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let mut advanced = state.clone();
+        advanced.base_commit = git::rev_parse(&state.candidates[0].worktree, "HEAD")
+            .await
+            .unwrap();
+        advanced.save_under(&f.home).unwrap();
+        assert_eq!(seat_diff(&f.home, &state.id, &head).await.unwrap(), diff);
+        // Corruption blocks execution before a replacement checkout is made.
+        let raw: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        let archive = PathBuf::from(raw["evidence"].as_str().unwrap());
+        let patch = std::fs::read(archive.join("change.patch")).unwrap();
+        std::fs::write(archive.join("change.patch"), "corrupt").unwrap();
+        assert!(restore_execution_seats(&f.home, &state).await.is_err());
+        assert!(!review.exists());
+        std::fs::write(archive.join("change.patch"), patch).unwrap();
+        std::fs::create_dir(&review).unwrap();
+        std::fs::write(review.join("operator-notes"), "keep").unwrap();
+        assert!(restore_execution_seats(&f.home, &state).await.is_err());
+        assert_eq!(
+            std::fs::read_to_string(review.join("operator-notes")).unwrap(),
+            "keep"
+        );
+    }
+
+    #[tokio::test]
     async fn source_eviction_preserves_history_and_restores_binary_modes_after_gc() {
         use std::os::unix::fs::PermissionsExt;
         let mut f = Fx::new().await;
@@ -5238,6 +6008,7 @@ mod tests {
             "empty-directory",
             "untracked",
             "borrowed",
+            "borrowed-symlink",
             "lease",
             "owner",
             "driver",
@@ -5248,7 +6019,6 @@ mod tests {
             "resumable",
             "archive-symlink",
             "root-symlink",
-            "public",
             "checkpoint",
             "symlink",
             "retained",
@@ -5284,6 +6054,13 @@ mod tests {
                 "borrowed" => {
                     let mut other = f.run("ec03", true).await;
                     other.candidates[0].worktree = review.clone();
+                    other.save_under(&f.home).unwrap();
+                }
+                "borrowed-symlink" => {
+                    let alias = f._temp.path().join("borrowed-alias");
+                    std::os::unix::fs::symlink(&review, &alias).unwrap();
+                    let mut other = f.run("ec03", true).await;
+                    other.candidates[0].worktree = alias;
                     other.save_under(&f.home).unwrap();
                 }
                 "lease" => output = OutputLease::borrow(&review).unwrap(),
@@ -5338,7 +6115,6 @@ mod tests {
                     std::fs::rename(&root, &outside).unwrap();
                     std::os::unix::fs::symlink(&outside, &root).unwrap();
                 }
-                "public" => state.pr_head = Some(state.candidates[0].branch.clone()),
                 "checkpoint" => {
                     let admin = git::git(&review, &["rev-parse", "--absolute-git-dir"])
                         .await

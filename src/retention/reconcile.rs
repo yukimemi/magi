@@ -103,15 +103,9 @@ fn plain_file(path: &Path) -> Result<()> {
 
 async fn fingerprint(repo: &Path, path: &Path) -> Result<String> {
     plain_file(path)?;
-    git::git(
-        repo,
-        &[
-            "hash-object",
-            "--no-filters",
-            path.to_str().context("non UTF-8 artifact")?,
-        ],
-    )
-    .await
+    path.to_str().context("non UTF-8 artifact")?;
+    let argument = git::path_arg(path);
+    git::git(repo, &["hash-object", "--no-filters", &argument]).await
 }
 
 // Reports are never removed. Their exact inventory is nevertheless part of the
@@ -431,10 +425,25 @@ pub(super) async fn evidence(
     state: &RunState,
     paths: &[PathBuf],
 ) -> Result<BTreeMap<PathBuf, String>> {
+    evidence_with(state, paths, false).await
+}
+
+pub(super) async fn execution_evidence(
+    state: &RunState,
+    paths: &[PathBuf],
+) -> Result<BTreeMap<PathBuf, String>> {
+    evidence_with(state, paths, true).await
+}
+
+async fn evidence_with(
+    state: &RunState,
+    paths: &[PathBuf],
+    executing: bool,
+) -> Result<BTreeMap<PathBuf, String>> {
     let mut result = BTreeMap::new();
     for path in paths {
         let admin = git::git(path, &["rev-parse", "--absolute-git-dir"]).await?;
-        let admin = PathBuf::from(admin.trim());
+        let admin = git::canonical_output_path(admin.trim())?;
         result.insert(
             path.join(".git"),
             fingerprint(&state.repo, &path.join(".git")).await?,
@@ -487,7 +496,7 @@ pub(super) async fn evidence(
                                 | "magi-setup-paths"
                                 | "magi-setup-exclude"
                         )
-                    ),
+                    ) || executing && crate::incremental::current_wrapper(&entry.path())?,
                     "unknown Git administration artifact: {}",
                     name.to_string_lossy()
                 );
