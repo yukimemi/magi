@@ -724,6 +724,9 @@ pub(super) async fn evict_with(
                         EVIDENCE_BUDGET.saturating_sub(report.source_evidence_added_logical_bytes),
                     )
                     .await?;
+                    for archive in history.values() {
+                        crate::fold_evidence::validate_execution_snapshot(archive).await?;
+                    }
                     let ledger = eviction_ledger(&artifacts, path)?;
                     let mut record = Eviction {
                         version: 2,
@@ -841,6 +844,7 @@ pub(super) async fn evict_with(
                     for (tip, archive) in &record.history {
                         crate::fold_evidence::validate_identity(archive, tip, &state.base_commit)
                             .await?;
+                        crate::fold_evidence::validate_execution_snapshot(archive).await?;
                     }
                     ensure!(
                         git::worktree_remove_clean(&state.repo, path).await?,
@@ -1030,6 +1034,9 @@ async fn reconcile_pending(
             {
                 eligible(home, state, now, disk, maintenance, &record.source)?;
                 unborrowed(home, state, &record.source, now)?;
+                for archive in record.history.values() {
+                    crate::fold_evidence::validate_execution_snapshot(archive).await?;
+                }
                 remove_missing_registration(state, &record).await?;
             }
             record.phase = "evicted".into();

@@ -38,7 +38,9 @@ Each `artifacts/source-evidence/<head>-<base>/` contains complete base and sourc
 trees/blobs in a non-thin pack, original commit metadata, the same binary diff
 format used by fold evidence, and a raw NUL-delimited path/mode/blob index.
 All HEAD reflog and ORIG_HEAD tips, including unrelated earlier tips, are independently
-archived, without walking or bundling the repository's entire history. The
+archived with the complete reachable commit/tree/blob closure of each tip.
+Closure enumeration and expanded objects share the existing 4,096-object and
+64 MiB limits; ancestry exceeding either limit retains the checkout. The
 archive is checked in a separate repository without alternates: both trees
 must materialize and hash correctly, and their diff/index must match. Applying the
 archived binary patch to the base in the inspection repository's private index
@@ -95,7 +97,13 @@ and produces an independent inspection repository with the source index and
 files. Original commit metadata and complete base/source trees remain in the
 archive; restoring does not select a recovery source, resume a task, change a
 public branch, or grant approval. Inspection restoration also reinstalls the
-original base/head commit objects and points detached HEAD at the original tip.
+original HEAD and its complete ancestry, then points detached HEAD at that tip.
+Legacy tree-only archives still restore files/index and expose diffs; when their
+commit ancestry is incomplete, inspection HEAD remains unborn and execution
+import is rejected before writing into the shared repository. The original base
+commit remains archive metadata unless it belongs to the proved HEAD closure.
+Independent connectivity checks precede eviction and import, including retries;
+old immutable evidence is never rewritten to fill missing ancestry.
 
 Execution has a separate restoration contract before graph dispatch, prep shortcuts
 or continuation delivery: under owner/driver and repository coordination leases,

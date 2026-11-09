@@ -404,8 +404,8 @@ mod tests {
     }
 }
 
-/// A bounded, history-independent tree archive. Pack input is an explicit set
-/// of tree/blob objects, never a revision walk through the repository history.
+/// A bounded source archive. New packs include the HEAD's complete object
+/// closure; legacy packs may contain only the two endpoint trees and blobs.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Snapshot {
@@ -522,6 +522,33 @@ pub(crate) async fn snapshot(
             ensure!(objects.len() <= MAX_FILES, "snapshot object limit exceeded");
         }
     }
+    // A restored HEAD becomes a root in the shared repository. Preserve its
+    // entire reachable closure, not just its final tree. One extra commit
+    // beyond the object bound makes truncation fail rather than look complete.
+    let commit_limit = format!("--max-count={}", MAX_FILES + 1);
+    let ancestry = capture(
+        &state.repo,
+        &[
+            "rev-list",
+            "--objects",
+            "--no-object-names",
+            &commit_limit,
+            head,
+        ],
+    )
+    .await
+    .context("cannot enumerate snapshot commit ancestry")?;
+    for oid in std::str::from_utf8(&ancestry)?.lines() {
+        ensure!(
+            matches!(oid.len(), 40 | 64) && oid.bytes().all(|b| b.is_ascii_hexdigit()),
+            "invalid ancestry object identity"
+        );
+        objects.insert(oid.to_owned());
+        ensure!(
+            objects.len() <= MAX_FILES,
+            "snapshot ancestry/object limit exceeded"
+        );
+    }
     let object_list = objects
         .iter()
         .map(|s| s.to_owned() + "\n")
@@ -626,7 +653,7 @@ pub(crate) async fn snapshot(
         &mut bytes,
         &mut files,
     )?;
-    validate_snapshot(&pending).await?;
+    validate_execution_snapshot(&pending).await?;
     std::fs::rename(&pending, &dir)?;
     sync_directory(&parent)?;
     Ok(dir)
@@ -754,6 +781,35 @@ pub(crate) async fn validate_snapshot(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Prove a HEAD can become reachable without adding missing-parent history.
+/// Older tree-only snapshots remain useful for diffs and index restoration,
+/// but must pass this independent check before any shared-store import.
+pub(crate) async fn validate_execution_snapshot(dir: &Path) -> Result<()> {
+    validate_snapshot(dir).await?;
+    let temp = Inspection::new(&std::env::temp_dir())?;
+    git::git(&temp.0, &["init", "--quiet", "--template="]).await?;
+    let manifest = load_snapshot(dir, &temp.0).await?;
+    input(
+        &temp.0,
+        &["hash-object", "-w", "-t", "commit", "--stdin"],
+        manifest.head_commit,
+    )
+    .await?;
+    capture(
+        &temp.0,
+        &[
+            "fsck",
+            "--connectivity-only",
+            "--no-reflogs",
+            "--no-dangling",
+            &manifest.head,
+        ],
+    )
+    .await
+    .context("incomplete archived commit ancestry")?;
+    Ok(())
+}
+
 /// Restore an archived source into a NEW inspection repository. This does not
 /// transfer public/recovery authority or change any task/run record.
 pub async fn restore_snapshot(dir: &Path, destination: &Path) -> Result<()> {
@@ -783,17 +839,17 @@ pub async fn restore_snapshot(dir: &Path, destination: &Path) -> Result<()> {
     let manifest = load_snapshot(dir, &repo).await?;
     capture(&repo, &["checkout-index", "--all"]).await?;
     super::retention::tracked_base(&repo, &manifest.head_tree).await?;
-    // Reinstall original commit bytes as well as trees. The archive need not
-    // contain ancestors, so never ask Git to traverse their history here.
-    for commit in [&manifest.base_commit, &manifest.head_commit] {
+    // Legacy archives may contain only trees. Keep those inspections unborn
+    // rather than manufacture a reachable commit with missing parents.
+    if validate_execution_snapshot(dir).await.is_ok() {
         input(
             &repo,
             &["hash-object", "-w", "-t", "commit", "--stdin"],
-            commit.clone(),
+            manifest.head_commit,
         )
         .await?;
+        capture(&repo, &["update-ref", "--no-deref", "HEAD", &manifest.head]).await?;
     }
-    capture(&repo, &["update-ref", "--no-deref", "HEAD", &manifest.head]).await?;
     std::fs::rename(&temp.0, destination)?;
     sync_directory(&parent)?;
     Ok(())
@@ -802,7 +858,8 @@ pub async fn restore_snapshot(dir: &Path, destination: &Path) -> Result<()> {
 /// Import only validated archived objects, without changing the repository's
 /// index, refs or working tree. Execution restoration holds repository coordination.
 pub(crate) async fn import_snapshot(dir: &Path, repo: &Path) -> Result<()> {
-    validate_snapshot(dir).await?;
+    // Validate in isolation before introducing any commit into the shared store.
+    validate_execution_snapshot(dir).await?;
     let manifest: Snapshot = serde_json::from_slice(&std::fs::read(dir.join("manifest.json"))?)?;
     input(
         repo,
@@ -810,14 +867,14 @@ pub(crate) async fn import_snapshot(dir: &Path, repo: &Path) -> Result<()> {
         std::fs::read(dir.join("objects.pack"))?,
     )
     .await?;
-    for commit in [&manifest.base_commit, &manifest.head_commit] {
-        input(
-            repo,
-            &["hash-object", "-w", "-t", "commit", "--stdin"],
-            commit.clone(),
-        )
-        .await?;
-    }
+    // The base commit is metadata, not necessarily an ancestor of this HEAD.
+    // Only the proved HEAD closure may become commit objects in this store.
+    input(
+        repo,
+        &["hash-object", "-w", "-t", "commit", "--stdin"],
+        manifest.head_commit,
+    )
+    .await?;
     Ok(())
 }
 
@@ -902,4 +959,54 @@ pub(crate) fn snapshot_storage(root: &Path) -> Result<u64> {
         }
     }
     Ok(bytes)
+}
+
+#[cfg(test)]
+pub(crate) mod fixtures {
+    use super::*;
+
+    // Reproduce the old writer, which stored complete endpoint trees but no
+    // commit ancestry. This modifies only isolated fixture evidence.
+    pub(crate) async fn tree_only_archive(
+        state: &RunState,
+        home: &Path,
+        head: &str,
+    ) -> std::path::PathBuf {
+        let archive = snapshot(state, home, head, MAX_BYTES).await.unwrap();
+        let mut manifest: Snapshot =
+            serde_json::from_slice(&std::fs::read(archive.join("manifest.json")).unwrap()).unwrap();
+        let mut objects = BTreeSet::from([manifest.base_tree.clone(), manifest.head_tree.clone()]);
+        for tree in [&manifest.base_tree, &manifest.head_tree] {
+            for oid in git::git(
+                &state.repo,
+                &["ls-tree", "-r", "-t", "--format=%(objectname)", tree],
+            )
+            .await
+            .unwrap()
+            .lines()
+            {
+                objects.insert(oid.to_owned());
+            }
+        }
+        let pack = input(
+            &state.repo,
+            &["pack-objects", "--stdout"],
+            objects
+                .iter()
+                .map(|s| s.to_owned() + "\n")
+                .collect::<String>()
+                .into_bytes(),
+        )
+        .await
+        .unwrap();
+        manifest.pack_hash = digest(&state.repo, pack.clone()).await.unwrap();
+        std::fs::write(archive.join("objects.pack"), pack).unwrap();
+        std::fs::write(
+            archive.join("manifest.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        validate_snapshot(&archive).await.unwrap();
+        archive
+    }
 }

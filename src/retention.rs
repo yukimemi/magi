@@ -5236,16 +5236,154 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn source_eviction_retains_tree_only_archives_and_rejects_import_before_writes() {
+        let f = Fx::new().await;
+        let state = inactive_source(&f, "ef08", true).await;
+        let review = reviewer(&f, &state, &f.base).await;
+        let tree = git::rev_parse(&review, "HEAD^{tree}").await.unwrap();
+        let parent = git::git(&review, &["commit-tree", &tree, "-m", "U0"])
+            .await
+            .unwrap();
+        let head = git::git(&review, &["commit-tree", &tree, "-p", &parent, "-m", "U1"])
+            .await
+            .unwrap();
+        git::git(&review, &["checkout", "--detach", &head])
+            .await
+            .unwrap();
+        let archive =
+            crate::fold_evidence::fixtures::tree_only_archive(&state, &f.home, &head).await;
+        let mut report = Report::default();
+        copies::evict(&f.home, &Fx::disk(), Fx::now(), &mut report).await;
+        assert_eq!(report.evicted_copies, 0, "{report:?}");
+        assert!(review.exists());
+        assert!(
+            report
+                .retained
+                .iter()
+                .any(|r| r.contains("incomplete archived commit ancestry")),
+            "{report:?}"
+        );
+        // Simulate a historical checkout already removed by the old writer.
+        assert!(git::worktree_remove_clean(&f.repo, &review).await.unwrap());
+        git::git(&f.repo, &["reflog", "expire", "--expire=now", "--all"])
+            .await
+            .unwrap();
+        git::git(&f.repo, &["gc", "--prune=now"]).await.unwrap();
+        for oid in [&parent, &head] {
+            assert!(
+                !git::git_raw(&f.repo, &["cat-file", "-e", oid])
+                    .await
+                    .unwrap()
+                    .ok()
+            );
+        }
+        let patch = source_diff(&archive).await.unwrap();
+        assert!(
+            crate::fold_evidence::import_snapshot(&archive, &f.repo)
+                .await
+                .is_err()
+        );
+        assert!(
+            !git::git_raw(&f.repo, &["cat-file", "-e", &head])
+                .await
+                .unwrap()
+                .ok()
+        );
+        git::git(&f.repo, &["fsck", "--full"]).await.unwrap();
+        git::git(&f.repo, &["gc", "--prune=now"]).await.unwrap();
+        let inspection = f._temp.path().join("legacy-tree-inspection");
+        restore_source(&archive, &inspection).await.unwrap();
+        assert_eq!(git::git(&inspection, &["write-tree"]).await.unwrap(), tree);
+        assert!(
+            !git::git_raw(&inspection, &["rev-parse", "--verify", "HEAD"])
+                .await
+                .unwrap()
+                .ok()
+        );
+        git::git(&inspection, &["fsck", "--full"]).await.unwrap();
+        git::git(&inspection, &["gc", "--prune=now"]).await.unwrap();
+        assert_eq!(source_diff(&archive).await.unwrap(), patch);
+        assert!(state.candidates[0].worktree.exists());
+    }
+
+    #[tokio::test]
+    async fn source_eviction_retains_ancestry_above_expanded_budget() {
+        let f = Fx::new().await;
+        let state = inactive_source(&f, "ef09", true).await;
+        let review = reviewer(&f, &state, &f.base).await;
+        std::fs::File::create(review.join("ancestor-only"))
+            .unwrap()
+            .set_len(64 * 1024 * 1024 + 1)
+            .unwrap();
+        git::git(&review, &["add", "."]).await.unwrap();
+        let parent_tree = git::git(&review, &["write-tree"]).await.unwrap();
+        let parent = git::git(
+            &review,
+            &["commit-tree", &parent_tree, "-m", "large ancestor"],
+        )
+        .await
+        .unwrap();
+        std::fs::remove_file(review.join("ancestor-only")).unwrap();
+        git::git(&review, &["add", "."]).await.unwrap();
+        let tree = git::git(&review, &["write-tree"]).await.unwrap();
+        let head = git::git(
+            &review,
+            &[
+                "commit-tree",
+                &tree,
+                "-p",
+                &parent,
+                "-m",
+                "small final tree",
+            ],
+        )
+        .await
+        .unwrap();
+        git::git(&review, &["checkout", "--detach", &head])
+            .await
+            .unwrap();
+        let mut report = Report::default();
+        copies::evict(&f.home, &Fx::disk(), Fx::now(), &mut report).await;
+        assert_eq!(report.evicted_copies, 0, "{report:?}");
+        assert!(
+            report
+                .retained
+                .iter()
+                .any(|r| r.contains("expanded object limit exceeded")),
+            "{report:?}"
+        );
+        assert!(review.exists());
+        assert!(state.candidates[0].worktree.exists());
+    }
+
+    #[tokio::test]
     async fn source_eviction_restores_execution_after_gc_and_preserves_generations() {
         let f = Fx::new().await;
         let state = inactive_source(&f, "ef04", true).await;
         let review = reviewer(&f, &state, &f.base).await;
+        std::fs::write(review.join("ancestor-only"), "ancestral content").unwrap();
+        git::git(&review, &["add", "."]).await.unwrap();
+        let parent_tree = git::git(&review, &["write-tree"]).await.unwrap();
+        let parent = git::git(
+            &review,
+            &["commit-tree", &parent_tree, "-m", "unrelated parent"],
+        )
+        .await
+        .unwrap();
+        std::fs::remove_file(review.join("ancestor-only")).unwrap();
         std::fs::write(review.join("source"), "unrelated review checkpoint").unwrap();
         git::git(&review, &["add", "."]).await.unwrap();
         let tree = git::git(&review, &["write-tree"]).await.unwrap();
         let head = git::git(
             &review,
-            &["commit-tree", &tree, "-m", "unrelated review checkpoint"],
+            &[
+                "commit-tree",
+                &tree,
+                "-p",
+                &parent,
+                "-m",
+                "unrelated review checkpoint",
+            ],
         )
         .await
         .unwrap();
@@ -5273,6 +5411,12 @@ mod tests {
                 .unwrap()
                 .ok()
         );
+        assert!(
+            !git::git_raw(&f.repo, &["cat-file", "-e", &parent])
+                .await
+                .unwrap()
+                .ok()
+        );
         assert_eq!(seat_diff(&f.home, &state.id, &head).await.unwrap(), diff);
         assert!(
             seat_heads(&f.home, &state.id)
@@ -5282,6 +5426,25 @@ mod tests {
         );
         restore_execution_seats(&f.home, &state).await.unwrap();
         assert_eq!(git::rev_parse(&review, "HEAD").await.unwrap(), head);
+        assert_eq!(
+            git::git(&review, &["log", "--format=%H"]).await.unwrap(),
+            format!("{head}\n{parent}")
+        );
+        git::git(&f.repo, &["fsck", "--full"]).await.unwrap();
+        git::git(&f.repo, &["gc", "--prune=now"]).await.unwrap();
+        let inspection = f._temp.path().join("complete-history-inspection");
+        restore_seat(&f.home, &state.id, &head, &inspection)
+            .await
+            .unwrap();
+        assert_eq!(
+            git::git(&inspection, &["log", "--format=%H"])
+                .await
+                .unwrap(),
+            format!("{head}\n{parent}")
+        );
+        git::git(&inspection, &["fsck", "--full"]).await.unwrap();
+        git::git(&inspection, &["gc", "--prune=now"]).await.unwrap();
+
         assert_eq!(git::git(&review, &["write-tree"]).await.unwrap(), tree);
         assert!(
             !git::git_raw(&review, &["symbolic-ref", "-q", "HEAD"])
