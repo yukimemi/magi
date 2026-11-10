@@ -1477,8 +1477,8 @@ common::e2e! {
 async fn fresh_cli_answers_survive_migration_before_and_after_first_sweep() {
     use magi::{ask::{Answer, ChoiceAction, Question, Questions}, task_decision::Status};
     let fx = common::fixture(common::home_lock().await, common::Judges::Unanimous, false);
-    for (migrate_first, associate_later) in [(false, false), (true, false), (false, true)] {
-        let home = fx.tmp.path().join(format!("fresh-cli-{migrate_first}-{associate_later}"));
+    for (migrate_first, associate_later, delivery_fails) in [(false, false, false), (true, false, false), (false, true, false), (false, true, true)] {
+        let home = fx.tmp.path().join(format!("fresh-cli-{migrate_first}-{associate_later}-{delivery_fails}"));
         let queue = Queue::at(home.join("queue"));
         let talks = Talks::at(home.join("talks"));
         let questions = Questions::at(home.join("questions"));
@@ -1498,26 +1498,24 @@ async fn fresh_cli_answers_survive_migration_before_and_after_first_sweep() {
             .current_dir(&fx.repo).output().unwrap();
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
         let accepted: Question = serde_json::from_slice(&std::fs::read(questions.path_of(&fresh.id)).unwrap()).unwrap();
-        assert!(accepted.accepted_answer_at.is_some(), "CLI must persist fresh acceptance before migration; migrate_first={migrate_first} associate_later={associate_later}; executable={:?}; source={accepted:?}; stdout={}", common::magi_cli(&home).get_program(), String::from_utf8_lossy(&output.stdout));
+        assert!(accepted.accepted_answer_at.is_some(), "CLI must persist fresh acceptance before migration; migrate_first={migrate_first} associate_later={associate_later} delivery_fails={delivery_fails}; executable={:?}; source={accepted:?}; stdout={}", common::magi_cli(&home).get_program(), String::from_utf8_lossy(&output.stdout));
         assert_eq!(accepted.accepted_answer_at, accepted.answered_at, "CLI acceptance must bind the exact response generation");
-        if associate_later {
-            queue.put(&mut task).unwrap();
-            // A late ownership association must preserve fresh consent even
-            // when reserving or creating its chat cannot deliver the inquiry.
-            std::fs::write(talks.root(), "delivery unavailable").unwrap();
-        }
+        if associate_later { queue.put(&mut task).unwrap(); }
+        // A late ownership association must preserve fresh consent even
+        // when reserving or creating its chat cannot deliver the inquiry.
+        if delivery_fails { std::fs::write(talks.root(), "delivery unavailable").unwrap(); }
         for _ in 0..2 {
             magi::task_chat::sweep(&queue, &talks, &questions, &home);
             let reopened = Questions::at(home.join("questions")).get(&fresh.id).unwrap();
             assert_eq!(reopened.resolution().as_deref(), Some("hold"));
             let decision = Outbox::at(&home).get(&fresh.id).unwrap().decision.unwrap();
-            assert_eq!(decision.request.as_deref(), Some("decision: hold"), "migrate_first={migrate_first} associate_later={associate_later}: {decision:?}; source={reopened:?}");
+            assert_eq!(decision.request.as_deref(), Some("decision: hold"), "migrate_first={migrate_first} associate_later={associate_later} delivery_fails={delivery_fails}: {decision:?}; source={reopened:?}");
             assert_eq!(decision.source_answer_at, reopened.answered_at);
             assert_eq!(decision.status, Status::Queued, "acceptance is not an effect receipt");
             assert!(questions.get(&historical.id).unwrap().answer.is_none());
             assert!(Outbox::at(&home).get(&historical.id).unwrap().decision.unwrap().request.is_none());
         }
-        if associate_later {
+        if delivery_fails {
             assert!(Outbox::at(&home).get(&fresh.id).unwrap().delivered_to.is_none());
             assert!(!magi::task_chat::migration_issues(&home).is_empty());
             assert!(!queue.get(&task.id).unwrap().action_applied(&fresh.id), "acceptance is not an effect");

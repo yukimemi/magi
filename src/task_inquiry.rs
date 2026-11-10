@@ -68,6 +68,7 @@ pub struct Outbox {
 /// Release the execution fence even if a concurrent fork still retains a
 /// descriptor for the same open file description.
 pub(crate) struct ExecutionClaim {
+    // Closing the retained file releases the lock on platforms without flock.
     _file: File,
 }
 
