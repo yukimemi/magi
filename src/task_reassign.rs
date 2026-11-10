@@ -18,6 +18,19 @@ pub async fn reassign(
     selector: &Path,
     actor: &str,
 ) -> Result<Task> {
+    // Keep repository discovery and duplicate screening out of every caller's
+    // future frame, including ordinary task commands and Windows chat control.
+    Box::pin(reassign_inner(queue, home, cwd, id, selector, actor)).await
+}
+
+async fn reassign_inner(
+    queue: &Queue,
+    home: &Path,
+    cwd: &Path,
+    id: &str,
+    selector: &Path,
+    actor: &str,
+) -> Result<Task> {
     let listed = queue.get(id)?;
     let _claim = queue
         .claim(&listed.id)

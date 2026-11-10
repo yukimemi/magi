@@ -4178,7 +4178,7 @@ async fn resolve_repo_with_clone(
     magi::repo_selector::resolve_repo_with_clone(repo, cwd, hint, allow_clone).await
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 async fn resolve_repo_with_gh(
     repo: &Path,
     cwd: &Path,
@@ -7660,6 +7660,17 @@ command = ['sh', '-c', 'cat >/dev/null; printf "%s" "{\"duplicate\":true,\"reaso
             magi::retention::reconcile::run(Path::new("unused-home"), "task", "run", None);
         let bytes = std::mem::size_of_val(&reconciliation);
         assert!(bytes < 1024, "reconciliation entry occupies {bytes} bytes");
+        let queue = Queue::at(PathBuf::from("unused-queue"));
+        let reassignment = magi::task_reassign::reassign(
+            &queue,
+            Path::new("unused-home"),
+            Path::new("unused-repo"),
+            "task",
+            Path::new("destination"),
+            "test",
+        );
+        let bytes = std::mem::size_of_val(&reassignment);
+        assert!(bytes < 1024, "reassignment entry occupies {bytes} bytes");
     }
 
     #[tokio::test]

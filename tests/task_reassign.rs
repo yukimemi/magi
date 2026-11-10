@@ -30,6 +30,10 @@ fn publish_config(repo: &Path, config: &Config) {
 }
 
 fn destination(f: &common::Fixture) -> PathBuf {
+    destination_with_coordination(f, cfg!(unix))
+}
+
+fn destination_with_coordination(f: &common::Fixture, coordinated: bool) -> PathBuf {
     let repo = f.tmp.path().join("destination");
     std::fs::create_dir(&repo).unwrap();
     git(&repo, &["init", "-b", "main"]);
@@ -53,12 +57,18 @@ fn destination(f: &common::Fixture) -> PathBuf {
     config.graph.judges = 1;
     config.graph.advise = false;
     config.graph.land = false;
-    config.coordination = Some(magi::config::Coordination {
-        contract_file: "scope-contract".into(),
-        contract_token: "destination".into(),
-        lock_file: "scope-lock".into(),
-    });
-    std::fs::write(repo.join(".git/scope-contract"), "destination\n").unwrap();
+    config.coordination = if coordinated {
+        Some(magi::config::Coordination {
+            contract_file: "scope-contract".into(),
+            contract_token: "destination".into(),
+            lock_file: "scope-lock".into(),
+        })
+    } else {
+        None
+    };
+    if coordinated {
+        std::fs::write(repo.join(".git/scope-contract"), "destination\n").unwrap();
+    }
     publish_config(&repo, &config);
     repo.canonicalize().unwrap()
 }
@@ -147,16 +157,20 @@ async fn reassign_preserves_history_and_executes_with_destination_config_and_sco
     magi::daemon::run_claimed(&magi::daemon::Opts { repo: f.repo.clone(), ..Default::default() }, &queue, &mut released).await;
     assert_eq!(released.runs.len(), 2, "{released:?}");
     let new = RunState::load(released.runs.last().unwrap()).unwrap();
-    assert_eq!(new.repo, dest);
+    assert_eq!(new.repo.canonicalize().unwrap(), dest);
     assert_eq!(new.status, RunStatus::Ready, "{new:?}");
     assert_eq!(new.base_commit, magi::git::rev_parse(&dest, "origin/main").await.unwrap());
     assert_eq!(new.config.graph.reviewers, 1);
-    assert_eq!(new.config.coordination.as_ref().unwrap().contract_token, "destination");
+    if cfg!(unix) {
+        assert_eq!(new.config.coordination.as_ref().unwrap().contract_token, "destination");
+    } else {
+        assert!(new.config.coordination.is_none());
+    }
     assert_eq!(new.candidates.len(), 1);
-    assert_eq!(magi::git::toplevel(&new.candidates[0].worktree).await.unwrap(), new.candidates[0].worktree.canonicalize().unwrap());
+    assert_eq!(magi::git::toplevel(&new.candidates[0].worktree).await.unwrap().canonicalize().unwrap(), new.candidates[0].worktree.canonicalize().unwrap());
     let common = magi::git::git_raw(&new.candidates[0].worktree, &["rev-parse", "--path-format=absolute", "--git-common-dir"]).await.unwrap();
     assert_eq!(PathBuf::from(common.stdout.trim()).canonicalize().unwrap(), dest.join(".git").canonicalize().unwrap());
-    assert!(dest.join(".git/scope-lock").exists());
+    assert_eq!(dest.join(".git/scope-lock").exists(), cfg!(unix));
     assert!(!f.repo.join(".git/scope-lock").exists());
     assert_eq!(std::fs::read(home.join("runs").join(&old.id).join("run.json")).unwrap(), old_json);
     assert!(magi::git::branch_exists(&f.repo, "retained-evidence").await.unwrap());
@@ -225,10 +239,13 @@ async fn reassign_cli_uses_filing_selectors_and_stale_questions_cannot_resume() 
     let (task, old) = stopped(&f, &queue);
     let mut config = f.config.clone();
     let root = f.tmp.path().join("repos");
+    // Git's checkout spelling is portable as a clone URL; Windows extended
+    // filesystem paths can otherwise be mistaken for SSH repository URLs.
+    let clone_source = magi::git::toplevel(&dest).await.unwrap();
     for owner in ["one", "two"] {
         let parent = root.join("host").join(owner);
         std::fs::create_dir_all(&parent).unwrap();
-        git(&parent, &["clone", dest.to_str().unwrap(), "same"]);
+        git(&parent, &["clone", clone_source.to_str().unwrap(), "same"]);
     }
     config.repos.roots = vec![root];
     publish_config(&f.repo, &config);
@@ -393,5 +410,27 @@ async fn unreadable_task_cannot_reset_a_reassigned_publication_scope() {
         magi::run::Origin::queue(&task.id)).await.err().expect("assignment cannot be determined");
     assert!(error.to_string().contains("cannot capture task repository assignment"), "{error:#}");
     assert_eq!(magi::run::list_ids(), runs_before, "do not reserve an execution under the legacy head");
+}
+}
+
+#[cfg(windows)]
+common::e2e! {
+async fn reassign_keeps_registered_windows_execution_fail_closed() {
+    let f = fixture(home_lock().await, Judges::Unanimous, false);
+    let dest = destination_with_coordination(&f, true);
+    let home = magi::run::home();
+    let queue = Queue::open();
+    let (original, old) = stopped(&f, &queue);
+    let old_json = std::fs::read(old.dir().join("run.json")).unwrap();
+    magi::task_reassign::reassign(&queue, &home, &f.repo, &original.id, &dest, "test").await.unwrap();
+    let mut released = magi::chat_control::release(&queue, &original.id).unwrap();
+    let _claim = queue.claim(&released.id).unwrap();
+    magi::daemon::run_claimed(&magi::daemon::Opts { repo: f.repo.clone(), ..Default::default() }, &queue, &mut released).await;
+    assert_eq!(released.status, TaskStatus::Held);
+    assert!(released.last_error.as_deref().unwrap().contains("coordination currently requires Unix process groups"));
+    assert_eq!(released.runs, original.runs, "unsupported containment must not start a new execution");
+    assert_eq!(released.repo, dest);
+    assert!(!released.execution_run(&old.id));
+    assert_eq!(std::fs::read(old.dir().join("run.json")).unwrap(), old_json);
 }
 }
