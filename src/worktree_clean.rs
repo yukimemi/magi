@@ -8,6 +8,30 @@ use crate::{git, run::RunState};
 
 const PENDING: &str = "magi-pre-clean-pending";
 
+/// The accepted tracked tree before reset and the paths already authorized for
+/// deletion distinguish an interrupted reset from later external edits.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Pending {
+    head: String,
+    before_tree: Option<String>,
+    untracked: Option<String>,
+}
+
+async fn record_pending(wt: &Path, marker: &Path) -> Result<()> {
+    let before_tree = if git::git_raw(wt, &["diff", "--quiet"]).await?.ok() {
+        Some(git::git(wt, &["write-tree"]).await?)
+    } else {
+        None
+    };
+    let pending = Pending {
+        head: git::rev_parse(wt, "HEAD").await?,
+        before_tree,
+        untracked: Some(git::git(wt, &["ls-files", "--others", "-z"]).await?),
+    };
+    std::fs::write(marker, serde_json::to_vec(&pending)?)
+        .context("record unfinished pre-clean boundary before reset")
+}
+
 /// Finish a recorded cleanup before base-sync can classify an already-moved
 /// branch as synchronized. Legacy fixer records may have no Operation reservation.
 /// Reading the Git file avoids extra subprocesses when no cleanup was started.
@@ -19,19 +43,51 @@ pub(crate) async fn resume_pending(state: &mut RunState, wt: &Path) -> Result<()
         return Ok(());
     };
     let marker = wt.join(dir).join(PENDING);
-    let head = match std::fs::read_to_string(&marker) {
-        Ok(head) => head,
+    let body = match std::fs::read_to_string(&marker) {
+        Ok(body) => body,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e).context("read unfinished pre-clean boundary"),
     };
+    let pending: Pending = serde_json::from_str(&body)
+        .or_else(|error| {
+            // Older head-only markers have no evidence authorizing leftover data
+            // or a pre-reset tree. Preserve their conservative recovery behavior.
+            if body.trim().len() == 40 && body.trim().bytes().all(|b| b.is_ascii_hexdigit()) {
+                Ok(Pending {
+                    head: body.trim().into(),
+                    before_tree: None,
+                    untracked: None,
+                })
+            } else {
+                Err(error)
+            }
+        })
+        .context("parse unfinished pre-clean boundary")?;
     validate_owner(state, wt, false).await?;
+    let index_tree = git::git(wt, &["write-tree"]).await?;
+    let target_tree = git::rev_parse(wt, "HEAD^{tree}").await?;
+    let tracked_known = git::git_raw(wt, &["diff", "--quiet"]).await?.ok()
+        && (index_tree.trim() == target_tree.trim()
+            || pending
+                .before_tree
+                .as_ref()
+                .is_some_and(|tree| index_tree.trim() == tree.trim()));
+    let untracked = git::git(wt, &["ls-files", "--others", "-z"]).await?;
+    let allowed: std::collections::BTreeSet<_> = pending
+        .untracked
+        .as_deref()
+        .unwrap_or_default()
+        .split('\0')
+        .filter(|p| !p.is_empty())
+        .collect();
     ensure!(
-        git::rev_parse(wt, "HEAD").await? == head.trim()
-            && git::is_clean(wt).await?
-            && git::git(wt, &["ls-files", "--others", "-z"])
-                .await?
-                .is_empty(),
-        "unfinished pre-clean in {} has changed HEAD, edits or untracked/ignored data; inspect before resuming synchronization",
+        git::rev_parse(wt, "HEAD").await? == pending.head.trim()
+            && tracked_known
+            && untracked
+                .split('\0')
+                .filter(|p| !p.is_empty())
+                .all(|p| allowed.contains(p)),
+        "unfinished pre-clean in {} has changed HEAD, tracked edits or new untracked/ignored paths; inspect before resuming synchronization",
         wt.display()
     );
     reset(state, wt, None).await?;
@@ -63,8 +119,7 @@ pub(crate) async fn reset(state: &mut RunState, wt: &Path, rev: Option<&str>) ->
     let output = crate::retention::OutputLease::take(wt, true)?;
     let marker = Path::new(dir.trim()).join(PENDING);
     if rev.is_none() {
-        std::fs::write(&marker, git::rev_parse(wt, "HEAD").await?)
-            .context("record unfinished pre-clean boundary before reset")?;
+        record_pending(wt, &marker).await?;
     }
     let wait = crate::repo_lock::WaitPolicy::current();
     let coordination =
@@ -170,6 +225,13 @@ async fn validate_owner(state: &RunState, wt: &Path, reviewer: bool) -> Result<(
         actual == root.join(wt.file_name().context("missing worktree name")?),
         "pre-clean refuses a worktree alias"
     );
+    ensure!(
+        !state
+            .foreign_checkout
+            .as_ref()
+            .is_some_and(|checkout| checkout.path == actual),
+        "pre-clean refuses the external checkout"
+    );
     let owned = if reviewer {
         wt.file_name()
             .and_then(|n| n.to_str())
@@ -183,7 +245,7 @@ async fn validate_owner(state: &RunState, wt: &Path, reviewer: bool) -> Result<(
                         .map_or(0, |r| r.reviewers.len())
             })
     } else {
-        state.foreign_checkout.is_none() && state.candidates.iter().any(|c| c.worktree == wt)
+        state.candidates.iter().any(|c| c.worktree == wt)
     };
     ensure!(
         owned,
@@ -387,6 +449,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_hook_resumes_with_its_existing_ignored_cache() {
+        let (_tmp, mut state, wt) = fixture(&["exit 7"]).await;
+        std::fs::write(wt.join(".gitignore"), "cache/\n").unwrap();
+        git::git(&wt, &["add", ".gitignore"]).await.unwrap();
+        git::git(&wt, &["commit", "-m", "ignore local cache"])
+            .await
+            .unwrap();
+        std::fs::create_dir(wt.join("cache")).unwrap();
+        std::fs::write(wt.join("cache/module"), "cache").unwrap();
+        assert!(reset(&mut state, &wt, None).await.is_err());
+        assert!(wt.join("cache/module").exists());
+        state.config.worktree.pre_clean[0].run = "exit 0".into();
+        resume_pending(&mut state, &wt).await.unwrap();
+        assert!(!wt.join("cache").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_clean_resumes_by_running_the_corrected_cache_hook() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let (_tmp, mut state, wt) = fixture(&["exit 0"]).await;
+        std::fs::create_dir_all(wt.join("cache/module")).unwrap();
+        std::fs::write(wt.join("cache/module/data"), "cache").unwrap();
+        std::fs::set_permissions(
+            wt.join("cache/module"),
+            std::fs::Permissions::from_mode(0o555),
+        )
+        .unwrap();
+        assert!(reset(&mut state, &wt, None).await.is_err());
+        state.config.worktree.pre_clean[0].run = "chmod u+w cache/module".into();
+        let result = resume_pending(&mut state, &wt).await;
+        if wt.join("cache/module").exists() {
+            std::fs::set_permissions(
+                wt.join("cache/module"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+        }
+        result.unwrap();
+        assert!(!wt.join("cache").exists());
+    }
+
+    #[tokio::test]
+    async fn interrupted_reset_accepts_the_recorded_old_index_and_tree() {
+        let (_tmp, mut state, wt) = fixture(&["exit 0"]).await;
+        git::git(&wt, &["checkout", "-b", "candidate"])
+            .await
+            .unwrap();
+        std::fs::write(state.repo.join("tracked"), "new base").unwrap();
+        git::git(&state.repo, &["commit", "-am", "advance base"])
+            .await
+            .unwrap();
+        let new = git::rev_parse(&state.repo, "HEAD").await.unwrap();
+        git::git(&state.repo, &["update-ref", "refs/heads/candidate", &new])
+            .await
+            .unwrap();
+        assert!(!git::is_clean(&wt).await.unwrap());
+        let dir = git::git(&wt, &["rev-parse", "--absolute-git-dir"])
+            .await
+            .unwrap();
+        // This is the boundary immediately before coordination/reset. A
+        // timeout or cancellation here leaves the old index and files intact.
+        record_pending(&wt, &Path::new(dir.trim()).join(PENDING))
+            .await
+            .unwrap();
+        std::fs::write(wt.join("tracked"), "external edit").unwrap();
+        assert!(resume_pending(&mut state, &wt).await.is_err());
+        std::fs::write(wt.join("tracked"), "original").unwrap();
+        resume_pending(&mut state, &wt).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(wt.join("tracked")).unwrap(),
+            "new base"
+        );
+        assert!(!Path::new(dir.trim()).join(PENDING).exists());
+    }
+
+    #[tokio::test]
+    async fn foreign_review_allows_its_owned_shadow_and_refuses_the_external_path() {
+        let (_tmp, mut state, wt) = fixture(&["exit 0"]).await;
+        state.foreign_checkout = Some(
+            crate::foreign_checkout::inspect(&state.repo, "main", &state.repo)
+                .await
+                .unwrap(),
+        );
+        std::fs::write(wt.join("junk"), "remove").unwrap();
+        reset(&mut state, &wt, None).await.unwrap();
+        assert!(!wt.join("junk").exists());
+        let external = state.repo.clone();
+        assert!(reset(&mut state, &external, None).await.is_err());
+        // The explicit external identity also wins if a mistaken candidate
+        // record happens to point at an otherwise linked, run-local checkout.
+        state.foreign_checkout.as_mut().unwrap().path = wt.canonicalize().unwrap();
+        assert!(reset(&mut state, &wt, None).await.is_err());
+    }
+
+    #[tokio::test]
     async fn moved_branch_cleanup_failure_leaves_sync_reservation_unfinished() {
         let (_tmp, mut state, wt) = fixture(&["exit 7"]).await;
         git::git(&wt, &["checkout", "-b", "candidate"])
@@ -420,6 +581,9 @@ mod tests {
         );
         let saved = RunState::load(&state.id).unwrap();
         assert!(!saved.base_sync_recovery.operations.last().unwrap().finished);
+        state.config.worktree.pre_clean[0].run = "exit 0".into();
+        resume_pending(&mut state, &wt).await.unwrap();
+        assert!(!wt.join("cache").exists());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

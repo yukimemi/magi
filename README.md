@@ -1366,7 +1366,7 @@ Use the same explicit cache path in the project's build task.
 | Existing reviewer reset for a new review round | Yes, in that reviewer only; before setup is repeated |
 | New worktree creation / setup | No |
 | `restore_to`, including recursive submodule cleans (`git clean -ffdq`, preserves ignored products) | No |
-| Primary checkout, foreign checkout, rebase/base-conflict scratch, local release scratch | No |
+| Primary checkout, actual foreign checkout, rebase/base-conflict scratch, local release scratch | No |
 | Worktree removal, retention, setup rollback | No |
 | Low-level Git helpers called without the owned-worktree wrapper | No |
 
@@ -1389,23 +1389,27 @@ A hook can still modify files; it is trusted project code, not a sandbox.
 With an empty list magi follows its existing Git path without extra subprocesses
 or ownership checks. With hooks configured, targets must belong to this run,
 share its Git common directory, and reside directly in its worktree root;
-linked-worktree status alone does not authorize execution. Candidate cleanup
-never enumerates or resets independent reviewer worktrees.
+linked-worktree status alone does not authorize execution. An owned shadow
+worktree used to review a foreign branch remains eligible; the original external
+checkout is always excluded. Candidate cleanup never enumerates or resets independent reviewer worktrees.
 
 Synchronization completion is recorded only after hooks and clean succeed.
 An interrupted rebase may already have moved the branch while its worktree
 still needs synchronization. The existing operation reservation remains
 unfinished on cleanup failure. A candidate-local Git metadata marker also records
 the cleanup boundary before reset, including legacy synchronization histories
-without an operation reservation. Before classifying a resumed branch, magi
-retries that boundary only if HEAD matches and there are no tracked edits or
-untracked/ignored files; removing the hook configuration cannot skip it. The
-marker is removed only after clean succeeds. On resume, unrecognized edits or remaining
-untracked/ignored files after that branch movement conservatively stop recovery
-for inspection; hooks do not grant permission to discard them. No automatic
-retry bypasses this check, and no additional conflict-resolution attempt is
-introduced by cleanup. A retained run may consequently require an owner decision
-before recovery can proceed.
+without an operation reservation. The marker records the target HEAD, the
+accepted index tree before reset, and the untracked/ignored paths already
+scheduled for deletion. Before classifying a resumed branch, magi accepts either
+that unchanged old index/tree or the clean target tree. Existing recorded cache
+paths may remain: hooks run again to remove them before Git clean. Changed HEAD,
+unrecognized tracked edits, or newly introduced untracked/ignored paths stop
+recovery for inspection. Hook-created paths that were not present when cleanup
+started also require inspection after interruption. Removing the hook
+configuration cannot skip the recorded clean. The marker is removed only after
+clean succeeds. Older head-only markers lack this evidence and retain their
+conservative clean-tree/empty-untracked recovery requirement. No additional
+conflict-resolution attempt is introduced by cleanup.
 
 ## The review loop
 
