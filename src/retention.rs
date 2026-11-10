@@ -40,6 +40,12 @@ pub async fn restore_source(evidence: &Path, destination: &Path) -> Result<()> {
     crate::fold_evidence::restore_snapshot(evidence, destination).await
 }
 
+/// Historical scan observations, independent of archive readability or deletion authority.
+pub fn seat_inspections(home: &Path, id: &str) -> Result<Vec<String>> {
+    ensure!(crate::run::is_run_id(id), "invalid run id");
+    copies::seat_inspections(home, id)
+}
+
 /// List archived checkout tips for a run, validating their durable evidence.
 pub async fn seat_evidence(home: &Path, id: &str) -> Result<Vec<String>> {
     copies::seat_evidence(home, id).await
@@ -370,6 +376,7 @@ pub(crate) struct Report {
     pub observed_home_free_change_bytes: Option<i64>,
     pub retired: usize,
     pub evicted_copies: usize,
+    pub source_scan: Option<serde_json::Value>,
     pub removed_empty_roots: usize,
     pub source_unlinked_logical_bytes: u64,
     pub source_unlinked_allocated_bytes: Option<u64>,
@@ -6418,6 +6425,361 @@ mod tests {
             }
         }
     }
+    fn source_census(home: &Path) -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(home.join("source-eviction-cursor")).unwrap())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn source_eviction_scan_bounds_missing_root_checkpoints_and_eventually_reclaims() {
+        let f = Fx::new().await;
+        let state = inactive_source(&f, "ffff", true).await;
+        let review = reviewer(&f, &state, &f.base).await;
+        for i in 0..130 {
+            let mut old = state.clone();
+            old.id = format!("20260101-000000-{i:04x}");
+            old.candidates.clear();
+            old.save_under(&f.home).unwrap();
+            // Missing roots with ledger records must still be inspected.
+            if i == 0 {
+                let artifacts = f.home.join("runs").join(&old.id).join("artifacts");
+                std::fs::create_dir_all(&artifacts).unwrap();
+                std::fs::write(artifacts.join("eviction-review-1.json"), "{}").unwrap();
+            }
+        }
+        // Each invocation reloads the durable cursor. The corrupt ledger uses
+        // one normal inspection slot; the remaining missing roots use a
+        // separate 64-entry skip budget, bounding full-census checkpoint writes.
+        // Repeat through wrap so idle sweeps cannot reintroduce an unbounded pass.
+        for cycle in 1..=2 {
+            for (pass, expected_next) in [65, 129, 131].into_iter().enumerate() {
+                let mut report = Report::default();
+                copies::evict(&f.home, &Fx::disk(), Fx::now(), &mut report).await;
+                assert!(report.failures.is_empty(), "{report:?}");
+                assert_eq!(report.evicted_copies, usize::from(cycle == 1 && pass == 2));
+                assert_eq!(review.exists(), cycle == 1 && pass < 2);
+                let census = source_census(&f.home);
+                assert_eq!(census["current"]["next"], expected_next);
+                assert_eq!(census["current"]["completed_at"].is_null(), pass < 2);
+                assert_eq!(census["current"]["number"], cycle);
+                assert_eq!(
+                    census["current"]["runs"]["20260101-000000-0000"]["root"]["outcome"],
+                    "error"
+                );
+                assert_eq!(
+                    census["current"]["runs"]["20260101-000000-0001"]["root"]["detail"],
+                    "root absent and no eviction records; nothing to reclaim"
+                );
+                if pass < 2 {
+                    let next_id = format!("20260101-000000-{expected_next:04x}");
+                    assert_eq!(
+                        census["current"]["runs"][next_id]["root"]["outcome"],
+                        "not-yet-inspected"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn source_eviction_scan_reaches_old_seats_despite_empty_roots_and_timestamp_churn() {
+        let f = Fx::new().await;
+        let mut state = inactive_source(&f, "ffff", true).await;
+        let review = reviewer(&f, &state, &f.base).await;
+        // Empty checkout roots still need ownership checks and consume a
+        // discovery slot; mutable timestamp ordering must not move the cursor.
+        let mut history = Vec::new();
+        for i in 0..130 {
+            let mut old = state.clone();
+            old.id = format!("20260101-000000-{i:04x}");
+            old.candidates.clear();
+            old.save_under(&f.home).unwrap();
+            std::fs::create_dir_all(old.worktree_root()).unwrap();
+            history.push(old);
+        }
+        state
+            .save_under_at(
+                &f.home,
+                Timestamp::now() + jiff::SignedDuration::from_secs(10),
+            )
+            .unwrap();
+        for pass in 0..3 {
+            let mut report = Report::default();
+            copies::evict(&f.home, &Fx::disk(), Fx::now(), &mut report).await;
+            assert!(report.failures.is_empty(), "{report:?}");
+            let census = source_census(&f.home);
+            assert_eq!(
+                census["current"]["next"].as_u64().unwrap(),
+                ((pass + 1) * 64).min(131)
+            );
+            if pass < 2 {
+                assert!(review.exists());
+                assert!(census["current"]["completed_at"].is_null());
+                assert_eq!(
+                    census["current"]["runs"][&state.id]["root"]["outcome"],
+                    "not-yet-inspected"
+                );
+            }
+            // Reorder the records on disk, including the cursor's former ID.
+            // Loading a fresh scan on the next invocation models a restart.
+            for old in history.iter_mut().take(64) {
+                old.updated_at = Timestamp::now();
+                old.save_under(&f.home).unwrap();
+            }
+            if pass == 1 {
+                // Reproduce the old cursor's non-progress: moving its timestamp
+                // before already visited records makes its next 64 slots revisit
+                // those roots, excluding the eligible tail again. Repeating this
+                // bookkeeping permutation can keep the tail out indefinitely.
+                let older = Timestamp::now() - jiff::SignedDuration::from_secs(100);
+                for old in history.iter_mut().take(128) {
+                    if f.home.join("runs").join(&old.id).exists() {
+                        old.save_under_at(&f.home, older).unwrap();
+                    }
+                }
+                history[127]
+                    .save_under_at(&f.home, older - jiff::SignedDuration::from_secs(100))
+                    .unwrap();
+                let mut legacy: Vec<_> = history
+                    .iter()
+                    .filter(|r| f.home.join("runs").join(&r.id).exists())
+                    .cloned()
+                    .collect();
+                legacy.push(state.clone());
+                legacy.sort_by_key(|r| r.updated_at);
+                let index = legacy.iter().position(|r| r.id == history[127].id).unwrap();
+                let len = legacy.len();
+                legacy.rotate_left((index + 1) % len);
+                assert!(legacy.iter().take(64).all(|r| r.id != state.id));
+            }
+            if pass == 0 {
+                std::fs::remove_dir_all(f.home.join("runs").join(&history[64].id)).unwrap();
+                let mut added = state.clone();
+                added.id = "20260101-000000-fffe".into();
+                added.candidates.clear();
+                added.save_under(&f.home).unwrap();
+            }
+        }
+        assert!(!review.exists());
+        let census = source_census(&f.home);
+        assert!(!census["current"]["completed_at"].is_null());
+        assert_eq!(
+            census["current"]["runs"][&state.id]["seats"]["review-1"]["outcome"],
+            "evicted"
+        );
+        assert_eq!(
+            census["current"]["runs"][&history[64].id]["root"]["outcome"],
+            "error"
+        );
+        let mut next = Report::default();
+        copies::evict(&f.home, &Fx::disk(), Fx::now(), &mut next).await;
+        let wrapped = source_census(&f.home);
+        assert_eq!(wrapped["current"]["number"], 2);
+        assert_eq!(wrapped["previous"], census["current"]);
+        assert!(
+            wrapped["current"]["runs"]
+                .get("20260101-000000-fffe")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn source_eviction_scan_resumes_within_run_and_bounds_failed_seats() {
+        fn fail_one(path: &Path) -> Result<()> {
+            ensure!(
+                path.file_name().unwrap() != "review-2",
+                "injected checkpoint failure"
+            );
+            Ok(())
+        }
+        let f = Fx::new().await;
+        let state = inactive_source(&f, "ef20", true).await;
+        let mut paths = Vec::new();
+        for i in 1..=8 {
+            let path = state.worktree_root().join(format!("review-{i}"));
+            git::worktree_add_detached(&f.repo, &path, &f.base)
+                .await
+                .unwrap();
+            paths.push(path);
+        }
+        std::fs::write(paths[2].join("owner-data"), "retain me").unwrap();
+        let mut first = Report::default();
+        copies::evict_with(&f.home, &Fx::disk(), Fx::now(), &mut first, fail_one).await;
+        assert_eq!(first.evicted_copies, 3, "{first:?}");
+        let census = source_census(&f.home);
+        let seats = &census["current"]["runs"][&state.id]["seats"];
+        assert_eq!(census["current"]["after_seat"], "review-5");
+        assert_eq!(seats["review-2"]["outcome"], "error");
+        assert_eq!(seats["review-2"]["stage"], "unlink");
+        assert_eq!(seats["review-3"]["outcome"], "protected");
+        assert_eq!(seats["review-6"]["outcome"], "not-yet-inspected");
+        assert!(first.source_unlinked_logical_bytes > 0);
+        assert!(first.source_evidence_added_logical_bytes > 0);
+        let mut second = Report::default();
+        copies::evict(&f.home, &Fx::disk(), Fx::now(), &mut second).await;
+        assert_eq!(second.evicted_copies, 3, "{second:?}");
+        assert!(paths[1].exists(), "failed seat waits until next cycle");
+        assert!(paths[2].exists());
+        assert!(!source_census(&f.home)["current"]["completed_at"].is_null());
+        let mut third = Report::default();
+        copies::evict(&f.home, &Fx::disk(), Fx::now(), &mut third).await;
+        assert_eq!(third.evicted_copies, 1, "{third:?}");
+        assert!(!paths[1].exists());
+        assert_eq!(
+            std::fs::read_to_string(paths[2].join("owner-data")).unwrap(),
+            "retain me"
+        );
+        let shown = seat_inspections(&f.home, &state.id).unwrap().join("\n");
+        assert!(
+            shown.contains("cycle=1 complete=true review-2 error stage=unlink"),
+            "{shown}"
+        );
+        git::git(&f.repo, &["gc", "--prune=now"]).await.unwrap();
+        let destination = f.bay.join("restored-scan-seat");
+        restore_seat(&f.home, &state.id, &f.base, &destination)
+            .await
+            .unwrap();
+        assert_eq!(git::rev_parse(&destination, "HEAD").await.unwrap(), f.base);
+    }
+
+    #[tokio::test]
+    async fn source_eviction_scan_continues_after_archive_failure_and_busy_output() {
+        let f = Fx::new().await;
+        let failed = inactive_source(&f, "ef30", true).await;
+        let failed_seat = reviewer(&f, &failed, &f.base).await;
+        let evidence = f
+            .home
+            .join("runs")
+            .join(&failed.id)
+            .join("artifacts/source-evidence");
+        std::fs::create_dir_all(&evidence).unwrap();
+        std::fs::File::create(evidence.join("reserved-evidence"))
+            .unwrap()
+            .set_len(64 * 1024 * 1024)
+            .unwrap();
+        let state = inactive_source(&f, "ef31", true).await;
+        let busy = reviewer(&f, &state, &f.base).await;
+        let available = state.worktree_root().join("review-2");
+        git::worktree_add_detached(&f.repo, &available, &f.base)
+            .await
+            .unwrap();
+        let output = OutputLease::take(&busy, true).unwrap();
+        let mut report = Report::default();
+        copies::evict(&f.home, &Fx::disk(), Fx::now(), &mut report).await;
+        assert_eq!(report.evicted_copies, 1, "{report:?}");
+        assert!(failed_seat.exists());
+        assert!(busy.exists());
+        assert!(!available.exists());
+        let census = source_census(&f.home);
+        assert!(!census["current"]["completed_at"].is_null());
+        assert_eq!(
+            census["current"]["runs"][&failed.id]["seats"]["review-1"]["outcome"],
+            "error"
+        );
+        assert_eq!(
+            census["current"]["runs"][&state.id]["seats"]["review-1"]["outcome"],
+            "protected"
+        );
+        drop(output);
+        let mut retry = Report::default();
+        copies::evict(&f.home, &Fx::disk(), Fx::now(), &mut retry).await;
+        assert_eq!(retry.evicted_copies, 1, "{retry:?}");
+        assert!(!busy.exists());
+        assert!(failed_seat.exists());
+    }
+
+    #[tokio::test]
+    async fn source_eviction_scan_checkpoint_failure_stops_before_later_seats() {
+        fn block_checkpoint(path: &Path) -> Result<()> {
+            let home = path
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("home");
+            let cursor = home.join("source-eviction-cursor");
+            std::fs::rename(&cursor, home.join("saved-cursor"))?;
+            std::fs::create_dir(&cursor)?;
+            Ok(())
+        }
+        let f = Fx::new().await;
+        let state = inactive_source(&f, "ef32", true).await;
+        let first = reviewer(&f, &state, &f.base).await;
+        let second = state.worktree_root().join("review-2");
+        git::worktree_add_detached(&f.repo, &second, &f.base)
+            .await
+            .unwrap();
+        let mut report = Report::default();
+        copies::evict_with(
+            &f.home,
+            &Fx::disk(),
+            Fx::now(),
+            &mut report,
+            block_checkpoint,
+        )
+        .await;
+        assert_eq!(report.evicted_copies, 1, "{report:?}");
+        assert!(!first.exists());
+        assert!(second.exists());
+        assert!(
+            report
+                .failures
+                .iter()
+                .any(|e| e.contains("persist source scan census"))
+        );
+        assert_eq!(report.source_scan.as_ref().unwrap()["outcome"], "error");
+        std::fs::remove_dir(f.home.join("source-eviction-cursor")).unwrap();
+        std::fs::rename(
+            f.home.join("saved-cursor"),
+            f.home.join("source-eviction-cursor"),
+        )
+        .unwrap();
+        let mut retry = Report::default();
+        copies::evict(&f.home, &Fx::disk(), Fx::now(), &mut retry).await;
+        assert_eq!(retry.evicted_copies, 1, "{retry:?}");
+        assert!(!second.exists());
+    }
+
+    #[tokio::test]
+    async fn source_eviction_scan_reports_invalid_cursor_and_global_ownership() {
+        let f = Fx::new().await;
+        let state = inactive_source(&f, "ef21", true).await;
+        let review = reviewer(&f, &state, &f.base).await;
+        let cursor = f.home.join("source-eviction-cursor");
+        std::fs::write(&cursor, "broken cursor").unwrap();
+        let mut report = Report::default();
+        copies::evict(&f.home, &Fx::disk(), Fx::now(), &mut report).await;
+        assert_eq!(std::fs::read_to_string(&cursor).unwrap(), "broken cursor");
+        assert_eq!(report.source_scan.as_ref().unwrap()["outcome"], "error");
+        assert!(review.exists());
+        // Migrate a valid legacy cursor even if its target no longer exists.
+        std::fs::write(&cursor, "20260101-000000-abcd").unwrap();
+        let mut disabled = Fx::disk();
+        disabled.auto_fold = false;
+        let mut report = Report::default();
+        copies::evict(&f.home, &disabled, Fx::now(), &mut report).await;
+        assert_eq!(report.source_scan.as_ref().unwrap()["outcome"], "disabled");
+        let record = f.home.join("runs").join(&state.id).join("run.json");
+        let original = std::fs::read(&record).unwrap();
+        std::fs::write(&record, "invalid ownership").unwrap();
+        let mut report = Report::default();
+        copies::evict(&f.home, &Fx::disk(), Fx::now(), &mut report).await;
+        assert!(
+            report
+                .failures
+                .iter()
+                .any(|e| e.contains("global run ownership validation"))
+        );
+        assert!(review.exists());
+        std::fs::write(record, original).unwrap();
+        let mut report = Report::default();
+        copies::evict(&f.home, &Fx::disk(), Fx::now(), &mut report).await;
+        assert_eq!(report.evicted_copies, 1, "{report:?}");
+        assert_eq!(source_census(&f.home)["version"], 1);
+    }
+
     #[tokio::test]
     async fn source_eviction_batches_reproducible_seats_without_dropping_task_history() {
         let f = Fx::new().await;

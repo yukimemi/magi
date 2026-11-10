@@ -1840,6 +1840,9 @@ async fn dispatch(command: Command) -> Result<()> {
             ..
         } => {
             let id = resolve_id(&id)?;
+            for observation in magi::retention::seat_inspections(&magi::run::home(), &id)? {
+                println!("{observation}");
+            }
             for record in magi::retention::seat_evidence(&magi::run::home(), &id).await? {
                 println!("{record}");
             }

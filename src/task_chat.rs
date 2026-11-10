@@ -220,6 +220,13 @@ pub fn post(
         delivery_error: None,
         archived: false,
     })?;
+    // Fresh consent can predate task ownership. Once the inquiry has its
+    // owner, bind that exact response before chat creation/delivery can fail.
+    // Saved replies without the live acceptance generation remain history.
+    if q.answer.is_some() && q.accepted_answer_at.is_some() && q.accepted_answer_at == q.answered_at
+    {
+        accept_fresh_reply(home, q)?;
+    }
     outbox.deliver(queue, talks, &q.id)
 }
 

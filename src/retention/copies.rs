@@ -1,5 +1,7 @@
 //! Checkout eviction does not retire a run or alter task/recovery lineage.
+mod scan;
 mod schema;
+use scan::Observation;
 
 use super::*;
 use std::collections::BTreeMap;
@@ -46,13 +48,18 @@ fn history(home: &Path) -> Result<Vec<RunState>> {
             continue;
         }
         let path = entry.path().join("run.json");
-        bytes = bytes.saturating_add(std::fs::symlink_metadata(&path)?.len());
+        bytes = bytes.saturating_add(
+            std::fs::symlink_metadata(&path)
+                .with_context(|| format!("run {id}: ownership record metadata"))?
+                .len(),
+        );
         ensure!(
             bytes <= 256 * 1024 * 1024 && states.len() < 4096,
             "run ownership inspection budget exceeded"
         );
-        let raw = read_record(&path)?;
-        let state = RunState::load_under(&id, home)?;
+        let raw = read_record(&path).with_context(|| format!("run {id}: ownership record"))?;
+        let state = RunState::load_under(&id, home)
+            .with_context(|| format!("run {id}: ownership schema"))?;
         ensure!(
             schema::known(&raw, &state)?,
             "unknown source/authority fields in run {id}"
@@ -87,7 +94,8 @@ fn tasks(home: &Path) -> Result<Vec<crate::queue::Task>> {
     ensure!(queue.unreadable().is_empty(), "unreadable task ownership");
     let tasks = queue.list();
     for task in &tasks {
-        let raw = read_record(&queue.path_of(&task.id))?;
+        let raw = read_record(&queue.path_of(&task.id))
+            .with_context(|| format!("task {}: ownership record", task.id))?;
         ensure!(
             schema::known(&raw, task)?,
             "unknown source/authority fields in task {}",
@@ -124,7 +132,11 @@ fn control_records(root: &Path) -> Result<Vec<(PathBuf, serde_json::Value)>> {
                 records.len() < 4096 && bytes <= 64 * 1024 * 1024,
                 "control ownership inspection budget exceeded"
             );
-            records.push((path.clone(), read_record(&path)?));
+            records.push((
+                path.clone(),
+                read_record(&path)
+                    .with_context(|| format!("control ownership record {}", path.display()))?,
+            ));
         }
     }
     Ok(records)
@@ -536,73 +548,140 @@ pub(super) async fn evict_with(
     report: &mut Report,
     before_unlink: fn(&Path) -> Result<()>,
 ) {
+    let mut status = serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"), "checked_at": now,
+        "auto_fold": disk.auto_fold, "reclaim_bytes": disk.worktree_reclaim_bytes,
+        "outcome": "inspecting", "stage": "ownership",
+    });
+    let result = evict_scan(home, disk, now, report, before_unlink, &mut status).await;
+    if let Err(e) = result {
+        status["outcome"] = "error".into();
+        status["detail"] = format!("{e:#}").into();
+        report.retained.push(format!("source eviction: {e:#}"));
+        report.failures.push(format!("source eviction: {e:#}"));
+    }
+    report.source_scan = Some(status.clone());
+    if let Err(e) = crate::fold_evidence::atomic_write(
+        &home.join("source-eviction-status.json"),
+        &serde_json::to_vec(&status).expect("scan status"),
+    ) {
+        report
+            .failures
+            .push(format!("source eviction status persistence: {e:#}"));
+    }
+}
+
+async fn evict_scan(
+    home: &Path,
+    disk: &crate::config::Disk,
+    now: Timestamp,
+    report: &mut Report,
+    before_unlink: fn(&Path) -> Result<()>,
+    status: &mut serde_json::Value,
+) -> Result<()> {
     if !disk.auto_fold || disk.worktree_reclaim_bytes == 0 {
-        return;
+        status["outcome"] = "disabled".into();
+        return Ok(());
     }
-    let states = match history(home) {
-        Ok(mut states) => {
-            states.sort_by_key(|s| s.updated_at);
-            states
-        }
-        Err(e) => {
-            report
-                .retained
-                .push(format!("source eviction: unreadable ownership: {e:#}"));
-            return;
-        }
-    };
-    let cursor = home.join("source-eviction-cursor");
-    let mut states = states;
-    match std::fs::symlink_metadata(&cursor) {
-        Ok(meta) => {
-            if !meta.is_file()
-                || meta.file_type().is_symlink()
-                || meta.len() > 128
-                || !cursor.canonicalize().is_ok_and(|p| p == cursor)
-            {
-                report
-                    .retained
-                    .push("source eviction: unknown scan cursor retained".into());
-                return;
-            }
-            if let Ok(last) = std::fs::read_to_string(&cursor)
-                && let Some(index) = states.iter().position(|s| s.id == last)
-            {
-                let len = states.len();
-                if len > 0 {
-                    states.rotate_left((index + 1) % len);
-                }
-            }
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => {
-            report.retained.push(format!("source eviction cursor: {e}"));
-            return;
-        }
-    }
+    let mut states = history(home).context("global run ownership validation")?;
+    states.sort_by(|a, b| a.id.cmp(&b.id));
+    // Validate all borrowers before spending a seat's archive budget. These
+    // global errors are distinct from a policy protecting an inspected seat.
+    tasks(home).context("global task ownership validation")?;
+    questions(home).context("global question ownership validation")?;
+    let mut scan = scan::Scan::load(home, &states, now)?;
+    scan.complete_empty(now);
+    scan.save(home)?;
+    status["stage"] = "bounded-scan".into();
     let mut attempted = 0;
     let mut unlinked = 0u64;
-    for listed in states.into_iter().take(64) {
+    let mut inspected_runs = 0;
+    let mut skipped_roots = 0;
+    // Every visited run checkpoints the full bounded census. Missing roots
+    // need their own cap so this sweep cannot rewrite it once per history entry.
+    while inspected_runs < 64 && skipped_roots < 64 {
         if attempted >= LIMIT
             || unlinked >= disk.worktree_reclaim_bytes
             || report.source_evidence_added_logical_bytes >= EVIDENCE_BUDGET
         {
             break;
         }
+        let Some(id) = scan.next() else { break };
+        let mut has_work = true;
+        let mut finished_run = true;
+        let mut stage = "discovery";
         let result = async {
+            let listed = states
+                .iter()
+                .find(|s| s.id == id)
+                .context("frozen run record disappeared")?;
+            let root = listed.worktree_root();
+            scan.validate_root(&id, &root)?;
+            if !run_has_work(home, listed)? {
+                has_work = false;
+                scan.root(
+                    &id,
+                    Observation::new(
+                        "inspected",
+                        "discovery",
+                        "root absent and no eviction records; nothing to reclaim",
+                        now,
+                    ),
+                );
+                return Ok(());
+            }
+            if root.try_exists()? {
+                ensure!(
+                    plain_dir(&root) && root.canonicalize()? == root,
+                    "noncanonical run root"
+                );
+                let entries = std::fs::read_dir(&root)?
+                    .take(4097)
+                    .collect::<std::io::Result<Vec<_>>>()?;
+                ensure!(entries.len() <= 4096, "run root discovery budget exceeded");
+                scan.discover(
+                    &id,
+                    entries
+                        .iter()
+                        .filter(|e| disposable(listed, &e.path()))
+                        .map(|e| e.file_name().to_string_lossy().into_owned()),
+                    now,
+                );
+                scan.root(
+                    &id,
+                    Observation::new(
+                        "inspected",
+                        "discovery",
+                        "root inventory discovered; seat outcomes follow",
+                        now,
+                    ),
+                );
+            } else {
+                scan.root(
+                    &id,
+                    Observation::new(
+                        "inspected",
+                        "discovery",
+                        "root absent; pending ledger reconciliation required",
+                        now,
+                    ),
+                );
+            }
+            scan.save(home)?;
+            stage = "ownership-and-leases";
             let queue = crate::queue::Queue::at(home.join("queue"));
             let tasks = tasks(home)?;
             let mut claims = Vec::new();
-            for task in tasks.iter().filter(|t| t.runs.contains(&listed.id)) {
+            for task in tasks.iter().filter(|t| t.runs.contains(&id)) {
                 claims.push(queue.claim(&task.id)?);
             }
-            let run_dir = home.join("runs").join(&listed.id);
+            let run_dir = home.join("runs").join(&id);
             ensure!(
                 plain_dir(&run_dir) && run_dir.canonicalize()? == run_dir,
                 "noncanonical run ownership"
             );
-            let _owner = crate::pr_head::owner_lock(home, &listed.id)?;
-            let state = RunState::load_under(&listed.id, home)?;
+            let _owner = crate::pr_head::owner_lock(home, &id)?;
+            let state = RunState::load_under(&id, home)?;
             // Empty roots contain no source bytes. They do not require task
             // retirement or choosing one implementation out of the lineage.
             ensure!(
@@ -622,11 +701,9 @@ pub(super) async fn evict_with(
                     "noncanonical run root"
                 );
             }
-            let paths = worktrees(&state).await?;
-            let mut outputs = Vec::new();
-            for path in paths.iter().filter(|p| disposable(&state, p)) {
-                outputs.push(OutputLease::take(path, true)?);
-            }
+            let mut paths = worktrees(&state).await?;
+            paths.sort();
+            scan.registration_gaps(&id, &paths, now);
             let wait =
                 crate::repo_lock::WaitPolicy::new(std::time::Duration::from_secs(1), || false);
             let _coordination = crate::repo_lock::SeatLease::operation_with(
@@ -635,8 +712,18 @@ pub(super) async fn evict_with(
                 &wait,
             )
             .await?;
+            stage = "pending-reconciliation";
             reconcile_pending(home, &state, disk, now, &_driver).await?;
             if !root.try_exists()? {
+                scan.root(
+                    &id,
+                    Observation::new(
+                        "inspected",
+                        "reconciliation",
+                        "root absent; pending ledger checked",
+                        now,
+                    ),
+                );
                 return Ok(());
             }
             if std::fs::read_dir(&root)?.next().is_none() {
@@ -653,13 +740,26 @@ pub(super) async fn evict_with(
                 report.removed_empty_roots += 1;
                 return Ok(());
             }
+            stage = "seat-inspection";
+            let after = scan.after().map(str::to_owned);
             for path in paths.iter().filter(|p| disposable(&state, p)) {
+                let name = path
+                    .file_name()
+                    .context("seat name")?
+                    .to_string_lossy()
+                    .into_owned();
+                if after.as_ref().is_some_and(|last| name <= *last) {
+                    continue;
+                }
                 if attempted >= LIMIT
                     || unlinked >= disk.worktree_reclaim_bytes
                     || report.source_evidence_added_logical_bytes >= EVIDENCE_BUDGET
                 {
+                    finished_run = false;
                     break;
                 }
+                attempted += 1;
+                let mut seat_stage = "eligibility";
                 let artifacts = home.join("runs").join(&state.id).join("artifacts");
                 let before = if artifacts.exists() {
                     crate::disk::dir_size(&artifacts)
@@ -673,8 +773,11 @@ pub(super) async fn evict_with(
                     0
                 };
                 let result = async {
+                    let _output = OutputLease::take(path, true)?;
                     eligible(home, &state, now, disk, &_driver, path)?;
+                    seat_stage = "source-proof";
                     let head = proof(home, &state, path, now, disk).await?;
+                    seat_stage = "archive";
                     // Shared strict administration inventory rejects operations,
                     // local refs, symlinks and unknown checkpoint artifacts.
                     let admin =
@@ -839,6 +942,7 @@ pub(super) async fn evict_with(
                         "eviction publication budget exceeded"
                     );
                     crate::fold_evidence::atomic_write(&ledger, &pending)?;
+                    seat_stage = "unlink";
                     before_unlink(path)?;
                     // Rebuild every recorded patch in an independent index at
                     // the last boundary before removing its materialized source.
@@ -859,7 +963,6 @@ pub(super) async fn evict_with(
                         "checkout removal incomplete"
                     );
                     report.evicted_copies += 1;
-                    attempted += 1;
                     report.source_unlinked_logical_bytes += bytes;
                     unlinked += bytes;
                     for file in files {
@@ -887,27 +990,120 @@ pub(super) async fn evict_with(
                                 .saturating_sub(allocated_before),
                     );
                 }
-                if let Err(e) = result {
-                    report.retained.push(format!(
-                        "{}/{}: {e:#}",
-                        state.id,
-                        path.file_name().unwrap_or_default().to_string_lossy()
-                    ));
-                }
+                let observation = match result {
+                    Ok(()) => Observation::new(
+                        "evicted",
+                        "complete",
+                        "durable restore evidence and clean removal verified",
+                        now,
+                    ),
+                    Err(e) => {
+                        let detail = format!("{e:#}");
+                        report
+                            .retained
+                            .push(format!("{}/{name}: {detail}", state.id));
+                        let outcome = inspection_outcome(&e, &detail);
+                        Observation::new(outcome, seat_stage, detail, now)
+                    }
+                };
+                scan.seat(&id, &name, observation);
+                scan.save(home)?;
             }
             Ok::<_, anyhow::Error>(())
         }
         .await;
-        if !cursor.try_exists().unwrap_or(true) || cursor.canonicalize().is_ok_and(|p| p == cursor)
-        {
-            let _ = crate::fold_evidence::atomic_write(&cursor, listed.id.as_bytes());
+        if has_work {
+            inspected_runs += 1;
+        } else {
+            skipped_roots += 1;
         }
-        if let Err(e) = result {
+        // A failed checkpoint must never be silently treated as a completed run.
+        if result
+            .as_ref()
+            .err()
+            .is_some_and(|e| e.downcast_ref::<scan::CheckpointFailure>().is_some())
+        {
+            return result;
+        }
+        let blocker = result.err().map(|e| {
+            let detail = format!("{e:#}");
             report
                 .retained
-                .push(format!("{}: source eviction: {e:#}", listed.id));
+                .push(format!("{id}: source eviction: {detail}"));
+            let outcome = inspection_outcome(&e, &detail);
+            Observation::new(outcome, stage, detail, now)
+        });
+        if finished_run || blocker.is_some() {
+            scan.finish_run(&id, blocker.as_ref(), now);
+        }
+        scan.save(home)?;
+        status["scan"] = scan.summary();
+    }
+    status["scan"] = scan.summary();
+    status["outcome"] = "inspected".into();
+    Ok(())
+}
+
+// Only proven absent roots without eviction intents use the separate bounded
+// skip budget. Symlinks, unreadable paths and ledger records need normal inspection.
+fn run_has_work(home: &Path, state: &RunState) -> Result<bool> {
+    match std::fs::symlink_metadata(state.worktree_root()) {
+        Ok(_) => return Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    let artifacts = home.join("runs").join(&state.id).join("artifacts");
+    match std::fs::symlink_metadata(&artifacts) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e.into()),
+        Ok(_) => ensure!(
+            plain_dir(&artifacts) && artifacts.canonicalize()? == artifacts,
+            "noncanonical artifacts"
+        ),
+    }
+    for (count, entry) in std::fs::read_dir(artifacts)?.enumerate() {
+        ensure!(count < 4096, "eviction record inspection limit exceeded");
+        let name = entry?.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("eviction-") && name.ends_with(".json") {
+            return Ok(true);
         }
     }
+    Ok(false)
+}
+
+fn inspection_outcome(error: &anyhow::Error, detail: &str) -> &'static str {
+    let busy = error.chain().any(|e| {
+        e.downcast_ref::<std::io::Error>().is_some_and(|e| {
+            e.kind() == std::io::ErrorKind::WouldBlock
+                || cfg!(windows) && e.raw_os_error() == Some(33)
+        })
+    });
+    let policy = [
+        "output lease: outputs are in use or being reclaimed:",
+        "checkout path dependency:",
+        "continuation path dependency:",
+        "tracked, untracked, ignored content",
+        "unknown source entry",
+        "index differs from HEAD",
+        "source is attached to a branch",
+        "recent or unreadable output activity",
+        "selected implementation checkout",
+        "resume contract:",
+        "run acquired a daemon claim",
+        "run live or ownership unknown",
+        "execution activity within grace period",
+        "explicitly retained recovery sources",
+        "implementation authority:",
+        "restoration checkpoint:",
+        "continuation lease:",
+        "task has an unanswered owner decision",
+        "resume/source authority:",
+        "unanswered owner decision",
+    ]
+    .iter()
+    .any(|reason| detail.contains(reason));
+    if busy || policy { "protected" } else { "error" }
 }
 
 fn eviction_storage(artifacts: &Path) -> Result<u64> {
@@ -1232,6 +1428,24 @@ async fn archived_records(home: &Path, id: &str) -> Result<Vec<Eviction>> {
     }
     records.sort_by(|a, b| a.source.cmp(&b.source));
     Ok(records)
+}
+
+pub(super) fn seat_inspections(home: &Path, id: &str) -> Result<Vec<String>> {
+    let mut shown = Vec::new();
+    for name in [
+        "source-eviction-status.json",
+        "source-eviction-housekeeping-dispatch.json",
+        "source-eviction-housekeeping-worker.json",
+        "source-eviction-disk-pressure-dispatch.json",
+        "source-eviction-disk-pressure-worker.json",
+    ] {
+        let path = home.join(name);
+        if path.try_exists()? {
+            shown.push(format!("{name}: {}", read_record(&path)?));
+        }
+    }
+    shown.extend(scan::shown(home, id)?);
+    Ok(shown)
 }
 
 pub(super) async fn seat_evidence(home: &Path, id: &str) -> Result<Vec<String>> {

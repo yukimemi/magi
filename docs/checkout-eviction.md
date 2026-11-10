@@ -22,8 +22,56 @@ unarchivable recovery history, dirty/index-hidden edits, ignored/untracked entri
 symlinks and even unknown empty directories block deletion. Build outputs are
 never archived; a copy containing any such leftovers is retained.
 
-The pass visits at most 64 runs, oldest first with a rotating continuation,
-and evicts at most five copies. New evidence has a 64 MiB per-pass budget and a 64 MiB per-run archive bound
+The pass inspects at most 64 run roots and skips at most 64 proven absent roots
+without eviction records, using separate budgets. Each visited run checkpoints
+the census, so both budgets bound full-census writes even with thousands of
+missing roots. It inspects at most five disposable seats, including unsuccessful
+inspections. Missing and empty roots never spend seat slots.
+Runs use immutable ID order, not `updated_at`:
+ordinary bookkeeping cannot move the continuation. A cycle freezes its run IDs
+and upper ID; newly added runs join the next cycle. Deleting a queued run records
+an error and advances. A seat-budget interruption resumes after the last inspected
+seat in the same run. Failures advance once per cycle, so a consistently failing
+archive cannot starve later seats. A busy output lease protects its own seat,
+without preventing independent seats in the run from being inspected.
+
+`source-eviction-cursor` is an atomically saved, versioned census and continuation,
+with the current cycle and the preceding completed cycle only (32 MiB maximum).
+It records run root identities, discovery state, per-seat outcomes, stages,
+reasons and observation times. Until a root is discovered, its run entry explicitly
+says `not-yet-inspected`; the seat inventory is not yet known. Discovered seats
+awaiting the seat budget each have their own `not-yet-inspected` entry. A completed
+cycle covers the frozen run list, not newly created runs or checkouts added behind
+its continuation. Root identity changes are errors until the next cycle.
+Unregistered or noncanonical discovered seats remain protected. Missing roots
+still require pending-ledger reconciliation; absence alone proves no eviction.
+Legacy valid run-ID cursors start a new census because they prove no completed
+coverage; malformed/unknown cursors fail closed and are never silently reset.
+Checkpoint failures stop the scan and appear as failures rather than being ignored.
+Observations are historical diagnostics and never reusable deletion permission.
+
+`source-eviction-status.json` and `retention.json`'s `source_scan` report the
+executing version, effective source-eviction switches, last attempt, cycle position,
+completion and global ownership/scan errors. Separate
+`source-eviction-{housekeeping,disk-pressure}-{dispatch,worker}.json` receipts
+record scheduler/worker versions, configuration where available, cadence,
+active-worker/queue skips and configuration/launch errors. Idle housekeeping and
+active disk-pressure services share the same persistent scan. Their receipts do
+not assert that a still-running service has finished; use the scan observation
+time and completion field. `magi fold <run-id> --show-seats` includes these receipts
+and both cycles' run/seat observations, even for runs with no evicted seats.
+A global validation error prevents inspection and is distinct from an observed
+seat protection. Do not interpret zero evictions or one bounded pass as a census.
+
+The former timestamp-ordered run-ID continuation could skip seats when records
+moved across the cursor; a budget stop also marked an entire partially visited run
+as passed. Isolated historical fixtures reproduce these progress failures. This
+does not establish which failure or legitimate blocker explains every production
+checkout: follow a completed census and each remaining seat's observation before
+making that claim. No production checkout/store changes are required to diagnose
+coverage with these records.
+
+New evidence has a 64 MiB per-pass budget and a 64 MiB per-run archive bound
 including incomplete publication products;
 archives additionally bound expanded object bytes, object count and checkpoint
 count. Ownership inspection rejects records above 16 MiB, run histories above

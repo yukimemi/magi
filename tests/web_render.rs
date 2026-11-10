@@ -5110,7 +5110,7 @@ async fn pending_chat_links_survive_closed_chats_and_explicit_settlement() {
         .open_page(&format!("{base}#/decisions"), 390, 844, true)
         .await
         .unwrap();
-    browser.wait_for(&page, "!document.querySelector('#decisions-history').hidden && document.querySelectorAll('#decisions-list .decision-card').length === 0 && document.querySelectorAll('#decisions-resolved .decision-card').length === 1", Duration::from_secs(30)).await.unwrap();
+    browser.wait_for(&page, "document.querySelector('#decisions-history')?.hidden === false && document.querySelectorAll('#decisions-list .decision-card').length === 0 && document.querySelectorAll('#decisions-resolved .decision-card').length === 1", Duration::from_secs(30)).await.unwrap();
     browser.eval(&page, "document.querySelector('#decisions-history summary').click(); document.querySelector('#decisions-resolved a[href*=\"/inquiry/\"]').click()").await.unwrap();
     browser.wait_for(&page, "!document.querySelector('#talk-inquiry').hidden && document.querySelector('#talk-inquiry').innerText.includes('解決済み')", Duration::from_secs(30)).await.unwrap();
     assert!(!talks.get(&chat.id).unwrap().status.open());

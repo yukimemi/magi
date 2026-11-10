@@ -3572,6 +3572,32 @@ fn conductor_work(queue: &Queue, home: &Path) -> (Vec<Task>, Vec<Task>, Vec<Task
     (queued, stalled, finished)
 }
 
+// Separate latest dispatch and worker receipts expose version handoff and skips
+// without erasing the last completed scan or treating observations as authority.
+fn retention_service_receipt(
+    home: &Path,
+    operation: &str,
+    phase: &str,
+    outcome: &str,
+    detail: &str,
+    cfg: Option<&Config>,
+) {
+    if !matches!(operation, "housekeeping" | "disk-pressure") {
+        return;
+    }
+    let receipt = serde_json::json!({"checked_at": Timestamp::now(),
+        "version": env!("CARGO_PKG_VERSION"), "pid": std::process::id(),
+        "operation": operation, "outcome": outcome, "detail": detail,
+        "auto_fold": cfg.map(|c| c.disk.auto_fold),
+        "reclaim_bytes": cfg.map(|c| c.disk.worktree_reclaim_bytes)});
+    if let Err(error) = crate::fold_evidence::atomic_write(
+        &home.join(format!("source-eviction-{operation}-{phase}.json")),
+        &serde_json::to_vec(&receipt).expect("service receipt"),
+    ) {
+        tracing::warn!("retention service receipt failed: {error:#}");
+    }
+}
+
 async fn start_service(
     home: &Path,
     opts: &Opts,
@@ -3609,6 +3635,14 @@ async fn start_service(
     };
     let now = Timestamp::now();
     if !cache_check_due(last, now, interval) {
+        retention_service_receipt(
+            home,
+            operation,
+            "dispatch",
+            "skipped",
+            "cadence not due",
+            cfg,
+        );
         return Ok(());
     }
     let key = format!("service:daemon-{operation}");
@@ -3616,6 +3650,14 @@ async fn start_service(
         .iter()
         .any(|job| job.key == key)
     {
+        retention_service_receipt(
+            home,
+            operation,
+            "dispatch",
+            "skipped",
+            "service worker already active",
+            cfg,
+        );
         return Ok(());
     }
     let eligible = match operation {
@@ -3647,8 +3689,28 @@ async fn start_service(
         _ => false,
     };
     if !eligible {
+        retention_service_receipt(
+            home,
+            operation,
+            "dispatch",
+            "skipped",
+            if operation == "housekeeping" {
+                "active work or runnable task queue"
+            } else {
+                "no active work; idle housekeeping owns scan"
+            },
+            cfg,
+        );
         return Ok(());
     }
+    retention_service_receipt(
+        home,
+        operation,
+        "dispatch",
+        "launching",
+        "eligible and cadence due",
+        cfg,
+    );
     let request = ServiceWorker {
         opts: opts.absolute()?,
         queue: std::path::absolute(queue.root())?,
@@ -3658,6 +3720,14 @@ async fn start_service(
     if let Err(error) =
         crate::worker::spawn(home, "daemon-service", &key, serde_json::to_value(request)?).await
     {
+        retention_service_receipt(
+            home,
+            operation,
+            "dispatch",
+            "error",
+            &format!("worker launch: {error:#}"),
+            cfg,
+        );
         tracing::warn!(operation, "could not launch daemon service: {error:#}");
     }
     std::fs::write(receipt, serde_json::to_vec(&now)?)?;
@@ -3722,6 +3792,14 @@ pub async fn run_service_worker(home: &Path, payload: serde_json::Value) -> Resu
         }
         "disk-pressure" => {
             if let Ok(cfg) = prepare(&opts.repo, opts) {
+                retention_service_receipt(
+                    home,
+                    "disk-pressure",
+                    "worker",
+                    "running",
+                    "retention sweep",
+                    Some(&cfg),
+                );
                 crate::retention::sweep(home, &cfg.disk, Timestamp::now()).await;
                 if let Err(e) = clean::prune_cache_if_over_limit(&cfg, home) {
                     tracing::warn!("disk pressure cache cleanup failed: {e:#}");
@@ -3750,16 +3828,52 @@ pub async fn run_service_worker(home: &Path, payload: serde_json::Value) -> Resu
                         );
                     }
                 }
+            } else {
+                retention_service_receipt(
+                    home,
+                    "disk-pressure",
+                    "worker",
+                    "error",
+                    "configuration could not be loaded",
+                    None,
+                );
             }
         }
         "housekeeping" => {
             if task_jobs(home)?.is_empty() {
-                if let Ok(cfg) = prepare(&opts.repo, opts) {
-                    crate::retention::sweep(home, &cfg.disk, Timestamp::now()).await;
+                match prepare(&opts.repo, opts) {
+                    Ok(cfg) => {
+                        retention_service_receipt(
+                            home,
+                            "housekeeping",
+                            "worker",
+                            "running",
+                            "retention sweep",
+                            Some(&cfg),
+                        );
+                        crate::retention::sweep(home, &cfg.disk, Timestamp::now()).await;
+                    }
+                    Err(error) => retention_service_receipt(
+                        home,
+                        "housekeeping",
+                        "worker",
+                        "error",
+                        &format!("configuration: {error:#}"),
+                        None,
+                    ),
                 }
                 janitor(&opts.repo, opts, home, &request.worktrees_root).await;
                 resweep_superseded_attempts(&queue, home);
                 triage_held(&queue, home, opts).await;
+            } else {
+                retention_service_receipt(
+                    home,
+                    "housekeeping",
+                    "worker",
+                    "skipped",
+                    "task worker became active",
+                    None,
+                );
             }
         }
         operation => bail!("unknown daemon service {operation}"),
@@ -10412,6 +10526,64 @@ mod tests {
             home,
             worktrees,
         )
+    }
+
+    #[tokio::test]
+    async fn source_eviction_service_receipts_explain_idle_and_active_skips() {
+        let dir = tempfile::tempdir().unwrap();
+        let (opts, queue, _, home, worktrees) = idle_loop(dir.path());
+        let cfg = Config::default();
+        start_service(
+            &home,
+            &opts,
+            &queue,
+            &worktrees,
+            "housekeeping",
+            Some(&cfg),
+            true,
+        )
+        .await
+        .unwrap();
+        let receipt = home.join("source-eviction-housekeeping-dispatch.json");
+        let read = |path: &Path| -> serde_json::Value {
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+        };
+        assert_eq!(read(&receipt)["detail"], "cadence not due");
+        std::fs::remove_file(home.join("service-ticks/daemon-housekeeping")).unwrap();
+        start_service(
+            &home,
+            &opts,
+            &queue,
+            &worktrees,
+            "housekeeping",
+            Some(&cfg),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read(&receipt)["detail"],
+            "active work or runnable task queue"
+        );
+        assert_eq!(read(&receipt)["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(read(&receipt)["auto_fold"], cfg.disk.auto_fold);
+        std::fs::remove_file(home.join("service-ticks/daemon-disk-pressure")).unwrap();
+        start_service(
+            &home,
+            &opts,
+            &queue,
+            &worktrees,
+            "disk-pressure",
+            Some(&cfg),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read(&home.join("source-eviction-disk-pressure-dispatch.json"))["detail"],
+            "no active work; idle housekeeping owns scan"
+        );
+        assert!(crate::worker::active(&home).unwrap().is_empty());
     }
 
     #[test]
