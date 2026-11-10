@@ -1497,13 +1497,16 @@ async fn fresh_cli_answers_survive_migration_before_and_after_first_sweep() {
         let output = common::magi_cli(&home).args(["answer", &fresh.id, "--reply", "hold"])
             .current_dir(&fx.repo).output().unwrap();
         assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        let accepted: Question = serde_json::from_slice(&std::fs::read(questions.path_of(&fresh.id)).unwrap()).unwrap();
+        assert!(accepted.accepted_answer_at.is_some(), "CLI must persist fresh acceptance before migration; migrate_first={migrate_first} associate_later={associate_later}; executable={:?}; source={accepted:?}; stdout={}", common::magi_cli(&home).get_program(), String::from_utf8_lossy(&output.stdout));
+        assert_eq!(accepted.accepted_answer_at, accepted.answered_at, "CLI acceptance must bind the exact response generation");
         if associate_later { queue.put(&mut task).unwrap(); }
         for _ in 0..2 {
             magi::task_chat::sweep(&queue, &talks, &questions, &home);
             let reopened = Questions::at(home.join("questions")).get(&fresh.id).unwrap();
             assert_eq!(reopened.resolution().as_deref(), Some("hold"));
             let decision = Outbox::at(&home).get(&fresh.id).unwrap().decision.unwrap();
-            assert_eq!(decision.request.as_deref(), Some("decision: hold"));
+            assert_eq!(decision.request.as_deref(), Some("decision: hold"), "migrate_first={migrate_first} associate_later={associate_later}: {decision:?}; source={reopened:?}");
             assert_eq!(decision.source_answer_at, reopened.answered_at);
             assert_eq!(decision.status, Status::Queued, "acceptance is not an effect receipt");
             assert!(questions.get(&historical.id).unwrap().answer.is_none());

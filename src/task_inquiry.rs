@@ -67,7 +67,9 @@ pub struct Outbox {
 
 /// Release the execution fence even if a concurrent fork still retains a
 /// descriptor for the same open file description.
-pub(crate) struct ExecutionClaim(File);
+pub(crate) struct ExecutionClaim {
+    _file: File,
+}
 
 #[cfg(unix)]
 impl Drop for ExecutionClaim {
@@ -75,7 +77,7 @@ impl Drop for ExecutionClaim {
         use std::os::fd::AsRawFd;
         // SAFETY: this guard owns the live descriptor; LOCK_UN releases only
         // this open file description's flock.
-        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+        unsafe { libc::flock(self._file.as_raw_fd(), libc::LOCK_UN) };
     }
 }
 
@@ -159,7 +161,7 @@ impl Outbox {
             .open(self.root.join(format!("{id}.execution.lock")))?;
         crate::pr_head::try_lock_file(&file)
             .with_context(|| format!("effect consumer for inquiry {id} is busy"))?;
-        Ok(ExecutionClaim(file))
+        Ok(ExecutionClaim { _file: file })
     }
 
     fn save(&self, inquiry: &Inquiry) -> Result<()> {
@@ -663,7 +665,7 @@ mod tests {
         let outbox = Outbox::at(home.path());
         let claim = outbox.execution_claim("legacy-inquiry").unwrap();
         // A fork shares this open file description until exec closes it.
-        let inherited = claim.0.try_clone().unwrap();
+        let inherited = claim._file.try_clone().unwrap();
         assert!(outbox.execution_claim("legacy-inquiry").is_err());
         drop(claim);
         let next = outbox.execution_claim("legacy-inquiry").unwrap();
