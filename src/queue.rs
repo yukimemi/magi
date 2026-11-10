@@ -1029,6 +1029,11 @@ impl Task {
         self.operator_decided_at = Some(at);
     }
 
+    /// Public branch for the task's current repository assignment.
+    pub fn publication_branch(&self) -> String {
+        crate::run::task_pr_branch_name(&self.id, self.reassignments.len())
+    }
+
     /// Runs eligible for execution in the current assignment only.
     pub fn execution_runs(&self) -> &[String] {
         let boundary = self.reassignments.last().map_or(0, |r| r.run_boundary);
@@ -1044,6 +1049,7 @@ impl Task {
     pub(crate) fn assignment_accepts(&self, run: &crate::run::RunState) -> bool {
         self.reassignments.last().is_none_or(|boundary| {
             self.execution_run(&run.id)
+                && run.task_assignment == self.reassignments.len()
                 && run.created_at > boundary.at
                 && run
                     .repo

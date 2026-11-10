@@ -267,9 +267,11 @@ preserves a reviewed fix independently of the public-head lease. See
 This queues a single review candidate from the fetched public commit with its
 complete ancestry, preserving the task's instructions. The selection overrides
 historical review branches and resume pins.
-The PR must be the unique open PR for `magi/task-<task-id>` in the task's
-repository, targeting the configured base. Active or unknown previous
-publishers prevent takeover; historical source branches and worktrees remain.
+The PR must be the unique open PR for the task's current assignment head:
+`magi/task-<task-id>` initially, or `magi/task-<task-id>-assignment-<generation>`
+after reassignment, targeting the configured base in the task's repository.
+Active or unknown previous publishers prevent takeover; historical source
+branches and worktrees remain.
 
 Recovery synchronizes through the ordinary current-base path and still needs
 verification, review and owner merge approval. Publication checks ownership

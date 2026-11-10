@@ -230,7 +230,10 @@ use crate::verdict::{Finding, Rejection, ReviewVote, Severity};
 ///
 /// Schema 16 records empty-attempt retirement. Older executors must reject
 /// retired runs rather than ignoring the new execution fence.
-pub const SCHEMA: u32 = 16;
+///
+/// Schema 17 pins task repository assignments for publication. Older executors
+/// must not derive an initial-assignment head for a reassigned run.
+pub const SCHEMA: u32 = 17;
 
 /// Why a pass over a run stopped at a node boundary, recorded when it
 /// happened. Never inferred afterwards: `upgrade.json` is overwritten by the
@@ -2644,6 +2647,9 @@ pub struct RunState {
     /// existed, and is reported as unknown, never as an operator's.
     #[serde(default)]
     pub origin: Option<Origin>,
+    /// Repository assignment generation captured before startup; legacy runs use zero.
+    #[serde(default)]
+    pub task_assignment: usize,
     /// Follow-up tasks filed from this run's open findings after it merged
     /// (`crate::followup`). Additive and `#[serde(default)]`, so `SCHEMA`
     /// stays put.
@@ -2686,6 +2692,28 @@ pub struct BranchOwnerHold {
     pub file: String,
     /// Pinned commit where the hold was first observed.
     pub head: String,
+}
+
+/// Keep legacy heads stable while separating later repository assignments.
+pub(crate) fn task_pr_branch_name(task: &str, assignment: usize) -> String {
+    if assignment == 0 {
+        format!("magi/task-{task}")
+    } else {
+        format!("magi/task-{task}-assignment-{assignment}")
+    }
+}
+
+/// Origin-only legacy callers have no queue record. A present but unreadable
+/// record must never silently reset publication to the initial assignment.
+pub(crate) fn task_assignment_for(task: &str) -> Result<usize> {
+    let queue = crate::queue::Queue::open();
+    match queue.get(task) {
+        Ok(task) => Ok(task.reassignments.len()),
+        Err(error) if queue.path_of(task).try_exists()? => {
+            Err(error).context("cannot capture task repository assignment")
+        }
+        Err(_) => Ok(0),
+    }
 }
 
 impl RunState {
@@ -2835,6 +2863,7 @@ impl RunState {
             attachments: Vec::new(),
             reviewed_commits: None,
             origin: None,
+            task_assignment: 0,
             followups: Vec::new(),
             followup_generation: None,
             deputy_followups: Vec::new(),
@@ -2861,6 +2890,16 @@ impl RunState {
         format!("magi/{}/{}", self.short(), label)
     }
 
+    /// Capture task publication scope once, before reserving a new execution.
+    pub(crate) fn set_origin(&mut self, origin: Origin) -> Result<()> {
+        self.task_assignment = match origin.task.as_deref() {
+            Some(task) => task_assignment_for(task)?,
+            None => 0,
+        };
+        self.origin = Some(origin);
+        Ok(())
+    }
+
     /// Public head for a queue competition. Review-only and standalone runs
     /// keep their existing branch. Invalid task ids cannot become git refs.
     pub fn task_pr_branch(&self) -> Option<String> {
@@ -2880,10 +2919,11 @@ impl RunState {
             }
         }
         let task = self.origin.as_ref()?.task.as_ref()?;
+        let branch = task_pr_branch_name(task, self.task_assignment);
         let branch = if let Some(replaces) = &self.replaces {
-            format!("magi/task-{task}-{}", replaces.question)
+            format!("{branch}-{}", replaces.question)
         } else {
-            format!("magi/task-{task}")
+            branch
         };
         std::process::Command::new("git")
             .quiet()
@@ -3716,6 +3756,11 @@ pub(crate) fn migrate_schema(mut state: RunState) -> Result<RunState> {
     // Native schema-15 preservation outcomes remain unchanged. Retirement
     // adds an execution fence without inferring any new preservation result.
     if state.schema == 15 {
+        state.schema = 16;
+    }
+    // Legacy runs belong to the initial assignment unless a generation was
+    // explicitly captured. Do not derive it from the task's current state.
+    if state.schema == 16 {
         state.schema = SCHEMA;
     }
     if state.schema != SCHEMA {
@@ -4707,6 +4752,33 @@ mod tests {
         run.reviewed_commits = None;
         run.origin = Some(Origin::operator());
         assert!(run.task_pr_branch().is_none());
+    }
+
+    #[test]
+    fn task_public_head_keeps_its_saved_repository_assignment() {
+        let mut run = state();
+        run.origin = Some(Origin::queue("task-id"));
+        assert_eq!(run.task_pr_branch().as_deref(), Some("magi/task-task-id"));
+        run.task_assignment = 1;
+        assert_eq!(
+            run.task_pr_branch().as_deref(),
+            Some("magi/task-task-id-assignment-1")
+        );
+        run.task_assignment = 2;
+        let saved = serde_json::to_value(&run).unwrap();
+        let restored: RunState = serde_json::from_value(saved.clone()).unwrap();
+        assert_eq!(
+            restored.task_pr_branch().as_deref(),
+            Some("magi/task-task-id-assignment-2")
+        );
+        let mut legacy = saved;
+        legacy["schema"] = serde_json::json!(16);
+        legacy.as_object_mut().unwrap().remove("task_assignment");
+        let legacy: RunState = migrate_schema(serde_json::from_value(legacy).unwrap()).unwrap();
+        assert_eq!(
+            legacy.task_pr_branch().as_deref(),
+            Some("magi/task-task-id")
+        );
     }
 
     #[test]

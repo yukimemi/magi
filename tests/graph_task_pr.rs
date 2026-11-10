@@ -808,3 +808,52 @@ async fn rebased_retained_source_keeps_review_fixes_and_public_lease() {
     assert_eq!(git::remote_head(&fx.repo, "origin", "magi/task-abcd-1234").await.unwrap(), Some(final_head));
 }
 }
+
+common::e2e! {
+async fn roundtrip_reassignment_publishes_a_separate_head_without_adopting_history() {
+    use magi::queue::{Queue, Source, Task};
+    let mut fx = fixture(home_lock().await, Judges::Unanimous, false);
+    let forge = forge(fx.tmp.path());
+    pr_config(&mut fx);
+    std::fs::write(fx.repo.join("magi.toml"), toml::to_string(&fx.config).unwrap()).unwrap();
+    git::git(&fx.repo, &["add", "magi.toml"]).await.unwrap();
+    git::git(&fx.repo, &["commit", "-m", "configure fixture"]).await.unwrap();
+    git::git(&fx.repo, &["push", "origin", "main"]).await.unwrap();
+    let queue = Queue::open().with_id_source(|| "abcd-1234".into());
+    let mut task = Task::new("note".into(), "create note.txt".into(), fx.repo.clone(), Source::Human);
+    queue.put(&mut task).unwrap();
+    let first = attempt(&fx.repo, &fx.config).await;
+    task.start(first.id.clone());
+    task.hold_manual(Some("completed publication".into()));
+    queue.put(&mut task).unwrap();
+    let mut merged = RunState::load(&first.id).unwrap();
+    merged.pr.as_mut().unwrap().state = "merged".into();
+    merged.save().unwrap();
+    let original_head = merged.pr_branch().unwrap().to_owned();
+    let original_tip = git::remote_head(&fx.repo, "origin", &original_head).await.unwrap().unwrap();
+    let original_json = std::fs::read(merged.dir().join("run.json")).unwrap();
+    let other = fx.tmp.path().join("other-repository");
+    git::git(fx.tmp.path(), &["clone", fx.repo.to_str().unwrap(), other.to_str().unwrap()]).await.unwrap();
+    let home = magi::run::home();
+    magi::task_reassign::reassign(&queue, &home, &fx.repo, &task.id, &other, "test").await.unwrap();
+    let moved = magi::task_reassign::reassign(&queue, &home, &other, &task.id, &fx.repo, "test").await.unwrap();
+    assert_eq!(moved.reassignments.len(), 2);
+    std::fs::remove_file(forge.join("open")).unwrap();
+    // Subsequent forge responses describe the new assignment's PR head.
+    let script = std::fs::read_to_string(forge.join("gh")).unwrap();
+    std::fs::write(forge.join("gh"), script.replace("magi/task-abcd-1234", "magi/task-abcd-1234-assignment-2")).unwrap();
+    let second = attempt(&fx.repo, &fx.config).await;
+    assert_eq!(second.task_assignment, 2);
+    assert_eq!(second.pr_branch(), Some("magi/task-abcd-1234-assignment-2"));
+    assert_eq!(second.task_pr_branch().as_deref(), Some(moved.publication_branch().as_str()));
+    assert_eq!(git::remote_head(&fx.repo, "origin", &original_head).await.unwrap().as_deref(), Some(original_tip.as_str()));
+    assert_eq!(std::fs::read(merged.dir().join("run.json")).unwrap(), original_json);
+    assert_eq!(RunState::load(&first.id).unwrap().task_pr_branch().as_deref(), Some(original_head.as_str()));
+    // Retries within the current assignment retain the stable current head.
+    let third = attempt(&fx.repo, &fx.config).await;
+    assert_eq!(third.task_assignment, 2);
+    assert_eq!(third.pr_branch(), second.pr_branch());
+    assert_eq!(git::remote_head(&fx.repo, "origin", &original_head).await.unwrap().as_deref(), Some(original_tip.as_str()));
+    assert_eq!(std::fs::read(merged.dir().join("run.json")).unwrap(), original_json);
+}
+}

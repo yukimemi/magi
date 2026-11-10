@@ -3892,7 +3892,7 @@ async fn task_cmd_inner(command: TaskCmd, q: Queue) -> Result<()> {
             );
             let mut selected = magi::pr_recovery::Selection {
                 url: pr,
-                branch: format!("magi/task-{}", t.id),
+                branch: t.publication_branch(),
                 head,
                 source_head,
                 source_run,
@@ -3901,7 +3901,7 @@ async fn task_cmd_inner(command: TaskCmd, q: Queue) -> Result<()> {
                 instruction: t.instruction.clone(),
                 approved_at: jiff::Timestamp::now(),
             };
-            selected.check_task(&t.id, &t.instruction)?;
+            selected.check_task_assignment(&t.id, &t.instruction, t.reassignments.len())?;
             let overrides = t
                 .overrides
                 .get_or_insert_with(|| magi::queue::RunOverrides {

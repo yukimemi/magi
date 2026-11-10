@@ -43,6 +43,7 @@ pub async fn reassign(
 
     // Hold owner locks and execution leases through the task commit. A direct
     // resume cannot race the boundary even though it does not take a task claim.
+    let mut fixes = Vec::new();
     let mut owners = Vec::new();
     let mut leases = Vec::new();
     let mut outputs = Vec::new();
@@ -53,6 +54,11 @@ pub async fn reassign(
         .cloned()
         .collect();
     for run in ids {
+        fixes.push(
+            crate::graph::FixClaim::acquire(&home.join("runs").join(&run)).with_context(|| {
+                format!("run {run} targeted fix is active or unproven; wait before reassigning")
+            })?,
+        );
         owners
             .push(crate::pr_head::owner_lock(home, &run).with_context(|| {
                 format!("run {run} ownership is busy; wait before reassigning")
@@ -140,11 +146,11 @@ pub async fn reassign(
     Ok(task)
 }
 
-/// Refuse historical execution even when a caller holds a stale Runner.
+/// Refuse historical execution by canonical full run id, including stale Runners.
 pub(crate) fn ensure_current(queue: &Queue, run: &str) -> Result<()> {
+    let state = RunState::load_under(run, queue.root().parent().context("queue has no parent")?)?;
+    let run = state.id.as_str();
     if let Some(task) = crate::direct::resume_owner(queue, run) {
-        let state =
-            RunState::load_under(run, queue.root().parent().context("queue has no parent")?)?;
         ensure!(
             task.execution_run(run) && task.assignment_accepts(&state),
             "run {run} belongs to a previous repository assignment of task {}; release the task to start fresh in its current repository",

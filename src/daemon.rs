@@ -4264,7 +4264,9 @@ async fn attempt(
     let saved_recovery = previous.as_ref().filter(|run| {
         task.replacement.is_none()
             && task.pr_recovery.as_ref().is_some_and(|selected| {
-                selected.check_task(&task.id, &task.instruction).is_ok()
+                selected
+                    .check_task_assignment(&task.id, &task.instruction, task.reassignments.len())
+                    .is_ok()
                     && selected_starter(selected, Some(run), unfinished.as_deref())
                         == Starter::Resume(run.id.clone())
             })
@@ -4512,7 +4514,10 @@ async fn attempt(
     } else if retry_selected {
         Starter::Resume(previous.as_ref().unwrap().id.clone())
     } else if let Some(selected) = &task.pr_recovery {
-        if selected.check_task(&task.id, &task.instruction).is_ok() {
+        if selected
+            .check_task_assignment(&task.id, &task.instruction, task.reassignments.len())
+            .is_ok()
+        {
             selected_starter(selected, previous.as_ref(), unfinished.as_deref())
         } else {
             Starter::Review(selected.branch.clone())
@@ -4587,7 +4592,7 @@ async fn attempt(
     let started = wait.scope(Box::pin(async { match &starter {
         Starter::Review(_) if task.pr_recovery.is_some() => {
             let selected = task.pr_recovery.clone().expect("selected recovery");
-            match selected.check_task(&task.id, &task.instruction) {
+            match selected.check_task_assignment(&task.id, &task.instruction, task.reassignments.len()) {
                 Ok(()) => Runner::recover_pr(&repo, &task.id, selected, config)
                     .await
                     .map(|mut r| {

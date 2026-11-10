@@ -1005,6 +1005,7 @@ upstream CRLF, not drift worth committing — normalise back to LF and
 
 - Competition branch names carry the **label**, never the agent id
   (`RunState::branch_for`). Queue competitions publish to `magi/task-<task id>`
+  initially, then `magi/task-<task id>-assignment-<generation>` after reassignment
   (`RunState::task_pr_branch`); neither label nor agent identity appears in
   that public head. Review-only and taskless runs keep their existing head;
   an invalid task ref falls back to the candidate branch.
@@ -3519,3 +3520,10 @@ maintenance questions. Chat reassignment requires its authenticated bridge and
 must never fall back to direct store writes. Reassignment holds task claims,
 run owner/execution leases and output reservations until its atomic task save;
 new execution discovers destination config and takes destination coordination.
+
+Targeted `Runner::fix_selected` operations hold the same `FixClaim` as repository
+reassignment, including preflight and follow-up review. Recheck the canonical
+full run ID inside that claim before awaiting or editing. New runs snapshot
+`task_assignment` before startup: their public heads use that durable generation,
+not the task's later assignment. Legacy generation zero keeps its original head.
+Publication takeover and explicit PR recovery must not cross assignment generations.

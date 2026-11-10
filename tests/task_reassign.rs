@@ -349,3 +349,49 @@ async fn chat_reassign_requires_control_channel_without_store_fallback() {
     assert_eq!(std::fs::read(queue.path_of(&task.id)).unwrap(), before);
 }
 }
+
+common::e2e! {
+async fn reassignment_refuses_short_run_fixes_and_preloaded_fix_runners() {
+    let f = fixture(home_lock().await, Judges::Unanimous, false);
+    let dest = destination(&f);
+    let home = magi::run::home();
+    let queue = Queue::open();
+    let (task, old) = stopped(&f, &queue);
+    let mut loaded = magi::graph::Runner::resume(&old.id).unwrap();
+    assert_eq!(magi::graph::Runner::resume(old.short()).unwrap().state.id, old.id);
+    magi::task_reassign::reassign(&queue, &home, &f.repo, &task.id, &dest, "test").await.unwrap();
+    let run_before = std::fs::read(old.dir().join("run.json")).unwrap();
+    let task_before = std::fs::read(queue.path_of(&task.id)).unwrap();
+    for id in [old.id.as_str(), old.short()] {
+        let error = magi::graph::Runner::resume(id).err().expect("historical resume must fail");
+        assert!(error.to_string().contains("previous repository assignment"), "{error:#}");
+        let result = common::magi_cli(&home).current_dir(&f.repo)
+            .args(["fix", id, "--finding", "R1-1-1", "--reason", "requested fix"])
+            .output().unwrap();
+        assert!(!result.status.success());
+        assert!(String::from_utf8_lossy(&result.stderr).contains("previous repository assignment"), "{}", String::from_utf8_lossy(&result.stderr));
+    }
+    let error = loaded.fix_selected(&["R1-1-1".into()], "requested before reassignment", false).await.unwrap_err();
+    assert!(error.to_string().contains("previous repository assignment"), "{error:#}");
+    assert!(loaded.state.operator_fixes.is_empty());
+    assert_eq!(std::fs::read(old.dir().join("run.json")).unwrap(), run_before);
+    assert_eq!(std::fs::read(queue.path_of(&task.id)).unwrap(), task_before);
+    assert!(!old.dir().join("fix.lock").exists());
+}
+}
+
+common::e2e! {
+async fn unreadable_task_cannot_reset_a_reassigned_publication_scope() {
+    let f = fixture(home_lock().await, Judges::Unanimous, false);
+    let dest = destination(&f);
+    let queue = Queue::open();
+    let (task, _) = stopped(&f, &queue);
+    magi::task_reassign::reassign(&queue, &magi::run::home(), &f.repo, &task.id, &dest, "test").await.unwrap();
+    let runs_before = magi::run::list_ids();
+    std::fs::write(queue.path_of(&task.id), "unreadable task record").unwrap();
+    let error = magi::graph::Runner::start(&dest, task.instruction, f.config.clone(),
+        magi::run::Origin::queue(&task.id)).await.err().expect("assignment cannot be determined");
+    assert!(error.to_string().contains("cannot capture task repository assignment"), "{error:#}");
+    assert_eq!(magi::run::list_ids(), runs_before, "do not reserve an execution under the legacy head");
+}
+}

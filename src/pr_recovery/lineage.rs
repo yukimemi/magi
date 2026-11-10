@@ -119,13 +119,15 @@ pub(super) async fn prove(
         common(repo).await? == common(&run.repo).await?,
         "source-run repository differs from recovery repository"
     );
-    let task = selected
-        .branch
-        .strip_prefix("magi/task-")
-        .context("invalid selected task branch")?;
+    let task = run
+        .origin
+        .as_ref()
+        .and_then(|origin| origin.task.as_deref())
+        .context("source-run has no owning task")?;
     ensure!(
-        run.id == id && run.origin.as_ref().and_then(|o| o.task.as_deref()) == Some(task),
-        "source-run belongs to another task"
+        run.id == id
+            && selected.branch == crate::run::task_pr_branch_name(task, run.task_assignment),
+        "source-run belongs to another task or repository assignment"
     );
     let original = run.pr_recovery.as_ref().context(
         "source-run lacks its original public-head selection; ancestry cannot be inferred",

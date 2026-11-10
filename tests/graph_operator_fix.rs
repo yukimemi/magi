@@ -412,3 +412,36 @@ async fn operator_fix_report_outage_preserves_work_and_can_be_retried() {
     unavailable_operator_fix_can_be_retried("MOCK_CONTINUATION_AUTH").await;
 }
 }
+
+common::e2e! {
+async fn a_fix_in_preflight_excludes_repository_reassignment() {
+    use std::future::Future;
+    use std::task::Poll;
+    let (fx, mut runner) = ready_run_with_two_minor_findings(common::home_lock().await).await;
+    let queue = Queue::open();
+    let mut task = Task::new("fix".into(), "fix the selected finding".into(), fx.repo.clone(), Source::Human);
+    task.start(runner.state.id.clone());
+    task.hold_manual(Some("operator fix pending".into()));
+    queue.put(&mut task).unwrap();
+    let id = runner.state.last_round_findings()[0].id.clone();
+    let run_dir = runner.state.dir();
+    let task_before = std::fs::read(queue.path_of(&task.id)).unwrap();
+    let ids = [id];
+    let mut fix = Box::pin(runner.fix_selected(&ids, "requested fix", false));
+    // Pause at the first asynchronous preflight, before any seat or output
+    // reservation exists. The shared claim must already exclude reassignment.
+    std::future::poll_fn(|cx| match fix.as_mut().poll(cx) {
+        Poll::Pending => Poll::Ready(()),
+        Poll::Ready(result) => panic!("fix completed before preflight could be paused: {result:?}"),
+    }).await;
+    assert!(run_dir.join("fix.lock").exists());
+    let saved = RunState::load(run_dir.file_name().unwrap().to_str().unwrap()).unwrap();
+    assert!(saved.active.is_empty());
+    let error = magi::task_reassign::reassign(&queue, &magi::run::home(), &fx.repo,
+        &task.id, &fx.tmp.path().join("destination"), "test").await.unwrap_err();
+    assert!(error.to_string().contains("targeted fix is active or unproven"), "{error:#}");
+    assert_eq!(std::fs::read(queue.path_of(&task.id)).unwrap(), task_before);
+    fix.await.unwrap();
+    assert!(!run_dir.join("fix.lock").exists());
+}
+}
