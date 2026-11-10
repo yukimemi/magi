@@ -180,12 +180,28 @@ fn tail(s: &str) -> &str {
 }
 
 async fn run_step(shell: &[String], command: &str, wt: &Path, timeout: Duration) -> Result<()> {
+    run_command(shell, command, wt, timeout, None, Vec::new(), false).await
+}
+
+/// Shared contained shell runner for setup and pre-clean commands.
+pub(crate) async fn run_command(
+    shell: &[String],
+    command: &str,
+    wt: &Path,
+    timeout: Duration,
+    lease: Option<crate::repo_lock::SeatLease>,
+    outputs: Vec<crate::retention::OutputLease>,
+    pre_clean: bool,
+) -> Result<()> {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let log = std::env::temp_dir().join(format!(
         "magi-setup-{}-{}.out",
         std::process::id(),
         SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
+    if pre_clean {
+        tracing::info!(cwd = %wt.display(), output = %log.display(), command, "pre-clean command output (retained on interruption)");
+    }
     let out = std::fs::File::create(&log).context("create output file")?;
     let err = out.try_clone()?;
     let mut cmd = tokio::process::Command::new(&shell[0]);
@@ -199,15 +215,29 @@ async fn run_step(shell: &[String], command: &str, wt: &Path, timeout: Duration)
         .stdout(out)
         .stderr(err)
         .kill_on_drop(true);
+    if pre_clean {
+        cmd.env("MAGI_PRE_CLEAN_ACTIVE", "1");
+        for key in crate::worker::INVOCATION_ENV {
+            cmd.env_remove(key);
+        }
+    }
     crate::incremental::configure(&mut cmd, wt)?;
-    let mut running = crate::seat_process::Running::spawn_operation(cmd, None, Vec::new())
+    let mut running = crate::seat_process::Running::spawn_operation(cmd, lease, outputs)
         .with_context(|| format!("spawn `{}` for `{command}`", shell[0]))?;
     let waited = tokio::time::timeout(timeout, running.child().wait()).await;
     // Compiler wrappers supervise their own process groups. Join cleanup of
     // the entire setup tree before returning, on success as well as timeout.
     // Cancellation transfers the same ownership to Running's cleanup thread.
     running.finish().await;
-    let body = || tail(&std::fs::read_to_string(&log).unwrap_or_default()).to_owned();
+    let body = || {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut bytes = Vec::new();
+        if let Ok(mut f) = std::fs::File::open(&log) {
+            let _ = f.seek(SeekFrom::End(-(TAIL as i64)));
+            let _ = f.take(TAIL as u64).read_to_end(&mut bytes);
+        }
+        tail(&String::from_utf8_lossy(&bytes)).to_owned()
+    };
     let result = match waited {
         Ok(Ok(status)) if status.success() => Ok(()),
         Ok(Ok(status)) => Err(anyhow::anyhow!(

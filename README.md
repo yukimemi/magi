@@ -1312,6 +1312,101 @@ Things to know:
 - The cost is paid once per seat (and per review round), so prefer light
   commands, and write `run` steps to be safe to repeat.
 
+### Project cleanup before destructive cleaning
+
+Some tool caches need their own cleanup command: for example Go module
+cache directories can be read-only even when owned by the current user.
+Configure optional, ordered commands in one configuration layer:
+
+```toml
+[worktree]
+pre_clean = [
+  { run = 'GOMODCACHE="$PWD/target/nats-identity/cache/mod" go clean -modcache', timeout_secs = 60 },
+]
+```
+
+This POSIX shell example targets **only the project's explicit worktree-local
+GOMODCACHE**. It must match the cache path used by the build. Never omit that
+assignment or substitute the user's global Go cache. Nothing in magi detects
+Go or changes directory permissions automatically.
+
+Commands use the configured verification shell, stdin closed, and the target
+worktree as cwd. `run` is required and nonempty; `timeout_secs` must be positive
+and defaults to the verification timeout. Unknown step keys are rejected.
+`MAGI_RUN`, `MAGI_NODE` and worker invocation overrides are removed. Configuration
+comes from the launcher's pinned upstream base, never from the cleanup target.
+
+For Windows or other shell differences, prefer a tracked project task/script,
+for example `{ run = "python scripts/clean-local-go-cache.py", timeout_secs = 60 }`.
+A project-owned Python script can use this pattern (Python is an example, not a
+magi dependency):
+
+```python
+import os
+from pathlib import Path
+import subprocess
+
+root = Path.cwd().resolve()
+cache = root / "target/nats-identity/cache/mod"
+resolved = cache.resolve()
+if resolved != cache or not resolved.is_relative_to(root):
+    raise RuntimeError("local module cache must use its worktree-local path")
+if cache.exists():
+    subprocess.run(["go", "clean", "-modcache"], check=True,
+                   env={**os.environ, "GOMODCACHE": str(resolved)})
+```
+
+The script constructs an absolute path, rejects symlink escapes, succeeds if
+the cache is already absent, and works without POSIX environment assignments.
+Use the same explicit cache path in the project's build task.
+
+| Cleanup path | Runs `pre_clean`? |
+| --- | --- |
+| Candidate base synchronization, including resumed and fixer-finished synchronization | Yes, in that candidate only |
+| Existing reviewer reset for a new review round | Yes, in that reviewer only; before setup is repeated |
+| New worktree creation / setup | No |
+| `restore_to`, including recursive submodule cleans (`git clean -ffdq`, preserves ignored products) | No |
+| Primary checkout, foreign checkout, rebase/base-conflict scratch, local release scratch | No |
+| Worktree removal, retention, setup rollback | No |
+| Low-level Git helpers called without the owned-worktree wrapper | No |
+
+The sequence is reset to the selected commit, run hooks in declaration order,
+then `git clean -fdx`. Hooks therefore see scripts from the selected commit.
+The first failure, timeout or interruption prevents later hooks and clean;
+failures identify the target, purpose and step, with at most 4000 bytes of
+output read from the log tail. Attempts are saved before command launch; an
+interrupted command retains its temporary output file, whose location is logged.
+Timeout and cancellation use the existing process
+tree cleanup owner; output reservations, repository coordination and the
+pre-clean lock remain held until child processes terminate. A worktree output
+lease excludes active borrowers/reclamation; a separate exclusive pre-clean
+lock and inherited recursion marker reject nested or concurrent cleanup.
+The caller's run driver claim remains responsible for run liveness.
+
+**Hooks must be safe to repeat**, including after partial execution and when a
+cache no longer exists. They should clean only disposable worktree-local data.
+A hook can still modify files; it is trusted project code, not a sandbox.
+With an empty list magi follows its existing Git path without extra subprocesses
+or ownership checks. With hooks configured, targets must belong to this run,
+share its Git common directory, and reside directly in its worktree root;
+linked-worktree status alone does not authorize execution. Candidate cleanup
+never enumerates or resets independent reviewer worktrees.
+
+Synchronization completion is recorded only after hooks and clean succeed.
+An interrupted rebase may already have moved the branch while its worktree
+still needs synchronization. The existing operation reservation remains
+unfinished on cleanup failure. A candidate-local Git metadata marker also records
+the cleanup boundary before reset, including legacy synchronization histories
+without an operation reservation. Before classifying a resumed branch, magi
+retries that boundary only if HEAD matches and there are no tracked edits or
+untracked/ignored files; removing the hook configuration cannot skip it. The
+marker is removed only after clean succeeds. On resume, unrecognized edits or remaining
+untracked/ignored files after that branch movement conservatively stop recovery
+for inspection; hooks do not grant permission to discard them. No automatic
+retry bypasses this check, and no additional conflict-resolution attempt is
+introduced by cleanup. A retained run may consequently require an owner decision
+before recovery can proceed.
+
 ## The review loop
 
 The winner — and only the winner — enters a bounded loop:
