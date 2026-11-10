@@ -690,9 +690,32 @@ async fn execute_decision(
     {
         // A live task cannot accept a repair grant. Do not prevent decisions
         // that its active driver is waiting for by taking its execution claim.
-        let _claim = (queue.get(&task.id)?.status != TaskStatus::Running)
+        let claim = (queue.get(&task.id)?.status != TaskStatus::Running)
             .then(|| queue.claim(&task.id))
-            .transpose()?;
+            .transpose();
+        let _claim = match claim {
+            Ok(claim) => claim,
+            Err(error) => {
+                // Admission could not start this attempt. Retain the exact
+                // owner request and pre-effect failure just as execution-side
+                // claim contention does, without publishing any task effect.
+                let message = format!(
+                    "{error:#}. No effect began; retry this same request after resolving the cause, or explicitly settle it."
+                );
+                outbox.update_decision(id, |d| {
+                    let safe = d.request.is_none() || d.retry_safe;
+                    d.accept(&request)?;
+                    if safe {
+                        d.fail_before_effect(&message)
+                    } else {
+                        // A prior queued/uncertain attempt still needs its own
+                        // receipt. Contention is not proof that it never ran.
+                        Ok(false)
+                    }
+                })?;
+                return Err(anyhow::Error::new(BeforeEffect(error)));
+            }
+        };
         outbox.update_decision(id, |d| d.accept(&request))?;
     }
     if decision.request.is_some()
