@@ -1572,6 +1572,22 @@ pub struct GithubTextAsk {
     /// Final rejected rewrite, kept locally for display and an explicit override.
     #[serde(default)]
     pub rewrite: Option<GithubTextRewrite>,
+    /// Set only after the selected text was successfully published to the forge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication: Option<GithubTextPublication>,
+}
+
+/// Durable application proof, distinct from choosing a publication payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GithubTextPublication {
+    /// Exact source inquiry whose selected text was posted.
+    pub inquiry: String,
+    /// Original withheld text identity.
+    pub fingerprint: String,
+    /// Applied selection.
+    pub choice: GithubTextChoice,
+    /// Confirmed publication destination.
+    pub url: String,
 }
 
 /// A usable rewrite that still failed the posting gate.
@@ -2407,6 +2423,9 @@ pub struct RunState {
     /// Owner stop/withdraw/replacement checkpoint, independent of PR head movement.
     #[serde(default)]
     pub merge_decision: Option<crate::merge_decision::Decision>,
+    /// Exact owner requests committed atomically with abandonment.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub abandonment_receipts: BTreeMap<String, String>,
     /// Previous attempt replaced by this run; its PR is never reused.
     #[serde(default)]
     pub replaces: Option<crate::merge_decision::Replacement>,
@@ -2459,6 +2478,13 @@ pub struct RunState {
     /// Additive, so `SCHEMA` is not bumped.
     #[serde(default)]
     pub passes: Vec<RunPass>,
+    /// Inquiry-to-pass receipts, persisted only after the execution lease and
+    /// owner claim have been acquired. Later completion/holds retain them.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub decision_starts: BTreeMap<String, usize>,
+    /// Inquiries whose dispatched resumes this upcoming execution will consume.
+    #[serde(skip)]
+    pub next_pass_inquiries: Vec<String>,
     /// Set by whoever is about to execute this run on a task's behalf, read
     /// and cleared by the next [`RunState::begin_pass`]. Never persisted.
     #[serde(skip)]
@@ -2829,6 +2855,7 @@ impl RunState {
             land_approval: None,
             merge_repairs: Vec::new(),
             merge_decision: None,
+            abandonment_receipts: BTreeMap::new(),
             replaces: None,
             github_text: None,
             change_summary: None,
@@ -2842,6 +2869,8 @@ impl RunState {
             seat_history: BTreeMap::new(),
             withheld: Vec::new(),
             passes: Vec::new(),
+            decision_starts: BTreeMap::new(),
+            next_pass_inquiries: Vec::new(),
             next_pass_task_entry: false,
             parked: false,
             resource_wait: None,
@@ -2994,6 +3023,49 @@ impl RunState {
         }
     }
 
+    /// A prepared fallback on timeout is not an owner's request to replace
+    /// an existing human-edited payload. Explicit selections keep their source.
+    pub(crate) fn explicit_github_text_selection(&self) -> bool {
+        self.github_text.as_ref().is_some_and(|gate| {
+            gate.resolved
+                && gate.question.as_ref().is_some_and(|id| {
+                    crate::ask::Questions::open()
+                        .get(id)
+                        .is_ok_and(|q| q.run == self.id && q.resolution().is_some())
+                })
+        })
+    }
+
+    /// Save this marker together with the forge operation's successful checkpoint.
+    /// Selecting a payload, accepting a reply and queuing a post do not call it.
+    pub(crate) fn record_github_text_publication(&mut self, url: &str) {
+        if let Some(gate) = &mut self.github_text
+            && gate.resolved
+            && let Some(inquiry) = &gate.question
+            && let Some(choice) = gate.choice
+        {
+            gate.publication = Some(GithubTextPublication {
+                inquiry: inquiry.clone(),
+                fingerprint: gate.fingerprint.clone(),
+                choice,
+                url: url.to_owned(),
+            });
+        }
+    }
+
+    /// Carry durable dispatch ownership into driver admission without treating
+    /// dispatch itself as a receipt or replaying the owner's command.
+    pub(crate) fn carry_dispatched_resumes(&mut self, task: &crate::queue::Task) {
+        self.next_pass_inquiries = task
+            .dispatched_resumes
+            .iter()
+            .filter(|(inquiry, run)| {
+                **run == self.id && !self.decision_starts.contains_key(*inquiry)
+            })
+            .map(|(inquiry, _)| inquiry.clone())
+            .collect();
+    }
+
     /// Open a pass for the process that is about to drive this run. A pass
     /// left open by an earlier process is closed as [`PassEnd::Unrecorded`];
     /// one that recorded its own end is never touched.
@@ -3005,6 +3077,11 @@ impl RunState {
         {
             last.end = Some(PassEnd::Unrecorded);
             last.ended_at = Some(now);
+        }
+        for inquiry in std::mem::take(&mut self.next_pass_inquiries) {
+            self.decision_starts
+                .entry(inquiry)
+                .or_insert(self.passes.len());
         }
         let resumed = !self.passes.is_empty() || !self.candidates.is_empty();
         self.passes.push(RunPass {

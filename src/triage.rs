@@ -855,6 +855,13 @@ fn apply_deps_answer(queue: &Queue, questions: &Questions, q: &Question, now: Ti
     let Ok(_claim) = queue.claim(&q.run) else {
         return false;
     };
+    let Ok(current) = questions.get(&q.id) else {
+        return false;
+    };
+    if current.status != QuestionStatus::Answered {
+        return false;
+    }
+    let q = &current;
     let Ok(mut root) = queue.get(&q.run) else {
         return false;
     };
@@ -892,7 +899,7 @@ fn apply_deps_answer(queue: &Queue, questions: &Questions, q: &Question, now: Ti
         }
         DepsAction::Discard => {
             detach_dependants(queue, questions, &root.id);
-            return queue.remove(&root.id, false, questions).is_ok();
+            return queue.discard_triage(&root.id, questions, &q.id).is_ok();
         }
         DepsAction::Detach => detach_dependants(queue, questions, &root.id),
         // Matches no offered choice, so there is nothing to apply. Left unmarked:
@@ -1030,6 +1037,14 @@ pub fn apply_answers(queue: &Queue, questions: &Questions) -> Vec<String> {
         let Ok(mut task) = queue.get(&listed.id) else {
             continue;
         };
+        // Settlement holds this same task claim; discard a reply read before
+        // it won the claim rather than executing a settled answer.
+        let Ok(q) = questions.get(&q.id) else {
+            continue;
+        };
+        if q.status != QuestionStatus::Answered {
+            continue;
+        }
         if already_applied(&task, &q)
             || !matches!(task.status, TaskStatus::Held | TaskStatus::Queued)
         {
@@ -1084,7 +1099,7 @@ pub fn apply_answers(queue: &Queue, questions: &Questions) -> Vec<String> {
                     task.hold_manual(Some(note));
                 }
                 AnswerAction::Discard => {
-                    if queue.remove(&task.id, false, questions).is_ok() {
+                    if queue.discard_triage(&task.id, questions, &q.id).is_ok() {
                         applied.push(task.id);
                     }
                     continue;

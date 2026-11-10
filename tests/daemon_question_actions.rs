@@ -14,7 +14,7 @@ mod common;
 use std::time::Duration;
 
 use common::{Judges, SeatBlock, fixture, home_lock};
-use magi::ask::{Answer, ChoiceAction, Question, Questions};
+use magi::ask::{ChoiceAction, Question, Questions};
 use magi::daemon::{self, Opts};
 use magi::graph::{Pause, Runner};
 use magi::queue::{Queue, Source, Task, TaskStatus};
@@ -91,9 +91,22 @@ async fn answered_resume_action_is_executed(label: &str) {
             run: run_id.clone(),
         },
     );
+    // Deliver the open inquiry before accepting a fresh owner answer. A reply
+    // saved directly in Questions is historical migration data, not approval.
+    let talks = magi::talk::Talks::open();
+    let chat = magi::talk::begin(&talks, &fx.config, fx.repo.clone(), Some("alpha"))
+        .expect("begin task chat");
+    task.origin_chat = Some(chat.id.clone());
+    queue.put(&mut task).expect("associate task chat");
     questions.put(&mut q).expect("file the question");
-    q.answer(Answer::Choice(label.to_owned())).expect("answer");
-    questions.put(&mut q).expect("record the answer");
+    let home = questions.root().parent().unwrap();
+    magi::task_chat::sweep(&queue, &talks, &questions, home);
+    magi::chat_control::decide(&talks, home, &chat.id, &q.id, label)
+        .expect("accept fresh owner answer");
+    assert_eq!(
+        questions.get(&q.id).unwrap().resolution().as_deref(),
+        Some(label)
+    );
 
     let config_path = fx.tmp.path().join("magi.toml");
     std::fs::write(&config_path, toml::to_string(&fx.config).unwrap()).unwrap();

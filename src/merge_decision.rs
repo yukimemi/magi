@@ -171,15 +171,3 @@ pub(crate) fn resumable_hold(state: &crate::run::RunState) -> bool {
             !decision.closed && decision.choice.eq_ignore_ascii_case(crate::land::HOLD)
         })
 }
-
-/// Chat consultation may request a stop/repair only with the exact latest
-/// choice. Closing a PR explicitly names the consequence in its token.
-pub fn exact_owner_choice(choice: &str, message: &str, quote: &str) -> bool {
-    if choice.eq_ignore_ascii_case(crate::land::HOLD) {
-        message.trim().eq_ignore_ascii_case(choice) && quote.trim().eq_ignore_ascii_case(choice)
-    } else {
-        (stops(choice) || choice == crate::land::REPAIR)
-            && message.trim() == choice
-            && quote.trim() == choice
-    }
-}

@@ -1682,8 +1682,12 @@ config continues to come from the remote base commit.
 `src/worker.rs` owns durable detached reservations, execution leases and immutable
 SHA-256 executable generations. `magi web` serves HTTP; `magi serve` dispatches;
 task workers run the existing attempt and settlement. Updating replaces web and
-scheduler, never parks or cancels paid work. A scheduler restart reconstructs
-ordinary/urgent/decision-only capacity from reservations. Standalone CLI workers
+scheduler, never parks or cancels paid work. Conversation execution and publication
+fencing live in `src/chat_worker.rs`, independently of the legacy consultation
+protocol in `src/consult.rs`. Keep generation ordering, recorded-send restoration
+and TurnLease ownership in that chat-native module when removing consultation
+code. A scheduler restart reconstructs ordinary/urgent/decision-only capacity
+from reservations. Standalone CLI workers
 remain outside those lanes and global queue-worker park requests.
 
 - **The worker owns the claim.** Keep task claims and run execution leases until
@@ -2754,7 +2758,7 @@ inherits `MAGI_RUN` / `MAGI_NODE`.
   another process. Exit codes, signals, startup failure and timeout are
   distinct reports. Killing a supervisor can lose its in-memory output tail.
 - **The existing delivery path.** `daemon::poll` sweeps watches beside task
-  notices, then `chat_notify::start_turns` uses `consult::drain_turns` in the
+  notices, then `chat_notify::start_turns` uses `chat_worker::drain_turns` in the
   talk's own session and lease. Atomic result records and
   `talk::queue_once` with `watch:<id>:finished` tolerate a restart between
   saving the draft and marking delivery. Transient I/O failures retry; closed
@@ -2802,7 +2806,7 @@ with `magi answer` or puts the decision points to the owner in the chat.
   `Question::answer` is untouched. The question stays `Open`; `Question::consult`
   (`ask::SCHEMA` 6, `#[serde(default)]`) only records that the chat was asked, so
   a second tap is a no-op. Written through `Questions::update`.
-- **The talk-turn gate is cross-process.** `Ui::talk_turns` (in-process, source of the 409 / queued / busy responses) is layered with an on-disk lease, `<talks>/<id>.turn` (`Talks::claim_turn` -> `talk::TurnLease`; not a `*.json`, so `list` ignores it and `revision` skips it). Content `{token, pid, beat_at}`; held means a beat within `ask::LEASE_TTL` (90 s), no pid checks. Acquire is `create_new`; a stale or unreadable lease is replaced only under a short-lived exclusive `<id>.turn.lock` (aged out after 10 s), so one taker wins. Release / beat only act while the file still carries the guard's own token. The web claim inserts into `live` first, then takes the lease, and undoes the insert if the lease is refused; `is_thinking` is `live` or `Talks::turn_held`. `talk::respond` and `talk::say` take a `&TurnLease` for that talk (checked against the talk's id) and run the turn inside `TurnLease::beating` every `talk::TURN_BEAT` (20 s), no extra task, so a starter without a lease does not compile; `turn` stays private. A crashed turn leaves the talk busy for up to 90 s. `magi answer --ask-chat` (`consult::start_turn`) takes the lease *before* `consult::begin`, then drains the draft and runs the turn synchronously; a lease held elsewhere is reported (`Started::Busy`, non-zero exit) and leaves no consult record or draft. `say` against a lease held by another process answers 409 (`TalkTurnStart::Foreign`) rather than queueing, since no local drain loop would ever answer that draft. Every change to an existing lease (takeover, beat, release) happens under the `.turn.lock`, new leases are published by hard-linking a complete file, and a beat that finds the lease taken over stops the turn. Publication (`publish_exclusive`) is `hard_link` first; only an *unsupported* error falls back to an exclusive `create_new` of the path itself, written through that handle (never a `rename` over it), and `lease_blocks` treats an empty file younger than 10 s as held. Removing a lock is `remove_if_carries` (rename aside, verify, restore exclusively), used by both `TurnLock::take` and its `Drop`; no path-only compare-and-unlink exists, so a fourth party publishing during the microseconds the file is aside can still overlap with the displaced holder until TTL (warned). A guard releases the on-disk lease before the in-process slot.
+- **The talk-turn gate is cross-process.** `Ui::talk_turns` (in-process, source of the 409 / queued / busy responses) is layered with an on-disk lease, `<talks>/<id>.turn` (`Talks::claim_turn` -> `talk::TurnLease`; not a `*.json`, so `list` ignores it and `revision` skips it). Content `{token, pid, beat_at}`; held means a beat within `talk::TURN_LEASE_TTL` (90 s), no pid checks. Acquire is `create_new`; a stale or unreadable lease is replaced only under a short-lived exclusive `<id>.turn.lock` (aged out after 10 s), so one taker wins. Release / beat only act while the file still carries the guard's own token. The web claim inserts into `live` first, then takes the lease, and undoes the insert if the lease is refused; `is_thinking` is `live` or `Talks::turn_held`. `talk::respond` and `talk::say` take a `&TurnLease` for that talk (checked against the talk's id) and run the turn inside `TurnLease::beating` every `talk::TURN_BEAT` (20 s), no extra task, so a starter without a lease does not compile; `turn` stays private. A crashed turn leaves the talk busy for up to 90 s. `magi answer --ask-chat` (`consult::start_turn`) takes the lease *before* `consult::begin`, then drains the draft and runs the turn synchronously; a lease held elsewhere is reported (`Started::Busy`, non-zero exit) and leaves no consult record or draft. `say` against a lease held by another process answers 409 (`TalkTurnStart::Foreign`) rather than queueing, since no local drain loop would ever answer that draft. Every change to an existing lease (takeover, beat, release) happens under the `.turn.lock`, new leases are published by hard-linking a complete file, and a beat that finds the lease taken over stops the turn. Publication (`publish_exclusive`) is `hard_link` first; only an *unsupported* error falls back to an exclusive `create_new` of the path itself, written through that handle (never a `rename` over it), and `lease_blocks` treats an empty file younger than 10 s as held. Removing a lock is `remove_if_carries` (rename aside, verify, restore exclusively), used by both `TurnLock::take` and its `Drop`; no path-only compare-and-unlink exists, so a fourth party publishing during the microseconds the file is aside can still overlap with the displaced holder until TTL (warned). A guard releases the on-disk lease before the in-process slot.
 - **Consultation activity is persisted separately from question resolution.**
   Answered/abandoned questions and questions with `consult_outcome` are no
   longer active consultations. `magi answer --reply-other` saves the owner's
@@ -3314,9 +3318,19 @@ apply; fold never authorizes deletion of another run's source.
 This section supersedes earlier task-question waiting, choice and deputy rules;
 those rules now apply only to the retained non-task legacy workflow.
 
-Task-scoped Questions are a durable outbox for `task_chat::sweep`, not a
-conversation with their asker. `magi ask` posts and finishes; do not wait or
-start a deputy/waiter for these records. Decisions go as free text to the task's
+`task_chat::sweep` converts task-scoped source records into independent
+`task_inquiry::Inquiry` deliveries in `notifications/task-inquiries`. The outbox
+stores task/run/repository ownership, producer identity, free text, display facts,
+semantic evidence and a delivery receipt. Filing and delivery grant no owner
+authority; a separate decision lifecycle may retain an explicitly accepted owner
+request and confirmed effect receipt. Keep the original `question:<id>` transcript key when adapting
+an existing source, so a crash before its new receipt cannot duplicate delivery.
+The scheduler retries pending native deliveries independently of source records;
+a corrupt record is reported without preventing unrelated deliveries. Legacy decision
+consumers still use their source records until that migration is complete;
+native task inquiries bind typed chat commands directly.
+These deliveries are not conversations with their askers. `magi ask` posts and
+finishes; do not wait or start a deputy/waiter for these records. Decisions go as free text to the task's
 persisted `chat`, its own source chat, or its inherited origin chat. A missing
 chat is created with the chatter-chain head, default persona and one
 implementer. This decision path deliberately **reopens closed chats**; the
@@ -3332,11 +3346,9 @@ owner's request without a button or extra evidence.
 Silence is a hold; `land_approval` stays on by default. Keep the Question store and non-task legacy workflow until the
 next migration step.
 
-`[graph] question_routing` (default on) is the per-repository switch for task
-decision routing (`task_chat::enabled_for`, consulted by `Questions::put`,
-`task_chat::routes` and `task_chat::sweep`). Off restores the question/deputy/
-waiter path. `Queue::put_unlocked` keeps a stored `Task::chat` against stale
-writes, so the one chat per task is never lost.
+Task inquiries always route to their chat. The retired `[graph] question_routing`
+key is read only for saved-config compatibility and never selects a workflow.
+`Queue::put_unlocked` keeps a stored `Task::chat` against stale writes.
 
 Update (step 2 scope): every task-scoped producer routes, including the posting
 gate, the branch-divergence question and non-merge release-watch questions
@@ -3345,16 +3357,10 @@ abandoned on delivery: the record stays open for the machinery that reads its
 answer, and the chat settles it with `magi task control decide`
 (`chat_control::decide`: open calling chat, open record, valid offered
 choice). Merge and recovery decisions use the same command. Existing consumers
-retain state, ownership, liveness and transition checks. The legacy non-routed
-consultation workflow follows the same owner-request policy. An approval or release-watch
-record offering `merge` with no `merge_target` is
-an old card and is never routed, even when its watch record identifies a task.
-`Questions::with_repair_choice` first attempts to recover the saved watch head;
-if none exists, it also clears any invalid routing from earlier versions so
-the compatibility card is usable again. Non-merge release recovery records
-still route. `task_chat::enabled_for` treats an unreadable
-repository config as "off", because `routed_task` is persisted and cannot be
-undone when the config returns. The button endpoint has no stronger caller
+retain state, ownership, liveness and transition checks. Approvals without a recorded `merge_target` still route to chat for recovery;
+`task control decide` rejects merging them until a PR/head has been recovered.
+Unreadable repository config retains the native pending inquiry and exposes its
+delivery/migration error; it never enables a legacy task route. The button endpoint has no stronger caller
 identity than every other owner route (the tailnet is the boundary); what it
 validates is the optional chat binding and displayed head binding. A direct
 answer requires neither a prior persona offer nor a button. Open routed
@@ -3527,3 +3533,145 @@ full run ID inside that claim before awaiting or editing. New runs snapshot
 `task_assignment` before startup: their public heads use that durable generation,
 not the task's later assignment. Legacy generation zero keeps its original head.
 Publication takeover and explicit PR recovery must not cross assignment generations.
+
+### Durable pending decision lifecycle
+
+`task_inquiry::Inquiry::decision` is task/chat-native durable state, independent
+of transport acknowledgement. `task_decision::Decision` tracks awaiting owner,
+queued, in progress, retry needed and resolved, with append-only outcome history.
+Never resolve it from delivery, read receipts, opening/closing a conversation,
+ordinary replies, elapsed time or restart. Information-only inquiries have no
+`decision` and never enter the list. The phone dock's `判断待ち` route is
+`#/decisions`, and exact inquiry links are
+`#/chat/<chat>/inquiry/<inquiry>`; the inquiry snapshot survives transcript burial.
+
+Task-scoped CLI asks now file native inquiries directly. Chat effects bind to
+these records through `magi task control --decision <inquiry> <command>`;
+acceptance is saved before execution, duplicate/uncertain operations are never
+blindly replayed, and only confirmed application resolves them. Resume commands
+wait for the owning execution to start. Explicit no-effect settlement and
+supersession use `settle-decision --reason`, with a same-task/chat active
+replacement when supplied; accepted effects need receipt reconciliation.
+`reconcile-decision` is an explicit, read-only owner request to confirm an exact
+task-local end condition under its claim. External effects require their own
+matching receipts. Never infer merge completion from an accepted command.
+
+Legacy source decisions are still operational in this continuation. Their import
+preserves stable source keys, pending intent and saved replies as history; it
+never reissues a saved reply as owner authority. Do not claim the Question /
+deputy / waiter retirement is complete until every remaining consumer and
+compatibility execution path has been replaced and removed. The source adapter
+lives in `task_chat`, not in the native decision state machine.
+
+Task-local chat effects commit `Task::decision_effects` with the queue transition;
+the value is the exact serialized typed command. Keep these receipts across
+later holds, releases, retries and execution starts. Receipt reconciliation must
+check task/repository ownership and command equality before resolving an inquiry;
+a queue state that merely looks similar is insufficient for automatic recovery.
+Native inquiry identities include the execution-pass/owner-decision generation,
+so repeated wording after a new occurrence does not alias resolved history.
+
+The bounded migration snapshots source filenames as well as readable records.
+Keep per-source import errors in its journal and show them in Pending decisions;
+a corrupt source must not disappear because the old list reader skipped it.
+`Questions::read_history` is the passive decoder: never use a getter that upgrades
+or writes records as the history migration's reader.
+
+Native CLI inquiries use an independent occurrence ID for each invocation.
+`magi ask --request <id>` explicitly replays an occurrence, preserving its first
+prose and lifecycle. Low-level `Outbox::file` distinguishes different content in
+the same task/run/producer generation; `file_for_occurrence` supports stable
+explicit keys independent of rephrasing.
+
+Only known pre-execution failures set `Decision::retry_safe`; failed writes or
+external uncertainty must never set it. Owner retries of those known-unstarted
+requests revalidate their task claim and preconditions. Explicit settlement may
+cancel them without claiming an applied effect. Reading or restart does neither.
+
+The migration journal retains `sources` after its `pending` batch drains.
+Consumers project its saved replies as unanswered until a fresh native command
+binds both the operation and `source_answer_at`. This timestamp identifies the
+accepted source response generation; it is not owner quote/consent evidence.
+Do not execute an older payload between native acceptance and the source write.
+Passive history reads preserve the raw source; legacy workers skip imported IDs.
+
+
+This foundation stage intentionally retains Questions, deputy, waiter, legacy
+CLI/API/UI and choice-effect consumers. Full retirement belongs to the subsequent
+migration task, as approved on 2026-11-02. Preserve non-task foreground inquiries:
+empty-run, unassociated questions stay outside the task migration quarantine.
+Older overbroad migration boundaries must release those standalone sources too.
+Ownerless imported pending decisions support explicit `settle-decision --reason`
+from an authorized existing chat without inventing ownership or executing an
+effect; accepted uncertain requests still require reconciliation. Resume queue
+claim contention is pre-effect and retryable; a queue persistence failure remains
+uncertain. Dismissal's durable run checkpoint confirms its effect even when the
+owning task is Done or has a later attempt and intentionally receives no marker.
+
+run 付きの非タスク問い合わせにも legacy foreground 経路がある。
+`Question::legacy_foreground` は CLI がタスク所有を見つけられなかった時点の来歴である。
+過去分は確認できる foreground 来歴を使い、queue にタスクがないことだけで
+移行対象から除外しない。破損した無関係な inquiry は新規作成を止めず、
+一覧の未読込件数と警告に残す。同一 ID の破損は上書きしない。
+`resume::pin_queued` の書込み前の拒否は取消・再試行可能にする一方、
+queue 書込み失敗の結果は不確実として保持する。
+撤回は対応する質問・対象の閉鎖確認と実行終了の永続記録で解決する。
+watch の既報の起動待ちタイムアウトと再現検証の限界は README の検証記録を参照する。
+
+判断待ち基盤の受領記録は後続の状態遷移から独立させる。
+着地保留は適用時に task の `decision_effects` に記録し、旧形式の
+`actions_applied` と run の対応 checkpoint も引き続き照合する。
+dispatch 前に再開 pin を置換・削除する queue 書込みは、元の依頼 ID と run を
+`superseded_resumes` に保存する。通常の Running 遷移で pin を消費しただけでは
+置換扱いにせず、実行開始記録を待つ。放棄は run の Failed 更新と同時に
+`abandonment_receipts` へ依頼 ID と正確な操作を保存する。
+明示的照合も再起動時の照合もこれらを読み、操作を再実行しない。
+
+通常の ChoiceAction の Hold / Requeue / Done も、実際に適用する task 書込みで
+`decision_effects` に受領記録を残す。Stale / Refuse や、まだ実行開始を待つ
+Resume に完了受領記録を付けない。状態フラグだけを後から完了証拠にしない。
+着地停止用の `attempt` 分岐も通常の再開分岐と同じく、`task.start` が pin を
+消費するときに依頼 ID と run の対応を task の `dispatched_resumes` に保存する。
+この対応は再起動・回収・古い task の保存でも失わせず、開始保存に失敗したら
+実行しない。実行前に未記録の対応を `next_pass_inquiries` に復元し、実行 lease と
+owner claim の取得後に開始 pass と `decision_starts` を同時保存するまでは解決しない。
+後続の pass で元の開始受領記録を上書きしない。放棄の保存前拒否は `BeforeAbandonWrite` として再試行・取消可能にし、
+run 保存を試みた後の失敗は引き続き不確実として扱う。
+相談テストではタスク所有の質問と実在する run の関連を維持し、本番の task chat
+配送経路で実行不変を確認する。非タスク相談も実在する独立 run を使って維持する。
+非タスク deputy の再起動テストも `Origin::operator()` の実在する独立 run を使う。
+存在しない run を非タスクの代用にしない。移行時には所有者不明の判断として保留される。
+
+release-watch の hold / leave it は `WatchState::applied` と、watch 削除前に保存する
+`release-watch-receipts/<inquiry>.json` で照合する。rerun の transport 用記録を
+外部実行の成功証拠にしない。triage / triage-deps の discard は queue の task
+本体を `triage-discard/<inquiry>.json` に原子的に移す。受領記録は task 削除と
+同じ操作で成立し、単に task が見つからないことは成功証拠にしない。
+
+ローカル監視の `watch_local::LocalStep::Hold` と `settle_job_question` の leave it
+も、効果保存と同じ `WatchState::applied` に問い合わせ ID を記録する。
+受領記録を生成できない受理済みの従来型 `decision: ...` は、所有者が結果を確認し
+残る効果がないと明示した `settle-decision --reason` で精算できる。
+`Decision::legacy_settled` は成功受領記録ではなく、この明示的精算を表す。
+Questions の `get` / `list` は精算済み回答を実行しない表示へ投影し、元の JSON は
+監査履歴として保持する。native コマンドの不確実性は引き続き受領記録を要する。
+
+従来型の精算と consumer の実行は同じ実行権で排他する。
+`Outbox::execution_claim` は回答を読む前から効果・受領記録の保存まで保持し、
+release-watch と daemon の choice consumer が使う。精算は待機せず実行中を拒否する。
+タスク所有の精算は queue claim も保持する。triage は claim 取得後に回答を読み直し、
+取得前に読んだ精算済み回答を実行しない。Queued の表示だけで未実行と判断しない。
+チェック再実行の開始コールバック前の forge 読取り失敗は `BeforeEffect` とし、
+同じ依頼の明示的再試行を許す。開始受領記録以後の失敗は不確実として残す。
+
+`rerun_preflight` は run の所有・保存済み PR・request 名を受理前と実行時に検証する。
+修正可能な入力エラーで判断を命令へ固定しない。実行時の同じ事前検証での拒否も
+`BeforeEffect` とするが、既存の不確実な受領記録や書込み失敗には適用しない。
+rerun の受領記録ロック競合と別操作への request ID 衝突も開始前拒否として扱う。
+同一操作の `started` 受領記録は不確実なまま保持し、再実行・取消を許さない。
+
+native 判断の実行も `Outbox::execution_claim` を受理前から保持する。
+再開要求の公開前中断は、この実行権と task claim を取得してから再読込し、
+`actions_applied`（pin と同じ queue 書込み）、pin、`dispatched_resumes`、
+`superseded_resumes` と run の開始受領記録で判定する。未公開と証明できる場合だけ
+再試行・取消可能にする。公開済みの pin が消費されたことを未公開の証拠にしない。

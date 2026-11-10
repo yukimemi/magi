@@ -601,6 +601,10 @@ pub struct Question {
     /// Task decision outbox; retained until task-chat delivery is durable.
     #[serde(default)]
     pub routed_task: Option<String>,
+    /// `ask_cmd` chose the legacy foreground path because no task owned it.
+    /// Persist this provenance: a nonempty run alone is not task ownership.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub legacy_foreground: bool,
     /// Set after delivery; merge consent remains in this record.
     #[serde(default)]
     pub routed_chat: Option<String>,
@@ -638,6 +642,10 @@ pub struct Question {
     pub triage_generation: Option<u64>,
     /// When the owner answered, if they did.
     pub answered_at: Option<Timestamp>,
+    /// Exact response generation recorded by a live answer update. Absent on
+    /// imported history; survives an answer made before task ownership exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_answer_at: Option<Timestamp>,
     /// What they said.
     pub answer: Option<Answer>,
     /// Everything said after the question itself, oldest first: the owner
@@ -764,6 +772,7 @@ impl Question {
             choices,
             merge_target: None,
             routed_task: None,
+            legacy_foreground: false,
             routed_chat: None,
             publication_title: None,
             actions: std::collections::BTreeMap::new(),
@@ -773,6 +782,7 @@ impl Question {
             asked_at: Timestamp::now(),
             triage_generation: None,
             answered_at: None,
+            accepted_answer_at: None,
             answer: None,
             thread: Vec::new(),
             answer_timeout: 0,
@@ -1479,9 +1489,21 @@ impl Questions {
         }
         let _guard = Unlock(lock);
         let mut q = read_path(&self.path_of(id))?;
-        let was_dismissed = q.resolution().as_deref() == Some(crate::merge_decision::DISMISS);
+        let effective_dismissal = |q: &Question| {
+            q.resolution().as_deref() == Some(crate::merge_decision::DISMISS)
+                && !self.root.parent().is_some_and(|home| {
+                    crate::task_chat::saved_reply_requires_confirmation(home, q)
+                })
+        };
+        let was_dismissed = effective_dismissal(&q);
+        let prior_answer = (q.answered_at, q.resolution());
         let out = f(&mut q)?;
-        if !was_dismissed && q.resolution().as_deref() == Some(crate::merge_decision::DISMISS) {
+        if q.resolution().is_some() && prior_answer != (q.answered_at, q.resolution()) {
+            let home = self.root.parent().context("question store has no home")?;
+            q.accepted_answer_at = q.answered_at;
+            crate::task_chat::accept_fresh_reply(home, &q)?;
+        }
+        if !was_dismissed && effective_dismissal(&q) {
             let home = self.root.parent().context("question store has no home")?;
             crate::merge_decision::dismiss(home, &q)?;
         }
@@ -1515,9 +1537,8 @@ impl Questions {
             && let Some(home) = self.root.parent()
         {
             let tasks = crate::queue::Queue::at(home.join("queue")).list();
-            q.routed_task = crate::task_chat::task_of(q, &tasks).filter(|id| {
-                crate::task_chat::chat_routable(q) && crate::task_chat::enabled_for(&tasks, id)
-            });
+            q.routed_task =
+                crate::task_chat::task_of(q, &tasks).filter(|_| crate::task_chat::chat_routable(q));
         }
         std::fs::create_dir_all(&self.root)
             .with_context(|| format!("create {}", self.root.display()))?;
@@ -1539,11 +1560,83 @@ impl Questions {
         Ok(())
     }
 
+    /// Decode an exact saved record for migration without repair upgrades,
+    /// routing writes, lease changes or any other operational side effect.
+    pub(crate) fn read_history(&self, id: &str) -> Result<Question> {
+        anyhow::ensure!(
+            !id.is_empty() && !id.contains(['/', '\\']) && id != "." && id != "..",
+            "invalid saved inquiry identity"
+        );
+        let q = read_path(&self.path_of(id))?;
+        anyhow::ensure!(
+            q.id == id,
+            "saved inquiry identity does not match its filename"
+        );
+        Ok(q)
+    }
+
     /// Load a question by id or unambiguous id prefix.
     pub fn get(&self, id: &str) -> Result<Question> {
         let resolved = self.resolve_id(id)?;
         let q = read_path(&self.path_of(&resolved))?;
-        Ok(self.with_repair_choice(q))
+        Ok(self.consumption_view(self.with_repair_choice(q)))
+    }
+
+    // Keep the source JSON intact for the passive history decoder. Every
+    // operational reader sees an unanswered hold until a fresh owner answer
+    // exists; neither delivery nor a saved legacy reply supplies that authority.
+    fn consumption_view(&self, q: Question) -> Question {
+        let migrated = self
+            .root
+            .parent()
+            .is_some_and(|home| crate::task_chat::migrated_source(home, &q.id));
+        self.consumption_view_in(q, migrated)
+    }
+
+    fn consumption_view_in(&self, mut q: Question, migrated: bool) -> Question {
+        if self.root.parent().is_some_and(|home| {
+            crate::task_inquiry::Outbox::at(home)
+                .get(&q.id)
+                .is_ok_and(|record| {
+                    record.decision.is_some_and(|d| {
+                        d.legacy_settled && d.status == crate::task_decision::Status::Resolved
+                    })
+                })
+        }) {
+            // Keep the immutable source reply in read_history, while every
+            // operational reader observes the owner's explicit settlement.
+            q.answer = None;
+            q.answered_at = None;
+            q.answer_authority = None;
+            q.status = QuestionStatus::Abandoned;
+            return q;
+        }
+        if let Some(home) = self.root.parent()
+            && migrated
+            && !crate::task_chat::standalone_inquiry(home, &q)
+            && crate::task_chat::source_reply_needs_confirmation(home, &q)
+        {
+            let saved = q.resolution().unwrap_or_default();
+            q.detail.push_str(&format!(
+                "\n\nSaved reply (history only; no new owner request): {saved}"
+            ));
+            q.answer = None;
+            q.answered_at = None;
+            q.answer_authority = None;
+            q.status = if crate::task_inquiry::Outbox::at(home)
+                .get(&q.id)
+                .is_ok_and(|record| {
+                    record.archived
+                        || record
+                            .decision
+                            .is_some_and(|d| d.status == crate::task_decision::Status::Resolved)
+                }) {
+                QuestionStatus::Abandoned
+            } else {
+                QuestionStatus::Open
+            };
+        }
+        q
     }
 
     fn with_repair_choice(&self, mut q: Question) -> Question {
@@ -1559,29 +1652,6 @@ impl Questions {
                 }
                 Ok(())
             })
-        {
-            q = current;
-        }
-        // A previous routing version treated targetless release approvals as
-        // ordinary recovery decisions. If no saved head can be recovered,
-        // restore their compatibility card instead of leaving an approval
-        // that neither the chat button nor task control can answer.
-        if q.status.open()
-            && q.routed_task.is_some()
-            && !crate::task_chat::chat_routable(&q)
-            && let Ok((current, ())) =
-                self.update(&q.id, |current| {
-                    if current.status.open() && !crate::task_chat::chat_routable(current) {
-                        if current.consult.as_ref().is_some_and(|c| {
-                            current.routed_chat.as_deref() == Some(c.talk.as_str())
-                        }) {
-                            current.consult = None;
-                        }
-                        current.routed_task = None;
-                        current.routed_chat = None;
-                    }
-                    Ok(())
-                })
         {
             q = current;
         }
@@ -1612,6 +1682,8 @@ impl Questions {
     /// corrupt question must not take the web UI down, and must certainly not
     /// hide the open question the operator was looking for.
     pub fn list(&self) -> Vec<Question> {
+        // Parse the immutable boundary once per scan, rather than once per file.
+        let sources = self.root.parent().map(crate::task_chat::migration_sources);
         let mut all: Vec<Question> = std::fs::read_dir(&self.root)
             .into_iter()
             .flatten()
@@ -1619,7 +1691,14 @@ impl Questions {
             .map(|e| e.path())
             .filter(|p| p.extension().is_some_and(|x| x == "json"))
             .filter_map(|p| read_path(&p).ok())
-            .map(|q| self.with_repair_choice(q))
+            .map(|q| {
+                let migrated = match &sources {
+                    Some(Ok(Some(ids))) => ids.contains(&q.id),
+                    Some(_) => true,
+                    None => false,
+                };
+                self.consumption_view_in(self.with_repair_choice(q), migrated)
+            })
             .collect();
         all.sort_unstable_by(|a, b| {
             let rank = |q: &Question| u8::from(!q.status.open());

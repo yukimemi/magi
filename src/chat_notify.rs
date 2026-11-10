@@ -703,13 +703,13 @@ pub fn start_turns(talks: &Talks, parking: bool, turns: &mut tokio::task::JoinSe
     }
     let mut started = 0;
     for id in talks_to_start(talks) {
-        if talks.turn_held(&id) || crate::consult::turn_worker_active(talks, &id) {
+        if talks.turn_held(&id) || crate::chat_worker::turn_worker_active(talks, &id) {
             continue;
         }
         started += 1;
         let talks = talks.clone();
         turns.spawn(async move {
-            if let Err(e) = crate::consult::spawn_notice_turn(&talks, &id).await {
+            if let Err(e) = crate::chat_worker::spawn_notice_turn(&talks, &id).await {
                 tracing::warn!("chat {id}: notice worker failed to start: {e:#}");
             }
         });

@@ -552,9 +552,11 @@ waiter stays held and no choice action runs.
 | Merge (land and release-watch approvals) | Recorded PR/head; final head, review and gate checks still apply |
 | `post original` / `use rewrite` / `use fallback` / `use my text` | Final posting gate; `use my text` needs the literal title |
 
-`[graph] question_routing` (default `true`) sends what used to be a question
-about a task to that task's chat as free text. Setting it to `false` for a
-repository keeps the question store, deputies and waiter as they were there.
+Task inquiries always route to their task's chat. The retired
+`[graph] question_routing` key is accepted for saved configuration compatibility
+and warns when disabled; its value no longer selects a legacy workflow.
+An approval without a saved PR/head remains discoverable in chat for recovery;
+its missing target never authorizes a merge.
 
 Merge approval uses two independent controls: `land_approval=true` asks for
 every merge; `hold_contested_merge=true` asks for unresolved Major-or-above
@@ -625,7 +627,9 @@ than overwrite a draft changed by another action. Restarting the web or schedule
 does not terminate an in-flight Chat invocation: its independent worker retains
 the same conversation and CLI session, and the replacement web process displays
 its busy state and eventual reply. Submissions accepted after an update use the
-new executable; queued sends remain serialized behind the running turn.
+new executable; queued sends remain serialized behind the running turn. Chat
+execution, publication fencing and startup recovery are implemented together in
+`src/chat_worker.rs`; they do not use the legacy question consultation dispatcher.
 Use **Resume queued draft** for text-only or image-only recovery after an actual
 execution failure, rather than resending the stored message. A launch failure
 proven to have started no execution restores the recorded send to that draft;
@@ -1607,8 +1611,9 @@ and repair never permit a merge.
 
 Task questions (including `magi ask` from a task seat) are posted as free text
 in the task's chat and the asker finishes without waiting. The daemon uses the
-question record as a durable outbox, then runs the existing chat turn; it starts
-no deputy or waiter. If needed it opens a Solo chat with the chatter-chain head
+task-owned delivery record in `notifications/task-inquiries`, then runs the
+existing chat turn; it starts no deputy or waiter. If needed it opens a Solo
+chat with the chatter-chain head
 and default persona, and records that chat on the task for later messages.
 Decision delivery reopens a closed associated chat. Passive completion and
 watched-command notifications still skip closed chats.
@@ -1623,3 +1628,170 @@ Buttons remain optional and validate their displayed head. Silence is a hold.
 Existing head verification and merge transitions remain in charge. The Question store and legacy non-task
 question/deputy/waiter workflows remain available during this migration.
 Delivery requires the daemon; pending outbox records survive a restart.
+
+### Pending decisions in task chats
+
+The phone dock and desktop rail include **判断待ち** (Pending decisions), separate
+from notifications. Each actionable native inquiry retains its reason, task,
+optional run, exact chat inquiry link, lifecycle status and outcome history.
+Delivery, opening or reading the chat, ordinary replies and newer messages never
+remove an unresolved decision. Informational deliveries do not create items.
+
+Task-scoped `magi ask --summary ... --detail ...` files a native durable inquiry
+and exits. Each CLI invocation creates an independent inquiry, even with identical
+wording. Use `--request <stable-occurrence-id>` to retry the same post after an
+uncertain CLI result; reusing that key preserves the original inquiry and its
+lifecycle. Use a different key for a different decision. The scheduler reuses
+or reopens the task chat and creates a missing
+chat with its configured chatter head, default persona, task repository and Solo
+mode. An unsent owner draft remains a draft. The outbox and independent chat
+execution workers recover across web and scheduler replacement.
+
+The owner discusses and decides in free text. The chat binds a task/run effect
+to the inquiry with `magi task control --decision <inquiry-id> <command>`.
+Acceptance, execution and confirmed application are separate states; recording
+or queuing an operation is insufficient to clear it. A failed or uncertain
+operation remains visible with its error and receipt context. Repeating a request
+never blindly replays an effect that might already have happened. A task claim or
+pure validation failure is recorded as a proven pre-execution failure: the owner
+can retry the same command after fixing the cause or explicitly cancel it with
+`settle-decision`. A failed write or uncertain external result retains its receipt
+reconciliation requirement. Restart itself performs no retry. Resume requests
+remain active until the scheduler observes the owning execution running.
+
+再開 pin を消費するタスク開始保存には、依頼 ID と対象 run の対応も含める。
+開始 pass の保存前に worker が終了しても、再起動後の実行へこの対応を引き継ぐ。
+タスクが Running になっただけでは解決せず、実行 lease と所有権を取得して
+`decision_starts` と開始 pass を永続化したことを確認して解決する。
+
+Task-local hold, release, completion and instruction-retry effects save the exact
+command receipt in the same queue write as their transition. Restart recovery
+can therefore finish an interrupted decision projection even after the task has
+moved to a later state; it does not execute the command again. Repeated inquiry
+wording in a later execution pass or owner-decision generation creates a new
+pending item while redelivery in the same generation remains deduplicated.
+
+If the owner explicitly settles discussion with no effect remaining necessary,
+the chat uses `magi task control settle-decision <id> --reason <reason>`. Add
+`--replacement <new-inquiry-id>` to supersede an unanswered inquiry with an
+existing active one in the same task chat. Native commands with accepted or
+uncertain effects need receipt reconciliation first. For a task-local crash window, the owner can ask
+for `magi task control reconcile-decision <id>`: it executes nothing and resolves
+only if the exact intended task condition is already durably confirmed. External
+merge and check-rerun operations retain their own request-bound receipts. No exact owner phrase, quote fingerprint or button
+click is required; silence remains a hold and landing approval remains on by
+default.
+
+An imported inquiry with missing ownership can be explicitly settled from any
+existing authorized chat using `settle-decision <id> --reason <reason>` when the
+owner confirms no effect remains. This assigns neither a task nor a delivery
+chat and executes no operation. Its ID and recovery instructions appear in the
+Pending decisions list. Native commands with accepted or uncertain effects still
+require receipt reconciliation. A successful obsolete-approval dismissal is confirmed by
+its durable run checkpoint, including when its task is already done or has moved
+to another attempt; it does not require changing that task's later outcome.
+release-watch の hold / leave it は、監視終了後にも残す適用済み問い合わせ ID で
+照合する。triage の破棄は削除対象のタスクを問い合わせ専用の受領記録へ原子的に
+移すため、タスク削除後も再起動時の照合証拠を失わず、その判断を解決できる。
+
+ローカルのリリース承認の hold と、失敗ジョブへの leave it も、効果を保存する
+同じ監視状態に問い合わせ ID を記録する。merge / retry / 従来の rerun など、
+consumer が完了受領記録を出せない従来型依頼は、結果を確認した所有者が
+`settle-decision <id> --reason <reason>` で残る効果がないことを明示的に精算できる。
+これは成功受領記録や実行中の操作の取消ではない。元の依頼・回答・不確実な結果の
+履歴を残し、精算済みの回答は以後の consumer に実行可能な回答として渡さない。
+通常の再照合は操作を繰り返さず、読むことや回答の保存だけで精算されることもない。
+実行中の consumer が共有実行権を保持している間は精算を拒否する。
+チェック再実行で forge の事前読取りに失敗した場合は、効果未開始として同じ依頼を
+再試行できる。開始受領記録を保存した後の失敗は、引き続き照合が必要な不確実な結果として残す。
+
+Existing task-scoped source inquiries are imported under their original delivery
+keys, including saved replies without confirmed effects. A saved reply is
+historical evidence, never a new owner instruction or approval. Migration posts
+no operation and retains unresolved outcomes. Source decision consumers still
+remain operational in this foundation stage. Their complete retirement, including
+Questions, deputy, waiter, legacy CLI/API/UI and choice-effect consumers, is
+explicitly deferred to the subsequent migration task. This stage does not claim
+that retirement is complete. Non-task foreground inquiries retain their legacy
+answer and wait workflow.
+
+Unreadable saved inquiry files are included in the migration boundary. Their
+source identities and errors remain visible in Pending decisions across visits
+and restarts, alongside readable items. Restoring a source retries its import
+with the original delivery identity. The migration decoder reads history without
+repair upgrades or routing writes; importing actionable work still uses the
+source adapter described above.
+
+The migration retains its complete source-ID boundary after imports finish.
+Saved replies in that boundary remain history, including while awaiting import;
+operational readers cannot use them to execute task actions, merge or release.
+Fresh chat commands bind their exact response generation before it is exposed
+to consumers, avoiding a crash window that could consume an older title or
+answer. Legacy workers cannot resume imported sources. The original source
+files remain available to the passive history decoder.
+
+
+判断待ち基盤の追加検証（2026-11-02）:
+`watch_supervisor_loss_is_reported_without_reexecuting_the_command` の既報の失敗は、
+watch 登録後、コマンドが `starts` を作成するまでの5秒待ちで発生しており、
+SIGKILL 後の効果再実行や判断待ちへの投影まで到達していない。
+第1修正ラウンドでは実際の CLI・supervisor・コマンドを使う同テストが2回とも通過した。
+その時点の `src/chat_watch.rs` と `tests/chat_notify.rs` は、固定された基点
+`4eda9559dff7c6a9fac29100d549d8e22bddcea2` との差分がないことを確認した。
+したがって今回導入した判断状態の変更による回帰を示す証拠は得られていないが、
+既報のタイムアウトの根本原因は未特定であり、修正済みとは扱わない。
+再発時の診断用に、同じ5秒制限の失敗メッセージへ永続ジョブと
+`armed` / `executing` / `spawn-error` の状態を追加した。
+本番の wrapper 起動猶予は10秒で、登録成功はコマンドの最初の書込み完了を保証しない。
+この差から起動遅延は調査候補になるが、既報の実測原因だとは断定できない。
+テストの時間制限、強制終了、通知内容と一度だけの実行の検証は維持している。
+第2修正ラウンドでも、`RUSTUP_TOOLCHAIN=stable cargo test --locked --test chat_notify
+watch_supervisor_loss_is_reported_without_reexecuting_the_command -- --nocapture`
+を3回実行してすべて通過し、既報の失敗は再現しなかった。
+第1修正時点と基点の同一性は `git diff 4eda9559dff7c6a9fac29100d549d8e22bddcea2
+f93acf27 -- src/chat_watch.rs tests/chat_notify.rs` が空であることから再確認できる。
+全対象テストと最終ゲートは親実行で確認する。
+
+run を持つ従来型問い合わせも維持対象となる。新規 CLI 問い合わせは
+所有タスクがないため foreground 経路を選んだことを `legacy_foreground` に保存する。
+過去分は operator 由来、またはタスクを持たない run と保存済みの作業ディレクトリから
+来歴を確認し、タスク不在だけでは非タスク扱いにしない。
+撤回の解決には対応する質問・対象の閉鎖確認と `Superseded` の永続記録が必要で、
+回答の受付や閉鎖失敗では解決しない。無関係な破損項目は報告を続けながら新規作成から隔離する。
+
+適用済みの着地保留は、その後の解放や指示変更で判断待ちへ戻らない。
+同一 run への再開依頼が実行前に置換された場合や、完了・指示変更で取り消された場合は、
+queue に元の依頼と run の置換記録を残して照合する。
+通常の実行開始による pin の消費だけでは解決せず、実行開始の永続記録が必要となる。
+再開要求を受理してから queue に公開する前の中断は、再起動時または
+`reconcile-decision` で未公開と確認できれば再試行待ちへ戻す。
+判断の実行権と task claim を保持し、公開時に同時保存する `actions_applied`、
+pin、dispatch・置換記録と実行開始受領記録を照合する。公開前なら所有者が
+同じ要求を明示的に再試行するか `settle-decision --reason` で取り消せる。
+照合だけでは再公開せず、公開済み・実行開始待ちの要求は未実行扱いに戻さない。
+放棄操作は run の終了状態と同時に依頼固有の受領記録を保存するため、
+判断一覧への最終更新が失われても、再起動時または `reconcile-decision` で
+操作を再実行せずに解決できる。単なる Failed 状態は別の依頼の完了証拠にならない。
+
+今回の受領記録修正でも、相談の統合テスト8件と問い合わせの統合テスト33件、
+および上記 watch テスト1件が通過した。
+`cargo test --locked --lib landing_` は24件成功・6件失敗で、
+失敗6件はいずれも既存の着地検証が約4.1GBの空き容量を disk pressure と判定し、
+検証コマンドを開始できなかったもの。今回追加した保留受領記録と再起動照合の
+単体テストは成功した。この環境上の失敗を解消済み・基点でも再現済みとは扱わず、
+全体検証と最終ゲートの結果は引き続き親実行で確認する。
+
+通常の従来型 choice による保留・再キュー・完了も、適用と同じ task 保存で
+受領記録を残すため、次の worker 開始や別理由の保留で完了証拠を失わない。
+再開は着地停止専用の経路でも依頼 ID を実行 pass に記録する。
+放棄操作の live driver・終了済み run などの保存前拒否は、未開始として同じ依頼を
+再試行または明示的取消できる。保存を試みた後の失敗は不確実なまま残し、
+自動的に再実行しない。
+
+今回の第2レビュー修正では、タスク所有の質問と実在する run の関連を維持した
+相談テストを復元し、非タスク相談も含む10件が通過した。
+問い合わせの統合テスト35件と、追加した着地保留再開の本番経路テスト1件も通過した。
+後者は同じ run で新しい着地承認待ちへ進み、依頼固有の実行開始記録から解決すること、
+所有者の新たな回答なしに merge しないことを確認する。
+前回の容量不足による着地テスト6件の失敗は、この修正で解消済みとは扱わない。
+全体検証と最終ゲートは引き続き親実行が担当する。

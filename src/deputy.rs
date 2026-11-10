@@ -373,6 +373,7 @@ impl Deputies {
             && self.store.list().iter().any(|q| {
                 kind_of(q).is_some()
                     && !crate::task_chat::routes(q, &self.home)
+                    && !crate::task_chat::migrated_source(&self.home, &q.id)
                     && q.status.open()
                     && q.deputy
                         .as_ref()
@@ -449,7 +450,11 @@ impl Deputies {
     }
 
     fn ready(&self, q: Question, now: Timestamp) -> Option<Question> {
-        if (self.halt)() || !q.status.open() || crate::task_chat::routes(&q, &self.home) {
+        if (self.halt)()
+            || !q.status.open()
+            || crate::task_chat::routes(&q, &self.home)
+            || crate::task_chat::migrated_source(&self.home, &q.id)
+        {
             return None;
         }
         let kind = kind_of(&q)?;
@@ -613,6 +618,10 @@ struct WorkerRequest {
 /// Hidden detached entry point for exactly one existing question/seat.
 pub async fn run_worker(home: &Path, payload: serde_json::Value) -> Result<()> {
     let request: WorkerRequest = serde_json::from_value(payload)?;
+    anyhow::ensure!(
+        !crate::task_chat::migrated_source(home, &request.question),
+        "saved inquiry belongs to its task chat; legacy worker cannot resume it"
+    );
     Job {
         store: Questions::at(home.join("questions")),
         home: home.to_path_buf(),
@@ -704,6 +713,7 @@ impl Job {
         };
         if !q.status.open()
             || crate::task_chat::routes(&q, &self.home)
+            || crate::task_chat::migrated_source(&self.home, &q.id)
             || dep.starts >= MAX_STARTS
             || self.store.read_lease(&q.id).is_some_and(|l| l.fresh(now))
             || !start_due(&self.store, &q.id, now)

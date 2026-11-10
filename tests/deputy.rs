@@ -695,7 +695,7 @@ async fn a_release_merge_settle_can_say_the_follow_ups_were_not_queued() {
 }
 
 common::e2e! {
-async fn a_merge_settle_on_an_operator_held_task_goes_through_without_a_quote() {
+async fn a_chat_merge_decision_on_an_operator_held_task_goes_through_without_a_quote() {
     let s = scene(home_lock().await);
     let land = file_land(&s.store, "Merge #7?");
     s.store.update(&s.q.id, |q| { q.abandon("not under test"); Ok(()) }).unwrap();
@@ -708,18 +708,28 @@ async fn a_merge_settle_on_an_operator_held_task_goes_through_without_a_quote() 
     );
     task.runs.push(land.run.clone());
     task.hold_manual(Some("operator says wait".to_owned()));
+    let talks = magi::talk::Talks::at(s.home.join("talks"));
+    let chat = magi::talk::begin(&talks, &s.fx.config, s.fx.repo.clone(), Some("alpha")).unwrap();
+    task.origin_chat = Some(chat.id.clone());
     queue.put(&mut task).unwrap();
     assert!(queue.get(&task.id).unwrap().operator_held());
+    s.store.update(&land.id, |q| {
+        q.merge_target = Some(magi::merge_decision::Target {
+            pr: "https://example.test/pull/7".into(),
+            head: "deadbeef".into(),
+            language: "en".into(),
+        });
+        Ok(())
+    }).unwrap();
+    magi::task_chat::sweep(&queue, &talks, &s.store, &s.home);
+    assert_eq!(s.store.get(&land.id).unwrap().routed_chat.as_deref(), Some(chat.id.as_str()));
     // The owner speaks after their own hold: that answer is the newer decision.
     s.store.update(&land.id, |q| q.say("マージしていいよ")).unwrap();
-    let inspect = format!("MAGI task show {} > /dev/null", task.id);
-    script(&s, &[
-        &inspect,
-        "MAGI ask --settle \"$qid\" --choice merge",
-    ]);
-
+    // Task-owned inquiries use their chat, never a legacy deputy. Acceptance
+    // needs no quoted consent and records no merge effect by itself.
     turn(&mut deputies(&s, 2)).await;
-    assert_actions_succeeded(&s, 2);
+    assert!(log(&s).is_empty(), "the task chat owns the inquiry");
+    magi::chat_control::decide(&talks, &s.home, &chat.id, &land.id, "merge").unwrap();
 
     let q = s.store.get(&land.id).unwrap();
     assert_eq!(q.status, QuestionStatus::Answered, "{:?}", q.thread);
@@ -727,6 +737,8 @@ async fn a_merge_settle_on_an_operator_held_task_goes_through_without_a_quote() 
     // Settling records the answer only; land applies it to the saved head.
     let held = queue.get(&task.id).unwrap();
     assert_eq!(held.runs, task.runs);
+    assert!(held.operator_held(), "recording approval applies no task effect");
+    assert_eq!(held.held_at, task.held_at);
 }
 }
 
@@ -1434,20 +1446,22 @@ async fn maintenance_conductor_release_restores_its_original_hold_once() {
 }
 
 common::e2e! {
-async fn maintenance_resume_preserves_operator_decisions_after_deputy_settle() {
+async fn maintenance_resume_preserves_later_operator_decisions_after_chat_acceptance() {
     use magi::{ask::ChoiceAction, queue::{Queue, Source, Task, TaskStatus}, run::{RunState, RunStatus}};
     let s = scene(home_lock().await);
     s.store.update(&s.q.id, |q| { q.abandon("not under test"); Ok(()) }).unwrap();
-    // This is the retained legacy deputy workflow: the repository opts out of
-    // task-chat routing (`question_routing = false`) in its committed layer.
+    // The retired opt-out cannot divert an owned maintenance decision back
+    // to a deputy. Its native acceptance must preserve later operator intent.
     let mut legacy = s.fx.config.clone();
     legacy.graph.question_routing = false;
     std::fs::write(s.fx.repo.join("magi.toml"), toml::to_string(&legacy).unwrap()).unwrap();
-    for args in [vec!["add", "magi.toml"], vec!["commit", "-m", "test: legacy question path"], vec!["push", "origin", "main"]] {
+    for args in [vec!["add", "magi.toml"], vec!["commit", "-m", "test: retired routing key compatibility"], vec!["push", "origin", "main"]] {
         let out = std::process::Command::new("git").args(&args).current_dir(&s.fx.repo).output().unwrap();
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     }
     let queue = Queue::at(s.home.join("queue"));
+    let talks = magi::talk::Talks::at(s.home.join("talks"));
+    let chat = magi::talk::begin(&talks, &s.fx.config, s.fx.repo.clone(), Some("alpha")).unwrap();
     for manual_hold in [true, false] {
         let mut run = RunState::new(s.fx.repo.clone(), "main".into(), "base".into(),
             "work".into(), s.fx.config.clone());
@@ -1456,15 +1470,14 @@ async fn maintenance_resume_preserves_operator_decisions_after_deputy_settle() {
         run.save_under(&s.home).unwrap();
         let mut task = Task::new("resume".into(), "work".into(), s.fx.repo.clone(), Source::Human);
         task.runs.push(run.id.clone());
+        task.chat = Some(chat.id.clone());
         task.hold_machine(Some("waiting for resume".into()));
         queue.put(&mut task).unwrap();
-        let mut q = conductor_maintenance_question(&s, &queue, &task,
+        let q = conductor_maintenance_question(&s, &queue, &task,
             ChoiceAction::ResumeRun { run: run.id.clone() });
-        q.say("daemon: execute").unwrap();
-        s.store.put(&mut q).unwrap();
-        script(&s, &["MAGI ask --settle \"$qid\" --choice 'daemon: execute'"]);
-        turn(&mut deputies(&s, 2)).await;
-        assert_actions_succeeded(&s, 1);
+        magi::task_chat::sweep(&queue, &talks, &s.store, &s.home);
+        assert_eq!(s.store.get(&q.id).unwrap().routed_chat.as_deref(), Some(chat.id.as_str()));
+        magi::chat_control::decide(&talks, &s.home, &chat.id, &q.id, "daemon: execute").unwrap();
         assert_eq!(s.store.get(&q.id).unwrap().status, QuestionStatus::Answered);
         task = queue.get(&task.id).unwrap();
         assert_eq!(task.status, TaskStatus::Blocked, "settling applies nothing");

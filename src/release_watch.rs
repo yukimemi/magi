@@ -420,6 +420,30 @@ pub(crate) fn state_for_question(home: &Path, question_id: &str) -> Option<Watch
         .find(|s| s.question.as_deref() == Some(question_id))
 }
 
+/// Quiet watcher effects retain receipts even after the PR watch is retired.
+pub(crate) fn quiet_effect_applied(home: &Path, q: &Question) -> Result<bool> {
+    if q.node != crate::bump::NOTICE_NODE
+        || q.seat != "release-watch"
+        || !matches!(q.resolution().as_deref(), Some(HOLD | LEAVE_IT))
+    {
+        return Ok(false);
+    }
+    let watcher = Watcher::new(Box::new(GhForge), home.to_path_buf());
+    if watcher.stored().iter().any(|st| st.applied.contains(&q.id)) {
+        return Ok(true);
+    }
+    let bytes = match std::fs::read(
+        home.join("release-watch-receipts")
+            .join(format!("{}.json", q.id)),
+    ) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e.into()),
+    };
+    let st: WatchState = serde_json::from_slice(&bytes)?;
+    Ok(st.applied.contains(&q.id))
+}
+
 /// Resolve a release notification through its saved watch record, never its prose.
 pub(crate) fn question_for_notice(home: &Path, key: &str) -> Option<String> {
     let pr = key.strip_prefix("release-pr:")?;
@@ -729,6 +753,21 @@ impl Watcher {
             let tmp = path.with_extension("json.tmp");
             std::fs::write(&tmp, serde_json::to_string_pretty(st)?)?;
             std::fs::rename(&tmp, &path)?;
+            // Preserve per-inquiry evidence beyond the bounded applied list and
+            // watch retirement. These are local effects, never rerun receipts.
+            let receipts = self.home.join("release-watch-receipts");
+            if !st.applied.is_empty() {
+                std::fs::create_dir_all(&receipts)?;
+                for id in &st.applied {
+                    let path = receipts.join(format!("{id}.json"));
+                    if path.exists() {
+                        continue;
+                    }
+                    let tmp = path.with_extension("json.tmp");
+                    std::fs::write(&tmp, serde_json::to_vec(st)?)?;
+                    std::fs::rename(tmp, path)?;
+                }
+            }
             Ok(())
         };
         match write() {
@@ -837,6 +876,17 @@ impl Watcher {
             return;
         };
         let mut st = self.load(&pr);
+        let _execution = if let Some(id) = &st.question {
+            match crate::task_inquiry::Outbox::at(&self.home).execution_claim(id) {
+                Ok(claim) => Some(claim),
+                Err(error) => {
+                    tracing::debug!("release decision is busy: {error:#}");
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         st.repo = repo.to_string_lossy().into_owned();
         st.url = url.to_owned();
 
@@ -974,6 +1024,7 @@ impl Watcher {
                 }
             },
             PrLifecycle::Open => {
+                let consumed = st.question.clone();
                 let approved = match st.question.clone() {
                     None => Approved::NoQuestion,
                     Some(id) => match self.questions().get(&id) {
@@ -1015,7 +1066,18 @@ impl Watcher {
                 }
                 match step {
                     LocalStep::Wait => {}
-                    LocalStep::Hold(head) => st.held_head = Some(head),
+                    LocalStep::Hold(head) => {
+                        st.held_head = Some(head);
+                        if let Some(id) = consumed
+                            && self
+                                .questions()
+                                .get(&id)
+                                .is_ok_and(|q| q.resolution().as_deref() == Some(HOLD))
+                            && !st.applied.contains(&id)
+                        {
+                            st.applied.push(id);
+                        }
+                    }
                     LocalStep::Ask => {
                         st.held_head = None;
                         st.asked_head = Some(snap.head.clone());
@@ -1391,6 +1453,9 @@ impl Watcher {
                         }
                         Some(Answer::Choice(c)) if c == LEAVE_IT => {
                             st.ignored = true;
+                            if !st.applied.contains(&q.id) {
+                                st.applied.push(q.id.clone());
+                            }
                             let _ = Notices::at(self.home.join("notifications"))
                                 .dismiss(&notices::id_of(&notice_key(pr)));
                         }
@@ -1469,6 +1534,11 @@ impl Watcher {
 
     /// The pull request is confirmed merged or closed: clear everything.
     fn finish(&self, pr: &str, st: &WatchState) {
+        // Do not retire the last live evidence until per-inquiry receipts are
+        // durable too (including recovery after a partial save).
+        if !st.applied.is_empty() && !self.save(pr, st) {
+            return;
+        }
         let _ =
             Notices::at(self.home.join("notifications")).dismiss(&notices::id_of(&notice_key(pr)));
         if let Some(id) = &st.question {
@@ -1712,6 +1782,9 @@ mod tests {
         merge_fails: Mutex<bool>,
         /// `Config::discover` itself fails.
         config_fails: Mutex<bool>,
+        merge_paused: std::sync::atomic::AtomicBool,
+        merge_entered: tokio::sync::Notify,
+        merge_release: tokio::sync::Notify,
     }
 
     impl ReleaseForge for std::sync::Arc<Fake> {
@@ -1744,7 +1817,13 @@ mod tests {
         fn merge<'a>(&'a self, _: &'a Path, _: &'a str, head: &'a str) -> Fut<'a, Result<bool>> {
             self.merges.lock().unwrap().push(head.to_owned());
             let fails = *self.merge_fails.lock().unwrap();
-            Box::pin(async move { if fails { bail!("refused") } else { Ok(true) } })
+            Box::pin(async move {
+                if self.merge_paused.load(std::sync::atomic::Ordering::SeqCst) {
+                    self.merge_entered.notify_one();
+                    self.merge_release.notified().await;
+                }
+                if fails { bail!("refused") } else { Ok(true) }
+            })
         }
         fn land_approval<'a>(&'a self, _: &'a Path) -> Fut<'a, Result<bool>> {
             let a = *self.approval.lock().unwrap();
@@ -1832,6 +1911,82 @@ mod tests {
         w.questions()
             .update(id, |q| q.answer(Answer::Choice(choice.to_owned())))
             .unwrap();
+    }
+
+    #[test]
+    fn quiet_effect_receipts_survive_watch_retirement_and_restart() {
+        for choice in [HOLD, LEAVE_IT, RERUN_AGAIN] {
+            let (dir, _fake, w) = rig();
+            let mut q = Question::new(
+                "run".into(),
+                crate::bump::NOTICE_NODE.into(),
+                "release-watch".into(),
+                "stalled release".into(),
+                String::new(),
+                vec![choice.into()],
+            );
+            q.answer(Answer::Choice(choice.into())).unwrap();
+            let mut st = WatchState {
+                url: URL.into(),
+                question: Some(q.id.clone()),
+                ..WatchState::default()
+            };
+            assert!(
+                !quiet_effect_applied(dir.path(), &q).unwrap(),
+                "answering is not application"
+            );
+            w.apply_answer("o/r#7", &mut st, &red(), &q, 3000);
+            assert!(
+                !quiet_effect_applied(dir.path(), &q).unwrap(),
+                "memory is not durable evidence"
+            );
+            assert!(w.save("o/r#7", &st));
+            assert_eq!(
+                quiet_effect_applied(dir.path(), &q).unwrap(),
+                choice != RERUN_AGAIN
+            );
+            // Both the rolling applied list and the live watch may disappear.
+            st.applied.clear();
+            assert!(w.save("o/r#7", &st));
+            w.finish("o/r#7", &st);
+            assert!(w.stored().is_empty());
+            assert_eq!(
+                quiet_effect_applied(dir.path(), &q).unwrap(),
+                choice != RERUN_AGAIN
+            );
+        }
+    }
+
+    #[test]
+    fn receipt_write_failure_keeps_the_watch_for_reconciliation() {
+        let (dir, _fake, w) = rig();
+        let mut q = Question::new(
+            "run".into(),
+            crate::bump::NOTICE_NODE.into(),
+            "release-watch".into(),
+            "release".into(),
+            String::new(),
+            vec![HOLD.into()],
+        );
+        q.answer(Answer::Choice(HOLD.into())).unwrap();
+        let mut st = WatchState {
+            url: URL.into(),
+            ..WatchState::default()
+        };
+        w.apply_answer("o/r#7", &mut st, &red(), &q, 3000);
+        let receipts = dir.path().join("release-watch-receipts");
+        std::fs::write(&receipts, "unavailable").unwrap();
+        assert!(!w.save("o/r#7", &st));
+        w.finish("o/r#7", &st);
+        assert_eq!(w.stored().len(), 1, "live effect evidence is retained");
+        std::fs::remove_file(receipts).unwrap();
+        let restarted = Watcher::new(
+            Box::new(std::sync::Arc::new(Fake::default())),
+            dir.path().into(),
+        );
+        restarted.finish("o/r#7", &restarted.load("o/r#7"));
+        assert!(restarted.stored().is_empty());
+        assert!(quiet_effect_applied(dir.path(), &q).unwrap());
     }
 
     #[tokio::test]
@@ -2032,6 +2187,102 @@ mod tests {
     }
 
     // ---- [release] mode = "local" ----
+
+    #[tokio::test]
+    async fn local_quiet_decisions_reconcile_through_the_real_watch_consumers() {
+        use crate::{
+            queue::{Queue, Source, Task},
+            talk::{self, Talks},
+            task_decision::Status,
+            task_inquiry::Outbox,
+        };
+        for choice in [HOLD, LEAVE_IT] {
+            let (dir, fake, w) = rig();
+            let home = dir.path();
+            let repo = home.join("repo");
+            std::fs::create_dir(&repo).unwrap();
+            let mut config = crate::config::Config::default();
+            config.agents.push(
+                serde_json::from_value(serde_json::json!({
+                    "id": "test", "kind": "command", "command": [std::env::current_exe().unwrap()]
+                }))
+                .unwrap(),
+            );
+            let talks = Talks::at(home.join("talks"));
+            let chat = talk::begin(&talks, &config, repo.clone(), Some("test")).unwrap();
+            let queue = Queue::at(home.join("queue"));
+            let mut task = Task::new(
+                "release".into(),
+                "release".into(),
+                repo.clone(),
+                Source::Human,
+            );
+            task.runs.push("run1".into());
+            task.origin_chat = Some(chat.id.clone());
+            task.status = crate::queue::TaskStatus::Done;
+            queue.put(&mut task).unwrap();
+            register(home, &repo, URL, "run1");
+            *fake.local.lock().unwrap() = true;
+            *fake.snap.lock().unwrap() = Some(snap(
+                if choice == HOLD {
+                    PrLifecycle::Open
+                } else {
+                    PrLifecycle::Merged
+                },
+                "h1",
+                vec![],
+            ));
+            *fake.info.lock().unwrap() = Some(PrInfo {
+                branch: "chore/release-v1.0.0".into(),
+                merge_commit: Some("deadbeef".into()),
+                title: "release".into(),
+            });
+            // The failed-job case uses the actual release driver: the empty
+            // fixture repository cannot provide the release commit.
+            w.watch(&repo, URL, 60, 1, &|| false).await;
+            let questions = w.questions();
+            let q = questions
+                .list()
+                .into_iter()
+                .find(|q| q.status.open())
+                .unwrap();
+            crate::task_chat::sweep(&queue, &talks, &questions, home);
+            crate::chat_control::decide(&talks, home, &chat.id, &q.id, choice).unwrap();
+            assert_eq!(
+                Outbox::at(home)
+                    .get(&q.id)
+                    .unwrap()
+                    .decision
+                    .unwrap()
+                    .status,
+                Status::Queued
+            );
+            w.watch(&repo, URL, 60, 2, &|| false).await;
+            let st = w.load("o/r#7");
+            assert!(st.applied.contains(&q.id));
+            if choice == HOLD {
+                assert_eq!(st.held_head.as_deref(), Some("h1"));
+            } else {
+                assert!(st.ignored);
+            }
+            for now in [3, 4] {
+                let restarted = Watcher::new(Box::new(fake.clone()), home.into());
+                restarted.watch(&repo, URL, 60, now, &|| false).await;
+                crate::task_chat::sweep(&Queue::at(home.join("queue")), &talks, &questions, home);
+                assert_eq!(
+                    Outbox::at(home)
+                        .get(&q.id)
+                        .unwrap()
+                        .decision
+                        .unwrap()
+                        .status,
+                    Status::Resolved
+                );
+            }
+            assert!(fake.merges.lock().unwrap().is_empty());
+            assert!(fake.reruns.lock().unwrap().is_empty());
+        }
+    }
 
     fn local_st(asked: Option<&str>, held: Option<&str>) -> WatchState {
         WatchState {
@@ -2260,6 +2511,79 @@ mod tests {
         assert_eq!(qs.len(), 1, "one approval question, not one per lap");
         assert_eq!(qs[0].choices, vec![land::APPROVE, land::HOLD]);
         assert!(fake.merges.lock().unwrap().is_empty(), "silence is a hold");
+    }
+
+    #[tokio::test]
+    async fn legacy_settlement_is_fenced_through_the_external_merge() {
+        for settle_first in [false, true] {
+            let (dir, fake, w) = rig();
+            *fake.local.lock().unwrap() = true;
+            *fake.snap.lock().unwrap() = Some(open(vec![]));
+            let repo = PathBuf::from("/nowhere");
+            w.lap(std::slice::from_ref(&repo), 60, 1, &|| false).await;
+            let q = w.questions().list().pop().unwrap();
+            answer(&w, &q.id, land::APPROVE);
+            let outbox = crate::task_inquiry::Outbox::at(dir.path());
+            let task = crate::queue::Task::new(
+                "release".into(),
+                "release".into(),
+                repo.clone(),
+                crate::queue::Source::Human,
+            );
+            let mut inquiry = outbox
+                .file(&task, None, "release-watch".into(), "Merge release", "")
+                .unwrap();
+            inquiry.id = q.id.clone();
+            inquiry.task.clear();
+            inquiry
+                .decision
+                .as_mut()
+                .unwrap()
+                .accept("decision: merge")
+                .unwrap();
+            outbox.enqueue(inquiry).unwrap();
+            if settle_first {
+                outbox
+                    .settle(&q.id, "chat", "Owner confirmed no effect remains", None)
+                    .unwrap();
+            }
+            fake.merge_paused
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let no = || false;
+            let lap = w.lap(std::slice::from_ref(&repo), 60, 2, &no);
+            tokio::pin!(lap);
+            if !settle_first {
+                tokio::select! {
+                    () = fake.merge_entered.notified() => {}
+                    () = &mut lap => panic!("merge did not reach the held external call"),
+                    () = tokio::time::sleep(std::time::Duration::from_secs(5)) => panic!("merge did not start"),
+                }
+                assert!(
+                    outbox
+                        .settle(&q.id, "chat", "Cannot settle an executing merge", None)
+                        .is_err()
+                );
+                assert_eq!(
+                    outbox.get(&q.id).unwrap().decision.unwrap().status,
+                    crate::task_decision::Status::Queued
+                );
+                fake.merge_release.notify_one();
+            }
+            lap.await;
+            assert_eq!(
+                fake.merges.lock().unwrap().len(),
+                usize::from(!settle_first)
+            );
+            // After the consumer returns, explicit settlement is supported.
+            outbox
+                .settle(&q.id, "chat", "Owner inspected the outcome", None)
+                .unwrap();
+            w.lap(std::slice::from_ref(&repo), 60, 3, &no).await;
+            assert_eq!(
+                fake.merges.lock().unwrap().len(),
+                usize::from(!settle_first)
+            );
+        }
     }
 
     #[tokio::test]

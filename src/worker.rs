@@ -1063,7 +1063,7 @@ pub async fn run(home: &Path, id: &str) -> Result<()> {
     let result = match job.kind.as_str() {
         "task" => crate::daemon::run_task_worker(home, job.payload.clone()).await,
         "scheduler" => crate::daemon::run_scheduler_worker(home, job.payload.clone()).await,
-        "chat" => crate::consult::run_turn_worker(home, job.payload.clone()).await,
+        "chat" => crate::chat_worker::run_turn_worker(home, job.payload.clone()).await,
         "service" => crate::consult::run_service_worker(home, job.payload.clone()).await,
         "daemon-service" => crate::daemon::run_service_worker(home, job.payload.clone()).await,
         "deputy" => crate::deputy::run_worker(home, job.payload.clone()).await,

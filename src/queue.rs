@@ -43,6 +43,8 @@ use crate::id_reserve::{IdSource, path_exists};
 
 /// On-disk format for a queued task. Bumped when a field's meaning changes.
 ///
+/// 21: task/chat command effect receipts commit atomically with local transitions.
+///
 /// 18: retained review criteria snapshots survive operator edits.
 ///
 /// 17: durable explicit operator resumption, independent of run startup.
@@ -460,6 +462,19 @@ pub struct Task {
     /// `#[serde(default)]` so an older record reads as empty.
     #[serde(default)]
     pub actions_applied: Vec<String>,
+    /// Exact task/chat commands committed in the same write as their effects.
+    /// These receipts survive subsequent transitions and execution starts.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub decision_effects: std::collections::BTreeMap<String, String>,
+    /// Exact resume pins explicitly replaced or removed before dispatch.
+    /// Retained independently of later task transitions and stale writers.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub superseded_resumes: std::collections::BTreeMap<String, String>,
+    /// Resume inquiry ownership committed atomically with task dispatch.
+    /// This is not effect evidence: only the run's committed pass proves execution.
+    /// Retained across recovery and stale writers until that pass can consume it.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub dispatched_resumes: std::collections::BTreeMap<String, String>,
     /// The operator's "resume" answer to a triage question, kept until the
     /// task actually runs (or is done) so `crate::conduct` cannot silently
     /// undo it and `crate::triage` can tell that a hold it sees now came
@@ -969,6 +984,9 @@ impl Task {
             answers: Vec::new(),
             triage_applied: Vec::new(),
             actions_applied: Vec::new(),
+            decision_effects: Default::default(),
+            superseded_resumes: Default::default(),
+            dispatched_resumes: Default::default(),
             resume_override: None,
             repair_grants: Vec::new(),
             resumption: None,
@@ -1319,6 +1337,13 @@ impl Task {
         self.status = TaskStatus::Running;
         self.attempts += 1;
         self.runs.retain(|id| id != &run);
+        if let Some(pin) = &self.resume_override
+            && pin.pinned_run.as_ref() == Some(&run)
+            && !pin.question_id.is_empty()
+        {
+            self.dispatched_resumes
+                .insert(pin.question_id.clone(), run.clone());
+        }
         self.runs.push(run);
         self.last_error = None;
         self.park_reason = None;
@@ -2708,6 +2733,27 @@ impl Queue {
                     task.held_at = stored.held_at;
                 }
             }
+            task.superseded_resumes.extend(stored.superseded_resumes);
+            task.dispatched_resumes.extend(stored.dispatched_resumes);
+            if task.status != TaskStatus::Running
+                && let Some(pin) = &stored.resume_override
+                && !pin.question_id.is_empty()
+                && let Some(run) = &pin.pinned_run
+                && task.resume_override.as_ref().is_none_or(|next| {
+                    next.question_id != pin.question_id || next.pinned_run != pin.pinned_run
+                })
+            {
+                task.superseded_resumes
+                    .insert(pin.question_id.clone(), run.clone());
+            }
+            // A writer holding an older task snapshot must never erase or
+            // rewrite proof that a chat command already committed its effect.
+            for (id, receipt) in stored.decision_effects {
+                task.decision_effects.insert(id, receipt);
+            }
+            if !task.decision_effects.is_empty() {
+                task.schema = task.schema.max(SCHEMA);
+            }
             // The task's message chat is recorded once and never rewound or
             // dropped by a writer holding an older snapshot.
             if task.chat.is_none() {
@@ -2896,13 +2942,53 @@ impl Queue {
     /// from, passed in rather than reopened here so a test queue at an
     /// explicit root never reads the operator's real questions directory.
     pub fn remove(&self, id: &str, in_flight: bool, questions: &Questions) -> Result<Removal> {
+        self.remove_with_receipt(id, in_flight, questions, None)
+    }
+
+    /// Atomically retain the deleted task as the receipt for this triage inquiry.
+    pub(crate) fn discard_triage(
+        &self,
+        id: &str,
+        questions: &Questions,
+        inquiry: &str,
+    ) -> Result<Removal> {
+        self.remove_with_receipt(id, false, questions, Some(inquiry))
+    }
+
+    pub(crate) fn triage_discard_applied(&self, id: &str, inquiry: &str) -> Result<bool> {
+        let path = self
+            .root
+            .join("triage-discard")
+            .join(format!("{inquiry}.json"));
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e.into()),
+        };
+        let receipt: Task = serde_json::from_slice(&bytes)?;
+        Ok(receipt.id == id && !self.path_of(id).exists())
+    }
+
+    fn remove_with_receipt(
+        &self,
+        id: &str,
+        in_flight: bool,
+        questions: &Questions,
+        inquiry: Option<&str>,
+    ) -> Result<Removal> {
         let resolved = self.resolve_id(id)?;
         if in_flight {
             bail!("task {resolved} is being run by a live daemon right now");
         }
+        let receipt = inquiry.map(|q| self.root.join("triage-discard").join(format!("{q}.json")));
+        if let Some(path) = &receipt {
+            std::fs::create_dir_all(path.parent().expect("receipt directory"))?;
+        }
         self.write_tombstone(&resolved)?;
-        if let Err(e) = self.remove_record_with_attachments(&resolved, |p| std::fs::remove_file(p))
-        {
+        if let Err(e) = self.remove_record_with_attachments(&resolved, |p| match &receipt {
+            Some(path) => std::fs::rename(p, path),
+            None => std::fs::remove_file(p),
+        }) {
             // A record that is still there was not deleted: take the marker
             // back. One already gone keeps it, so the deletion still reads
             // as deliberate.

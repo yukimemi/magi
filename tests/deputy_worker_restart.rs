@@ -70,9 +70,9 @@ async fn wait_for(mut condition: impl FnMut() -> bool, what: &str) {
     .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
 }
 
-fn question(store: &Questions, repo: &Path, agent: &str, title: &str) -> Question {
+fn question(store: &Questions, repo: &Path, run: &str, agent: &str, title: &str) -> Question {
     let mut q = Question::new(
-        "task".into(),
+        run.into(),
         magi::conduct::NODE.into(),
         "conduct".into(),
         title.into(),
@@ -122,8 +122,20 @@ printf 'setup conversation finished\n'
     scenario.fx.config.disk.auto_fold = false;
     let config = scenario.fx.tmp.path().join("deputy-config.toml");
     std::fs::write(&config, toml::to_string(&scenario.fx.config).unwrap()).unwrap();
+    // Use a real standalone run: a missing task/run is intentionally held by
+    // migration as an ownerless decision, not admitted to legacy deputy work.
+    let head = std::process::Command::new("git").args(["rev-parse", "HEAD"])
+        .current_dir(&scenario.fx.repo).output().unwrap();
+    assert!(head.status.success());
+    let mut run = magi::run::RunState::new(
+        scenario.fx.repo.clone(), "main".into(),
+        String::from_utf8(head.stdout).unwrap().trim().into(),
+        "Standalone setup conversation".into(), scenario.fx.config.clone(),
+    );
+    run.origin = Some(magi::run::Origin::operator());
+    run.reserve_under(&home).unwrap();
     let store = Questions::at(home.join("questions"));
-    let first = question(&store, &scenario.fx.repo, &deputy_agent, "first setup");
+    let first = question(&store, &scenario.fx.repo, &run.id, &deputy_agent, "first setup");
     scenario.questions.push(first.id.clone());
     let started = |q: &Question| state.join(format!("{}.started", magi::ask::deputy_seat_key(&q.id)));
     scenario.schedulers.push(scheduler(&home, &scenario.fx.repo, &config, &scenario.fx.tmp.path().join("old.log")));
@@ -132,13 +144,13 @@ printf 'setup conversation finished\n'
         .find(|job| job.key == format!("deputy:{}", first.id)).expect("independent first deputy");
     scenario.original = Some(original.clone());
     scenario.schedulers[0].stop();
-    let second = question(&store, &scenario.fx.repo, &deputy_agent, "second setup");
+    let second = question(&store, &scenario.fx.repo, &run.id, &deputy_agent, "second setup");
     scenario.questions.push(second.id.clone());
     scenario.schedulers.push(scheduler(&home, &scenario.fx.repo, &config, &scenario.fx.tmp.path().join("new.log")));
     let new_pid = scenario.schedulers[1].0.id();
     wait_for(|| started(&second).exists(), "second deputy while the first is still blocked").await;
     assert!(!release.exists());
-    let third = question(&store, &scenario.fx.repo, &deputy_agent, "third setup");
+    let third = question(&store, &scenario.fx.repo, &run.id, &deputy_agent, "third setup");
     scenario.questions.push(third.id.clone());
     let baseline = magi::daemon::read_status(&home).unwrap().polls;
     wait_for(|| magi::daemon::read_status(&home).is_some_and(|reading|
@@ -166,6 +178,10 @@ printf 'setup conversation finished\n'
         let deputy = store.get(&q.id).unwrap().deputy.unwrap();
         assert_eq!(deputy.starts, 1, "restart must not count another deputy start");
         assert!(deputy.seat.is_some());
+        assert!(store.get(&q.id).unwrap().routed_task.is_none());
     }
+    let imported = magi::task_inquiry::Outbox::at(&home).list().unwrap();
+    assert!(imported.iter().all(|record| !scenario.questions.contains(&record.id)),
+        "standalone deputy questions must retain legacy ownership across migration and restart");
 }
 }

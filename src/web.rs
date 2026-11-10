@@ -332,6 +332,15 @@ struct Delta {
     removed: Vec<String>,
 }
 
+fn notice_and_decision_stamps(ui: &Ui) -> std::io::Result<Stamps> {
+    let mut stamps = try_stamps(ui.notices.root(), false, true)?;
+    let inquiries = ui.home.join("notifications").join("task-inquiries");
+    for (id, stamp) in try_stamps(&inquiries, false, false)? {
+        stamps.insert(format!("decision:{id}"), stamp);
+    }
+    Ok(stamps)
+}
+
 fn diff_stamps(previous: &Stamps, next: &Stamps, base: u64) -> Delta {
     let mut changed: Vec<_> = next
         .iter()
@@ -617,7 +626,7 @@ fn monitor_scan(ui: &Ui, previous: MonitorSnapshot) -> (Revisions, [Stamps; 3]) 
     if let Ok(next) = try_stamps(ui.questions.root(), false, true) {
         rev.2 = stamps_revision(&next);
     }
-    if let Ok(next) = try_stamps(ui.notices.root(), false, true) {
+    if let Ok(next) = notice_and_decision_stamps(ui) {
         rev.4 = stamps_revision(&next);
     }
     rev.5 = ui.lock_loop().rev;
@@ -1387,7 +1396,7 @@ impl Ui {
             // Another process (the CLI) can hold the turn through the
             // on-disk lease.
             || self.talks.turn_held(id)
-            || crate::consult::turn_worker_active(&self.talks, id)
+            || crate::chat_worker::turn_worker_active(&self.talks, id)
     }
 
     /// 表示専用の観測。ローカルの受付処理やワーカーストアの書き込みを待たない。
@@ -1438,7 +1447,7 @@ impl Ui {
             .talk_turns
             .lock()
             .map_err(|_| ApiError::internal("the talk turn lock was poisoned"))?;
-        if crate::consult::turn_worker_active(&self.talks, id) {
+        if crate::chat_worker::turn_worker_active(&self.talks, id) {
             if queued {
                 *live.queued.entry(id.to_owned()).or_default() += 1;
             }
@@ -1491,7 +1500,7 @@ impl Ui {
             .lock()
             .map_err(|_| ApiError::internal("the talk turn lock was poisoned"))?;
         // A detached worker owns its turn across web process replacement.
-        if live.live.contains(id) || crate::consult::turn_worker_active(&self.talks, id) {
+        if live.live.contains(id) || crate::chat_worker::turn_worker_active(&self.talks, id) {
             return Ok(TalkTurnStart::Busy);
         }
         let Some(lease) = self.talks.claim_turn(id).map_err(ApiError::from)? else {
@@ -1628,6 +1637,8 @@ impl Ui {
             .route("/api/queue/{id}/attempt-limit", post(queue_attempt_limit))
             .route("/api/queue/{id}/edit", post(queue_edit))
             .route("/api/queue/{id}/done", post(queue_done))
+            .route("/api/decisions", get(decisions_list))
+            .route("/api/decisions/{id}", get(decision_get))
             .route("/api/questions", get(questions_list))
             .route("/api/questions/core", get(questions_core))
             .route("/api/questions/origins", get(question_origins))
@@ -3109,7 +3120,7 @@ fn health_counts(
         });
     }
     let notifications_rev =
-        stamps_revision(&try_stamps(ui.notices.root(), false, true).map_err(anyhow::Error::from)?);
+        stamps_revision(&notice_and_decision_stamps(ui).map_err(anyhow::Error::from)?);
     if index
         .notices
         .is_none_or(|(rev, _)| rev != notifications_rev)
@@ -7997,6 +8008,75 @@ fn holder_of(q: &Question, lease: Option<&ask::Lease>) -> Option<&'static str> {
 /// Everything, not just the open ones: an answered question is the record of a
 /// decision, and the phone is where the operator goes back to check what they
 /// told an agent at 3am. `ask::Questions::list` already ranks open first.
+#[derive(serde::Serialize)]
+struct DecisionView {
+    id: String,
+    task: String,
+    run: Option<String>,
+    chat: Option<String>,
+    display: String,
+    delivery_error: Option<String>,
+    decision: crate::task_decision::Decision,
+}
+
+impl DecisionView {
+    fn from_inquiry(inquiry: crate::task_inquiry::Inquiry) -> Option<Self> {
+        Some(Self {
+            id: inquiry.id,
+            task: inquiry.task,
+            run: inquiry.run,
+            chat: inquiry.delivered_to,
+            display: inquiry.display,
+            delivery_error: inquiry.delivery_error,
+            decision: inquiry.decision?,
+        })
+    }
+}
+
+#[derive(serde::Serialize)]
+struct DecisionsView {
+    items: Vec<DecisionView>,
+    unreadable: usize,
+    migration_errors: Vec<crate::task_chat::MigrationIssue>,
+}
+
+// Read-only: list visits and inquiry links never create owner decisions,
+// delivery receipts or effect acknowledgements.
+async fn decisions_list(State(ui): State<Arc<Ui>>) -> ApiResult<Json<DecisionsView>> {
+    blocking(move || {
+        let (items, unreadable) = crate::task_inquiry::Outbox::at(&ui.home).list_readable()?;
+        let mut views: Vec<_> = items
+            .into_iter()
+            .filter_map(DecisionView::from_inquiry)
+            .collect();
+        views.sort_by_key(|view| {
+            (
+                view.decision.status == crate::task_decision::Status::Resolved,
+                view.id.clone(),
+            )
+        });
+        Ok(Json(DecisionsView {
+            items: views,
+            unreadable,
+            migration_errors: crate::task_chat::migration_issues(&ui.home),
+        }))
+    })
+    .await
+}
+
+async fn decision_get(
+    State(ui): State<Arc<Ui>>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<DecisionView>> {
+    blocking(move || {
+        let inquiry = crate::task_inquiry::Outbox::at(&ui.home).get(&id)?;
+        DecisionView::from_inquiry(inquiry)
+            .map(Json)
+            .ok_or_else(|| ApiError::not_found("inquiry is informational"))
+    })
+    .await
+}
+
 async fn questions_list(State(ui): State<Arc<Ui>>) -> ApiResult<Json<Vec<QuestionView>>> {
     blocking(move || {
         let questions = ui.questions.list();
@@ -8433,7 +8513,7 @@ async fn question_consult(
             }
         })
         .await?;
-        let _publication = crate::consult::publication_guard(&ui.talks, &talk.id)
+        let _publication = crate::chat_worker::publication_guard(&ui.talks, &talk.id)
             .await
             .map_err(ApiError::from)?;
         let (view, reclaimed, submitted) = blocking({
@@ -8466,7 +8546,7 @@ async fn question_consult(
         #[cfg(not(test))]
         {
             if let Some(id) = submitted {
-                crate::consult::spawn_turn(&ui.talks, &id)
+                crate::chat_worker::spawn_turn(&ui.talks, &id)
                     .await
                     .map_err(ApiError::from)?;
             }
@@ -9343,7 +9423,7 @@ async fn talk_say(
         })
         .await?
     };
-    let _publication = crate::consult::publication_guard(&ui.talks, &id)
+    let _publication = crate::chat_worker::publication_guard(&ui.talks, &id)
         .await.map_err(ApiError::from)?;
 
     // Pending recovery and a new immediate turn are decided under the same
@@ -9459,7 +9539,7 @@ async fn talk_say(
                     {
                         match written {
                             Ok((view, reclaimed)) => {
-                                let launched = crate::consult::spawn_turn(&ui.talks, &id).await;
+                                let launched = crate::chat_worker::spawn_turn(&ui.talks, &id).await;
                                 drop(reclaimed);
                                 match launched {
                                     Ok(_) => { let _ = tx.send(Ok(view)); }
@@ -9581,7 +9661,7 @@ async fn talk_say(
                 // The reservation becomes durable while this process still
                 // holds the talk lease. The child waits for that lease; the
                 // new UI sees its startup reservation immediately.
-                let result = crate::consult::spawn_recorded_turn(
+                let result = crate::chat_worker::spawn_recorded_turn(
                     &talks, &id, talk.turns.len() - 1,
                 ).await;
                 drop(turn_guard);
@@ -9638,7 +9718,7 @@ async fn talk_pending_resume(
             let asked = id.clone();
             blocking(move || resolve_talk(&ui.talks, &asked)).await?
         };
-        let _publication = crate::consult::publication_guard(&ui.talks, &id)
+        let _publication = crate::chat_worker::publication_guard(&ui.talks, &id)
             .await
             .map_err(ApiError::from)?;
         let Some(turn_guard) = ui.begin_talk_turn(&id)? else {
@@ -9687,7 +9767,7 @@ async fn detach_talk_turn(
     id: String,
     turn: TalkTurnGuard,
 ) -> ApiResult<()> {
-    let launched = crate::consult::spawn_turn(&talks, &id).await;
+    let launched = crate::chat_worker::spawn_turn(&talks, &id).await;
     drop(turn);
     launched.map(|_| ()).map_err(ApiError::from)
 }
@@ -9740,7 +9820,7 @@ async fn drain_loop_started(
 ) {
     let pending = !talk.pending.is_empty() || !talk.pending_attachments.is_empty();
     let running = if pending {
-        match crate::consult::spawn_turn(&talks, &id).await {
+        match crate::chat_worker::spawn_turn(&talks, &id).await {
             Ok(_) => true,
             Err(error) => {
                 tracing::warn!("talk {id}: could not launch draft worker: {error:#}");
@@ -9907,7 +9987,7 @@ async fn talk_pending_edit(
             let ui = Arc::clone(&ui);
             blocking(move || resolve_talk(&ui.talks, &id)).await?
         };
-        let _publication = crate::consult::publication_guard(&ui.talks, &id)
+        let _publication = crate::chat_worker::publication_guard(&ui.talks, &id)
             .await
             .map_err(ApiError::from)?;
         let (view, reclaimed) = blocking({
@@ -9990,7 +10070,7 @@ async fn talk_agent(
             let ui = Arc::clone(&ui);
             blocking(move || resolve_talk(&ui.talks, &id)).await?
         };
-        let _publication = crate::consult::publication_guard(&ui.talks, &id)
+        let _publication = crate::chat_worker::publication_guard(&ui.talks, &id)
             .await
             .map_err(ApiError::from)?;
         let repo = {
@@ -10079,7 +10159,7 @@ async fn talk_persona(
             let ui = Arc::clone(&ui);
             blocking(move || resolve_talk(&ui.talks, &id)).await?
         };
-        let _publication = crate::consult::publication_guard(&ui.talks, &id)
+        let _publication = crate::chat_worker::publication_guard(&ui.talks, &id)
             .await
             .map_err(ApiError::from)?;
         let repo = {
@@ -10170,7 +10250,7 @@ async fn talk_implementers(
             let ui = Arc::clone(&ui);
             blocking(move || resolve_talk(&ui.talks, &id)).await?
         };
-        let _publication = crate::consult::publication_guard(&ui.talks, &id)
+        let _publication = crate::chat_worker::publication_guard(&ui.talks, &id)
             .await
             .map_err(ApiError::from)?;
         let repo = {
@@ -13009,6 +13089,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fresh_api_answers_survive_task_inquiry_migration() {
+        use crate::{ask::ChoiceAction, task_decision::Status, task_inquiry::Outbox};
+        for migrate_first in [false, true] {
+            let fx = Fixture::start().await;
+            let mut task = Task::new(
+                "work".into(),
+                "work".into(),
+                PathBuf::from("/repo/magi"),
+                Source::Human,
+            );
+            task.runs.push("run-a".into());
+            fx.queue().put(&mut task).unwrap();
+            let mut q = Question::new(
+                "run-a".into(),
+                "implement".into(),
+                "impl-A".into(),
+                "Keep held?".into(),
+                String::new(),
+                vec!["hold".into()],
+            );
+            q.actions.insert("hold".into(), ChoiceAction::Hold);
+            fx.questions().put(&mut q).unwrap();
+            if migrate_first {
+                crate::task_chat::sweep(&fx.queue(), &fx.talks(), &fx.questions(), fx.home.path());
+            }
+            let response = fx
+                .post(
+                    &format!("/api/questions/{}/answer", q.id),
+                    Some(r#"{"choice":"hold"}"#),
+                )
+                .await;
+            assert_eq!(response.status, 200, "{}", response.body);
+            for _ in 0..2 {
+                crate::task_chat::sweep(&fx.queue(), &fx.talks(), &fx.questions(), fx.home.path());
+                let source = fx.questions().get(&q.id).unwrap();
+                assert_eq!(source.resolution().as_deref(), Some("hold"));
+                let decision = Outbox::at(fx.home.path())
+                    .get(&q.id)
+                    .unwrap()
+                    .decision
+                    .unwrap();
+                assert_eq!(decision.request.as_deref(), Some("decision: hold"));
+                assert_eq!(decision.source_answer_at, source.answered_at);
+                assert_eq!(decision.status, Status::Queued);
+            }
+            assert_eq!(
+                fx.post(
+                    &format!("/api/questions/{}/answer", q.id),
+                    Some(r#"{"choice":"hold"}"#)
+                )
+                .await
+                .status,
+                409
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn question_text_handler_uses_running_capabilities_and_preserves_text_answers() {
         let home = tempfile::tempdir().unwrap();
         let ui = delta_test_ui(home.path());
@@ -13603,6 +13741,75 @@ mod tests {
                 .unwrap()
                 .contains("answerable_question")
         );
+    }
+
+    #[tokio::test]
+    async fn decisions_list_reports_unreadable_records_without_hiding_pending_items() {
+        let fx = Fixture::start().await;
+        let outbox = crate::task_inquiry::Outbox::at(fx.home.path());
+        let task = crate::queue::Task::new(
+            "work".into(),
+            "work".into(),
+            fx.home.path().into(),
+            crate::queue::Source::Human,
+        );
+        let inquiry = outbox
+            .file(&task, None, "test".into(), "入力待ち", "詳細")
+            .unwrap();
+        let root = fx.home.path().join("notifications/task-inquiries");
+        std::fs::write(root.join("broken.json"), "{").unwrap();
+        let mut unsupported = inquiry.clone();
+        unsupported.id = "unsupported".into();
+        unsupported.schema = 99;
+        std::fs::write(
+            root.join("unsupported.json"),
+            serde_json::to_vec(&unsupported).unwrap(),
+        )
+        .unwrap();
+        let before = std::fs::read(root.join(format!("{}.json", inquiry.id))).unwrap();
+        for _ in 0..2 {
+            let response = fx.get("/api/decisions").await;
+            assert_eq!(response.status, 200, "{}", response.body);
+            let listed = response.json();
+            assert_eq!(listed["unreadable"], 2);
+            assert_eq!(listed["items"].as_array().unwrap().len(), 1);
+            assert_eq!(listed["items"][0]["id"], inquiry.id);
+            assert_eq!(listed["items"][0]["decision"]["status"], "awaiting_owner");
+        }
+        assert_eq!(
+            before,
+            std::fs::read(root.join(format!("{}.json", inquiry.id))).unwrap()
+        );
+        assert!(outbox.list().is_err());
+        std::fs::remove_file(root.join("broken.json")).unwrap();
+        std::fs::remove_file(root.join("unsupported.json")).unwrap();
+        assert_eq!(fx.get("/api/decisions").await.json()["unreadable"], 0);
+    }
+
+    #[tokio::test]
+    async fn decisions_list_exposes_migration_errors_without_acknowledging_them() {
+        let fx = Fixture::start().await;
+        let root = fx.home.path().join("notifications/task-chat-migration-v1");
+        std::fs::create_dir_all(&root).unwrap();
+        let journal = serde_json::json!({
+            "schema": 1, "pending": ["saved-inquiry"],
+            "errors": {"saved-inquiry": "Source is unreadable; no action executed"}
+        });
+        let bytes = serde_json::to_vec(&journal).unwrap();
+        std::fs::write(root.join("state.json"), &bytes).unwrap();
+        for _ in 0..2 {
+            let response = fx.get("/api/decisions").await;
+            assert_eq!(response.status, 200);
+            let listed = response.json();
+            assert_eq!(listed["migration_errors"][0]["id"], "saved-inquiry");
+            assert!(listed["items"].as_array().unwrap().is_empty());
+            assert_eq!(std::fs::read(root.join("state.json")).unwrap(), bytes);
+        }
+        // An unreadable journal must not make the endpoint hide the list.
+        std::fs::write(root.join("state.json"), b"{").unwrap();
+        let response = fx.get("/api/decisions").await;
+        assert_eq!(response.status, 200);
+        assert_eq!(response.json()["migration_errors"][0]["id"], "migration");
     }
 
     #[tokio::test]
@@ -15745,7 +15952,7 @@ mod tests {
                 })
                 .expect("the busy branch dropped the gate without using it");
             assert!(
-                crate::consult::try_publication_guard(&talks, &id)
+                crate::chat_worker::try_publication_guard(&talks, &id)
                     .expect("publication fence")
                     .is_none(),
                 "a queued worker cannot promote text before its successor reservation is published"
@@ -15789,7 +15996,7 @@ mod tests {
             })
             .await;
             assert!(
-                crate::consult::try_publication_guard(&talks, &id)
+                crate::chat_worker::try_publication_guard(&talks, &id)
                     .expect("publication fence after disconnect")
                     .is_none()
             );
@@ -15806,7 +16013,7 @@ mod tests {
                     .expect("short admission transaction should release for replacement"),
             );
             assert!(
-                crate::consult::try_publication_guard(&talks, &id)
+                crate::chat_worker::try_publication_guard(&talks, &id)
                     .expect("publication fence after acknowledgement")
                     .is_some(),
                 "the publication fence is not retained by the long response"

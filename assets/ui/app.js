@@ -48,6 +48,7 @@ const API = {
   priority: (id) => `/api/queue/${encodeURIComponent(id)}/priority`,
   editTask: (id) => `/api/queue/${encodeURIComponent(id)}/edit`,
   doneTask: (id) => `/api/queue/${encodeURIComponent(id)}/done`,
+  decisions: "/api/decisions",
   questions: "/api/questions",
   notifications: "/api/notifications",
   notificationsReadAll: "/api/notifications/read-all",
@@ -5529,6 +5530,7 @@ function renderAskBar() {
 function renderIndicators(count) {
   for (const id of ["ask-badge-rail", "ask-badge-dock"]) {
     const badge = $(id);
+    if (!badge) continue;
     setText(badge, count > 99 ? "99+" : String(count));
     show(badge, count > 0);
   }
@@ -5549,6 +5551,8 @@ function renderTitle() {
       ? "Stats \u2014 magi"
       : state.route.name === "settings"
       ? "Settings \u2014 magi"
+      : state.route.name === "decisions"
+      ? "判断待ち \u2014 magi"
       : state.route.name === "questions"
         ? "Questions \u2014 magi"
         : state.route.name === "talks"
@@ -5838,13 +5842,14 @@ function scrollToLastTurn(containerId, { smooth = false } = {}) {
 let cancelTalkPosition = () => {};
 let openingTalkPosition = false;
 function scheduleTalkPosition(initial) {
+  if (state.route.inquiry) return;
   if (!initial && openingTalkPosition) return;
   cancelTalkPosition();
   openingTalkPosition = initial;
   const id = state.talkDetail.id;
   const pane = $("main").dataset.split === "1" ? $("view-talk") : null;
   const position = () => pane ? pane.scrollTop : window.scrollY;
-  const current = () => state.route.name === "talk" && state.route.id === id && state.talkDetail.id === id;
+  const current = () => state.route.name === "talk" && !state.route.inquiry && state.route.id === id && state.talkDetail.id === id;
   let frame = 0, timer = 0, observer = null, expected = null, anchorTop = null;
   const events = ["wheel", "touchstart", "pointerdown", "keydown"];
   const stop = () => {
@@ -10128,7 +10133,91 @@ function loadQuestions() {
  * bell's badge is the unread count; before /api/notifications has answered it
  * falls back to health's own count. Every string from the API is rendered as
  * text, and the one URL goes through forgeUrl(). */
+/* ---- durable pending decisions ------------------------------------------ */
+const decisionState = { items: [], unreadable: 0, migrationErrors: [], loaded: false, loading: false, error: null, focus: null };
+const decisionLabels = {
+  awaiting_owner: "所有者の入力待ち", queued: "受付・実行待ち", in_progress: "実行中",
+  retry_needed: "失敗・結果の確認が必要", resolved: "解決済み",
+};
+function decisionChatLink(item) {
+  return item.chat ? `#/chat/${encodeURIComponent(item.chat)}/inquiry/${encodeURIComponent(item.id)}` : null;
+}
+function decisionCard(item) {
+  const d = item.decision;
+  const card = el("li", { class: "decision-card panel", "data-decision-id": item.id },
+    el("h2", { text: d.reason }),
+    el("p", { class: "decision-status", text: decisionLabels[d.status] || d.status }),
+    el("div", { class: "decision-links" },
+      ...(item.task ? [el("a", { href: `#/tasks/${encodeURIComponent(item.task)}`, text: "タスク" })]
+        : [el("span", { text: "所有タスクの確認が必要" })]),
+      ...(item.run ? [el("a", { href: `#/runs/${encodeURIComponent(item.run)}`, text: "Run" })] : []),
+      ...(item.chat ? [el("a", { href: decisionChatLink(item), text: "チャットの問い合わせへ" })]
+        : [el("span", { text: "チャットへの配送待ち" })])));
+  if (!item.task && !item.chat) card.append(el("p", { text: `問い合わせ ${item.id}：元のタスクを復元するか、既存のチャットで理由を伝えて明示的な解決を依頼できます（settle-decision）。` }));
+  if (d.error || item.delivery_error) card.append(el("p", { class: "decision-error", text: d.error || item.delivery_error }));
+  if (d.history.length) card.append(el("details", {}, el("summary", { text: "状態の履歴" }),
+    el("ol", {}, d.history.map(event => el("li", { text: `${decisionLabels[event.status] || event.status}: ${event.evidence}` })))));
+  return card;
+}
+function renderDecisions() {
+  const active = decisionState.items.filter(item => item.decision.status !== "resolved");
+  const resolved = decisionState.items.filter(item => item.decision.status === "resolved");
+  for (const id of ["decision-badge-rail", "decision-badge-dock"]) {
+    const badge = $(id);
+    setText(badge, String(active.length)); show(badge, active.length > 0);
+  }
+  setText($("decisions-count"), decisionState.error ? "一覧を更新できませんでした" : decisionState.loaded ? `${active.length} 件の判断待ち` : "読み込み中…");
+  const problems = decisionState.migrationErrors.map(issue => `${issue.id}: ${issue.reason}`);
+  if (decisionState.unreadable) problems.unshift(`${decisionState.unreadable} 件の記録を読み込めません。表示中の件数には含まれていません。`);
+  const warning = decisionState.error || problems.join("\n") || null;
+  show($("decisions-error"), Boolean(warning));
+  if (warning) $("decisions-error").replaceChildren(
+    el("p", { text: warning }), el("button", { type: "button", text: "再読み込み", onclick: () => loadDecisions() }));
+  $("decisions-list").replaceChildren(...active.map(decisionCard));
+  $("decisions-resolved").replaceChildren(...resolved.map(decisionCard));
+  show($("decisions-empty"), decisionState.loaded && !active.length && !warning);
+  show($("decisions-history"), resolved.length > 0);
+}
+async function loadDecisions() {
+  if (decisionState.loading) return;
+  decisionState.loading = true;
+  try {
+    const result = await getJson(API.decisions);
+    decisionState.items = result.items;
+    decisionState.unreadable = result.unreadable;
+    decisionState.migrationErrors = result.migration_errors || [];
+    decisionState.loaded = true;
+    decisionState.error = null;
+  } catch (error) { decisionState.error = error.message; }
+  finally { decisionState.loading = false; renderDecisions(); }
+}
+async function loadInquiry(chat, id) {
+  const key = `${chat}/${id || ""}`;
+  decisionState.focus = key;
+  const box = $("talk-inquiry");
+  show(box, Boolean(id));
+  if (!id) { box.replaceChildren(); return; }
+  box.replaceChildren(el("p", { text: "問い合わせを読み込み中…" }));
+  try {
+    const item = await getJson(`${API.decisions}/${encodeURIComponent(id)}`);
+    if (decisionState.focus !== key) return;
+    if (item.chat !== chat) throw new Error("この問い合わせは別のチャットに属しています");
+    box.replaceChildren(el("h2", { text: item.decision.reason }),
+      el("p", { text: decisionLabels[item.decision.status] || item.decision.status }),
+      renderNoticeDisplay({ facts: item.display, task: item.task, run: item.run }),
+      el("a", { href: "#/decisions", text: "判断待ち一覧へ" }));
+    requestAnimationFrame(() => {
+      if (decisionState.focus === key) { box.scrollIntoView({ block: "start" }); box.focus({ preventScroll: true }); }
+    });
+  } catch (error) {
+    if (decisionState.focus !== key) return;
+    box.replaceChildren(el("p", { role: "alert", text: error.message }),
+      el("button", { type: "button", text: "再読み込み", onclick: () => loadInquiry(chat, id) }));
+  }
+}
+
 async function loadNotifications() {
+  if (!decisionState.loaded) loadDecisions();
   try {
     const out = await getJson(API.notifications);
     state.notices = { unread: Number(out.unread) || 0, items: Array.isArray(out.items) ? out.items : [] };
@@ -10589,6 +10678,7 @@ async function applyRevisions_(source) {
   if (notificationsRev !== state.rev.notifications || questionsRev !== state.rev.questions) {
     state.rev.notifications = notificationsRev;
     jobs.push(loadNotifications());
+    jobs.push(loadDecisions());
   }
 
   if (queueRev !== state.rev.queue) {
@@ -10701,8 +10791,9 @@ function parseRoute() {
   if (parts[0] === "stats") return { name: "stats", id: null };
   if (parts[0] === "settings") return { name: "settings", id: null };
   if (parts[0] === "questions") return { name: "questions", id: parts[1] ? decodeURIComponent(parts[1]) : null };
+  if (parts[0] === "decisions") return { name: "decisions", id: null };
   if (parts[0] === "notifications") return { name: "notifications", id: null };
-  if (parts[0] === "chat" && parts[1]) return { name: "talk", id: decodeURIComponent(parts[1]) };
+  if (parts[0] === "chat" && parts[1]) return { name: "talk", id: decodeURIComponent(parts[1]), inquiry: parts[2] === "inquiry" && parts[3] ? decodeURIComponent(parts[3]) : null };
   if (parts[0] === "chat") return { name: "talks", id: null };
   if (parts[0] === "runs" && parts[1]) {
     const tab = RUN_TABS.includes(parts[2]) ? parts[2] : "overview";
@@ -10866,7 +10957,7 @@ function markSelected() {
 
 function applyRoute() {
   const route = parseRoute();
-  const changed = route.name !== state.route.name || route.id !== state.route.id;
+  const changed = route.name !== state.route.name || route.id !== state.route.id || route.inquiry !== state.route.inquiry;
   if (changed) {
     cancelDetailSections();
     cancelTalkPosition();
@@ -10882,6 +10973,7 @@ function applyRoute() {
   show($("view-task"), detailShown("task"));
   show($("view-stats"), route.name === "stats");
   show($("view-settings"), route.name === "settings");
+  show($("view-decisions"), route.name === "decisions");
   show($("view-questions"), route.name === "questions");
   show($("view-notifications"), route.name === "notifications");
   show($("view-talks"), listShown("talks"));
@@ -10977,6 +11069,8 @@ function applyRoute() {
      the stream since the last visit. */
   if (changed && route.name === "stats") loadStats();
   if (changed && route.name === "settings") loadSettings();
+  if (changed && route.name === "decisions") loadDecisions();
+  if (changed) loadInquiry(route.name === "talk" ? route.id : null, route.inquiry || null);
   renderTitle();
 }
 

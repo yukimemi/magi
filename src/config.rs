@@ -536,10 +536,8 @@ pub struct Graph {
     /// after merge repair (including repair that leaves the head unchanged).
     /// The pull request is opened either way; only the merge waits.
     pub hold_contested_merge: bool,
-    /// Route what used to be a question about a task to the chat attached to
-    /// that task (`crate::task_chat`): free text, no choices, no waiting. On by
-    /// default; off keeps the question store, deputies and waiter as they were
-    /// for this repository.
+    /// Retired setting accepted for saved config compatibility only. Task
+    /// inquiries always route to chat; this value never selects a workflow.
     pub question_routing: bool,
     /// After a run's pull request merges, file the findings its last review
     /// round left open as follow-up tasks (`crate::followup`) instead of
@@ -1811,6 +1809,11 @@ impl Config {
             .try_into()
             .context("deserializing magi config")
             .context(ConfigFailure::layers("config-deserialize", paths))?;
+        if !cfg.graph.question_routing {
+            tracing::warn!(
+                "[graph] question_routing is retired and ignored; task inquiries always use their chat"
+            );
+        }
         crate::persona::validate(&cfg.talk.personas)?;
         cfg.worktree.validate()?;
         cfg.release.validate()?;

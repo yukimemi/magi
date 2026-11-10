@@ -223,6 +223,9 @@ impl Waiter {
     /// Admission check without starting a process for an idle question store.
     pub fn has_work(&self, now: Timestamp) -> bool {
         self.store.list().iter().any(|q| {
+            if crate::task_chat::migrated_source(&self.home, &q.id) {
+                return false;
+            }
             let lease = self.store.read_lease(&q.id);
             match decide_owned(
                 q,
@@ -279,7 +282,9 @@ impl Waiter {
             if halt() {
                 return;
             }
-            if crate::task_chat::routes(&q, &self.home) {
+            if crate::task_chat::routes(&q, &self.home)
+                || crate::task_chat::migrated_source(&self.home, &q.id)
+            {
                 continue;
             }
             let lease = self.store.read_lease(&q.id);
@@ -498,7 +503,9 @@ impl Waiter {
         // Re-read under the claim: the asker may have come back, or the owner
         // may have said more, since the tick's copy was taken.
         let q = self.store.get(&q.id)?;
-        if crate::task_chat::routes(&q, &self.home) {
+        if crate::task_chat::routes(&q, &self.home)
+            || crate::task_chat::migrated_source(&self.home, &q.id)
+        {
             return Ok(());
         }
         let now = Timestamp::now();

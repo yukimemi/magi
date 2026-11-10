@@ -59,7 +59,9 @@ fn executable(path: &Path, source: &str) {
 }
 
 fn generation_executable(path: &Path, label: &str) {
-    std::fs::copy(env!("CARGO_BIN_EXE_magi"), path).expect("copy real generation executable");
+    let executable = magi_cli(path.parent().unwrap());
+    std::fs::copy(Path::new(executable.get_program()), path)
+        .expect("copy real generation executable");
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
     #[cfg(not(target_os = "macos"))]
     {
@@ -114,7 +116,22 @@ async fn web(
         std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
     ))
     .unwrap();
-    let child = magi_cli(home)
+    // Use the test-owned immutable generation for the HTTP process too: a
+    // concurrent build may temporarily replace Cargo's shared CLI artifact.
+    let defaults = magi_cli(home);
+    let mut command = std::process::Command::new(generation);
+    command.current_dir(home);
+    for (key, value) in defaults.get_envs() {
+        match value {
+            Some(value) => {
+                command.env(key, value);
+            }
+            None => {
+                command.env_remove(key);
+            }
+        }
+    }
+    let child = command
         .args(["web", "--bind", "127.0.0.1", "--port", "0", "--repo"])
         .arg(repo)
         .env("PATH", path)
@@ -264,7 +281,7 @@ async fn chat_survives_web_restart_and_successor_submission_keeps_one_session() 
     assert!(talks.get(id).unwrap().turns.iter().any(|turn| turn.body == "response-1"));
     std::fs::write(state.join("release-2"), "go").unwrap();
     wait_for(|| talks.get(id).unwrap().turns.iter().any(|turn| turn.body == "response-2")
-        && !magi::consult::turn_worker_active(&talks, id), "both persisted responses").await;
+        && !magi::chat_worker::turn_worker_active(&talks, id), "both persisted responses").await;
     let talk = talks.get(id).unwrap();
     assert_eq!(talk.title.as_ref().unwrap().text, "再起動後の会話", "the separate title seat persisted its result");
     assert_eq!(talk.title.as_ref().unwrap().source, magi::talk::TitleSource::Generated);

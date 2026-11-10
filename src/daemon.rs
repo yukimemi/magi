@@ -1252,6 +1252,13 @@ pub async fn apply_choice_actions(queue: &Queue, questions: &Questions, home: &P
 /// release watcher need not have a queue task, and a predecessor is another run.
 async fn apply_maintenance_choices(queue: &Queue, questions: &Questions, home: &Path) {
     for q in questions.list() {
+        // Read again under the same fence used by explicit settlement.
+        let Ok(_execution) = crate::task_inquiry::Outbox::at(home).execution_claim(&q.id) else {
+            continue;
+        };
+        let Ok(q) = questions.get(&q.id) else {
+            continue;
+        };
         let Some(action) = q.chosen_action().filter(|a| a.maintenance()) else {
             continue;
         };
@@ -1511,6 +1518,13 @@ pub(crate) async fn rerun_checks_once(
 pub(crate) fn apply_task_choice_actions(queue: &Queue, questions: &Questions, home: &Path) {
     let tasks = queue.list();
     for q in questions.list() {
+        // Read again under the same fence used by explicit settlement.
+        let Ok(_execution) = crate::task_inquiry::Outbox::at(home).execution_claim(&q.id) else {
+            continue;
+        };
+        let Ok(q) = questions.get(&q.id) else {
+            continue;
+        };
         // Dismissal is committed by the question writer, never a resume.
         if q.resolution().as_deref() == Some(crate::merge_decision::DISMISS) {
             continue;
@@ -1592,6 +1606,12 @@ pub(crate) fn apply_task_choice_actions(queue: &Queue, questions: &Questions, ho
             continue;
         }
         let done = matches!(decision, ActionDecision::Done);
+        // Resume owes an execution pass; only these task-local effects finish
+        // in this write. Stale/refused actions never acquire an effect receipt.
+        let completed = matches!(
+            decision,
+            ActionDecision::Requeue | ActionDecision::Hold | ActionDecision::Done
+        );
         match decision {
             ActionDecision::Skip => continue,
             ActionDecision::Resume(run) => {
@@ -1612,6 +1632,8 @@ pub(crate) fn apply_task_choice_actions(queue: &Queue, questions: &Questions, ho
             ActionDecision::Hold => task.hold_manual(Some(q.summary.clone())),
             ActionDecision::Done => task.succeed(),
             ActionDecision::Refuse(why) => {
+                let _ =
+                    crate::task_inquiry::Outbox::at(home).update_decision(&q.id, |d| d.fail(&why));
                 if task.operator_held() {
                     // A rejected answer does not release the operator's hold
                     // or reclassify it as recoverable by the conductor.
@@ -1635,6 +1657,12 @@ pub(crate) fn apply_task_choice_actions(queue: &Queue, questions: &Questions, ho
             }
         }
         task.mark_action_applied(&q.id);
+        if completed {
+            task.decision_effects.insert(
+                q.id.clone(),
+                format!("decision: {}", q.resolution().expect("answered action")),
+            );
+        }
         // The applied id travels with the transition, so a failed save loses
         // neither and the answer is acted on at the next poll.
         record(queue, &mut task);
@@ -2002,6 +2030,10 @@ fn settle_and_diagnose(
             } else { format!("PR closure was not confirmed. Task held; inspect the existing run before starting replacement work. {}", state.merge.as_ref().map_or("", |m| m.detail.as_str())) }));
         }
         task.mark_action_applied(&d.question);
+        if d.choice.eq_ignore_ascii_case(land::HOLD) {
+            task.decision_effects
+                .insert(d.question.clone(), format!("decision: {}", d.choice));
+        }
         if let Some(pass) = state.passes.last() {
             task.record_pass_at(
                 &state.id,
@@ -3848,6 +3880,11 @@ async fn poll(
             &questions,
             home,
         );
+        if let Err(error) = crate::task_inquiry::Outbox::at(home)
+            .sweep(queue, &crate::talk::Talks::at(home.join("talks")))
+        {
+            tracing::warn!("task inquiry delivery remains pending: {error:#}");
+        }
         repair_choice_offers(&questions);
         resolve_blockers(queue, &questions);
         apply_task_choice_actions(queue, &questions, home);
@@ -3857,6 +3894,9 @@ async fn poll(
         crate::chat_notify::sweep(queue, &talks, home);
         crate::notice_delivery::sweep(queue, &talks, home, &opts.repo);
         crate::chat_watch::sweep(home, &talks);
+        if let Err(error) = crate::chat_control::reconcile_decisions(queue, home) {
+            tracing::warn!("decision receipt reconciliation remains pending: {error:#}");
+        }
         let mut turns = tokio::task::JoinSet::new();
         crate::chat_notify::start_turns(&talks, stop.parking(), &mut turns);
         // start_turns dispatches detached turns; no paid work lives in this set.
@@ -4175,13 +4215,26 @@ async fn attempt(
         runner.on_pause(stop.pause());
         runner.watch_interrupt(interrupt_pause);
         let quota_before = runner.state.quota.clone();
+        let before_start = task.clone();
         task.start(owner.id.clone());
-        record(queue, task);
+        if let Err(error) = queue.put(task) {
+            *task = before_start;
+            let error = runner.fail_startup("task-start", error);
+            if let Some(failure) = error.downcast_ref::<crate::run::StartupFailure>() {
+                task.record_startup_failure(failure.clone());
+            }
+            task.hold_manual(Some(format!(
+                "Could not persist task start; no agents dispatched: {error:#}"
+            )));
+            record(queue, task);
+            return Vec::new();
+        }
         lock(status).current.push(Current {
             worker: None,
             task: task.id.clone(),
             run: owner.id,
         });
+        runner.state.carry_dispatched_resumes(task);
         runner.state.next_pass_task_entry = true;
         let result = runner.execute().await;
         return finish_attempt(
@@ -4895,6 +4948,7 @@ async fn attempt(
     // `RunState::quota` is the run's whole history across every resume, so
     // only what this execution added may arm the cooldown or earn a refund.
     let quota_before = runner.state.quota.clone();
+    runner.state.carry_dispatched_resumes(task);
     runner.state.next_pass_task_entry = true;
     let result = runner.execute().await;
     finish_attempt(
@@ -9203,6 +9257,7 @@ mod tests {
             resolved: false,
             chosen_title: None,
             choice: None,
+            publication: None,
         });
         state.save().unwrap();
         let store = ask::Questions::open();
@@ -9274,6 +9329,62 @@ mod tests {
             t.status,
             TaskStatus::Done,
             "a run that actually finished must not stay `running` forever"
+        );
+    }
+
+    #[test]
+    fn reclaim_preserves_dispatched_inquiries_until_a_committed_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let mut task = task();
+        let mut run = run_state(RunStatus::Blocked);
+        run.reserve_under(dir.path()).unwrap();
+        run.driver_exited = true;
+        run.save_under(dir.path()).unwrap();
+        queue.put(&mut task).unwrap();
+        let stale = task.clone();
+        task.resume_override = Some(crate::queue::OperatorResume {
+            question_id: "pending-resume".into(),
+            at: Timestamp::now(),
+            conductor_rehold: None,
+            forced: true,
+            pinned_run: Some(run.id.clone()),
+        });
+        task.start(run.id.clone());
+        queue.put(&mut task).unwrap();
+        // Discard every in-memory handoff, as a worker death before execute does.
+        let mut recovered = queue.get(&task.id).unwrap();
+        let disk = RunState::load_under(&run.id, dir.path()).unwrap();
+        reclaim(&mut recovered, Some(disk), 2, "en");
+        queue.put(&mut recovered).unwrap();
+        assert!(recovered.resume_override.is_none());
+        assert_eq!(
+            recovered.dispatched_resumes.get("pending-resume"),
+            Some(&run.id)
+        );
+        let mut stale = stale;
+        queue.put(&mut stale).unwrap();
+        assert_eq!(
+            stale.dispatched_resumes, recovered.dispatched_resumes,
+            "a stale task writer cannot erase dispatch ownership"
+        );
+        let mut resumed = RunState::load_under(&run.id, dir.path()).unwrap();
+        assert!(resumed.decision_starts.is_empty());
+        resumed.carry_dispatched_resumes(&queue.get(&task.id).unwrap());
+        assert!(
+            resumed.decision_starts.is_empty(),
+            "handoff is not execution proof"
+        );
+        resumed.begin_pass();
+        resumed.save_under(dir.path()).unwrap();
+        let mut disk = RunState::load_under(&run.id, dir.path()).unwrap();
+        assert_eq!(disk.decision_starts.get("pending-resume"), Some(&0));
+        disk.carry_dispatched_resumes(&recovered);
+        disk.begin_pass();
+        assert_eq!(
+            disk.decision_starts.get("pending-resume"),
+            Some(&0),
+            "later execution must preserve the original pass receipt"
         );
     }
 
@@ -11772,6 +11883,54 @@ mod tests {
             "release keeps run history but must not resume it"
         );
         assert_eq!(released.runs, ["stalled-run"]);
+    }
+
+    #[test]
+    fn landing_hold_receipt_survives_release_retry_and_checkpoint_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let mut state = run_state(RunStatus::Blocked);
+        state.merge_decision = Some(crate::merge_decision::Decision {
+            question: "hold-inquiry".into(),
+            target: crate::merge_decision::Target {
+                pr: "https://example.test/pull/1".into(),
+                head: "reviewed-head".into(),
+                language: "en".into(),
+            },
+            choice: land::HOLD.into(),
+            closed: false,
+            replacement_run: None,
+            replacement_pr: None,
+        });
+        let mut t = task();
+        t.start(state.id.clone());
+        settle_and_diagnose(
+            &mut t,
+            Verdict {
+                status: RunStatus::Blocked,
+                left_pr: true,
+                quota_hit: false,
+                parked: false,
+                no_viable_candidates: false,
+            },
+            "held",
+            2,
+            &state,
+        );
+        queue.put(&mut t).unwrap();
+        t.release_operator("chat", None);
+        t.edit("revised".into(), "revised instruction".into())
+            .unwrap();
+        queue.put(&mut t).unwrap();
+        drop(state);
+        assert_eq!(
+            queue
+                .get(&t.id)
+                .unwrap()
+                .decision_effects
+                .get("hold-inquiry"),
+            Some(&format!("decision: {}", land::HOLD))
+        );
     }
 
     fn stopped_public_run(status: RunStatus) -> RunState {

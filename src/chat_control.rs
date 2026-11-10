@@ -61,6 +61,27 @@ pub enum Operation {
         /// Head-bound operator request.
         request: crate::repair_budget::Request,
     },
+    /// Reconcile a task-local uncertain effect against its durable end condition.
+    ReconcileDecision {
+        /// Stable inquiry id.
+        inquiry: String,
+    },
+    /// Bind a command to its durable inquiry; acceptance is not resolution.
+    ForDecision {
+        /// Stable inquiry id.
+        inquiry: String,
+        /// Existing typed task/run command.
+        command: Box<Operation>,
+    },
+    /// Explicitly confirm no effect remains, including accepted legacy choices.
+    SettleDecision {
+        /// Stable inquiry id.
+        inquiry: String,
+        /// Owner's reason for settlement.
+        reason: String,
+        /// Replacement active inquiry in the same task/chat.
+        replacement: Option<String>,
+    },
     /// File a new task through the launcher, including from read-only chats.
     Add {
         /// Validated filing inputs, without task state or a caller-selected id.
@@ -280,6 +301,55 @@ async fn execute(
             }
             message
         }
+        Operation::ReconcileDecision { inquiry } => {
+            reconcile_task_decision(queue, home, talk, &inquiry)?;
+            format!("decision {inquiry} reconciled from the task's durable state")
+        }
+        Operation::ForDecision { inquiry, command } => {
+            execute_decision(queue, home, talks, talk, &inquiry, *command).await?
+        }
+        Operation::SettleDecision {
+            inquiry,
+            reason,
+            replacement,
+        } => {
+            let outbox = crate::task_inquiry::Outbox::at(home);
+            let record = outbox.get(&inquiry)?;
+            // Task-backed legacy consumers run under the task claim. Hold it
+            // through settlement; ownerless release consumers use the inquiry
+            // execution fence inside Outbox::settle instead.
+            let _task_claim = if !record.task.is_empty()
+                && record
+                    .decision
+                    .as_ref()
+                    .is_some_and(|d| d.request.is_some())
+            {
+                Some(
+                    queue
+                        .claim(&record.task)
+                        .context("decision task is executing")?,
+                )
+            } else {
+                None
+            };
+            if record
+                .decision
+                .as_ref()
+                .is_some_and(|d| d.request.is_none())
+            {
+                let questions = crate::ask::Questions::at(home.join("questions"));
+                if let Ok(source) = questions.get(&inquiry)
+                    && !(record.task.is_empty() && record.delivered_to.is_none())
+                {
+                    ensure!(
+                        !crate::task_chat::awaits_decision(&source),
+                        "a legacy effect still awaits consumer reconciliation; settlement executes no action"
+                    );
+                }
+            }
+            outbox.settle(&inquiry, talk, &reason, replacement.as_deref())?;
+            format!("settled decision {inquiry}: {reason}")
+        }
         Operation::Add { filing } => {
             let mut task = Task::new(filing.title, filing.instruction, filing.repo, filing.source);
             task.sources = filing.sources;
@@ -315,20 +385,25 @@ async fn execute(
             number,
             head,
             request,
-        } => {
-            crate::chat_merge::merge(
-                home,
-                talks,
-                talk,
-                crate::chat_merge::Request {
-                    repo,
-                    number,
-                    head,
-                    request,
-                },
-            )
-            .await?
-        }
+        } => crate::chat_merge::merge(
+            home,
+            talks,
+            talk,
+            crate::chat_merge::Request {
+                repo,
+                number,
+                head,
+                request,
+            },
+        )
+        .await
+        .map_err(|error| {
+            if error.is::<crate::chat_merge::BeforeMergeWrite>() {
+                anyhow::Error::new(BeforeEffect(error))
+            } else {
+                error
+            }
+        })?,
         Operation::GrantRepair { request } => {
             // Keep run-state admission out of the shared control dispatcher
             // future, which is also embedded in ordinary CLI task operations.
@@ -418,6 +493,722 @@ async fn execute(
     })
 }
 
+/// Run one typed operation on behalf of the owner, retaining failures and
+/// uncertainty. A repeated command never blindly replays a possibly applied
+/// external effect. The underlying operation retains its existing claims and
+/// receipts; this journal is its user-visible lifecycle, not a second worker.
+async fn execute_decision(
+    queue: &Queue,
+    home: &Path,
+    talks: &Talks,
+    chat: &str,
+    id: &str,
+    command: Operation,
+) -> Result<String> {
+    use crate::task_decision::Status;
+    let outbox = crate::task_inquiry::Outbox::at(home);
+    let _execution = outbox.execution_claim(id)?;
+    let inquiry = outbox.get(id)?;
+    ensure!(
+        inquiry.delivered_to.as_deref() == Some(chat),
+        "decision belongs to another chat"
+    );
+    let task = queue.get(&inquiry.task)?;
+    ensure!(task.repo == inquiry.repo, "decision repository changed");
+    let deferred = matches!(
+        command,
+        Operation::Resume { .. } | Operation::MergePr { .. }
+    );
+    let merge = match &command {
+        Operation::MergePr {
+            repo,
+            number,
+            head,
+            request,
+        } => Some(crate::chat_merge::Request {
+            repo: repo.clone(),
+            number: *number,
+            head: head.clone(),
+            request: request.clone(),
+        }),
+        _ => None,
+    };
+    match &command {
+        Operation::Done { task: target }
+        | Operation::Hold { task: target, .. }
+        | Operation::Release { task: target }
+        | Operation::Retry { task: target, .. } => {
+            ensure!(
+                queue.resolve_id(target)? == task.id,
+                "command targets another task"
+            );
+        }
+        Operation::Resume { run }
+        | Operation::Abandon { run }
+        | Operation::RerunChecks { run, .. } => {
+            ensure!(
+                task.runs.contains(run) && inquiry.run.as_ref().is_none_or(|own| own == run),
+                "command targets another execution"
+            );
+            ensure!(
+                queue
+                    .list()
+                    .iter()
+                    .filter(|owner| owner.runs.contains(run))
+                    .count()
+                    == 1,
+                "execution ownership is ambiguous"
+            );
+        }
+        Operation::MergePr { repo, number, .. } => {
+            let run = inquiry
+                .run
+                .as_ref()
+                .or_else(|| task.runs.last())
+                .context("task has no execution for this merge")?;
+            let state = crate::run::RunState::load_under(run, home)?;
+            let expected = format!("https://github.com/{repo}/pull/{number}");
+            ensure!(
+                state.repo == task.repo
+                    && state
+                        .pr
+                        .as_ref()
+                        .is_some_and(|pr| pr.url.eq_ignore_ascii_case(&expected)),
+                "merge targets another task or repository"
+            );
+        }
+        _ => bail!("use a task/run effect command with --decision; routed approvals use decide"),
+    }
+    let request = serde_json::to_string(&command)?;
+    let mut decision = inquiry.decision.context("inquiry is informational")?;
+    if decision.request.is_some()
+        && decision.status != Status::Resolved
+        && let Operation::Resume { run } = &command
+    {
+        ensure!(
+            decision.request.as_deref() == Some(&request),
+            "decision already binds a different request"
+        );
+        // Queued also includes successfully published resumes. Reconcile under
+        // the execution claim before permitting any retry, even if the run has
+        // since returned to a resumable state. Only proven non-publication may
+        // enter the retry path below.
+        reconcile_resume_claimed(queue, home, &outbox, id, run)?;
+        decision = outbox
+            .get(id)?
+            .decision
+            .context("inquiry is informational")?;
+        ensure!(
+            decision.status == Status::Resolved || decision.retry_safe,
+            "previous resume remains queued or executing; it will not be replayed"
+        );
+    }
+    if decision.status == Status::Resolved {
+        ensure!(
+            decision.request.as_deref() == Some(&request),
+            "decision resolved for a different request"
+        );
+        return Ok(format!(
+            "decision {id} is already resolved; inspect its outcome history"
+        ));
+    }
+    if let Operation::RerunChecks { run, request, .. } = &command {
+        // Reject correctable input before binding the decision to this exact
+        // command. Execution revalidates these reads before taking its lock.
+        rerun_preflight(queue, home, run, request)?;
+    }
+    if let Some(action) = &merge {
+        // Malformed input must not durably bind this decision to a command
+        // that can never reach its effect service.
+        action.validate()?;
+    }
+    // Keep admission across acceptance and execution: contention and request
+    // collisions must not bind a fresh decision to an unstartable operation.
+    let merge_admission = merge
+        .as_ref()
+        .map(|action| crate::chat_merge::admit(home, talks, chat, action))
+        .transpose()?;
+    if decision.request.is_none() && decision.status == Status::RetryNeeded {
+        if let Ok(source) = crate::ask::Questions::at(home.join("questions")).get(id) {
+            ensure!(
+                !crate::task_chat::awaits_decision(&source),
+                "a legacy effect still needs its receipt reconciled before another effect is accepted"
+            );
+        }
+    }
+    outbox.update_decision(id, |d| d.accept(&request))?;
+    if decision.request.is_some()
+        && matches!(decision.status, Status::InProgress | Status::RetryNeeded)
+    {
+        if decision.retry_safe {
+            outbox.update_decision(id, |d| {
+                d.retry_unapplied()?;
+                d.start()
+            })?;
+        } else {
+            let action = merge
+                .as_ref()
+                .context("previous effect needs receipt reconciliation; it will not be replayed")?;
+            ensure!(
+                merge_receipt(home, chat, action)?.is_some(),
+                "previous merge has no receipt; inspect the operation before retrying"
+            );
+        }
+        // The shared merge service only checks the forge once this exact
+        // request has a receipt; it never issues the merge command twice.
+    } else {
+        outbox.update_decision(id, |d| d.start())?;
+    }
+    let local = apply_local_decision(
+        queue,
+        home,
+        id,
+        &request,
+        &inquiry.task,
+        &inquiry.repo,
+        &command,
+    );
+    let result = if let Err(error) = local {
+        Err(error)
+    } else if let Some(message) = local? {
+        Ok(message)
+    } else if let Operation::Resume { run } = &command {
+        // Validation precedes any write: a refusal means nothing began.
+        crate::resume::validate(home, run)
+            .map(|_| ())
+            .map_err(|e| anyhow::Error::new(BeforeEffect(e)))
+            .and_then(|()| -> Result<String> {
+                let pinned =
+                    crate::resume::pin_queued(queue, run, None, Some(id)).map_err(|error| {
+                        if error.is::<crate::resume::BeforeQueueWrite>() {
+                            anyhow::Error::new(BeforeEffect(error))
+                        } else {
+                            error
+                        }
+                    })?;
+                if !pinned {
+                    return Err(anyhow::Error::new(BeforeEffect(anyhow::anyhow!(
+                        "no queued task owns this run"
+                    ))));
+                }
+                Ok(format!(
+                    "resume queued for {run}; execution start remains unconfirmed"
+                ))
+            })
+    } else if let Operation::Abandon { run } = &command {
+        crate::driver::abandon_decision(home, run, id, &request)
+            .map_err(|error| {
+                if error.is::<crate::driver::BeforeAbandonWrite>() {
+                    anyhow::Error::new(BeforeEffect(error))
+                } else {
+                    error
+                }
+            })
+            .map(|()| format!("abandoned run {run}"))
+    } else if let Some(admission) = merge_admission {
+        crate::chat_merge::merge_admitted(home, merge.as_ref().unwrap().clone(), admission)
+            .await
+            .map_err(|error| {
+                if error.is::<crate::chat_merge::BeforeMergeWrite>() {
+                    anyhow::Error::new(BeforeEffect(error))
+                } else {
+                    error
+                }
+            })
+    } else {
+        Box::pin(execute(queue, home, talks, chat, command)).await
+    };
+    match result {
+        Ok(message) => {
+            if let Some(action) = &merge {
+                if let Some(receipt) = merge_receipt(home, chat, action)? {
+                    if receipt["status"] == "merged" {
+                        outbox.update_decision(id, |d| d.applied(&message))?;
+                    } else if receipt["status"] != "pending" {
+                        outbox.update_decision(id, |d| {
+                            d.fail(&format!(
+                                "{message}; reuse this same request ID to reconcile only"
+                            ))
+                        })?;
+                    }
+                }
+            } else if !deferred {
+                outbox.update_decision(id, |d| {
+                    d.applied(&format!("typed command completed: {message}"))
+                })?;
+            }
+            if deferred
+                && outbox
+                    .get(id)?
+                    .decision
+                    .as_ref()
+                    .is_some_and(|d| d.status == Status::InProgress)
+            {
+                outbox.update_decision(id, |d| d.queued())?;
+            }
+            // Resume has only been queued. Its execution is confirmed by a
+            // later scheduler projection, never by this command's return.
+            Ok(message)
+        }
+        Err(error) => {
+            let message = if error.is::<BeforeEffect>() {
+                format!(
+                    "{error:#}. No effect began; retry this same request after resolving the cause, or explicitly settle it."
+                )
+            } else {
+                format!(
+                    "Operation failed or has an uncertain result: {error:#}. Inspect its receipt before retrying."
+                )
+            };
+            outbox.update_decision(id, |d| {
+                if error.is::<BeforeEffect>() {
+                    d.fail_before_effect(&message)
+                } else {
+                    d.fail(&message)
+                }
+            })?;
+            Err(error)
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("effect did not start: {0:#}")]
+struct BeforeEffect(anyhow::Error);
+
+/// Commit a task-local effect and its exact receipt under one queue claim.
+/// The inquiry projection may lag this write, but restart never has to infer
+/// completion from the task's current status or repeat the operation.
+fn apply_local_decision(
+    queue: &Queue,
+    home: &Path,
+    id: &str,
+    request: &str,
+    owner: &str,
+    repo: &Path,
+    command: &Operation,
+) -> Result<Option<String>> {
+    let target = match command {
+        Operation::Done { task }
+        | Operation::Hold { task, .. }
+        | Operation::Release { task }
+        | Operation::Retry { task, .. } => task,
+        _ => return Ok(None),
+    };
+    let prepare = || -> Result<_> {
+        let (_claim, mut task) = claimed(queue, target)?;
+        ensure!(
+            task.id == owner && task.repo == repo,
+            "decision ownership changed"
+        );
+        if let Some(prior) = task.decision_effects.get(id) {
+            ensure!(prior == request, "decision receipt binds another command");
+            let message = format!("task {}: decision {id} already applied", task.id);
+            return Ok((_claim, task, message, true));
+        }
+        let message = match command {
+            Operation::Done { .. } => {
+                task.succeed();
+                describe(&task, "done")
+            }
+            Operation::Hold { reason, .. } => {
+                check_hold_release(&task, "hold")?;
+                let reason = reason.trim();
+                task.hold_manual((!reason.is_empty()).then(|| reason.to_owned()));
+                describe(&task, "held")
+            }
+            Operation::Release { .. } => {
+                check_hold_release(&task, "release")?;
+                task.release_operator("chat", Some(id));
+                describe(&task, "released")
+            }
+            Operation::Retry {
+                title, instruction, ..
+            } => {
+                ensure!(
+                    !instruction.trim().is_empty(),
+                    "the new instruction is empty"
+                );
+                let title = title
+                    .clone()
+                    .unwrap_or_else(|| crate::queue::title_from(instruction, 72));
+                task.edit(title, instruction.clone())?;
+                task.release_operator("chat", Some(id));
+                describe(&task, "retry queued for")
+            }
+            _ => unreachable!("task-local operation checked above"),
+        };
+        task.decision_effects
+            .insert(id.to_owned(), request.to_owned());
+        Ok((_claim, task, message, false))
+    };
+    let (_claim, mut task, message, already_applied) = prepare().map_err(BeforeEffect)?;
+    if !already_applied {
+        queue.put(&mut task)?;
+    }
+    if matches!(command, Operation::Done { .. }) {
+        crate::daemon::supersede_prior_runs(&task, home);
+    }
+    Ok(Some(message))
+}
+
+/// Explicit owner-requested reconciliation executes nothing. Under the task
+/// claim, prove that the exact intended condition already holds; otherwise keep
+/// uncertainty visible. External effects require their own receipts instead.
+fn reconcile_task_decision(queue: &Queue, home: &Path, chat: &str, id: &str) -> Result<()> {
+    let outbox = crate::task_inquiry::Outbox::at(home);
+    let inquiry = outbox.get(id)?;
+    ensure!(
+        inquiry.delivered_to.as_deref() == Some(chat),
+        "decision belongs to another chat"
+    );
+    let decision = inquiry.decision.context("inquiry is informational")?;
+    let request = decision
+        .request
+        .context("decision has no accepted operation to reconcile")?;
+    if request.starts_with("decision: ") {
+        let source = crate::ask::Questions::at(home.join("questions")).read_history(id)?;
+        crate::task_chat::sync_effect_receipt(home, queue, &source);
+        ensure!(
+            outbox
+                .get(id)?
+                .decision
+                .is_some_and(|d| d.status == crate::task_decision::Status::Resolved),
+            "source effect remains unconfirmed; no operation was replayed"
+        );
+        return Ok(());
+    }
+    let command: Operation = serde_json::from_str(&request)?;
+    if let Operation::Resume { run } = &command {
+        reconcile_resume_decision(queue, home, &outbox, id, run)?;
+        ensure!(
+            outbox.get(id)?.decision.is_some_and(|d| {
+                d.status == crate::task_decision::Status::Resolved || d.retry_safe
+            }),
+            "resume remains queued or executing; no operation was replayed"
+        );
+        return Ok(());
+    }
+    let (_claim, task) = claimed(queue, &inquiry.task)?;
+    ensure!(task.repo == inquiry.repo, "decision repository changed");
+    if let Some(receipt) = task.decision_effects.get(id) {
+        ensure!(
+            receipt == &request,
+            "decision receipt binds another command"
+        );
+        return outbox.update_decision(id, |d| {
+            d.applied("exact task command receipt confirmed; no operation replayed")
+        });
+    }
+    let matches = match command {
+        Operation::Hold {
+            task: target,
+            reason,
+        } => {
+            queue.resolve_id(&target)? == task.id
+                && task.status == TaskStatus::Held
+                && task.hold_reason.as_deref() == Some(reason.trim())
+        }
+        Operation::Release { task: target } => {
+            queue.resolve_id(&target)? == task.id
+                && task.status == TaskStatus::Queued
+                && !task.operator_held()
+        }
+        Operation::Done { task: target } => {
+            queue.resolve_id(&target)? == task.id && task.status == TaskStatus::Done
+        }
+        Operation::Retry {
+            task: target,
+            title,
+            instruction,
+        } => {
+            queue.resolve_id(&target)? == task.id
+                && task.instruction == instruction
+                && title.as_ref().is_none_or(|title| *title == task.title)
+                && task.status == TaskStatus::Queued
+        }
+        Operation::Abandon { run } => abandonment_receipt(home, &task, id, &run, &request)?,
+        _ => anyhow::bail!(
+            "external effects require their authoritative receipt; no operation was replayed"
+        ),
+    };
+    ensure!(
+        matches,
+        "intended task condition is not confirmed; no operation was replayed"
+    );
+    outbox.update_decision(id, |d| d.applied("owner-requested reconciliation: exact intended task condition confirmed under its claim; no effect remains necessary"))
+}
+
+/// Read the exact request's committed execution pass or durable pin supersession.
+/// A transient task status alone never proves either outcome.
+pub(crate) fn resume_started(home: &Path, task: &Task, inquiry: &str, run: &str) -> Result<bool> {
+    ensure!(
+        crate::run::is_run_id(run) && task.runs.iter().any(|id| id == run),
+        "resume run ownership changed"
+    );
+    let state = crate::run::RunState::load_under(run, home)?;
+    ensure!(state.repo == task.repo, "resume run repository changed");
+    if task
+        .superseded_resumes
+        .get(inquiry)
+        .is_some_and(|target| target == run)
+    {
+        return Ok(true);
+    }
+    Ok(state.decision_starts.get(inquiry).is_some_and(|index| {
+        state
+            .passes
+            .get(*index)
+            .is_some_and(|pass| pass.index == *index)
+    }))
+}
+
+/// Publication writes the pin and actions_applied marker atomically. Fence the
+/// publisher and scheduler before treating their absence as pre-effect proof.
+/// A published pin may already be consumed, so its absence alone is not proof.
+fn reconcile_resume_decision(
+    queue: &Queue,
+    home: &Path,
+    outbox: &crate::task_inquiry::Outbox,
+    id: &str,
+    run: &str,
+) -> Result<()> {
+    let Ok(_execution) = outbox.execution_claim(id) else {
+        return Ok(());
+    };
+    reconcile_resume_claimed(queue, home, outbox, id, run)
+}
+
+/// The caller holds this inquiry's execution claim, including on resubmission.
+fn reconcile_resume_claimed(
+    queue: &Queue,
+    home: &Path,
+    outbox: &crate::task_inquiry::Outbox,
+    id: &str,
+    run: &str,
+) -> Result<()> {
+    let inquiry = outbox.get(id)?;
+    let Ok(_claim) = queue.claim(&inquiry.task) else {
+        return Ok(());
+    };
+    let task = queue.get(&inquiry.task)?;
+    ensure!(task.repo == inquiry.repo, "resume task repository changed");
+    let decision = inquiry.decision.context("inquiry is informational")?;
+    if decision.status == crate::task_decision::Status::Resolved {
+        return Ok(());
+    }
+    if resume_started(home, &task, id, run)? {
+        outbox.update_decision(id, |d| {
+            d.applied("exact resume execution-start or supersession receipt confirmed")
+        })?;
+    } else if !task.action_applied(id)
+        && !task.dispatched_resumes.contains_key(id)
+        && !task.superseded_resumes.contains_key(id)
+        && !task
+            .resume_override
+            .as_ref()
+            .is_some_and(|pin| pin.question_id == id)
+    {
+        outbox.update_decision(id, |d| {
+            d.fail_before_effect("Resume was not published to the queue; the owner may retry the same request or cancel it. No operation was replayed.")
+        })?;
+    }
+    Ok(())
+}
+
+fn abandonment_receipt(
+    home: &Path,
+    task: &Task,
+    id: &str,
+    run: &str,
+    request: &str,
+) -> Result<bool> {
+    ensure!(
+        task.runs.iter().any(|own| own == run),
+        "abandon run ownership changed"
+    );
+    let state = crate::run::RunState::load_under(run, home)?;
+    ensure!(state.repo == task.repo, "abandon run repository changed");
+    Ok(state
+        .abandonment_receipts
+        .get(id)
+        .is_some_and(|receipt| receipt == request))
+}
+
+fn merge_receipt(
+    home: &Path,
+    chat: &str,
+    action: &crate::chat_merge::Request,
+) -> Result<Option<serde_json::Value>> {
+    ensure!(
+        crate::ask::valid_asset_name(chat) && crate::ask::valid_asset_name(&action.request),
+        "invalid merge receipt identity"
+    );
+    let path = home
+        .join("chat-controls")
+        .join(chat)
+        .join(format!("{}.json", action.request));
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let receipt: serde_json::Value = serde_json::from_slice(&bytes)?;
+    ensure!(
+        receipt["action"] == serde_json::to_value(action)?,
+        "merge receipt names another operation"
+    );
+    Ok(Some(receipt))
+}
+
+/// Repair the decision projection from independently durable command receipts.
+/// This starts no workers and retries no operation.
+pub fn reconcile_decisions(queue: &Queue, home: &Path) -> Result<()> {
+    let outbox = crate::task_inquiry::Outbox::at(home);
+    let (inquiries, unreadable) = outbox.list_readable()?;
+    let mut errors = Vec::new();
+    if unreadable != 0 {
+        errors.push(format!("{unreadable} unreadable inquiry record(s)"));
+    }
+    for inquiry in inquiries {
+        let id = inquiry.id.clone();
+        if let Err(error) = reconcile_inquiry(queue, home, &outbox, inquiry) {
+            let message = format!(
+                "Decision receipt reconciliation failed: {error:#}. Inspect this inquiry's receipt before retrying."
+            );
+            tracing::warn!("decision {id}: {message}");
+            if let Err(error) = outbox.update_decision(&id, |d| d.fail(&message)) {
+                tracing::warn!("decision {id} error could not be persisted: {error:#}");
+            }
+            errors.push(format!("{id}: {message}"));
+        }
+    }
+    ensure!(
+        errors.is_empty(),
+        "{} decision reconciliation problem(s): {}",
+        errors.len(),
+        errors.join("; ")
+    );
+    Ok(())
+}
+
+fn reconcile_inquiry(
+    queue: &Queue,
+    home: &Path,
+    outbox: &crate::task_inquiry::Outbox,
+    inquiry: crate::task_inquiry::Inquiry,
+) -> Result<()> {
+    use crate::task_decision::Status;
+    let Some(decision) = inquiry.decision else {
+        return Ok(());
+    };
+    if decision.status == Status::Resolved {
+        return Ok(());
+    }
+    let Some(request) = decision.request else {
+        return Ok(());
+    };
+    let Ok(command) = serde_json::from_str::<Operation>(&request) else {
+        return Ok(());
+    };
+    if let Operation::Resume { run } = &command {
+        return reconcile_resume_decision(queue, home, outbox, &inquiry.id, run);
+    }
+    let task = queue.get(&inquiry.task)?;
+    ensure!(task.repo == inquiry.repo, "decision repository changed");
+    if let Some(receipt) = task.decision_effects.get(&inquiry.id) {
+        ensure!(
+            receipt == &request,
+            "decision receipt binds another command"
+        );
+        outbox.update_decision(&inquiry.id, |d| {
+            d.applied("exact task command receipt confirmed after restart")
+        })?;
+        return Ok(());
+    }
+    let mut pending_external = false;
+    let receipt = match command {
+        Operation::Abandon { run } => {
+            abandonment_receipt(home, &task, &inquiry.id, &run, &request)?
+                .then(|| format!("run {run}: exact abandonment receipt committed"))
+        }
+        Operation::RerunChecks {
+            request,
+            run,
+            head,
+            workflows,
+        } => {
+            let chat = inquiry.delivered_to.as_deref().unwrap_or_default();
+            let path = home
+                .join("chat-controls")
+                .join(chat)
+                .join(format!("{request}.json"));
+            let state = crate::run::RunState::load_under(&run, home)?;
+            let action = serde_json::json!({
+                "run": run, "repo": state.repo,
+                "pr": state.pr.as_ref().map(|pr| pr.url.as_str()),
+                "head": head, "runs": workflows,
+            });
+            std::fs::read(path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .filter(|receipt| receipt["status"] == "applied" && receipt["action"] == action)
+                .map(|_| format!("chat-controls/{chat}/{request}.json: applied"))
+        }
+        Operation::MergePr {
+            repo,
+            number,
+            head,
+            request,
+        } => {
+            let action = crate::chat_merge::Request {
+                repo,
+                number,
+                head,
+                request,
+            };
+            let chat = inquiry
+                .delivered_to
+                .as_deref()
+                .context("merge decision has no chat")?;
+            let receipt = merge_receipt(home, chat, &action)?;
+            pending_external = receipt
+                .as_ref()
+                .is_some_and(|receipt| receipt["status"] == "pending");
+            if let Some(receipt) = &receipt
+                && receipt["status"] != "merged"
+                && receipt["status"] != "pending"
+            {
+                outbox.update_decision(&inquiry.id, |d| d.fail(&format!("Merge outcome requires reconciliation: {}. Reuse the same request ID to check only.", receipt["detail"])))?;
+            }
+            receipt
+                .filter(|receipt| receipt["status"] == "merged")
+                .map(|receipt| format!("confirmed merge receipt: {}", receipt["detail"]))
+        }
+        _ => None,
+    };
+    if let Some(receipt) = receipt {
+        outbox.update_decision(&inquiry.id, |d| d.applied(&receipt))?;
+    } else if decision.status == Status::InProgress
+        && !pending_external
+        && outbox
+            .get(&inquiry.id)?
+            .decision
+            .as_ref()
+            .is_some_and(|d| d.status == Status::InProgress)
+    {
+        let talks = Talks::at(home.join("talks"));
+        let chat = inquiry
+            .delivered_to
+            .as_deref()
+            .context("executing decision has no chat")?;
+        if !talks.turn_held(chat) && !crate::chat_worker::turn_worker_active(&talks, chat) {
+            outbox.update_decision(&inquiry.id, |d| d.fail("Execution ended without a confirmed effect receipt. Inspect the operation before retrying; restart did not replay it."))?;
+        }
+    }
+    Ok(())
+}
+
 /// Record the owner's choice for a decision from an open standing chat. The
 /// chat agent interprets the owner's request directly, a merge included; no
 /// quote, consent phrase or task ownership is required. See [`record_decision`].
@@ -465,6 +1256,21 @@ fn record_decision(
         q.short()
     );
     let (q, ()) = questions.update(&q.id, |r| {
+        if crate::task_chat::saved_reply_requires_confirmation(home, r) {
+            ensure!(
+                crate::task_inquiry::Outbox::at(home)
+                    .get(&r.id)?
+                    .decision
+                    .is_some_and(
+                        |decision| decision.status != crate::task_decision::Status::Resolved
+                    ),
+                "saved decision is settled; no effect remains necessary"
+            );
+            r.status = crate::ask::QuestionStatus::Open;
+            r.answer = None;
+            r.answered_at = None;
+            r.answer_authority = None;
+        }
         ensure!(
             r.status.open(),
             "question {} is already {}",
@@ -472,6 +1278,11 @@ fn record_decision(
             r.status.as_str()
         );
         let reply = r.resolve_reply(choice)?.to_owned();
+        ensure!(
+            crate::land::approval(Some(&reply)) != crate::land::Approval::Merge || r.merge_target.is_some()
+                || !(r.node == crate::land::APPROVAL_NODE || (r.node == crate::bump::NOTICE_NODE && r.seat == "release-watch")),
+            "approval has no recorded PR/head; recover its target or discuss a non-merge operation in chat"
+        );
         let replacement =
             r.node == crate::github_text::ASK_NODE && reply == crate::github_text::USE_MY_TEXT;
         ensure!(
@@ -495,7 +1306,8 @@ fn record_decision(
             Answer::Choice(reply)
         };
         r.publication_title = title;
-        r.answer(answer)
+        r.answer(answer)?;
+        Ok(())
     })?;
     Ok(q)
 }
@@ -649,6 +1461,24 @@ pub fn resume(queue: &Queue, home: &Path, run: &str) -> Result<Task> {
     queue.get(&task.id)
 }
 
+// These reads and input checks cannot start an effect. Keep them shared by
+// decision acceptance and execution so invalid input never pins a new request.
+fn rerun_preflight(
+    queue: &Queue,
+    home: &Path,
+    run: &str,
+    request: &str,
+) -> Result<crate::run::RunState> {
+    run_task(queue, run)?;
+    let state = crate::run::RunState::load_under(run, home)?;
+    ensure!(state.pr.is_some(), "the run recorded no pull request");
+    ensure!(
+        crate::ask::valid_asset_name(request),
+        "request must be a safe filename of at most 64 bytes"
+    );
+    Ok(state)
+}
+
 /// チャットのリクエスト単位で受付記録を残し、共通遷移でチェックを再実行する。
 pub async fn rerun_checks(
     queue: &Queue,
@@ -659,17 +1489,7 @@ pub async fn rerun_checks(
     head: &str,
     workflows: &[String],
 ) -> Result<Vec<String>> {
-    run_task(queue, run)?;
-    let state = crate::run::RunState::load_under(run, home)?;
-    let pr = &state
-        .pr
-        .as_ref()
-        .context("the run recorded no pull request")?
-        .url;
-    ensure!(
-        crate::ask::valid_asset_name(request),
-        "request must be a safe filename of at most 64 bytes"
-    );
+    let state = rerun_preflight(queue, home, run, request).map_err(BeforeEffect)?;
     let dir = home.join("chat-controls").join(talk);
     std::fs::create_dir_all(&dir)?;
     let lock = std::fs::OpenOptions::new()
@@ -677,17 +1497,24 @@ pub async fn rerun_checks(
         .truncate(false)
         .write(true)
         .open(dir.join(format!("{request}.lock")))?;
-    crate::pr_head::try_lock_file(&lock)?;
+    crate::pr_head::try_lock_file(&lock).map_err(|error| BeforeEffect(error.into()))?;
     let path = dir.join(format!("{request}.json"));
+    let pr = &state
+        .pr
+        .as_ref()
+        .context("the run recorded no pull request")?
+        .url;
     let action = serde_json::json!({
         "run": run, "repo": state.repo, "pr": pr, "head": head, "runs": workflows
     });
     if path.exists() {
         let prior: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
-        ensure!(
-            prior["action"] == action,
-            "request ID already binds a different operation"
-        );
+        if prior["action"] != action {
+            return Err(BeforeEffect(anyhow::anyhow!(
+                "request ID already binds a different operation"
+            ))
+            .into());
+        }
         ensure!(
             prior["status"] == "applied",
             "previous request has an uncertain result; inspect its receipt before a new request"
@@ -706,10 +1533,21 @@ pub async fn rerun_checks(
         Ok(())
     };
     let operation = format!("chat:{talk}:{request}");
+    let started = std::sync::atomic::AtomicBool::new(false);
     crate::daemon::rerun_checks_once(home, &operation, &state.repo, pr, head, workflows, || {
+        // Once a receipt exists, failure must remain uncertain even if the
+        // external command has not returned yet.
+        started.store(true, std::sync::atomic::Ordering::SeqCst);
         record("started")
     })
-    .await?;
+    .await
+    .map_err(|error| {
+        if started.load(std::sync::atomic::Ordering::SeqCst) {
+            error
+        } else {
+            anyhow::Error::new(BeforeEffect(error))
+        }
+    })?;
     record("applied")?;
     Ok(workflows.to_vec())
 }
@@ -760,6 +1598,54 @@ mod tests {
         );
         queue.put(&mut t).unwrap();
         t
+    }
+
+    #[test]
+    fn resume_recovery_waits_for_the_inquiry_publisher() {
+        let tmp = tempfile::tempdir().unwrap();
+        let queue = Queue::at(tmp.path().join("queue"));
+        let mut task = filed(&queue, "talk-a", "work");
+        let mut state = crate::run::RunState::new(
+            task.repo.clone(),
+            "main".into(),
+            "base".into(),
+            "work".into(),
+            crate::config::Config::default(),
+        );
+        state.status = crate::run::RunStatus::Blocked;
+        state.driver_exited = true;
+        state.save_under(tmp.path()).unwrap();
+        task.runs.push(state.id.clone());
+        queue.put(&mut task).unwrap();
+        let outbox = crate::task_inquiry::Outbox::at(tmp.path());
+        let inquiry = outbox
+            .file(
+                &task,
+                Some(state.id.clone()),
+                "resume".into(),
+                "Resume?",
+                "",
+            )
+            .unwrap();
+        let request = serde_json::to_string(&Operation::Resume {
+            run: state.id.clone(),
+        })
+        .unwrap();
+        outbox
+            .update_decision(&inquiry.id, |d| {
+                d.accept(&request)?;
+                d.start()
+            })
+            .unwrap();
+        let before = outbox.get(&inquiry.id).unwrap().decision.unwrap();
+        let publisher = outbox.execution_claim(&inquiry.id).unwrap();
+        reconcile_decisions(&queue, tmp.path()).unwrap();
+        assert_eq!(outbox.get(&inquiry.id).unwrap().decision.unwrap(), before);
+        drop(publisher);
+        reconcile_decisions(&queue, tmp.path()).unwrap();
+        let recovered = outbox.get(&inquiry.id).unwrap().decision.unwrap();
+        assert_eq!(recovered.status, crate::task_decision::Status::RetryNeeded);
+        assert!(recovered.retry_safe);
     }
 
     #[test]

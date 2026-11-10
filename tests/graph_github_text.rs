@@ -444,7 +444,33 @@ Adds note.txt. token=abcdef0123456789abcdef";
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    // Read the durable source separately from its operational consumption
+    // view. A fresh routed answer must retain the exact generation accepted by
+    // the decision journal; historical-answer quarantine must not mask it.
+    let source: ask::Question =
+        serde_json::from_slice(&std::fs::read(store.path_of(&q.id)).unwrap()).unwrap();
+    assert_eq!(
+        source.resolution().as_deref(),
+        Some(magi::github_text::USE_MY_TEXT)
+    );
+    assert!(source.answered_at.is_some());
+    assert_eq!(source.accepted_answer_at, source.answered_at);
+    if routed {
+        let decision = magi::task_inquiry::Outbox::at(&home)
+            .get(&q.id)
+            .unwrap()
+            .decision
+            .unwrap();
+        assert_eq!(decision.request.as_deref(), Some("decision: use my text"));
+        assert_eq!(decision.source_answer_at, source.answered_at);
+        assert_eq!(decision.status, magi::task_decision::Status::Queued);
+    }
     let saved = store.get(&q.id).unwrap();
+    assert_eq!(
+        saved.status, source.status,
+        "fresh answer was masked by the consumption view"
+    );
+    assert_eq!(saved.answer, source.answer);
     assert_eq!(saved.publication_title.as_deref(), Some(title));
     assert!(saved.answer_authority.is_none());
     assert!(
@@ -453,10 +479,50 @@ Adds note.txt. token=abcdef0123456789abcdef";
     );
     assert_eq!(
         magi::github_text::read_reply(&saved),
-        magi::github_text::Reply::Title(title.into())
+        magi::github_text::Reply::Title(title.into()),
+        "status={:?}, answer={:?}, answered_at={:?}, accepted_answer_at={:?}",
+        saved.status,
+        saved.answer,
+        saved.answered_at,
+        saved.accepted_answer_at
     );
+    if routed {
+        let outbox = magi::task_inquiry::Outbox::at(&home);
+        magi::task_chat::sweep(&queue, &talks, &store, &home);
+        assert_eq!(
+            outbox.get(&q.id).unwrap().decision.unwrap().status,
+            magi::task_decision::Status::Queued,
+            "accepting a publication payload is not successful publication"
+        );
+    }
     let mut runner = Runner::resume(&run_id).unwrap();
     runner.execute().await.unwrap();
+    let receipt = runner
+        .state
+        .github_text
+        .as_ref()
+        .unwrap()
+        .publication
+        .as_ref()
+        .unwrap();
+    assert_eq!(receipt.inquiry, q.id);
+    if routed {
+        magi::task_chat::sweep(&queue, &talks, &store, &home);
+        let resolved = magi::task_inquiry::Outbox::at(&home)
+            .get(&q.id)
+            .unwrap()
+            .decision
+            .unwrap();
+        assert_eq!(resolved.status, magi::task_decision::Status::Resolved);
+        assert!(
+            resolved
+                .history
+                .last()
+                .unwrap()
+                .evidence
+                .contains("publication")
+        );
+    }
     let made = creates(&log);
     assert_eq!(made.len(), 1);
     assert_eq!(arg_after(&made[0], "--title"), title);

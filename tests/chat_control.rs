@@ -108,6 +108,425 @@ fn refused(out: Output) -> String {
     String::from_utf8(out.stderr).unwrap()
 }
 
+#[tokio::test]
+async fn interrupted_resume_publication_recovers_only_unpublished_requests() {
+    use magi::{chat_control::Operation, task_decision::Status, task_inquiry::Outbox};
+    let _home = common::home_lock().await;
+    // Recreate the durable boundaries left by process loss, then use fresh
+    // store handles and real CLI commands to reconcile, retry or cancel.
+    for boundary in ["accepted", "started", "uncertain"] {
+        for cancel in [false, true] {
+            let f = Fixture::new();
+            let queue = f.queue();
+            let mut task = f.saved();
+            task.chat = Some(f.talk.clone());
+            queue.put(&mut task).unwrap();
+            let outbox = Outbox::at(f.tmp.path());
+            let inquiry = outbox
+                .file(
+                    &task,
+                    Some(f.run.id.clone()),
+                    "resume".into(),
+                    "Resume?",
+                    boundary,
+                )
+                .unwrap();
+            outbox.deliver(&queue, &f.talks, &inquiry.id).unwrap();
+            let request = serde_json::to_string(&Operation::Resume {
+                run: f.run.id.clone(),
+            })
+            .unwrap();
+            outbox
+                .update_decision(&inquiry.id, |d| {
+                    d.accept(&request)?;
+                    if boundary != "accepted" {
+                        d.start()?;
+                    }
+                    if boundary == "uncertain" {
+                        d.fail("Interrupted without a receipt")?;
+                    }
+                    Ok(true)
+                })
+                .unwrap();
+            let before = std::fs::read(queue.path_of(&task.id)).unwrap();
+            let claim = queue.claim(&task.id).unwrap();
+            magi::chat_control::reconcile_decisions(&queue, f.tmp.path()).unwrap();
+            assert!(
+                !outbox
+                    .get(&inquiry.id)
+                    .unwrap()
+                    .decision
+                    .unwrap()
+                    .retry_safe,
+                "contention cannot establish absence of publication"
+            );
+            drop(claim);
+            // Both the startup sweep and the explicit supported command can
+            // recover this gap, without modifying the queue or starting work.
+            if cancel {
+                passed(f.control(&["reconcile-decision", &inquiry.id]));
+            } else {
+                magi::chat_control::reconcile_decisions(
+                    &Queue::at(f.tmp.path().join("queue")),
+                    f.tmp.path(),
+                )
+                .unwrap();
+            }
+            let recovered = Outbox::at(f.tmp.path())
+                .get(&inquiry.id)
+                .unwrap()
+                .decision
+                .unwrap();
+            assert_eq!(recovered.status, Status::RetryNeeded);
+            assert!(recovered.retry_safe);
+            assert_eq!(std::fs::read(queue.path_of(&task.id)).unwrap(), before);
+            assert!(
+                RunState::load_under(&f.run.id, f.tmp.path())
+                    .unwrap()
+                    .decision_starts
+                    .is_empty()
+            );
+            if cancel {
+                passed(f.control(&[
+                    "settle-decision",
+                    &inquiry.id,
+                    "--reason",
+                    "Owner cancels the unpublished request",
+                ]));
+                assert_eq!(
+                    outbox.get(&inquiry.id).unwrap().decision.unwrap().status,
+                    Status::Resolved
+                );
+                assert_eq!(std::fs::read(queue.path_of(&task.id)).unwrap(), before);
+            } else {
+                passed(f.control(&["--decision", &inquiry.id, "resume", &f.run.id]));
+                let published = queue.get(&task.id).unwrap();
+                assert!(published.action_applied(&inquiry.id));
+                assert_eq!(published.resume_override.unwrap().question_id, inquiry.id);
+                // Process loss after publication but before the projection's
+                // queued write must never enable another publication/cancel.
+                outbox.update_decision(&inquiry.id, |d| d.start()).unwrap();
+                magi::chat_control::reconcile_decisions(&queue, f.tmp.path()).unwrap();
+                let pending = outbox.get(&inquiry.id).unwrap().decision.unwrap();
+                assert_eq!(pending.status, Status::InProgress);
+                assert!(!pending.retry_safe);
+                refused(f.control(&["--decision", &inquiry.id, "resume", &f.run.id]));
+                refused(f.control(&[
+                    "settle-decision",
+                    &inquiry.id,
+                    "--reason",
+                    "Cannot cancel published work",
+                ]));
+                // The pin can be consumed before a pass receipt is committed.
+                let mut dispatched = queue.get(&task.id).unwrap();
+                dispatched.start(f.run.id.clone());
+                queue.put(&mut dispatched).unwrap();
+                magi::chat_control::reconcile_decisions(&queue, f.tmp.path()).unwrap();
+                let pending = outbox.get(&inquiry.id).unwrap().decision.unwrap();
+                assert_eq!(pending.status, Status::InProgress);
+                assert!(!pending.retry_safe);
+            }
+        }
+    }
+}
+
+#[test]
+fn repeated_unpublished_resume_can_retry_after_inline_reconciliation() {
+    use magi::{chat_control::Operation, task_decision::Status, task_inquiry::Outbox};
+
+    let f = Fixture::new();
+    let mut task = f.saved();
+    task.chat = Some(f.talk.clone());
+    f.queue().put(&mut task).unwrap();
+    let outbox = Outbox::at(f.tmp.path());
+    let inquiry = outbox
+        .file(
+            &task,
+            Some(f.run.id.clone()),
+            "resume".into(),
+            "Resume?",
+            "",
+        )
+        .unwrap();
+    outbox.deliver(&f.queue(), &f.talks, &inquiry.id).unwrap();
+    let request = serde_json::to_string(&Operation::Resume {
+        run: f.run.id.clone(),
+    })
+    .unwrap();
+    // Acceptance survived restart, but no queue publication happened.
+    outbox
+        .update_decision(&inquiry.id, |d| d.accept(&request))
+        .unwrap();
+    passed(f.control(&["--decision", &inquiry.id, "resume", &f.run.id]));
+    let task = f.saved();
+    assert!(task.action_applied(&inquiry.id));
+    assert_eq!(task.resume_override.unwrap().question_id, inquiry.id);
+    let decision = outbox.get(&inquiry.id).unwrap().decision.unwrap();
+    assert_eq!(decision.status, Status::Queued);
+    assert!(!decision.retry_safe);
+    assert!(
+        decision
+            .history
+            .iter()
+            .any(|event| event.status == Status::RetryNeeded)
+    );
+}
+
+#[test]
+fn repeated_queued_resume_reconciles_receipts_before_republication() {
+    use magi::{task_decision::Status, task_inquiry::Outbox};
+
+    for boundary in ["published", "dispatched", "started", "superseded"] {
+        let f = Fixture::new();
+        let queue = f.queue();
+        let mut task = f.saved();
+        task.chat = Some(f.talk.clone());
+        queue.put(&mut task).unwrap();
+        let outbox = Outbox::at(f.tmp.path());
+        let inquiry = outbox
+            .file(
+                &task,
+                Some(f.run.id.clone()),
+                "resume".into(),
+                "Resume?",
+                boundary,
+            )
+            .unwrap();
+        outbox.deliver(&queue, &f.talks, &inquiry.id).unwrap();
+        passed(f.control(&["--decision", &inquiry.id, "resume", &f.run.id]));
+        assert_eq!(
+            outbox.get(&inquiry.id).unwrap().decision.unwrap().status,
+            Status::Queued
+        );
+        let mut task = f.saved();
+        let mut run = RunState::load_under(&f.run.id, f.tmp.path()).unwrap();
+        if matches!(boundary, "dispatched" | "started") {
+            task.start(run.id.clone());
+            queue.put(&mut task).unwrap();
+            if boundary == "started" {
+                run.next_pass_inquiries.push(inquiry.id.clone());
+                run.begin_pass();
+                run.status = RunStatus::Blocked;
+                run.driver_exited = true;
+                run.save_under(f.tmp.path()).unwrap();
+            }
+            // The first execution can return to a resumable state before a
+            // reconciliation sweep sees its receipt.
+            task.handed_off("blocked again");
+        } else if boundary == "superseded" {
+            // Replacing a published pin records explicit supersession.
+            task.resume_override = None;
+            task.handed_off("pin no longer present");
+        }
+        queue.put(&mut task).unwrap();
+        let queue_before = std::fs::read(queue.path_of(&task.id)).unwrap();
+        let passes_before = run.passes.len();
+        // A contended queue claim must not permit another publication either.
+        let claim = queue.claim(&task.id).unwrap();
+        refused(f.control(&["--decision", &inquiry.id, "resume", &f.run.id]));
+        drop(claim);
+        let result = f.control(&["--decision", &inquiry.id, "resume", &f.run.id]);
+        if matches!(boundary, "started" | "superseded") {
+            assert!(passed(result).contains("already resolved"));
+            assert_eq!(
+                Outbox::at(f.tmp.path())
+                    .get(&inquiry.id)
+                    .unwrap()
+                    .decision
+                    .unwrap()
+                    .status,
+                Status::Resolved
+            );
+        } else {
+            assert!(refused(result).contains("will not be replayed"));
+            assert_eq!(
+                outbox.get(&inquiry.id).unwrap().decision.unwrap().status,
+                Status::Queued
+            );
+        }
+        assert_eq!(
+            std::fs::read(queue.path_of(&task.id)).unwrap(),
+            queue_before
+        );
+        assert_eq!(
+            RunState::load_under(&f.run.id, f.tmp.path())
+                .unwrap()
+                .passes
+                .len(),
+            passes_before
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn routed_merge_preserves_admission_retries_and_reconciles_refused_receipts() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let f = Fixture::new();
+    let mut task = f.saved();
+    task.chat = Some(f.talk.clone());
+    f.queue().put(&mut task).unwrap();
+    let mut run = f.run.clone();
+    run.pr = Some(magi::run::PrRecord {
+        url: "https://github.com/example/project/pull/1".into(),
+        number: 1,
+        state: "open".into(),
+        checks: "green".into(),
+        round: 0,
+        rounds: 1,
+        red_at_merge: vec![],
+    });
+    run.save_under(f.tmp.path()).unwrap();
+    let outbox = magi::task_inquiry::Outbox::at(f.tmp.path());
+    let inquiry = outbox
+        .file(&task, Some(run.id), "merge".into(), "Merge PR", "")
+        .unwrap();
+    outbox.deliver(&f.queue(), &f.talks, &inquiry.id).unwrap();
+    let bin = f.tmp.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let gh = bin.join("gh");
+    std::fs::write(
+        &gh,
+        r#"#!/bin/sh
+if [ "$1 $2" = 'pr merge' ]; then
+  echo merge >> sent
+  if [ -f refuse ]; then exit 1; fi
+  touch merged
+elif [ -f merged ]; then
+  cat merged.json
+else
+  cat open.json
+fi
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let head = "a".repeat(40);
+    let invoke = |request: &str, sha: &str| {
+        common::magi_cli(f.tmp.path())
+            .args([
+                "task",
+                "control",
+                "--decision",
+                &inquiry.id,
+                "merge-pr",
+                "example/project",
+                "1",
+                "--head",
+                sha,
+                "--request",
+                request,
+            ])
+            .env("MAGI_CONFIG_DIR", "")
+            .env("MAGI_RUN", &f.talk)
+            .env("MAGI_NODE", CHAT_NODE)
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .output()
+            .unwrap()
+    };
+    let awaiting = outbox.get(&inquiry.id).unwrap().decision.unwrap();
+    assert!(refused(invoke("merge-once", "abc")).contains("full SHA"));
+    assert_eq!(outbox.get(&inquiry.id).unwrap().decision.unwrap(), awaiting);
+    assert!(refused(invoke("bad/id", &head)).contains("invalid request ID"));
+    assert_eq!(outbox.get(&inquiry.id).unwrap().decision.unwrap(), awaiting);
+    assert!(!f.tmp.path().join("chat-controls").exists());
+
+    // Admission failures leave the decision entirely unbound. Keep real
+    // flock guards in this process while each independent CLI attempts entry.
+    for lock_path in [
+        f.tmp
+            .path()
+            .join("chat-merge-locks/github.com_example_project_pull_1.lock"),
+        f.tmp
+            .path()
+            .join("chat-controls")
+            .join(&f.talk)
+            .join("merge-once.lock"),
+    ] {
+        use std::os::fd::AsRawFd;
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        refused(invoke("merge-once", &head));
+        assert_eq!(outbox.get(&inquiry.id).unwrap().decision.unwrap(), awaiting);
+        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
+    }
+    let receipt_path = f
+        .tmp
+        .path()
+        .join("chat-controls")
+        .join(&f.talk)
+        .join("other-request.json");
+    let foreign_receipt = serde_json::to_vec(&serde_json::json!({
+        "action": {"repo": "example/project", "number": 1, "head": "b".repeat(40), "request": "other-request"},
+        "status": "started", "detail": "another operation is uncertain"
+    })).unwrap();
+    std::fs::write(&receipt_path, &foreign_receipt).unwrap();
+    assert!(refused(invoke("other-request", &head)).contains("different operation"));
+    assert_eq!(outbox.get(&inquiry.id).unwrap().decision.unwrap(), awaiting);
+    assert_eq!(std::fs::read(&receipt_path).unwrap(), foreign_receipt);
+
+    // A forge read fails before the service writes its started receipt.
+    refused(invoke("merge-once", &head));
+    let failed = outbox.get(&inquiry.id).unwrap().decision.unwrap();
+    assert_eq!(failed.status, magi::task_decision::Status::RetryNeeded);
+    assert!(failed.retry_safe);
+    assert!(
+        !f.tmp
+            .path()
+            .join("chat-controls")
+            .join(&f.talk)
+            .join("merge-once.json")
+            .exists()
+    );
+    assert!(!f.tmp.path().join("sent").exists());
+    for (file, state) in [("open.json", "OPEN"), ("merged.json", "MERGED")] {
+        std::fs::write(
+            f.tmp.path().join(file),
+            serde_json::to_vec(&serde_json::json!({
+                "url": "https://github.com/example/project/pull/1", "state": state,
+                "isDraft": false, "mergeable": "MERGEABLE", "headRefOid": head,
+                "title": "Example change"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+    std::fs::write(f.tmp.path().join("refuse"), "").unwrap();
+    passed(invoke("merge-once", &head));
+    let refused_decision = outbox.get(&inquiry.id).unwrap().decision.unwrap();
+    assert_eq!(
+        refused_decision.status,
+        magi::task_decision::Status::RetryNeeded
+    );
+    assert!(!refused_decision.retry_safe);
+    // A separate owner operation merged this head. The next invocation may
+    // only read its outcome, even though our saved receipt said refused.
+    std::fs::write(f.tmp.path().join("merged"), "").unwrap();
+    passed(invoke("merge-once", &head));
+    passed(invoke("merge-once", &head));
+    assert_eq!(
+        outbox.get(&inquiry.id).unwrap().decision.unwrap().status,
+        magi::task_decision::Status::Resolved
+    );
+    assert_eq!(
+        std::fs::read_to_string(f.tmp.path().join("sent")).unwrap(),
+        "merge\n"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn ordinary_chat_turn_uses_inherited_controls_without_store_grants() {
@@ -636,6 +1055,189 @@ esac
         std::fs::read_to_string(f.tmp.path().join("sent")).unwrap(),
         "42\n42\n"
     );
+
+    // The same routed decision remains retryable when the forge read fails
+    // before the started callback. Exercise CLI persistence across processes.
+    let mut task = f.saved();
+    task.chat = Some(f.talk.clone());
+    f.queue().put(&mut task).unwrap();
+    let outbox = magi::task_inquiry::Outbox::at(f.tmp.path());
+    let inquiry = outbox
+        .file(
+            &task,
+            Some(f.run.id.clone()),
+            "checks".into(),
+            "Retry checks",
+            "",
+        )
+        .unwrap();
+    outbox.deliver(&f.queue(), &f.talks, &inquiry.id).unwrap();
+    let routed_for = |decision: &str, request: &str, head: &str, workflow: &str| {
+        common::magi_cli(f.tmp.path())
+            .args([
+                "task",
+                "control",
+                "--decision",
+                decision,
+                "rerun-checks",
+                &f.run.id,
+                "--request",
+                request,
+                "--head",
+                head,
+                "--workflow",
+                workflow,
+            ])
+            .env("MAGI_CONFIG_DIR", "")
+            .env("MAGI_RUN", &f.talk)
+            .env("MAGI_NODE", CHAT_NODE)
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .output()
+            .unwrap()
+    };
+    let routed = |request: &str| routed_for(&inquiry.id, request, "current", "42");
+    let awaiting = outbox.get(&inquiry.id).unwrap().decision.unwrap();
+    assert!(refused(routed("bad/id")).contains("safe filename"));
+    assert_eq!(outbox.get(&inquiry.id).unwrap().decision.unwrap(), awaiting);
+    // A missing PR is also a correctable pre-acceptance read failure.
+    let mut without_pr = RunState::load_under(&f.run.id, f.tmp.path()).unwrap();
+    let recorded_pr = without_pr.pr.take();
+    without_pr.save_under(f.tmp.path()).unwrap();
+    assert!(refused(routed("preflight")).contains("no pull request"));
+    assert_eq!(outbox.get(&inquiry.id).unwrap().decision.unwrap(), awaiting);
+    without_pr.pr = recorded_pr;
+    without_pr.save_under(f.tmp.path()).unwrap();
+    let snapshot = std::fs::read(f.tmp.path().join("snapshot.json")).unwrap();
+    std::fs::remove_file(f.tmp.path().join("snapshot.json")).unwrap();
+    refused(routed("preflight"));
+    let decision = outbox.get(&inquiry.id).unwrap().decision.unwrap();
+    assert_eq!(decision.status, magi::task_decision::Status::RetryNeeded);
+    assert!(decision.retry_safe);
+    assert!(
+        !f.tmp
+            .path()
+            .join("chat-controls")
+            .join(&f.talk)
+            .join("preflight.json")
+            .exists()
+    );
+    assert_eq!(
+        std::fs::read_to_string(f.tmp.path().join("sent")).unwrap(),
+        "42\n42\n"
+    );
+    std::fs::write(f.tmp.path().join("snapshot.json"), snapshot).unwrap();
+    passed(routed("preflight"));
+    passed(routed("preflight"));
+    assert_eq!(
+        outbox.get(&inquiry.id).unwrap().decision.unwrap().status,
+        magi::task_decision::Status::Resolved
+    );
+    assert_eq!(
+        std::fs::read_to_string(f.tmp.path().join("sent")).unwrap(),
+        "42\n42\n42\n"
+    );
+
+    let file_decision = |source: &str| {
+        let record = outbox
+            .file(
+                &task,
+                Some(f.run.id.clone()),
+                source.into(),
+                "Retry checks",
+                "",
+            )
+            .unwrap();
+        outbox.deliver(&f.queue(), &f.talks, &record.id).unwrap();
+        record.id
+    };
+    let controls = f.tmp.path().join("chat-controls").join(&f.talk);
+    let busy = file_decision("rerun-contention");
+    let lock = std::fs::File::create(controls.join("busy.lock")).unwrap();
+    use std::os::fd::AsRawFd;
+    // Hold the production receipt lock while a separate CLI process attempts
+    // admission. No forge invocation or started receipt may result.
+    assert_eq!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    for _ in 0..2 {
+        refused(routed_for(&busy, "busy", "current", "42"));
+        let decision = outbox.get(&busy).unwrap().decision.unwrap();
+        assert_eq!(decision.status, magi::task_decision::Status::RetryNeeded);
+        assert!(decision.retry_safe);
+        assert!(!controls.join("busy.json").exists());
+        assert_eq!(
+            std::fs::read_to_string(f.tmp.path().join("sent")).unwrap(),
+            "42\n42\n42\n"
+        );
+    }
+    drop(lock);
+    passed(routed_for(&busy, "busy", "current", "42"));
+    assert_eq!(
+        outbox.get(&busy).unwrap().decision.unwrap().status,
+        magi::task_decision::Status::Resolved
+    );
+    let sent = std::fs::read(f.tmp.path().join("sent")).unwrap();
+    for (index, request, head, workflow) in [
+        (0, "once", "other", "42"),
+        (1, "once", "current", "43"),
+        (2, "uncertain", "other", "42"),
+    ] {
+        let collision = file_decision(&format!("rerun-collision-{index}"));
+        let receipt = std::fs::read(controls.join(format!("{request}.json"))).unwrap();
+        for _ in 0..2 {
+            assert!(
+                refused(routed_for(&collision, request, head, workflow))
+                    .contains("different operation")
+            );
+            let decision = outbox.get(&collision).unwrap().decision.unwrap();
+            assert_eq!(decision.status, magi::task_decision::Status::RetryNeeded);
+            assert!(decision.retry_safe);
+            magi::chat_control::reconcile_decisions(&f.queue(), f.tmp.path()).unwrap();
+            assert!(outbox.get(&collision).unwrap().decision.unwrap().retry_safe);
+        }
+        passed(f.control(&[
+            "settle-decision",
+            &collision,
+            "--reason",
+            "Owner cancels the rejected request",
+        ]));
+        assert_eq!(
+            outbox.get(&collision).unwrap().decision.unwrap().status,
+            magi::task_decision::Status::Resolved
+        );
+        assert_eq!(
+            std::fs::read(controls.join(format!("{request}.json"))).unwrap(),
+            receipt
+        );
+        assert_eq!(std::fs::read(f.tmp.path().join("sent")).unwrap(), sent);
+    }
+    // The identical operation's started receipt remains uncertain, unlike a
+    // collision with an unrelated operation. It cannot be replayed or settled.
+    let uncertain = file_decision("rerun-identical-uncertainty");
+    let receipt = std::fs::read(controls.join("uncertain.json")).unwrap();
+    assert!(
+        refused(routed_for(&uncertain, "uncertain", "current", "42")).contains("uncertain result")
+    );
+    let decision = outbox.get(&uncertain).unwrap().decision.unwrap();
+    assert_eq!(decision.status, magi::task_decision::Status::RetryNeeded);
+    assert!(!decision.retry_safe);
+    magi::chat_control::reconcile_decisions(&f.queue(), f.tmp.path()).unwrap();
+    refused(routed_for(&uncertain, "uncertain", "current", "42"));
+    refused(f.control(&[
+        "settle-decision",
+        &uncertain,
+        "--reason",
+        "Cannot erase an uncertain effect",
+    ]));
+    assert_eq!(
+        std::fs::read(controls.join("uncertain.json")).unwrap(),
+        receipt
+    );
+    assert_eq!(std::fs::read(f.tmp.path().join("sent")).unwrap(), sent);
 }
 
 #[tokio::test]
@@ -738,16 +1340,16 @@ fn chat_controls_through_real_cli_child() {
 /// launcher's stores through the inherited bridge.
 #[cfg(unix)]
 #[test]
-fn chat_answer_over_the_bridge_records_the_answer_and_dismissal_run_record() {
+fn chat_commands_over_the_bridge_settle_native_inquiries_and_dismiss_approvals() {
     common::isolated(
-        "chat_answer_over_the_bridge_records_the_answer_and_dismissal_run_record",
+        "chat_commands_over_the_bridge_settle_native_inquiries_and_dismiss_approvals",
         || async {
             use std::os::unix::fs::PermissionsExt as _;
             let f = Fixture::new();
             let home = f.tmp.path();
             magi::run::set_home(home.to_owned());
             let questions = magi::ask::Questions::at(home.join("questions"));
-            // An ordinary (not task-chat routed) approval, answered here.
+            // Task inquiries use native chat commands even with the retired opt-out.
             let repo = home.join("repository");
             std::fs::create_dir(&repo).unwrap();
             assert!(
@@ -809,11 +1411,12 @@ fn chat_answer_over_the_bridge_records_the_answer_and_dismissal_run_record() {
                 Source::Human,
             );
             owner.runs.push(state.id.clone());
+            owner.chat = Some(f.talk.clone());
             owner.status = TaskStatus::Parked;
             f.queue().put(&mut owner).unwrap();
             questions.put(&mut approval).unwrap();
             let mut free = magi::ask::Question::new(
-                "20260902-000000-beef".into(),
+                state.id.clone(),
                 "implement".into(),
                 "impl-A".into(),
                 "Which file?".into(),
@@ -821,7 +1424,9 @@ fn chat_answer_over_the_bridge_records_the_answer_and_dismissal_run_record() {
                 Vec::new(),
             );
             questions.put(&mut free).unwrap();
-            assert!(approval.routed_task.is_none() && free.routed_task.is_none());
+            assert_eq!(approval.routed_task.as_deref(), Some(owner.id.as_str()));
+            assert_eq!(free.routed_task.as_deref(), Some(owner.id.as_str()));
+            magi::task_chat::sweep(&f.queue(), &f.talks, &questions, home);
 
             // The decoy home holds copies of what the CLI reads; its question
             // store is read-only, so a direct answer could not even lock it.
@@ -838,6 +1443,15 @@ fn chat_answer_over_the_bridge_records_the_answer_and_dismissal_run_record() {
                 Talks::at(decoy.join("talks")).path_of(&f.talk),
             )
             .unwrap();
+            let decoy_before: std::collections::BTreeMap<_, _> = [&free, &approval]
+                .into_iter()
+                .map(|q| {
+                    (
+                        q.id.clone(),
+                        std::fs::read(decoy_questions.path_of(&q.id)).unwrap(),
+                    )
+                })
+                .collect();
             let readonly = |mode| {
                 std::fs::set_permissions(
                     decoy.join("questions"),
@@ -893,8 +1507,8 @@ fn chat_answer_over_the_bridge_records_the_answer_and_dismissal_run_record() {
                  MAGI_HOME=\"$DECOY\" \"$ANSWER_BIN\" task add --repo \"$FILING_REPO\" --solo --urgent --priority 7 --implementers 2 --attach \"$FILING_ATTACH\" --hold 'owner requested' --title 'Follow-up' -- 'Implement follow-up work' || exit 35\n\
                  MAGI_HOME=\"$DECOY\" \"$ANSWER_BIN\" task priority \"$COMPLETE_TASK\" 12 || exit 36\n\
                  MAGI_HOME=\"$DECOY\" \"$ANSWER_BIN\" task done \"$COMPLETE_TASK\" || exit 37\n\
-                 MAGI_HOME=\"$DECOY\" \"$ANSWER_BIN\" answer \"$FREE\" --reply src/lib.rs || exit 33\n\
-                 MAGI_HOME=\"$DECOY\" \"$ANSWER_BIN\" answer \"$APPROVAL\" --reply \"$DISMISS\" || exit 34\n"
+                 MAGI_HOME=\"$DECOY\" \"$ANSWER_BIN\" task control settle-decision \"$FREE\" --reason 'Owner selected src/lib.rs; no further effect remains'  || exit 33\n\
+                 MAGI_HOME=\"$DECOY\" \"$ANSWER_BIN\" task control decide \"$APPROVAL\" \"$DISMISS\" || exit 34\n"
                     .into(),
             ];
             let mut seat = magi::agent::SeatState::new("chat", "mock", 1);
@@ -945,15 +1559,22 @@ fn chat_answer_over_the_bridge_records_the_answer_and_dismissal_run_record() {
                 RunStatus::Superseded
             );
             // The launcher's report comes back through the bridge.
-            assert!(output.text.contains("answered"), "{output:?}");
-            assert!(
-                output.text.contains("Obsolete approval ended"),
-                "{output:?}"
-            );
+            assert!(output.text.contains("settled decision"), "{output:?}");
+            assert!(output.text.contains("recorded"), "{output:?}");
 
-            assert_eq!(
-                questions.get(&free.id).unwrap().resolution().as_deref(),
-                Some("src/lib.rs")
+            let decision = magi::task_inquiry::Outbox::at(home)
+                .get(&free.id)
+                .unwrap()
+                .decision
+                .unwrap();
+            assert_eq!(decision.status, magi::task_decision::Status::Resolved);
+            assert!(
+                decision
+                    .history
+                    .last()
+                    .unwrap()
+                    .evidence
+                    .contains("src/lib.rs")
             );
             assert_eq!(
                 questions.get(&approval.id).unwrap().resolution().as_deref(),
@@ -968,7 +1589,10 @@ fn chat_answer_over_the_bridge_records_the_answer_and_dismissal_run_record() {
             assert_eq!(run.pr.unwrap().state, "open");
             assert_eq!(f.queue().get(&owner.id).unwrap().status, TaskStatus::Done);
             for q in [&free, &approval] {
-                assert!(decoy_questions.get(&q.id).unwrap().status.open());
+                assert_eq!(
+                    std::fs::read(decoy_questions.path_of(&q.id)).unwrap(),
+                    decoy_before[&q.id]
+                );
             }
         },
     );
