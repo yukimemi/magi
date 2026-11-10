@@ -22,9 +22,12 @@ unarchivable recovery history, dirty/index-hidden edits, ignored/untracked entri
 symlinks and even unknown empty directories block deletion. Build outputs are
 never archived; a copy containing any such leftovers is retained.
 
-The pass discovers at most 64 run roots and inspects at most five disposable
-seats, including unsuccessful inspections. Missing/empty roots consume discovery
-slots rather than seat slots. Runs use immutable ID order, not `updated_at`:
+The pass inspects at most 64 run roots and skips at most 64 proven absent roots
+without eviction records, using separate budgets. Each visited run checkpoints
+the census, so both budgets bound full-census writes even with thousands of
+missing roots. It inspects at most five disposable seats, including unsuccessful
+inspections. Missing and empty roots never spend seat slots.
+Runs use immutable ID order, not `updated_at`:
 ordinary bookkeeping cannot move the continuation. A cycle freezes its run IDs
 and upper ID; newly added runs join the next cycle. Deleting a queued run records
 an error and advances. A seat-budget interruption resumes after the last inspected

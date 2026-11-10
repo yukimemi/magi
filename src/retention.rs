@@ -6431,7 +6431,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn source_eviction_scan_skips_missing_roots_without_spending_inspection_budget() {
+    async fn source_eviction_scan_bounds_missing_root_checkpoints_and_eventually_reclaims() {
         let f = Fx::new().await;
         let state = inactive_source(&f, "ffff", true).await;
         let review = reviewer(&f, &state, &f.base).await;
@@ -6447,27 +6447,37 @@ mod tests {
                 std::fs::write(artifacts.join("eviction-review-1.json"), "{}").unwrap();
             }
         }
-        for pass in 0..2 {
-            let mut report = Report::default();
-            copies::evict(&f.home, &Fx::disk(), Fx::now(), &mut report).await;
-            assert!(report.failures.is_empty(), "{report:?}");
-            assert!(
-                !review.exists(),
-                "eligible tail must be reached in one pass"
-            );
-            assert_eq!(report.evicted_copies, usize::from(pass == 0));
-            let census = source_census(&f.home);
-            assert_eq!(census["current"]["next"], 131);
-            assert!(!census["current"]["completed_at"].is_null());
-            assert_eq!(census["current"]["number"], pass + 1);
-            assert_eq!(
-                census["current"]["runs"]["20260101-000000-0000"]["root"]["outcome"],
-                "error"
-            );
-            assert_eq!(
-                census["current"]["runs"]["20260101-000000-0001"]["root"]["detail"],
-                "root absent and no eviction records; nothing to reclaim"
-            );
+        // Each invocation reloads the durable cursor. The corrupt ledger uses
+        // one normal inspection slot; the remaining missing roots use a
+        // separate 64-entry skip budget, bounding full-census checkpoint writes.
+        // Repeat through wrap so idle sweeps cannot reintroduce an unbounded pass.
+        for cycle in 1..=2 {
+            for (pass, expected_next) in [65, 129, 131].into_iter().enumerate() {
+                let mut report = Report::default();
+                copies::evict(&f.home, &Fx::disk(), Fx::now(), &mut report).await;
+                assert!(report.failures.is_empty(), "{report:?}");
+                assert_eq!(report.evicted_copies, usize::from(cycle == 1 && pass == 2));
+                assert_eq!(review.exists(), cycle == 1 && pass < 2);
+                let census = source_census(&f.home);
+                assert_eq!(census["current"]["next"], expected_next);
+                assert_eq!(census["current"]["completed_at"].is_null(), pass < 2);
+                assert_eq!(census["current"]["number"], cycle);
+                assert_eq!(
+                    census["current"]["runs"]["20260101-000000-0000"]["root"]["outcome"],
+                    "error"
+                );
+                assert_eq!(
+                    census["current"]["runs"]["20260101-000000-0001"]["root"]["detail"],
+                    "root absent and no eviction records; nothing to reclaim"
+                );
+                if pass < 2 {
+                    let next_id = format!("20260101-000000-{expected_next:04x}");
+                    assert_eq!(
+                        census["current"]["runs"][next_id]["root"]["outcome"],
+                        "not-yet-inspected"
+                    );
+                }
+            }
         }
     }
 

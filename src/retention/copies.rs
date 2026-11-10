@@ -596,7 +596,10 @@ async fn evict_scan(
     let mut attempted = 0;
     let mut unlinked = 0u64;
     let mut inspected_runs = 0;
-    while inspected_runs < 64 {
+    let mut skipped_roots = 0;
+    // Every visited run checkpoints the full bounded census. Missing roots
+    // need their own cap so this sweep cannot rewrite it once per history entry.
+    while inspected_runs < 64 && skipped_roots < 64 {
         if attempted >= LIMIT
             || unlinked >= disk.worktree_reclaim_bytes
             || report.source_evidence_added_logical_bytes >= EVIDENCE_BUDGET
@@ -1011,6 +1014,8 @@ async fn evict_scan(
         .await;
         if has_work {
             inspected_runs += 1;
+        } else {
+            skipped_roots += 1;
         }
         // A failed checkpoint must never be silently treated as a completed run.
         if result
@@ -1039,8 +1044,8 @@ async fn evict_scan(
     Ok(())
 }
 
-// Only proven absent roots without eviction intents can bypass the inspection
-// budget. Symlinks, unreadable paths and ledger records need normal inspection.
+// Only proven absent roots without eviction intents use the separate bounded
+// skip budget. Symlinks, unreadable paths and ledger records need normal inspection.
 fn run_has_work(home: &Path, state: &RunState) -> Result<bool> {
     match std::fs::symlink_metadata(state.worktree_root()) {
         Ok(_) => return Ok(true),
