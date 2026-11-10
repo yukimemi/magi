@@ -214,6 +214,8 @@ pub enum Blocking {
     Yes,
     /// The branch no longer merges: the base moved under it.
     Conflict,
+    /// The forge requires the head to include the current base.
+    Behind,
     /// The forge did not say - an older `gh`, or a token without the scope.
     /// Treated as `Yes`, because refusing to guess is the rule everywhere
     /// else in this module.
@@ -228,8 +230,9 @@ impl Blocking {
             // non-required check failing or still running.
             "CLEAN" | "UNSTABLE" | "HAS_HOOKS" => Self::No,
             "DIRTY" => Self::Conflict,
+            "BEHIND" => Self::Behind,
             "" | "UNKNOWN" => Self::Unsaid,
-            // BLOCKED, BEHIND, DRAFT: something has to change first.
+            // BLOCKED, DRAFT: something has to change first.
             _ => Self::Yes,
         }
     }
@@ -365,7 +368,7 @@ pub fn decide_with(
 
     // Before the checks: every check on a branch that cannot land is an
     // answer about a state that cannot land.
-    if pr.blocking == Blocking::Conflict {
+    if matches!(pr.blocking, Blocking::Conflict | Blocking::Behind) {
         return Step::Rebase;
     }
 
@@ -3466,6 +3469,8 @@ fn bound_head<'a>(
 /// What a refused `gh pr merge` means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Refused {
+    /// An open PR on the observed head has a proven stale base.
+    Behind,
     /// The branch policy is not satisfied *yet*: go back to waiting.
     Pending,
     /// Checks have settled and the merge state still says no, seen for the
@@ -3496,6 +3501,9 @@ fn classify_refusal(
     // to the old commit): not a verdict on anything, look again.
     if !after.head.eq_ignore_ascii_case(observed_head) {
         return Refused::Pending;
+    }
+    if Blocking::of(&after.merge_state) == Blocking::Behind {
+        return Refused::Behind;
     }
     // The same binding the loop applies: checks of another commit say nothing.
     if bound_head(&after.head, &after.rollup_head, None).is_none() {
@@ -3986,11 +3994,35 @@ async fn rebase_landing_worktree(
 ) -> Result<crate::rebase::Rebased> {
     restore_landing_worktree(state).await?;
     let winner = state.winner().cloned().context("landing has no winner")?;
+    let scratch = state.dir().join("rebase");
+    let target = match state.land_sync_target.clone() {
+        Some(target) => target,
+        // Older records lack the target checkpoint, but Git retains the
+        // exact target of an interrupted operation. It is a continuation too.
+        None if git::rebase_in_progress(&scratch).await => {
+            crate::rebase::rebase_target(&scratch).await?
+        }
+        None => {
+            anyhow::ensure!(
+                state.land_sync_attempts < state.config.graph.land_rounds,
+                "landing base synchronization budget exhausted"
+            );
+            let target = git::rev_parse(&state.repo, onto).await?;
+            state.land_sync_attempts += 1;
+            state.land_sync_target = Some(target.clone());
+            target
+        }
+    };
+    state.land_sync_target = Some(target.clone());
     state.land_sync_pending = true;
     state.land_rebase_from = Some(git::rev_parse(&winner.worktree, "HEAD").await?);
     state.save()?;
-    let scratch = state.dir().join("rebase");
-    let result = crate::rebase::rebase_with_fixer(state, &scratch, &winner.branch, onto).await?;
+    // A continuation owns the attempt already charged above, including a
+    // crash before the scratch rebase started. Finish its pinned base first;
+    // a newer base must use another attempt on the next observation.
+    let result = crate::rebase::rebase_with_fixer(state, &scratch, &winner.branch, &target).await?;
+    state.land_sync_target = None;
+    state.save()?;
     if result == crate::rebase::Rebased::Applied {
         restore_landing_worktree(state).await?;
     }
@@ -4004,6 +4036,7 @@ async fn resume_landing_head<F: Forge>(
     observed: &str,
     pr_url: &str,
     forge: &F,
+    reason: Option<Blocking>,
 ) -> Result<String> {
     crate::pr_head::ensure_owner(state)?;
     let winner = state.winner().cloned().context("landing has no winner")?;
@@ -4029,6 +4062,15 @@ async fn resume_landing_head<F: Forge>(
     state.pr_pushed_head = Some(observed.to_owned());
     state.save()?;
     restore_landing_worktree(state).await?;
+    // Recover a rebase that finished before its completion checkpoint was
+    // saved. Restoration above has already reconciled its files and ancestry.
+    if let Some(target) = &state.land_sync_target
+        && !git::rebase_in_progress(&state.dir().join("rebase")).await
+        && git::ancestry(&winner.worktree, target, &local).await?
+    {
+        state.land_sync_target = None;
+        state.save()?;
+    }
     let remote = state.config.merge.remote.clone();
     let base = state.base_branch.clone();
     let fetched = git::fetch(&state.repo, &remote, &base).await?;
@@ -4037,15 +4079,74 @@ async fn resume_landing_head<F: Forge>(
         "cannot fetch landing base: {}",
         fetched.stderr
     );
+    anyhow::ensure!(
+        !owner_requested_stop(state)?,
+        "owner requested stop before base synchronization"
+    );
     let onto = format!("{remote}/{base}");
     let tip = git::rev_parse(&state.repo, &onto).await?;
-    if !git::is_ancestor(&state.repo, &tip, &local).await {
+    let contains_base = git::ancestry(&state.repo, &tip, &local)
+        .await
+        .context("could not determine whether the landing head contains the fetched base")?;
+    anyhow::ensure!(
+        reason != Some(Blocking::Behind) || !contains_base,
+        "BEHIND reported but the fetched base is already included; synchronization made no progress"
+    );
+    if !contains_base || reason == Some(Blocking::Conflict) {
         match rebase_landing_worktree(state, &onto).await? {
             crate::rebase::Rebased::Applied => {}
             crate::rebase::Rebased::Stopped(why) => bail!("landing rebase stopped: {why}"),
         }
     }
+    if reason == Some(Blocking::Behind) {
+        anyhow::ensure!(
+            git::rev_parse(&winner.worktree, "HEAD").await? != local,
+            "BEHIND synchronization left the head unchanged"
+        );
+    }
     publish_landing_head(state, observed, pr_url, forge).await
+}
+
+/// Share the synchronization path with structured evidence retained after a refusal.
+async fn synchronize_landing<F: Forge>(
+    state: &mut RunState,
+    pr: &mut PrState,
+    observed: &str,
+    pr_url: &str,
+    forge: &F,
+) -> Result<Option<String>> {
+    if owner_stop(state, pr, forge).await? {
+        return Ok(None);
+    }
+    state.event(
+        "land",
+        format!("{} base synchronization: {:?}", pr.url, pr.blocking),
+    );
+    state.save()?;
+    let synced = resume_landing_head(state, observed, pr_url, forge, Some(pr.blocking)).await;
+    if owner_stop(state, pr, forge).await? {
+        return Ok(None);
+    }
+    match synced {
+        Ok(head) => {
+            if let Some(branch) = state.winner().map(|w| w.branch.clone()) {
+                crate::graph::refresh_reviewed_commits(state, &branch).await;
+            }
+            Ok(Some(head))
+        }
+        Err(e) if e.is::<crate::repo_lock::ResourceBlocked>() => Err(e),
+        Err(e) => {
+            let repo = state.repo.clone();
+            stop(
+                state,
+                &repo,
+                pr,
+                &format!("could not synchronize landing base: {e:#}"),
+            )
+            .await?;
+            Ok(None)
+        }
+    }
 }
 
 async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> Result<PrState> {
@@ -4055,9 +4156,6 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
     let repo = state.repo.clone();
     let budget = state.config.graph.land_rounds;
     let mut round = 0usize;
-    // Counted apart from `round`: a rebase is not a fix, and a base that
-    // moved is not the change's fault.
-    let mut rebases = 0usize;
     let ci = state.config.merge.ci.expectation();
     if ci == CiExpectation::Absent {
         state.event(
@@ -4092,7 +4190,7 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
     // the first observation, where a pull request is known to stop with.
     let mut resumed_armed = state.land_armed_head.is_some();
 
-    loop {
+    'landing: loop {
         let seen = forge.view(&repo, pr_url).await?;
         let mut pr = seen.pr.clone();
         pr.review_comments.retain(|c| !shown.contains(&c.body));
@@ -4216,7 +4314,7 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
                     return Ok(pr);
                 }
             }
-            let synced = resume_landing_head(state, &seen.head, pr_url, forge).await;
+            let synced = resume_landing_head(state, &seen.head, pr_url, forge, None).await;
             // A stop detected before publication must apply its durable
             // decision, even when verification returned an error meanwhile.
             if owner_stop(state, &mut pr, forge).await? {
@@ -4227,6 +4325,22 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
             waited = Duration::ZERO;
             rechecked = false;
             // Read CI and approvals afresh, never from the pre-push observation.
+            continue;
+        }
+
+        // A stale base is independent of the CI rollup. Keep the public-head
+        // lease, but synchronize before waiting for checks on the old tree.
+        if pr.state == PrLifecycle::Open
+            && pr.blocking == Blocking::Behind
+            && bound_head(&seen.head, &seen.head, awaiting_head.as_deref()).is_some()
+        {
+            let synced = synchronize_landing(state, &mut pr, &seen.head, pr_url, forge).await?;
+            let Some(head) = synced else {
+                return Ok(pr);
+            };
+            awaiting_head = Some(head);
+            rechecked = false;
+            waited = Duration::ZERO;
             continue;
         }
 
@@ -4582,6 +4696,23 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
                 // above can be a moment old.
                 {
                     let fresh = forge.view(&repo, pr_url).await.ok();
+                    if fresh.as_ref().is_some_and(|current| {
+                        current.pr.state == PrLifecycle::Open
+                            && current.head.eq_ignore_ascii_case(&observed_head)
+                            && Blocking::of(&current.merge_state) == Blocking::Behind
+                    }) {
+                        pr.blocking = Blocking::Behind;
+                        let synced =
+                            synchronize_landing(state, &mut pr, &observed_head, pr_url, forge)
+                                .await?;
+                        let Some(head) = synced else {
+                            return Ok(pr);
+                        };
+                        awaiting_head = Some(head);
+                        rechecked = false;
+                        waited = Duration::ZERO;
+                        continue 'landing;
+                    }
                     if !direct_merge_is_safe(
                         fresh.as_ref(),
                         &observed_head,
@@ -4717,6 +4848,19 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
                 }
                 let verdict = classify_refusal(after_seen.as_ref(), rechecked, &observed_head, ci);
                 match verdict {
+                    Refused::Behind => {
+                        pr.blocking = Blocking::Behind;
+                        let synced =
+                            synchronize_landing(state, &mut pr, &observed_head, pr_url, forge)
+                                .await?;
+                        let Some(head) = synced else {
+                            return Ok(pr);
+                        };
+                        awaiting_head = Some(head);
+                        rechecked = false;
+                        waited = Duration::ZERO;
+                        continue 'landing;
+                    }
                     Refused::Final => {
                         let merge_state = after_seen
                             .as_ref()
@@ -4761,91 +4905,14 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
                 }
             }
             Step::Rebase => {
-                // Bounded by the same budget as a fix, because a rebase that
-                // keeps being needed means the base moves faster than this
-                // run can land and a person should decide what to do. It
-                // spends none of that budget: the change is not what is
-                // wrong.
-                if rebases >= budget {
-                    let why = format!(
-                        "the base moved under this branch {budget} time(s) and it still does \
-                         not merge; rebasing again would only race it"
-                    );
-                    stop(state, &repo, &pr, &why).await?;
-                    return Ok(pr);
-                }
-                rebases += 1;
-                let Some(branch) = state.winner().map(|w| w.branch.clone()) else {
-                    stop(
-                        state,
-                        &repo,
-                        &pr,
-                        "the pull request conflicts and this run has no winning branch to rebase",
-                    )
-                    .await?;
+                let synced = synchronize_landing(state, &mut pr, &seen.head, pr_url, forge).await?;
+                let Some(head) = synced else {
                     return Ok(pr);
                 };
-                let base = state.base_branch.clone();
-                state.event(
-                    "land",
-                    format!("{} no longer merges; rebasing onto {base}", pr.url),
-                );
-                state.save()?;
-
-                // Onto the base as the *remote* has it: the local ref may be
-                // behind, and rebasing onto a stale base produces a branch
-                // that conflicts all over again.
-                let remote = state.config.merge.remote.clone();
-                git::fetch(&repo, &remote, &base).await.ok();
-                if owner_stop(state, &mut pr, forge).await? {
-                    return Ok(pr);
-                }
-                let onto = format!("{remote}/{base}");
-                let rebased = match rebase_landing_worktree(state, &onto).await {
-                    Ok(crate::rebase::Rebased::Applied) => Ok(None),
-                    Ok(crate::rebase::Rebased::Stopped(why)) => Ok(Some(why)),
-                    Err(e) => Err(e),
-                };
-                if owner_stop(state, &mut pr, forge).await? {
-                    return Ok(pr);
-                }
-                match rebased {
-                    Ok(None) => {
-                        let published =
-                            publish_landing_head(state, &seen.head, pr_url, forge).await;
-                        if owner_stop(state, &mut pr, forge).await? {
-                            return Ok(pr);
-                        }
-                        let head = published?;
-                        crate::graph::refresh_reviewed_commits(state, &branch).await;
-                        state.pr_pushed_head = Some(head.clone());
-                        awaiting_head = Some(head);
-                        rechecked = false;
-                        state.event("land", format!("rebased {branch} onto {base}"));
-                        state.save()?;
-                        // The forge has to re-run its checks against the
-                        // rebased head before anything else can be decided.
-                        waited = Duration::ZERO;
-                        tokio::time::sleep(POLL).await;
-                    }
-                    // The fixer's rounds are spent (or it could not finish):
-                    // that is a decision for a person.
-                    Ok(Some(conflict)) => {
-                        let why = format!(
-                            "{} conflicts with {base} and the rebase did not apply: {}",
-                            pr.url,
-                            conflict.chars().take(600).collect::<String>()
-                        );
-                        stop(state, &repo, &pr, &why).await?;
-                        return Ok(pr);
-                    }
-                    Err(e) if e.is::<crate::repo_lock::ResourceBlocked>() => return Err(e),
-                    Err(e) => {
-                        let why = format!("could not rebase {branch} onto {base}: {e:#}");
-                        stop(state, &repo, &pr, &why).await?;
-                        return Ok(pr);
-                    }
-                }
+                awaiting_head = Some(head);
+                rechecked = false;
+                waited = Duration::ZERO;
+                continue 'landing;
             }
             Step::GiveUp { reason } => {
                 stop(state, &repo, &pr, &reason).await?;
@@ -5255,8 +5322,8 @@ struct Seen {
     /// The commit the checks belong to, read from the same GraphQL node as
     /// the checks themselves. Empty when unreadable.
     rollup_head: String,
-    /// `mergeStateStatus` as the forge spelled it. [`Blocking`] folds BLOCKED,
-    /// BEHIND and DRAFT together, and a stop reason has to say which.
+    /// `mergeStateStatus` as the forge spelled it. [`Blocking`] folds BLOCKED
+    /// and DRAFT together, and a stop reason has to say which.
     merge_state: String,
     /// Every check of the rollup, for naming what an armed merge waits on.
     contexts: Vec<CheckInfo>,
@@ -6999,7 +7066,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         }
         assert_eq!(Blocking::of("DIRTY"), Blocking::Conflict);
         assert_eq!(Blocking::of("BLOCKED"), Blocking::Yes);
-        assert_eq!(Blocking::of("BEHIND"), Blocking::Yes);
+        assert_eq!(Blocking::of("BEHIND"), Blocking::Behind);
         // An older `gh`, or a token without the scope, says nothing - and
         // refusing to guess is the rule everywhere else in this module.
         for quiet in ["", "UNKNOWN"] {
@@ -7294,7 +7361,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
 
     async fn resume_observed_head(state: &mut RunState, head: &str) -> Result<String> {
         let forge = Scripted::new(vec![seen(head, Checks::Green, "CLEAN", false)], vec![]);
-        resume_landing_head(state, head, &green_pr().url, &forge).await
+        resume_landing_head(state, head, &green_pr().url, &forge, None).await
     }
 
     async fn advance_landing_base(state: &RunState) {
@@ -7447,6 +7514,66 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         assert_eq!(state.gate_head.as_deref(), Some(head.as_str()));
         assert!(git::is_ancestor(&state.repo, "origin/main", &head).await);
         assert!(git::is_clean(&path).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn landing_resume_completes_the_last_charged_sync_attempt() {
+        for (scratch_started, saved_target) in [(false, true), (true, true), (true, false)] {
+            let (_tmp, mut state, old) = landing_git_fixture().await;
+            git::git(&state.repo, &["checkout", "main"]).await.unwrap();
+            std::fs::write(state.repo.join("change"), "conflicting base change").unwrap();
+            git::commit_all(&state.repo, "conflicting base")
+                .await
+                .unwrap();
+            git::git(&state.repo, &["push", "origin", "main"])
+                .await
+                .unwrap();
+            git::git(&state.repo, &["checkout", "winner"])
+                .await
+                .unwrap();
+            let target = git::rev_parse(&state.repo, "origin/main").await.unwrap();
+            state.config.graph.land_rounds = 1;
+            state.land_sync_attempts = 1;
+            state.land_sync_target = saved_target.then(|| target.clone());
+            state.land_rebase_from = Some(old.clone());
+            landing_gate_fixer(
+                &mut state,
+                "cat >/dev/null; printf resolved > change; printf '{\"addressed\":[],\"rejected\":[],\"notes\":\"resolved\"}'",
+            );
+            state.config.verify.gate = vec!["grep -q resolved change".into()];
+            state.save().unwrap();
+            // Simulate interruption before the scratch start and at a conflict.
+            if scratch_started {
+                assert!(matches!(
+                    git::rebase_start(&state.repo, &state.dir().join("rebase"), "winner", &target)
+                        .await
+                        .unwrap(),
+                    git::RebaseStart::Conflicted(_)
+                ));
+            }
+            state = RunState::load(&state.id).unwrap();
+            let head = resume_observed_head(&mut state, &old).await.unwrap();
+            assert_ne!(head, old);
+            assert_eq!(state.land_sync_attempts, 1);
+            assert!(state.land_sync_target.is_none());
+            assert!(state.land_rebase_from.is_none());
+            assert!(!state.land_sync_pending);
+            assert_eq!(state.gate_head.as_deref(), Some(head.as_str()));
+            assert!(state.gate_allows_progress());
+            assert_eq!(
+                git::remote_head(&state.repo, "origin", "task-head")
+                    .await
+                    .unwrap(),
+                Some(head)
+            );
+            assert!(
+                rebase_landing_worktree(&mut state, "origin/main")
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("budget exhausted")
+            );
+        }
     }
 
     #[tokio::test]
@@ -9892,6 +10019,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
     /// Answers views from a script (the last one repeats), merges from a
     /// queue, and records every call so a test can assert the order.
     struct Scripted {
+        public_repo: Option<PathBuf>,
         evidence: Mutex<Option<CiEvidence>>,
         views: Mutex<VecDeque<Seen>>,
         merges: Mutex<VecDeque<(bool, String)>>,
@@ -9915,6 +10043,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
     impl Scripted {
         fn new(views: Vec<Seen>, merges: Vec<(bool, &str)>) -> Self {
             Self {
+                public_repo: None,
                 evidence: Mutex::new(None),
                 views: Mutex::new(views.into()),
                 merges: Mutex::new(
@@ -9954,12 +10083,22 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             {
                 anyhow::bail!("forge unreachable");
             }
-            let mut v = self.views.lock().unwrap();
-            let mut seen = if v.len() > 1 {
-                v.pop_front().unwrap()
-            } else {
-                v[0].clone()
+            let mut seen = {
+                let mut v = self.views.lock().unwrap();
+                if v.len() > 1 {
+                    v.pop_front().unwrap()
+                } else {
+                    v[0].clone()
+                }
             };
+            if seen.head == "@published" {
+                let head =
+                    git::remote_head(self.public_repo.as_ref().unwrap(), "origin", "task-head")
+                        .await?
+                        .context("missing published head")?;
+                seen.head.clone_from(&head);
+                seen.rollup_head = head;
+            }
             if *self.merged.lock().unwrap() {
                 seen.pr.state = PrLifecycle::Merged;
             }
@@ -10088,6 +10227,256 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         assert_eq!(
             classify_refusal(Some(&closed), false, "a", CiExpectation::Expected),
             Refused::Final
+        );
+    }
+
+    #[test]
+    fn behind_precedes_old_ci_and_other_blocking_policies_stay_distinct() {
+        for checks in [Checks::Pending, Checks::Unknown, Checks::Red, Checks::Green] {
+            let pr = seen("a", checks, "BEHIND", false).pr;
+            assert_eq!(
+                decide_with(&pr, 0, 4, Duration::ZERO, CiExpectation::Expected),
+                Step::Rebase
+            );
+        }
+        for status in ["DRAFT", "BLOCKED", "UNKNOWN"] {
+            let current = seen("a", Checks::Green, status, false);
+            assert_ne!(
+                decide_with(&current.pr, 0, 4, Duration::ZERO, CiExpectation::Expected),
+                Step::Rebase
+            );
+            assert_ne!(
+                classify_refusal(Some(&current), false, "a", CiExpectation::Expected),
+                Refused::Behind
+            );
+        }
+        let mut current = seen("a", Checks::Pending, "BEHIND", false);
+        current.rollup_head = "old".into();
+        assert_eq!(
+            classify_refusal(Some(&current), true, "a", CiExpectation::Expected),
+            Refused::Behind
+        );
+        assert_eq!(
+            classify_refusal(Some(&current), true, "other", CiExpectation::Expected),
+            Refused::Pending
+        );
+        current.pr.state = PrLifecycle::Closed;
+        assert_eq!(
+            classify_refusal(Some(&current), true, "a", CiExpectation::Expected),
+            Refused::Final
+        );
+    }
+
+    #[tokio::test]
+    async fn behind_at_each_landing_boundary_syncs_and_requires_new_head_approval() {
+        for boundary in ["initial", "premerge", "refusal"] {
+            let (_tmp, mut state, old) = landing_git_fixture().await;
+            state.land_sync_pending = false;
+            advance_landing_base(&state).await;
+            state.config.verify.gate = vec!["test -f advance".into()];
+            state.config.verify.e2e = vec!["test -f advance".into()];
+            approval_gate(&mut state, &green_pr(), "feat: x", None, &old)
+                .await
+                .unwrap();
+            let old_binding = state.land_approval.clone().unwrap();
+            let store = ask::Questions::open();
+            let mut question = store.get(&old_binding.question).unwrap();
+            question
+                .answer(ask::Answer::Choice(APPROVE.to_owned()))
+                .unwrap();
+            store.put(&mut question).unwrap();
+            let mut views = Vec::new();
+            if boundary != "initial" {
+                views.push(seen(&old, Checks::Green, "CLEAN", false));
+            }
+            if boundary == "refusal" {
+                views.push(seen(&old, Checks::Green, "CLEAN", false));
+            }
+            let mut behind = seen(&old, Checks::Pending, "BEHIND", false);
+            behind.rollup_head = "old-ci-head".into();
+            views.push(behind);
+            // Publication checks the PR lease while verification has completed.
+            views.push(seen(&old, Checks::Green, "CLEAN", false));
+            views.push(seen("@published", Checks::Pending, "CLEAN", false));
+            views.push(seen("@published", Checks::Green, "CLEAN", false));
+            let merges = if boundary == "refusal" {
+                vec![(false, REFUSED)]
+            } else {
+                vec![]
+            };
+            let mut forge = Scripted::new(views, merges);
+            forge.public_repo = Some(state.repo.clone());
+            let run = state.id.clone();
+            land_with(&mut state, URL, &forge).await.unwrap();
+            let head = state.pr_pushed_head.clone().unwrap();
+            assert_ne!(head, old, "{boundary}");
+            assert_eq!(state.id, run);
+            assert_eq!(state.pr_branch(), Some("task-head"));
+            assert_eq!(state.winner().unwrap().branch, "winner");
+            assert_eq!(state.gate_head.as_deref(), Some(head.as_str()));
+            assert!(state.gate_allows_progress());
+            let e2e = state.head_e2e.as_ref().unwrap();
+            assert_eq!(e2e.head, head);
+            assert!(e2e.passed);
+            assert_eq!(state.land_sync_attempts, 1);
+            assert!(!state.land_sync_pending);
+            assert!(state.parked);
+            let binding = state.land_approval.as_ref().unwrap();
+            assert_eq!(binding.head, head);
+            assert_ne!(binding.question, old_binding.question);
+            assert_eq!(forge.argvs().len(), usize::from(boundary == "refusal"));
+            // The new question authorizes only the synchronized head on resume.
+            let mut question = store.get(&binding.question).unwrap();
+            question
+                .answer(ask::Answer::Choice(APPROVE.to_owned()))
+                .unwrap();
+            store.put(&mut question).unwrap();
+            let forge = Scripted::new(
+                vec![seen(&head, Checks::Green, "CLEAN", false)],
+                vec![(true, "")],
+            );
+            land_with(&mut state, URL, &forge).await.unwrap();
+            assert_eq!(state.status, RunStatus::Merged);
+            assert_eq!(
+                value_of(&forge.argvs()[0], "--match-head-commit"),
+                Some(head.as_str())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn behind_refusal_remains_actionable_when_the_next_view_is_clean() {
+        let (_tmp, mut state, old) = landing_git_fixture().await;
+        state.land_sync_pending = false;
+        state.config.graph.land_approval = false;
+        state.config.verify.gate = vec!["test -f advance && test -f change".into()];
+        advance_landing_base(&state).await;
+        let mut forge = Scripted::new(
+            vec![
+                seen(&old, Checks::Green, "CLEAN", false),
+                seen(&old, Checks::Green, "CLEAN", false),
+                seen(&old, Checks::Green, "BEHIND", false),
+                // The next observation is the publication lease check. The
+                // refusal's evidence still applies to exactly this old head.
+                seen(&old, Checks::Green, "CLEAN", false),
+                seen("@published", Checks::Green, "CLEAN", false),
+            ],
+            vec![(false, REFUSED), (true, "")],
+        );
+        forge.public_repo = Some(state.repo.clone());
+        land_with(&mut state, URL, &forge).await.unwrap();
+        let head = state.pr_pushed_head.as_deref().unwrap();
+        assert_ne!(head, old);
+        assert_eq!(state.land_sync_attempts, 1);
+        assert_eq!(state.gate_head.as_deref(), Some(head));
+        assert_eq!(state.status, RunStatus::Merged);
+        let requests = forge.argvs();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            value_of(&requests[0], "--match-head-commit"),
+            Some(old.as_str())
+        );
+        assert_eq!(value_of(&requests[1], "--match-head-commit"), Some(head));
+    }
+
+    #[tokio::test]
+    async fn behind_ancestry_failure_stops_without_rebasing_or_publishing() {
+        let (tmp, mut state, old) = landing_git_fixture().await;
+        state.land_sync_pending = false;
+        // A damaged history must not be interpreted as a missing base. Keep
+        // the head's tree intact so worktree restoration itself can succeed.
+        let tree = git::rev_parse(&state.repo, "HEAD^{tree}").await.unwrap();
+        let commit = tmp.path().join("broken-commit");
+        std::fs::write(
+            &commit,
+            format!(
+                "tree {tree}\nparent {}\nauthor Test <test@example.test> 1 +0000\ncommitter Test <test@example.test> 1 +0000\n\nbroken history\n",
+                "f".repeat(40)
+            ),
+        )
+        .unwrap();
+        let replacement = git::git(
+            &state.repo,
+            &[
+                "hash-object",
+                "-t",
+                "commit",
+                "-w",
+                commit.to_str().unwrap(),
+            ],
+        )
+        .await
+        .unwrap();
+        git::git(&state.repo, &["replace", &old, replacement.trim()])
+            .await
+            .unwrap();
+        let forge = Scripted::new(vec![seen(&old, Checks::Green, "BEHIND", false)], vec![]);
+        land_with(&mut state, URL, &forge).await.unwrap();
+        assert_eq!(state.land_sync_attempts, 0);
+        assert_eq!(state.pr_pushed_head.as_deref(), Some(old.as_str()));
+        assert_eq!(git::rev_parse(&state.repo, "HEAD").await.unwrap(), old);
+        assert!(forge.argvs().is_empty());
+        assert!(
+            state.events.iter().any(|e| e.message.contains(
+                "could not determine whether the landing head contains the fetched base"
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn behind_fetch_failure_stops_without_rebasing_or_publishing() {
+        let (_tmp, mut state, old) = landing_git_fixture().await;
+        state.land_sync_pending = false;
+        git::git(
+            &state.repo,
+            &["remote", "set-url", "origin", "missing-remote"],
+        )
+        .await
+        .unwrap();
+        let forge = Scripted::new(vec![seen(&old, Checks::Green, "BEHIND", false)], vec![]);
+        land_with(&mut state, URL, &forge).await.unwrap();
+        assert_eq!(state.land_sync_attempts, 0);
+        assert_eq!(git::rev_parse(&state.repo, "HEAD").await.unwrap(), old);
+        assert!(
+            state
+                .events
+                .iter()
+                .any(|e| e.message.contains("cannot fetch landing base"))
+        );
+        assert!(forge.argvs().is_empty());
+    }
+
+    #[tokio::test]
+    async fn behind_without_base_progress_and_exhausted_resume_budget_never_publish() {
+        let (_tmp, mut state, old) = landing_git_fixture().await;
+        state.land_sync_pending = false;
+        let forge = Scripted::new(vec![seen(&old, Checks::Green, "BEHIND", false)], vec![]);
+        land_with(&mut state, URL, &forge).await.unwrap();
+        assert_eq!(state.pr_pushed_head.as_deref(), Some(old.as_str()));
+        assert_eq!(state.land_sync_attempts, 0);
+        assert!(
+            state
+                .events
+                .iter()
+                .any(|e| e.message.contains("already included"))
+        );
+        advance_landing_base(&state).await;
+        state.land_sync_attempts = state.config.graph.land_rounds;
+        state.land_sync_pending = true;
+        state.save().unwrap();
+        let mut restored = RunState::load(&state.id).unwrap();
+        assert!(
+            resume_observed_head(&mut restored, &old)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("budget exhausted")
+        );
+        assert_eq!(
+            git::remote_head(&state.repo, "origin", "task-head")
+                .await
+                .unwrap(),
+            Some(old)
         );
     }
 
