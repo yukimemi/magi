@@ -63,6 +63,11 @@ pub enum Operation {
         /// Head-bound operator request.
         request: crate::repair_budget::Request,
     },
+    /// Reconcile an existing unimported repair receipt; never adds budget.
+    ReconcileRepairGrant {
+        /// Exact owner-authorized recovery identity.
+        request: crate::repair_budget::reconcile::Request,
+    },
     /// Reconcile a task-local uncertain effect against its durable end condition.
     ReconcileDecision {
         /// Stable inquiry id.
@@ -418,6 +423,9 @@ async fn execute(
                 error
             }
         })?,
+        Operation::ReconcileRepairGrant { request } => serde_json::to_string(
+            &Box::pin(crate::repair_budget::reconcile::apply(queue, home, request)).await?,
+        )?,
         Operation::GrantRepair { request } => {
             // Keep run-state admission out of the shared control dispatcher
             // future, which is also embedded in ordinary CLI task operations.
@@ -483,7 +491,10 @@ async fn execute(
             title,
         } => {
             let q = record_decision(home, &question, &choice, title.as_deref())?;
-            format!("recorded `{choice}` for decision {}", q.short())
+            format!(
+                "recorded `{choice}` for decision {}; effect pending until its durable application receipt is confirmed",
+                q.short()
+            )
         }
         Operation::Answer {
             question,
@@ -676,7 +687,14 @@ async fn execute_decision(
             );
         }
     }
-    outbox.update_decision(id, |d| d.accept(&request))?;
+    {
+        // A live task cannot accept a repair grant. Do not prevent decisions
+        // that its active driver is waiting for by taking its execution claim.
+        let _claim = (queue.get(&task.id)?.status != TaskStatus::Running)
+            .then(|| queue.claim(&task.id))
+            .transpose()?;
+        outbox.update_decision(id, |d| d.accept(&request))?;
+    }
     if decision.request.is_some()
         && matches!(decision.status, Status::InProgress | Status::RetryNeeded)
     {
@@ -1279,6 +1297,7 @@ fn record_decision(
     let id = questions.resolve_id(question)?;
     let q = questions.get(&id)?;
     let queue = Queue::at(home.join("queue"));
+    let _claims = decision_claims(&queue, &q)?;
     for task in queue.list() {
         if q.run == task.id
             || task.runs.contains(&q.run)
@@ -1350,6 +1369,45 @@ fn record_decision(
         Ok(())
     })?;
     Ok(q)
+}
+
+/// Fence idle built-in triage answers with grant admission and worker writes.
+/// Live drivers must remain answerable (grant admission refuses them). Other
+/// question consumers keep their own claims, including synchronous dismissal.
+/// Every grant also rechecks answered-but-unsettled effects before acceptance.
+pub(crate) fn decision_claims(
+    queue: &Queue,
+    q: &crate::ask::Question,
+) -> Result<Vec<crate::queue::Claim>> {
+    let mut owners: Vec<_> = queue
+        .list()
+        .into_iter()
+        .filter(|task| {
+            q.run == task.id
+                || task.runs.contains(&q.run)
+                || q.routed_task.as_deref() == Some(&task.id)
+        })
+        .map(|task| task.id)
+        .collect();
+    owners.sort();
+    let mut claims = Vec::new();
+    if matches!(
+        q.node.as_str(),
+        crate::triage::NODE | crate::triage::DEPS_NODE
+    ) {
+        for id in &owners {
+            if queue.get(id)?.status != TaskStatus::Running {
+                claims.push(queue.claim(id)?);
+            }
+        }
+    }
+    for id in owners {
+        ensure!(
+            !crate::repair_budget::reconcile::superseded_question(&queue.get(&id)?, q),
+            "question was superseded by explicit repair receipt recovery; inspect the reconciliation receipt"
+        );
+    }
+    Ok(claims)
 }
 
 /// The conversation this process speaks for, or why it may not act.

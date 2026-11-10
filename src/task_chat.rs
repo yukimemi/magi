@@ -893,12 +893,20 @@ pub(crate) fn sync_effect_receipt(home: &Path, queue: &Queue, q: &Question) {
     }
 }
 
-fn effect_receipt(
+pub(crate) fn effect_receipt(
     home: &Path,
     queue: &Queue,
     q: &Question,
     task: Option<&str>,
 ) -> Result<Option<String>> {
+    if let Some(task) = task.and_then(|id| queue.get(id).ok())
+        && crate::repair_budget::reconcile::superseded_question(&task, q)
+    {
+        return Ok(Some(format!(
+            "task {}: unanswered dependency question {} superseded by explicit repair receipt reconciliation; no generic resume applied",
+            task.id, q.id
+        )));
+    }
     if q.resolution().is_none() {
         return Ok(None);
     }
@@ -1076,9 +1084,43 @@ fn effect_receipt(
         return Ok(Some(format!("choice-actions/{}.json: applied", q.id)));
     }
     if q.node == crate::triage::NODE || q.node == crate::triage::DEPS_NODE {
-        return Ok(task
-            .filter(|task| task.triage_applied(&q.id))
-            .map(|_| format!("task triage {} committed", q.id)));
+        if let Some(task) = &task
+            && let Some(evidence) = task.decision_effects.get(&q.id)
+        {
+            if evidence.starts_with("repair-receipt-blocked:") {
+                anyhow::ensure!(
+                    evidence == &crate::repair_budget::reconcile::blocked_resume(q)?,
+                    "blocked resume source changed"
+                );
+                return Ok(Some(format!(
+                    "task {}: generic resume {} consumed without release; retained repair receipt requires explicit reconcile-repair-grant",
+                    task.id, q.id
+                )));
+            }
+            let (source, _, _, application): (
+                String,
+                Option<jiff::Timestamp>,
+                String,
+                crate::queue::Resumption,
+            ) = serde_json::from_str(evidence)
+                .context("triage application receipt is unreadable")?;
+            anyhow::ensure!(
+                source == crate::repair_budget::reconcile::source(q)?
+                    && task
+                        .resumption
+                        .iter()
+                        .chain(&task.resumption_history)
+                        .any(|r| crate::repair_budget::reconcile::application_identity(r)
+                            == application),
+                "triage source or application evidence changed"
+            );
+        }
+        return Ok(task.filter(|task| task.triage_applied(&q.id)).map(|_| {
+            format!(
+                "task triage {} settled by durable application/supersession evidence",
+                q.id
+            )
+        }));
     }
     if let Some(task) = &task
         && task.action_applied(&q.id)

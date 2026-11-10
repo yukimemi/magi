@@ -487,6 +487,9 @@ pub struct Task {
     /// Immutable repair receipts, saved atomically with the exact-run queue pin.
     #[serde(default)]
     pub repair_grants: Vec<crate::repair_budget::Receipt>,
+    /// Append-only owner-authorized reconciliation of an unspent receipt.
+    #[serde(default)]
+    pub repair_reconciliations: Vec<crate::repair_budget::reconcile::Receipt>,
     /// Latest explicit operator release. Historical answers remain audit evidence;
     /// this approval takes precedence over their earlier waiting premises.
     #[serde(default)]
@@ -993,6 +996,7 @@ impl Task {
             base_recovery_requests: Vec::new(),
             resume_override: None,
             repair_grants: Vec::new(),
+            repair_reconciliations: Vec::new(),
             resumption: None,
             resumption_history: Vec::new(),
             operator_decided_at: None,
@@ -2755,6 +2759,11 @@ impl Queue {
                     task.hold_source = stored.hold_source;
                     task.hold_reason = stored.hold_reason.clone();
                     task.held_at = stored.held_at;
+                }
+            }
+            for receipt in &stored.repair_reconciliations {
+                if !task.repair_reconciliations.contains(receipt) {
+                    task.repair_reconciliations.push(receipt.clone());
                 }
             }
             task.superseded_resumes.extend(stored.superseded_resumes);

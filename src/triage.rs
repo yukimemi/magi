@@ -880,6 +880,14 @@ fn apply_deps_answer(queue: &Queue, questions: &Questions, q: &Question, now: Ti
             if root.status == TaskStatus::Running {
                 return false;
             }
+            if crate::repair_budget::reconcile::blocker(queue, &root).is_some() {
+                let Ok(receipt) = crate::repair_budget::reconcile::blocked_resume(q) else {
+                    return false;
+                };
+                root.decision_effects.insert(q.id.clone(), receipt);
+                root.mark_triage_applied(&q.id);
+                return queue.put(&mut root).is_ok();
+            }
             root.answers.push(crate::queue::AnsweredQuestion {
                 question: q.summary.clone(),
                 answer: q.resolution().unwrap_or_default(),
@@ -888,7 +896,20 @@ fn apply_deps_answer(queue: &Queue, questions: &Questions, q: &Question, now: Ti
                 root.mark_triage_applied(&q.id);
                 return queue.put(&mut root).is_ok();
             }
+            let before = root.operator_decided_at;
+            let contract =
+                crate::repair_budget::contract(&root, crate::repair_budget::Kind::Review).ok();
             root.release_operator("triage-dependencies", Some(&q.id));
+            if let Some(contract) = contract
+                && let Ok(evidence) = crate::repair_budget::reconcile::effect_evidence(
+                    q,
+                    before,
+                    &contract,
+                    root.resumption.as_ref().expect("release"),
+                )
+            {
+                root.decision_effects.insert(q.id.clone(), evidence);
+            }
             root.resume_override = Some(OperatorResume {
                 question_id: q.id.clone(),
                 at: now,
@@ -910,6 +931,28 @@ fn apply_deps_answer(queue: &Queue, questions: &Questions, q: &Question, now: Ti
     }
     root.mark_triage_applied(&q.id);
     queue.put(&mut root).is_ok()
+}
+
+fn repair_receipt_notice(queue: &Queue, task: &Task) -> bool {
+    let Some(detail) = crate::repair_budget::reconcile::blocker(queue, task) else {
+        return false;
+    };
+    if let Some(home) = queue.root().parent() {
+        let _ = crate::task_inquiry::Outbox::at(home).file_for_occurrence(
+            task,
+            task.runs.last().cloned(),
+            "repair-receipt-recovery".into(),
+            &task
+                .repair_grants
+                .last()
+                .expect("diagnosed receipt")
+                .request
+                .request,
+            "Retained repair receipt needs reconciliation",
+            &detail,
+        );
+    }
+    true
 }
 
 /// One question per stuck dependency root. Answers are applied by the
@@ -969,6 +1012,9 @@ fn ask_about_stuck_roots(
             .filter(|t| current.stuck_roots(t).contains(root_id))
             .collect();
         if dependants.is_empty() {
+            continue;
+        }
+        if repair_receipt_notice(queue, root) {
             continue;
         }
         let latest = all
@@ -1084,8 +1130,30 @@ pub fn apply_answers(queue: &Queue, questions: &Questions) -> Vec<String> {
                     // The original answer remains in answers; it cannot authorize
                     // a new implementation or an additional base rebase.
                 }
+                AnswerAction::Resume
+                    if crate::repair_budget::reconcile::blocker(queue, &task).is_some() =>
+                {
+                    let Ok(receipt) = crate::repair_budget::reconcile::blocked_resume(&q) else {
+                        continue;
+                    };
+                    task.decision_effects.insert(q.id.clone(), receipt);
+                }
                 AnswerAction::Resume => {
+                    let before = task.operator_decided_at;
+                    let contract =
+                        crate::repair_budget::contract(&task, crate::repair_budget::Kind::Review)
+                            .ok();
                     task.release_operator("triage", Some(&q.id));
+                    if let Some(contract) = contract
+                        && let Ok(evidence) = crate::repair_budget::reconcile::effect_evidence(
+                            &q,
+                            before,
+                            &contract,
+                            task.resumption.as_ref().expect("release"),
+                        )
+                    {
+                        task.decision_effects.insert(q.id.clone(), evidence);
+                    }
                     task.resume_override = Some(OperatorResume {
                         question_id: q.id.clone(),
                         at: Timestamp::now(),
@@ -1160,6 +1228,9 @@ pub fn run_once(
             continue;
         }
         if crate::base_sync_recovery::held_task(queue, &task) {
+            continue;
+        }
+        if repair_receipt_notice(queue, &task) {
             continue;
         }
         // A question about what this task freezes is already the one question

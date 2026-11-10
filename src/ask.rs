@@ -2023,6 +2023,13 @@ pub fn record_answer(
     reply: &str,
     title: Option<&str>,
 ) -> Result<String> {
+    let home = store
+        .root()
+        .parent()
+        .context("questions have no state home")?;
+    let queue = crate::queue::Queue::at(home.join("queue"));
+    let question = store.get(id)?;
+    let _claims = crate::chat_control::decision_claims(&queue, &question)?;
     let (q, ()) = store.update(id, |r| {
         let answer = if r.free_text() {
             Answer::Text(reply.to_owned())

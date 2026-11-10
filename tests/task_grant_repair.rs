@@ -573,3 +573,204 @@ async fn ordinary_gate_failure_with_unused_budget_still_refuses_an_extra_grant()
     refused(&request, "gate repair budget is not exhausted");
 }
 }
+
+fn dependency_question(task: &Task) -> magi::ask::Question {
+    let mut q = magi::ask::Question::new(
+        task.id.clone(),
+        magi::triage::DEPS_NODE.into(),
+        "triage".into(),
+        "Release the dependency?".into(),
+        "Retained work is waiting".into(),
+        vec![
+            "release the dependency".into(),
+            "discard the dependency".into(),
+            "detach the dependants".into(),
+        ],
+    );
+    q.triage_generation = Some(task.resumption.as_ref().map_or(0, |r| r.generation));
+    magi::ask::Questions::open().put_executable(&mut q).unwrap();
+    q
+}
+
+fn decide_dependency(fx: &common::Fixture, q: &magi::ask::Question) -> String {
+    let talks = magi::talk::Talks::open();
+    let talk = magi::talk::begin(&talks, &fx.config, fx.repo.clone(), None).unwrap();
+    let out = magi_cli(&magi::run::home())
+        .args(["task", "control", "decide", &q.id, &q.choices[0]])
+        .env("MAGI_NODE", "chat")
+        .env("MAGI_RUN", &talk.id)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let message = String::from_utf8(out.stdout).unwrap();
+    assert!(message.contains("effect pending"), "{message}");
+    talk.id
+}
+
+fn settle_worker_projection() {
+    magi::task_chat::sweep(
+        &Queue::open(),
+        &magi::talk::Talks::open(),
+        &magi::ask::Questions::open(),
+        &magi::run::home(),
+    );
+}
+
+common::e2e! {
+async fn conversation_decision_barriers_fence_acceptance_until_worker_application_survives_restart() {
+    let (fx, task, _runner, request) = stopped(true).await;
+    let queue = Queue::open();
+    let questions = magi::ask::Questions::open();
+    let q = dependency_question(&task);
+    refused(&request, "unresolved question");
+    // The task claim is a deterministic barrier before answer recording. No
+    // worker, transport timing or wall-clock sleep is needed to expose the race.
+    let talks = magi::talk::Talks::open();
+    let talk = magi::talk::begin(&talks, &fx.config, fx.repo.clone(), None).unwrap();
+    let barrier = queue.claim(&task.id).unwrap();
+    assert!(magi::chat_control::decide(&talks, &magi::run::home(), &talk.id, &q.id, &q.choices[0]).is_err());
+    assert!(questions.get(&q.id).unwrap().status.open());
+    drop(barrier);
+    decide_dependency(&fx, &q);
+    // A separate grant process observes the recorded response before the
+    // asynchronous worker runs, including after stores are reopened.
+    refused(&request, "owner effect");
+    let outbox = magi::task_inquiry::Outbox::at(&magi::run::home());
+    assert_eq!(outbox.get(&q.id).unwrap().decision.unwrap().status, magi::task_decision::Status::Queued);
+    let barrier = queue.claim(&task.id).unwrap();
+    assert!(magi::triage::apply_answers(&queue, &questions).is_empty());
+    drop(barrier);
+    assert_eq!(magi::triage::apply_answers(&Queue::open(), &magi::ask::Questions::open()), [task.id.clone()]);
+    // Application is atomic in the task; projection can be repaired after a
+    // crash without executing the answer again.
+    assert!(magi::triage::apply_answers(&Queue::open(), &questions).is_empty());
+    settle_worker_projection();
+    assert_eq!(outbox.get(&q.id).unwrap().decision.unwrap().status, magi::task_decision::Status::Resolved);
+    let receipt = accepted(&request);
+    assert!(receipt["decision"].is_string());
+    assert_eq!(accepted(&request), receipt);
+    let mut resumed = Runner::resume(&request.run).unwrap();
+    resumed.execute().await.unwrap();
+    assert_eq!(resumed.state.repair_grants.len(), 1);
+    assert_eq!(resumed.state.repair_grants[0].spent, 1);
+    assert!(resumed.state.repair_grants[0].succeeded);
+}
+}
+
+common::e2e! {
+async fn historical_unspent_receipt_recovers_only_the_exact_original_answer_once() {
+    let (fx, task, runner, request) = stopped(true).await;
+    // Capture a historical acceptance snapshot. Reconstitute only the old
+    // admission ordering in this fixture; production acceptance now refuses it.
+    accepted(&request);
+    let queue = Queue::open();
+    let mut historical = queue.get(&task.id).unwrap();
+    let q = dependency_question(&historical);
+    let talk = decide_dependency(&fx, &q);
+    let q = magi::ask::Questions::open().get(&q.id).unwrap();
+    historical.repair_grants[0].at = jiff::Timestamp::now();
+    queue.put(&mut historical).unwrap();
+    let original = historical.repair_grants[0].clone();
+    assert_eq!(magi::triage::apply_answers(&queue, &magi::ask::Questions::open()), [task.id.clone()]);
+    settle_worker_projection();
+    let mut resumed = Runner::resume(&request.run).unwrap();
+    assert!(resumed.execute().await.unwrap_err().to_string().contains("owner decision changed"));
+    assert!(RunState::load(&request.run).unwrap().repair_grants.is_empty());
+    let config_before = serde_json::to_value(&runner.state.config).unwrap();
+    let reviews_before = serde_json::to_value(&runner.state.reviews).unwrap();
+    let mut recovery = magi::repair_budget::reconcile::Request {
+        task: task.id.clone(), run: request.run.clone(), head: request.head.clone(), expect_pass: request.expect_pass,
+        receipt: request.request.clone(), question: q.id.clone(), answer_at: q.answered_at.unwrap(),
+        request: "recover-original-answer".into(), reason: "owner approved reconciliation of the original accepted repair".into(),
+    };
+    // An unrelated pending decision is not an admission blocker.
+    let mut other = Task::new("unrelated".into(), "wait".into(), fx.repo.clone(), Source::Human);
+    queue.put(&mut other).unwrap();
+    let unrelated = dependency_question(&other);
+    decide_dependency(&fx, &unrelated);
+    let mut wrong = recovery.clone(); wrong.answer_at = q.asked_at;
+    assert!(magi::repair_budget::reconcile::apply(&queue, &magi::run::home(), wrong).await.is_err());
+    recovery.expect_pass += 1;
+    assert!(magi::repair_budget::reconcile::apply(&queue, &magi::run::home(), recovery.clone()).await.is_err());
+    recovery.expect_pass -= 1;
+    // Existing generic dependency questions are superseded by the explicit
+    // recovery, without turning them into another owner release.
+    let saved = queue.get(&task.id).unwrap();
+    let generic_resume = dependency_question(&saved);
+    decide_dependency(&fx, &generic_resume);
+    magi::triage::apply_answers(&queue, &magi::ask::Questions::open());
+    settle_worker_projection();
+    let after_generic = queue.get(&task.id).unwrap();
+    assert_eq!(after_generic.resumption, saved.resumption, "generic resume must not replace the original application");
+    assert!(after_generic.triage_applied(&generic_resume.id));
+    let generic_effect = magi::task_inquiry::Outbox::at(&magi::run::home()).get(&generic_resume.id).unwrap().decision.unwrap();
+    assert_eq!(generic_effect.status, magi::task_decision::Status::Resolved);
+    assert!(generic_effect.history.last().unwrap().evidence.contains("without release"));
+    let generic = dependency_question(&after_generic);
+    let dependent = {
+        let mut t = Task::new("dependent".into(), "wait".into(), fx.repo.clone(), Source::Human);
+        t.block(vec![task.id.clone()], Some("dependency".into())); queue.put(&mut t).unwrap(); t
+    };
+    let mut held = queue.get(&task.id).unwrap(); held.hold_machine(Some("repair grant held: owner decision changed after acceptance".into())); queue.put(&mut held).unwrap();
+    magi::triage::run_once(&queue, &magi::ask::Questions::open(), None, jiff::Timestamp::now());
+    let notices = magi::task_inquiry::Outbox::at(&magi::run::home()).list().unwrap();
+    assert!(notices.iter().any(|i| i.task == task.id && i.display.contains("reconcile-repair-grant") && i.display.contains(&q.answered_at.unwrap().to_string())));
+    assert_eq!(queue.get(&dependent.id).unwrap().blocked_by, [task.id.clone()]);
+    let receipt = magi::repair_budget::reconcile::apply(&queue, &magi::run::home(), recovery.clone()).await.unwrap();
+    assert_eq!(receipt.grant, original);
+    assert!(receipt.superseded_questions.iter().any(|(id, _)| id == &generic.id));
+    // Terminal/chat use the same operation; a lost reply is safely replayed.
+    let output = magi_cli(&magi::run::home()).args(["task", "control", "reconcile-repair-grant", &task.id,
+        "--run", &request.run, "--head", &request.head, "--expect-pass", &request.expect_pass.to_string(),
+        "--receipt", &request.request, "--question", &q.id, "--answer-at", &q.answered_at.unwrap().to_string(),
+        "--request", &recovery.request, "--reason", &recovery.reason])
+        .env("MAGI_NODE", "chat").env("MAGI_RUN", talk).output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let replay: magi::repair_budget::reconcile::Receipt = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(replay, receipt);
+    let saved = queue.get(&task.id).unwrap();
+    assert_eq!(saved.repair_grants, [original]);
+    assert_eq!(saved.repair_reconciliations.len(), 1);
+    assert_eq!(saved.operator_decided_at, historical.operator_decided_at.or(Some(receipt.decision)));
+    // A later owner hold wins even over an idempotent recovery replay. The
+    // replay returns its old receipt, never queues or releases the task again.
+    magi::chat_control::hold(&queue, &task.id, "owner now refuses repair").unwrap();
+    let held_before = std::fs::read(queue.path_of(&task.id)).unwrap();
+    assert_eq!(magi::repair_budget::reconcile::apply(&queue, &magi::run::home(), recovery.clone()).await.unwrap(), receipt);
+    assert_eq!(std::fs::read(queue.path_of(&task.id)).unwrap(), held_before);
+    let mut later = recovery.clone(); later.request = "another-recovery".into();
+    assert!(magi::repair_budget::reconcile::apply(&queue, &magi::run::home(), later).await.is_err());
+    let mut blocked = Runner::resume(&request.run).unwrap();
+    assert!(blocked.execute().await.is_err());
+    assert!(RunState::load(&request.run).unwrap().repair_grants.is_empty());
+    // Restore the fixture's original application state solely to test the
+    // independent source/contract fences; no production recovery does this.
+    let mut restore = saved.clone(); queue.put(&mut restore).unwrap();
+    let mut changed = magi::ask::Questions::open().get(&q.id).unwrap();
+    changed.summary.push_str(" changed source");
+    magi::ask::Questions::open().put(&mut changed).unwrap();
+    let mut blocked = Runner::resume(&request.run).unwrap();
+    assert!(blocked.execute().await.is_err());
+    assert!(RunState::load(&request.run).unwrap().repair_grants.is_empty());
+    let mut original_q = q.clone(); magi::ask::Questions::open().put(&mut original_q).unwrap();
+    let mut changed = saved.clone(); changed.instruction.push_str(" changed contract"); queue.put(&mut changed).unwrap();
+    let mut blocked = Runner::resume(&request.run).unwrap();
+    assert!(blocked.execute().await.is_err());
+    assert!(RunState::load(&request.run).unwrap().repair_grants.is_empty());
+    let mut restore = saved.clone(); queue.put(&mut restore).unwrap();
+    assert_eq!(serde_json::to_value(&RunState::load(&request.run).unwrap().reviews).unwrap(), reviews_before);
+    let mut resumed = Runner::resume(&request.run).unwrap(); resumed.execute().await.unwrap();
+    assert_eq!(resumed.state.repair_grants[0].spent, 1);
+    assert!(resumed.state.repair_grants[0].succeeded);
+    assert_eq!(serde_json::to_value(&resumed.state.config).unwrap(), config_before);
+    assert_eq!(serde_json::to_value(&resumed.state.reviews[0].reviews).unwrap(), reviews_before[0]["reviews"]);
+    assert_eq!(serde_json::to_value(&resumed.state.reviews[0].e2e).unwrap(), reviews_before[0]["e2e"]);
+    let mut again = Runner::resume(&request.run).unwrap(); again.execute().await.unwrap();
+    assert_eq!(again.state.repair_grants[0].spent, 1);
+    assert_eq!(magi::repair_budget::reconcile::apply(&queue, &magi::run::home(), recovery).await.unwrap(), receipt);
+}
+}

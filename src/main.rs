@@ -723,6 +723,11 @@ enum ControlCmd {
         #[command(flatten)]
         request: magi::repair_budget::Request,
     },
+    /// Reconcile an unimported repair receipt against its original owner answer.
+    ReconcileRepairGrant {
+        #[command(flatten)]
+        request: magi::repair_budget::reconcile::Request,
+    },
     /// Reconcile an uncertain task-local effect without replaying it.
     ReconcileDecision { inquiry: String },
     /// Explicitly confirm no effect remains, including accepted legacy choices.
@@ -838,6 +843,11 @@ enum TaskCmd {
         repo: PathBuf,
     },
 
+    /// Reconcile an unimported receipt without issuing another repair grant.
+    ReconcileRepairGrant {
+        #[command(flatten)]
+        request: magi::repair_budget::reconcile::Request,
+    },
     /// Grant 1..=3 additional repairs and queue the exact stopped run (not merge approval).
     GrantRepair {
         #[command(flatten)]
@@ -3638,6 +3648,27 @@ async fn task_cmd_inner(command: TaskCmd, q: Queue) -> Result<()> {
             Ok(())
         }
 
+        TaskCmd::ReconcileRepairGrant { request } => {
+            if std::env::var("MAGI_NODE").as_deref() == Ok("chat") {
+                println!(
+                    "{}",
+                    control_from_chat(magi::chat_control::Operation::ReconcileRepairGrant {
+                        request
+                    })
+                    .await?
+                );
+            } else {
+                magi::repair_budget::authorize_terminal()?;
+                let receipt = Box::pin(magi::repair_budget::reconcile::apply(
+                    &q,
+                    &magi::run::home(),
+                    request,
+                ))
+                .await?;
+                println!("{}", serde_json::to_string_pretty(&receipt)?);
+            }
+            Ok(())
+        }
         TaskCmd::GrantRepair { request } => {
             if std::env::var("MAGI_NODE").as_deref() == Ok("chat") {
                 println!(
@@ -3667,6 +3698,9 @@ async fn task_cmd_inner(command: TaskCmd, q: Queue) -> Result<()> {
             use magi::chat_control as cc;
             let operation = match op {
                 ControlCmd::Reassign { id, repo } => cc::Operation::Reassign { task: id, repo },
+                ControlCmd::ReconcileRepairGrant { request } => {
+                    cc::Operation::ReconcileRepairGrant { request }
+                }
                 ControlCmd::GrantRepair { request } => cc::Operation::GrantRepair { request },
                 ControlCmd::ReconcileDecision { inquiry } => {
                     cc::Operation::ReconcileDecision { inquiry }
