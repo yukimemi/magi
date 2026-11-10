@@ -265,18 +265,20 @@ async fn execute(
     Ok(match operation {
         Operation::Reassign { task, repo } => {
             let cwd = &talks.get(talk)?.repo;
-            describe(
-                &crate::task_reassign::reassign(
-                    queue,
-                    home,
-                    cwd,
-                    &task,
-                    &repo,
-                    &format!("chat:{talk}"),
-                )
-                .await?,
-                "reassigned",
+            let task = crate::task_reassign::reassign(
+                queue,
+                home,
+                cwd,
+                &task,
+                &repo,
+                &format!("chat:{talk}"),
             )
+            .await?;
+            let mut message = describe(&task, "reassigned");
+            for note in crate::task_reassign::advisory_notes(&task, home) {
+                message.push_str(&format!("\n  {note}"));
+            }
+            message
         }
         Operation::Add { filing } => {
             let mut task = Task::new(filing.title, filing.instruction, filing.repo, filing.source);

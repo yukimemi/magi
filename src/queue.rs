@@ -299,7 +299,7 @@ impl TaskCounts {
 }
 
 /// Audit record and execution boundary for a repository reassignment.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Reassignment {
     /// Original repository.
     pub from: PathBuf,
@@ -1019,6 +1019,11 @@ impl Task {
             run_boundary: self.runs.len(),
         });
         self.repo = repo;
+        self.review_branch = None;
+        self.review_instruction = None;
+        self.pr_recovery = None;
+        self.replacement = None;
+        self.interrupt = false;
         self.resume_override = None;
         self.fresh_start = true;
         self.operator_decided_at = Some(at);
@@ -2640,21 +2645,17 @@ impl Queue {
 
     /// [`Queue::put`] for a caller already holding [`Queue::lock_task`].
     fn put_unlocked(&self, task: &mut Task) -> Result<()> {
-        if let Ok(stored) = self.get(&task.id) {
-            anyhow::ensure!(
-                stored.reassignments.len() == task.reassignments.len(),
-                "task repository assignment changed; reload the task before saving"
-            );
-            if let Some(boundary) = stored.reassignments.last() {
-                anyhow::ensure!(
-                    task.repo == stored.repo
-                        && task.runs.get(..boundary.run_boundary)
-                            == stored.runs.get(..boundary.run_boundary),
-                    "historical repository execution cannot be restarted; reload the task"
-                );
-            }
-        }
         self.merge_stored(task);
+        if let Some(boundary) = task.reassignments.last() {
+            let stored = self.get(&task.id)?;
+            anyhow::ensure!(
+                task.reassignments == stored.reassignments
+                    && task.repo == stored.repo
+                    && task.runs.get(..boundary.run_boundary)
+                        == stored.runs.get(..boundary.run_boundary),
+                "historical repository execution cannot be restarted; reload the task"
+            );
+        }
         self.write_record(task)
     }
 
@@ -2676,6 +2677,16 @@ impl Queue {
     fn merge_stored(&self, task: &mut Task) {
         if let Ok(mut stored) = read_path(&self.path_of(&task.id)) {
             stored.import_chat_notice();
+            if stored.reassignments.len() > task.reassignments.len() {
+                // An older writer may contribute evidence, but cannot restore
+                // old execution selections, status, or runs across the boundary.
+                let stale = std::mem::replace(task, stored.clone());
+                for answer in stale.answers {
+                    if !task.answers.contains(&answer) {
+                        task.answers.push(answer);
+                    }
+                }
+            }
             for receipt in &stored.repair_grants {
                 if !task
                     .repair_grants
@@ -3633,6 +3644,53 @@ fn new_id() -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reassignment_clears_repository_bound_execution_selections() {
+        let mut task = Task::new(
+            "move".into(),
+            "evidence".into(),
+            "old".into(),
+            Source::Human,
+        );
+        task.review_branch = Some("old-review".into());
+        task.review_instruction = Some("old criteria".into());
+        task.pr_recovery = Some(crate::pr_recovery::Selection {
+            url: "https://example.invalid/pull/1".into(),
+            branch: "old-pr".into(),
+            head: "head".into(),
+            source_head: None,
+            source_run: None,
+            source_proof: None,
+            disposition: None,
+            instruction: "old criteria".into(),
+            approved_at: Timestamp::now(),
+        });
+        task.replacement = Some(crate::merge_decision::Replacement {
+            question: "owner".into(),
+            run: "old-run".into(),
+            pr: "https://example.invalid/pull/1".into(),
+            agent: "worker".into(),
+            context: "evidence".into(),
+        });
+        task.resume_override = Some(OperatorResume {
+            question_id: "old-question".into(),
+            at: Timestamp::now(),
+            conductor_rehold: None,
+            forced: true,
+            pinned_run: Some("old-run".into()),
+        });
+        task.interrupt = true;
+        task.reassign_repository("new".into(), "test");
+        assert!(task.review_branch.is_none());
+        assert!(task.review_instruction.is_none());
+        assert!(task.pr_recovery.is_none());
+        assert!(task.replacement.is_none());
+        assert!(task.resume_override.is_none());
+        assert!(!task.interrupt);
+        assert!(task.fresh_start);
+        assert_eq!(task.instruction, "evidence");
+    }
+
     #[test]
     fn explicit_resumption_is_not_invented_for_legacy_or_automatic_release() {
         let t = Task::new(

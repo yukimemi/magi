@@ -98,7 +98,15 @@ async fn reassign_preserves_history_and_executes_with_destination_config_and_sco
     let dest = destination(&f);
     let home = magi::run::home();
     let queue = Queue::open();
-    let (original, old) = stopped(&f, &queue);
+    let (mut original, mut old) = stopped(&f, &queue);
+    original.review_branch = Some("retained-evidence".into());
+    original.review_instruction = Some("old review criteria".into());
+    original.interrupt = true;
+    queue.put(&mut original).unwrap();
+    old.candidates.push(serde_json::from_value(serde_json::json!({
+        "index": 0, "label": "A", "agent": "worker", "branch": "retained-evidence", "worktree": f.repo
+    })).unwrap());
+    old.save().unwrap();
     git(&f.repo, &["branch", "retained-evidence"]);
     let old_json = std::fs::read(home.join("runs").join(&old.id).join("run.json")).unwrap();
     let stale_snapshot = original.clone();
@@ -107,12 +115,30 @@ async fn reassign_preserves_history_and_executes_with_destination_config_and_sco
     assert_eq!(moved.instruction, original.instruction);
     assert_eq!(moved.chat, original.chat);
     assert_eq!(moved.answers, original.answers);
+    assert!(moved.review_branch.is_none());
+    assert!(moved.review_instruction.is_none());
+    assert!(!moved.interrupt);
+    assert!(magi::task_reassign::advisory_notes(&moved, &home).iter().any(|note| note.contains("1 retained branch(es)")));
     assert_eq!(moved.runs, original.runs);
     assert_eq!(moved.status, TaskStatus::Held);
     assert!(moved.execution_runs().is_empty());
     assert!(moved.earlier_attempts().is_empty());
     let mut stale_snapshot = stale_snapshot;
-    assert!(queue.put(&mut stale_snapshot).unwrap_err().to_string().contains("assignment changed"));
+    stale_snapshot.answers.push(magi::queue::AnsweredQuestion { question: "additional evidence?".into(), answer: "preserve it".into() });
+    stale_snapshot.status = TaskStatus::Running;
+    stale_snapshot.interrupt = true;
+    stale_snapshot.resume_override = Some(magi::queue::OperatorResume {
+        question_id: "stale-question".into(), at: jiff::Timestamp::now(),
+        conductor_rehold: None, forced: true, pinned_run: Some(old.id.clone()),
+    });
+    queue.put(&mut stale_snapshot).unwrap();
+    assert_eq!(stale_snapshot.answers.len(), original.answers.len() + 1);
+    assert_eq!(stale_snapshot.repo, dest);
+    assert_eq!(stale_snapshot.status, TaskStatus::Held);
+    assert!(stale_snapshot.resume_override.is_none());
+    assert!(!stale_snapshot.interrupt);
+    assert!(stale_snapshot.fresh_start);
+    assert_eq!(stale_snapshot.runs, original.runs);
     assert!(magi::chat_control::resume(&queue, &home, &old.id).is_err());
     assert!(magi::graph::Runner::resume(&old.id).is_err());
 
@@ -225,6 +251,7 @@ async fn reassign_cli_uses_filing_selectors_and_stale_questions_cannot_resume() 
     let output = common::magi_cli(&home).current_dir(&f.repo)
         .args(["task", "reassign", &task.id, "--repo", "one/same"]).output().unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("2 unanswered question(s)"));
     magi::ask::record_answer(&questions, &q.id, "resume", None).unwrap();
     magi::ask::record_answer(&questions, &conductor.id, "retry", None).unwrap();
     magi::daemon::apply_choice_actions(&queue, &questions, &home).await;
@@ -270,7 +297,24 @@ async fn reassign_preserves_idle_transitions_and_save_failure_is_atomic() {
     assert!(magi::task_reassign::reassign(&queue, &home, &f.repo, &task.id, &dest, "test").await.unwrap_err().to_string().contains("example.invalid/pull/1"));
     assert_eq!(std::fs::read(home.join("runs").join(&run.id).join("run.json")).unwrap(), old_run);
     assert_eq!(std::fs::read(queue.path_of(&task.id)).unwrap(), before);
-    run.pr = None;
+    run.pr.as_mut().unwrap().state = "closed".into();
+    run.merge_decision = Some(magi::merge_decision::Decision {
+        question: "owner-decision".into(),
+        target: magi::merge_decision::Target { pr: "https://example.invalid/pull/1".into(), head: "head".into(), language: "en".into() },
+        choice: magi::merge_decision::WITHDRAW.into(), closed: false,
+        replacement_run: None, replacement_pr: None,
+    });
+    run.save().unwrap();
+    let error = magi::task_reassign::reassign(&queue, &home, &f.repo, &task.id, &dest, "test").await.unwrap_err().to_string();
+    assert!(error.contains("unresolved owner merge decision") && error.contains(&run.id) && error.contains("https://example.invalid/pull/1"), "{error}");
+    assert_eq!(std::fs::read(queue.path_of(&task.id)).unwrap(), before);
+    run.merge_decision.as_mut().unwrap().closed = true;
+    run.status = RunStatus::Landing;
+    run.save().unwrap();
+    let error = magi::task_reassign::reassign(&queue, &home, &f.repo, &task.id, &dest, "test").await.unwrap_err().to_string();
+    assert!(error.contains("is landing") && error.contains(&run.id) && error.contains("https://example.invalid/pull/1"), "{error}");
+    assert_eq!(std::fs::read(queue.path_of(&task.id)).unwrap(), before);
+    run.status = RunStatus::Blocked;
     run.save().unwrap();
     let tmp = queue.path_of(&task.id).with_extension("json.tmp");
     std::fs::create_dir(&tmp).unwrap();

@@ -34,7 +34,6 @@ pub async fn reassign(
     );
     ensure!(
         task.review_of.is_none()
-            && task.review_branch.is_none()
             && task.pr_recovery.is_none()
             && task.replacement.is_none()
             && task.sources.is_empty()
@@ -75,16 +74,8 @@ pub async fn reassign(
             outputs.push(crate::retention::OutputLease::take(&path, true)
                 .with_context(|| format!("run {run} seat/tool outputs are still reserved; wait for process cleanup before reassignment"))?);
         }
-        ensure!(
-            !state.pr_publication_pending && !state.land_sync_pending,
-            "run {run} has an unresolved publication/synchronization receipt; reconcile it through existing run controls first"
-        );
-        if let Some(pr) = &state.pr {
-            ensure!(
-                matches!(pr.state.as_str(), "closed" | "merged"),
-                "run {run} retains PR {}; resolve its disposition through existing landing controls before reassignment; reassignment never closes or adopts a PR",
-                pr.url
-            );
+        if let Some(reason) = reassign_blocker(&state) {
+            anyhow::bail!("{reason}");
         }
         if let Some(approval) = &state.land_approval {
             let question = crate::ask::Questions::at(home.join("questions"))
@@ -161,4 +152,69 @@ pub(crate) fn ensure_current(queue: &Queue, run: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Repository-bound publication and owner decisions must settle before a move.
+fn reassign_blocker(state: &RunState) -> Option<String> {
+    let pr = state
+        .pr
+        .as_ref()
+        .map_or("(no recorded PR)", |pr| pr.url.as_str());
+    let reason = if state.pr_publication_pending || state.land_sync_pending {
+        "has an unresolved publication/synchronization receipt; reconcile it through existing run controls first"
+    } else if state
+        .pr
+        .as_ref()
+        .is_some_and(|pr| !matches!(pr.state.as_str(), "closed" | "merged"))
+    {
+        "retains an open or unknown PR; resolve its disposition through existing landing controls first; reassignment never closes or adopts a PR"
+    } else if state
+        .merge_decision
+        .as_ref()
+        .is_some_and(|decision| !decision.closed)
+    {
+        return Some(format!(
+            "run {} has an unresolved owner merge decision for {}; complete that decision through existing landing controls before reassignment",
+            state.id,
+            state.merge_decision.as_ref().expect("decision").target.pr
+        ));
+    } else if state.status == crate::run::RunStatus::Landing {
+        "is landing a change; finish or resolve landing through existing run controls before reassignment"
+    } else {
+        return None;
+    };
+    Some(format!("run {} (PR {pr}) {reason}", state.id))
+}
+
+/// Advisory evidence only: old branches and unanswered questions stay in place.
+pub fn advisory_notes(task: &Task, home: &Path) -> Vec<String> {
+    let mut branches = std::collections::BTreeSet::new();
+    for run in task
+        .runs
+        .iter()
+        .chain(task.startup_failures.iter().map(|failure| &failure.run))
+    {
+        if let Ok(state) = RunState::load_under(run, home) {
+            for candidate in state.candidates {
+                branches.insert((state.repo.clone(), candidate.branch));
+            }
+        }
+    }
+    let questions = crate::ask::Questions::at(home.join("questions"))
+        .list()
+        .into_iter()
+        .filter(|q| {
+            q.status.open()
+                && (q.run == task.id || task.runs.contains(&q.run))
+                && task.stale_question(q)
+        })
+        .count();
+    let mut notes = Vec::new();
+    if !branches.is_empty() {
+        notes.push(format!("{} retained branch(es) remain in their original repositories; inspect historical runs for branch names before disposing of them", branches.len()));
+    }
+    if questions > 0 {
+        notes.push(format!("{questions} unanswered question(s) are stale and cannot restart earlier repository work"));
+    }
+    notes
 }

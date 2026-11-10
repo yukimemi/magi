@@ -11816,10 +11816,15 @@ function renderTaskActions(task) {
       if (!repo.value.trim()) return;
       reassign.disabled = true;
       try {
-        await postJson(API.reassign(task.id), { repo: repo.value.trim() });
+        const result = await postJson(API.reassign(task.id), { repo: repo.value.trim() });
         taskSheet.repo = "";
         closeTaskActions();
         await host.refresh(task.id);
+        for (const note of result.reassignment_notes || []) {
+          $("task-note").append(el("p", { text: note }));
+          show($("task-note"), true);
+          show($("task-why-panel"), true);
+        }
       } catch (error) {
         host.error(error.message || String(error));
       } finally { reassign.disabled = false; }

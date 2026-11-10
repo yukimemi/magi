@@ -5002,6 +5002,7 @@ struct TaskView {
     #[serde(flatten)]
     task: Task,
     source_label: String,
+    reassignment_notes: Vec<String>,
     source_link: Option<SourceLink>,
     status_str: &'static str,
     /// The instruction, parsed as markdown, for the Queue card's "Full
@@ -5023,6 +5024,7 @@ impl From<Task> for TaskView {
     fn from(task: Task) -> Self {
         Self {
             source_label: task.source.label(),
+            reassignment_notes: Vec::new(),
             source_link: source_link(&task.source),
             status_str: task.status.as_str(),
             instruction_md: md::to_nodes(&task.instruction, &md::ImageBase::None),
@@ -7384,7 +7386,10 @@ async fn queue_reassign(
     let task = crate::task_reassign::reassign(&ui.queue, &home, &ui.repo, &id, &body.repo, "web")
         .await
         .map_err(ApiError::bad_request_from)?;
-    Ok(Json(TaskView::from(task)))
+    let notes = crate::task_reassign::advisory_notes(&task, &home);
+    let mut view = TaskView::from(task);
+    view.reassignment_notes = notes;
+    Ok(Json(view))
 }
 
 async fn queue_release(

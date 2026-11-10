@@ -3232,6 +3232,9 @@ async fn task_cmd_inner(command: TaskCmd, q: Queue) -> Result<()> {
                 )
                 .await?;
                 println!("{} -> {}", task.short(), task.repo.display());
+                for note in magi::task_reassign::advisory_notes(&task, &magi::run::home()) {
+                    println!("  {note}");
+                }
             }
             Ok(())
         }
