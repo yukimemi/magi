@@ -2763,7 +2763,14 @@ impl Queue {
             }
             for receipt in &stored.repair_reconciliations {
                 if !task.repair_reconciliations.contains(receipt) {
+                    // A pre-reconciliation snapshot must preserve the recovery's
+                    // exact-run queue pin and release state with its receipt.
                     task.repair_reconciliations.push(receipt.clone());
+                    task.resume_override = stored.resume_override.clone();
+                    task.status = stored.status;
+                    task.hold_source = stored.hold_source;
+                    task.hold_reason = stored.hold_reason.clone();
+                    task.held_at = stored.held_at;
                 }
             }
             task.superseded_resumes.extend(stored.superseded_resumes);

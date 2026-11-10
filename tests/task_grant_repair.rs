@@ -723,6 +723,20 @@ async fn historical_unspent_receipt_recovers_only_the_exact_original_answer_once
     let receipt = magi::repair_budget::reconcile::apply(&queue, &magi::run::home(), recovery.clone()).await.unwrap();
     assert_eq!(receipt.grant, original);
     assert!(receipt.superseded_questions.iter().any(|(id, _)| id == &generic.id));
+    // A writer loaded before reconciliation must retain the recovery's queue
+    // state and exact-run pin, even though it already knew the original grant.
+    let recovered = queue.get(&task.id).unwrap();
+    assert_eq!(recovered.status, TaskStatus::Queued);
+    assert_eq!(recovered.resume_override.as_ref().unwrap().pinned_run.as_deref(), Some(request.run.as_str()));
+    queue.put(&mut held).unwrap();
+    let after_stale_write = queue.get(&task.id).unwrap();
+    assert_eq!(after_stale_write.repair_grants, recovered.repair_grants);
+    assert_eq!(after_stale_write.repair_reconciliations, recovered.repair_reconciliations);
+    assert_eq!(after_stale_write.resume_override, recovered.resume_override);
+    assert_eq!(after_stale_write.status, recovered.status);
+    assert_eq!(after_stale_write.hold_source, recovered.hold_source);
+    assert_eq!(after_stale_write.hold_reason, recovered.hold_reason);
+    assert_eq!(after_stale_write.held_at, recovered.held_at);
     // Terminal/chat use the same operation; a lost reply is safely replayed.
     let output = magi_cli(&magi::run::home()).args(["task", "control", "reconcile-repair-grant", &task.id,
         "--run", &request.run, "--head", &request.head, "--expect-pass", &request.expect_pass.to_string(),
