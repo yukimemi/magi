@@ -644,7 +644,7 @@ async fn conversation_decision_barriers_fence_acceptance_until_worker_applicatio
     let barrier = queue.claim(&task.id).unwrap();
     assert!(magi::triage::apply_answers(&queue, &questions).is_empty());
     drop(barrier);
-    assert_eq!(magi::triage::apply_answers(&Queue::open(), &magi::ask::Questions::open()), [task.id.clone()]);
+    assert_eq!(magi::triage::apply_answers(&Queue::open(), &magi::ask::Questions::open()), std::slice::from_ref(&task.id));
     // Application is atomic in the task; projection can be repaired after a
     // crash without executing the answer again.
     assert!(magi::triage::apply_answers(&Queue::open(), &questions).is_empty());
@@ -675,7 +675,7 @@ async fn historical_unspent_receipt_recovers_only_the_exact_original_answer_once
     historical.repair_grants[0].at = jiff::Timestamp::now();
     queue.put(&mut historical).unwrap();
     let original = historical.repair_grants[0].clone();
-    assert_eq!(magi::triage::apply_answers(&queue, &magi::ask::Questions::open()), [task.id.clone()]);
+    assert_eq!(magi::triage::apply_answers(&queue, &magi::ask::Questions::open()), std::slice::from_ref(&task.id));
     settle_worker_projection();
     let mut resumed = Runner::resume(&request.run).unwrap();
     assert!(resumed.execute().await.unwrap_err().to_string().contains("owner decision changed"));
@@ -719,7 +719,7 @@ async fn historical_unspent_receipt_recovers_only_the_exact_original_answer_once
     magi::triage::run_once(&queue, &magi::ask::Questions::open(), None, jiff::Timestamp::now());
     let notices = magi::task_inquiry::Outbox::at(&magi::run::home()).list().unwrap();
     assert!(notices.iter().any(|i| i.task == task.id && i.display.contains("reconcile-repair-grant") && i.display.contains(&q.answered_at.unwrap().to_string())));
-    assert_eq!(queue.get(&dependent.id).unwrap().blocked_by, [task.id.clone()]);
+    assert_eq!(queue.get(&dependent.id).unwrap().blocked_by, std::slice::from_ref(&task.id));
     let receipt = magi::repair_budget::reconcile::apply(&queue, &magi::run::home(), recovery.clone()).await.unwrap();
     assert_eq!(receipt.grant, original);
     assert!(receipt.superseded_questions.iter().any(|(id, _)| id == &generic.id));
@@ -846,7 +846,7 @@ async fn superseded_dependency_question_does_not_deadlock_triage_after_repair_fa
     assert!(!resumed.state.repair_grants[0].succeeded);
     let mut held = queue.get(&task.id).unwrap();
     held.hold_machine(Some("authorized repair failed its gate".into())); queue.put(&mut held).unwrap();
-    assert_eq!(queue.get(&dependent.id).unwrap().blocked_by, [task.id.clone()]);
+    assert_eq!(queue.get(&dependent.id).unwrap().blocked_by, std::slice::from_ref(&task.id));
     assert!(!magi::triage::pending_for(&questions, &held));
     let report = magi::triage::run_once(&queue, &questions, None, jiff::Timestamp::now());
     assert!(report.asked.contains(&task.id), "{report:?}");
@@ -854,7 +854,7 @@ async fn superseded_dependency_question_does_not_deadlock_triage_after_repair_fa
         && q.id != generic.id && q.id != original.id && q.status.open()).unwrap();
     assert!(magi::triage::pending_for(&questions, &queue.get(&task.id).unwrap()));
     assert!(magi::triage::open_task_ids(&questions).contains(&task.id));
-    assert_eq!(queue.get(&dependent.id).unwrap().blocked_by, [task.id.clone()]);
+    assert_eq!(queue.get(&dependent.id).unwrap().blocked_by, std::slice::from_ref(&task.id));
     // The replacement question can be answered through the real control route.
     decide_dependency(&fx, &fresh);
     magi::triage::apply_answers(&queue, &questions);
