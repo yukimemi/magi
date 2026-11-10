@@ -6431,21 +6431,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn source_eviction_scan_reaches_old_seats_despite_missing_roots_and_timestamp_churn() {
+    async fn source_eviction_scan_skips_missing_roots_without_spending_inspection_budget() {
+        let f = Fx::new().await;
+        let state = inactive_source(&f, "ffff", true).await;
+        let review = reviewer(&f, &state, &f.base).await;
+        for i in 0..130 {
+            let mut old = state.clone();
+            old.id = format!("20260101-000000-{i:04x}");
+            old.candidates.clear();
+            old.save_under(&f.home).unwrap();
+            // Missing roots with ledger records must still be inspected.
+            if i == 0 {
+                let artifacts = f.home.join("runs").join(&old.id).join("artifacts");
+                std::fs::create_dir_all(&artifacts).unwrap();
+                std::fs::write(artifacts.join("eviction-review-1.json"), "{}").unwrap();
+            }
+        }
+        for pass in 0..2 {
+            let mut report = Report::default();
+            copies::evict(&f.home, &Fx::disk(), Fx::now(), &mut report).await;
+            assert!(report.failures.is_empty(), "{report:?}");
+            assert!(
+                !review.exists(),
+                "eligible tail must be reached in one pass"
+            );
+            assert_eq!(report.evicted_copies, usize::from(pass == 0));
+            let census = source_census(&f.home);
+            assert_eq!(census["current"]["next"], 131);
+            assert!(!census["current"]["completed_at"].is_null());
+            assert_eq!(census["current"]["number"], pass + 1);
+            assert_eq!(
+                census["current"]["runs"]["20260101-000000-0000"]["root"]["outcome"],
+                "error"
+            );
+            assert_eq!(
+                census["current"]["runs"]["20260101-000000-0001"]["root"]["detail"],
+                "root absent and no eviction records; nothing to reclaim"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn source_eviction_scan_reaches_old_seats_despite_empty_roots_and_timestamp_churn() {
         let f = Fx::new().await;
         let mut state = inactive_source(&f, "ffff", true).await;
         let review = reviewer(&f, &state, &f.base).await;
-        // Historical records with no checkout roots used to consume every
-        // discovery slot, while mutable timestamp ordering moved the cursor.
+        // Empty checkout roots still need ownership checks and consume a
+        // discovery slot; mutable timestamp ordering must not move the cursor.
         let mut history = Vec::new();
         for i in 0..130 {
             let mut old = state.clone();
             old.id = format!("20260101-000000-{i:04x}");
             old.candidates.clear();
             old.save_under(&f.home).unwrap();
-            if i % 3 == 0 {
-                std::fs::create_dir_all(old.worktree_root()).unwrap();
-            }
+            std::fs::create_dir_all(old.worktree_root()).unwrap();
             history.push(old);
         }
         state

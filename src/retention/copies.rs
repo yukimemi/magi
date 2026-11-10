@@ -595,7 +595,8 @@ async fn evict_scan(
     status["stage"] = "bounded-scan".into();
     let mut attempted = 0;
     let mut unlinked = 0u64;
-    for _ in 0..64 {
+    let mut inspected_runs = 0;
+    while inspected_runs < 64 {
         if attempted >= LIMIT
             || unlinked >= disk.worktree_reclaim_bytes
             || report.source_evidence_added_logical_bytes >= EVIDENCE_BUDGET
@@ -603,6 +604,7 @@ async fn evict_scan(
             break;
         }
         let Some(id) = scan.next() else { break };
+        let mut has_work = true;
         let mut finished_run = true;
         let mut stage = "discovery";
         let result = async {
@@ -612,6 +614,19 @@ async fn evict_scan(
                 .context("frozen run record disappeared")?;
             let root = listed.worktree_root();
             scan.validate_root(&id, &root)?;
+            if !run_has_work(home, listed)? {
+                has_work = false;
+                scan.root(
+                    &id,
+                    Observation::new(
+                        "inspected",
+                        "discovery",
+                        "root absent and no eviction records; nothing to reclaim",
+                        now,
+                    ),
+                );
+                return Ok(());
+            }
             if root.try_exists()? {
                 ensure!(
                     plain_dir(&root) && root.canonicalize()? == root,
@@ -994,6 +1009,9 @@ async fn evict_scan(
             Ok::<_, anyhow::Error>(())
         }
         .await;
+        if has_work {
+            inspected_runs += 1;
+        }
         // A failed checkpoint must never be silently treated as a completed run.
         if result
             .as_ref()
@@ -1019,6 +1037,34 @@ async fn evict_scan(
     status["scan"] = scan.summary();
     status["outcome"] = "inspected".into();
     Ok(())
+}
+
+// Only proven absent roots without eviction intents can bypass the inspection
+// budget. Symlinks, unreadable paths and ledger records need normal inspection.
+fn run_has_work(home: &Path, state: &RunState) -> Result<bool> {
+    match std::fs::symlink_metadata(state.worktree_root()) {
+        Ok(_) => return Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    let artifacts = home.join("runs").join(&state.id).join("artifacts");
+    match std::fs::symlink_metadata(&artifacts) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e.into()),
+        Ok(_) => ensure!(
+            plain_dir(&artifacts) && artifacts.canonicalize()? == artifacts,
+            "noncanonical artifacts"
+        ),
+    }
+    for (count, entry) in std::fs::read_dir(artifacts)?.enumerate() {
+        ensure!(count < 4096, "eviction record inspection limit exceeded");
+        let name = entry?.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with("eviction-") && name.ends_with(".json") {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn inspection_outcome(error: &anyhow::Error, detail: &str) -> &'static str {
