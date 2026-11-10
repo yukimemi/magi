@@ -191,6 +191,98 @@ print('control completed')
     }
 }
 
+async fn check_head_prefix(legacy: bool, length: usize) {
+    let _home = common::home_lock().await;
+    let mut f = Fixture::new(legacy);
+    let full_head = f.head.clone();
+    for invalid in [
+        full_head[..6].to_owned(),
+        format!("{full_head}0"),
+        "xyz1234".into(),
+        format!(
+            "{}{}",
+            if full_head.starts_with('0') { '1' } else { '0' },
+            &full_head[1..7]
+        ),
+    ] {
+        f.head = invalid;
+        let response = f.recover("invalid").await;
+        assert_eq!(response["ok"], false, "{response}");
+    }
+    f.head = full_head[..length].to_owned();
+    if !legacy {
+        let mut state = f.state();
+        let stop = state.base_sync_recovery.stop.as_mut().unwrap();
+        // Even a matching request prefix must not bless a HEAD
+        // that differs from immutable stop evidence.
+        stop.head = format!("{}0", &full_head[..39]);
+        if stop.head == full_head {
+            stop.head = format!("{}1", &full_head[..39]);
+        }
+        state.save_under(f.tmp.path()).unwrap();
+        let response = f.recover("stale-stop").await;
+        assert_eq!(response["ok"], false, "{response}");
+        assert!(
+            response["err"]
+                .as_str()
+                .unwrap()
+                .contains("recorded stop head")
+        );
+        assert!(f.state().base_sync_recovery.authorizations.is_empty());
+        assert!(!f.receipt("stale-stop").exists());
+        state.base_sync_recovery.stop.as_mut().unwrap().head = full_head.clone();
+        state.save_under(f.tmp.path()).unwrap();
+    }
+    let response = f.recover("prefix").await;
+    assert_eq!(response["ok"], true, "{response}");
+    let state = f.state();
+    assert_eq!(state.base_sync_recovery.authorizations.len(), 1);
+    assert_eq!(
+        state.base_sync_recovery.stop.as_ref().unwrap().head,
+        full_head
+    );
+    assert_eq!(f.queue.get(&f.task.id).unwrap().status, TaskStatus::Queued);
+    let response = f.recover("prefix").await;
+    assert_eq!(response["ok"], true, "{response}");
+    assert_eq!(f.state().base_sync_recovery.authorizations.len(), 1);
+}
+
+common::e2e! {
+    async fn standing_base_recovery_accepts_7_digit_head_and_checks_stop() {
+        check_head_prefix(false, 7).await;
+    }
+}
+
+common::e2e! {
+    async fn standing_base_recovery_accepts_12_digit_head_and_checks_stop() {
+        check_head_prefix(false, 12).await;
+    }
+}
+
+common::e2e! {
+    async fn standing_base_recovery_accepts_40_digit_head_and_checks_stop() {
+        check_head_prefix(false, 40).await;
+    }
+}
+
+common::e2e! {
+    async fn standing_base_recovery_accepts_7_digit_head_historical() {
+        check_head_prefix(true, 7).await;
+    }
+}
+
+common::e2e! {
+    async fn standing_base_recovery_accepts_12_digit_head_historical() {
+        check_head_prefix(true, 12).await;
+    }
+}
+
+common::e2e! {
+    async fn standing_base_recovery_accepts_40_digit_head_historical() {
+        check_head_prefix(true, 40).await;
+    }
+}
+
 #[test]
 fn standing_base_recovery_queues_once_and_repeated_delivery_never_releases_a_new_hold() {
     common::isolated(
@@ -249,6 +341,8 @@ fn standing_base_recovery_restarts_between_authorization_and_queue_publication()
         || async {
             let _home = common::home_lock().await;
             let mut f = Fixture::new(true);
+            let full_head = f.head.clone();
+            f.head.truncate(7);
             let obstruction = f.queue.path_of(&f.task.id).with_extension("json.tmp");
             std::fs::create_dir(&obstruction).unwrap();
             let response = f.recover("interrupted").await;
@@ -269,7 +363,7 @@ fn standing_base_recovery_restarts_between_authorization_and_queue_publication()
             state.save_under(f.tmp.path()).unwrap();
             assert_eq!(f.recover("interrupted").await["ok"], true);
             assert_eq!(f.state().base_sync_recovery.authorizations.len(), 1);
-            assert_eq!(git(&f.repo, &["rev-parse", "HEAD"]), f.head);
+            assert_eq!(git(&f.repo, &["rev-parse", "HEAD"]), full_head);
         },
     );
 }

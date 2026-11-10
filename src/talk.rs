@@ -3264,7 +3264,8 @@ pub fn briefing_for(
          it starts nothing itself). Exhausted base movement needs the owner's explicit \
          recovery request: `magi task control recover-base <full run id> \
          --request <unique-id> --head <retained-head-sha>` through this inherited \
-         control channel. Inspect the retained HEAD first; reuse the same request \
+         control channel. Inspect the retained HEAD first (full SHA or 7+ hex digits); \
+         reuse the same request \
          ID and arguments after interruption. This authorizes one bounded interval \
          and queues the exact existing run; generic resume/release cannot renew it. \
          Do not start a separate run driver. `magi task control hold <task id> \

@@ -41,6 +41,9 @@ control channel instead of starting another run driver:
 magi task control recover-base <saved-run> --request <unique-id> --head <retained-head-sha>
 ```
 
+`--head` accepts the full retained SHA or a prefix of at least seven hex digits.
+The actual HEAD must also match the recorded stop HEAD when present.
+
 This uses the same validated maintenance transition and queues the exact existing
 run for the daemon. Ordinary `task control resume`, generic release and idle
 polling cannot authorize exhaustion recovery. A typed decision can offer

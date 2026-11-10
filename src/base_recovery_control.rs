@@ -58,8 +58,9 @@ pub(crate) async fn recover(queue: &Queue, home: &Path, request: Request) -> Res
         "recovery actor and request must be safe filenames of at most 64 bytes"
     );
     ensure!(
-        request.head.len() == 40 && request.head.bytes().all(|c| c.is_ascii_hexdigit()),
-        "recovery needs a full retained HEAD SHA"
+        (7..=40).contains(&request.head.len())
+            && request.head.bytes().all(|c| c.is_ascii_hexdigit()),
+        "recovery needs a retained HEAD SHA or prefix of 7 to 40 hex digits"
     );
     let dir = home.join("base-recovery-controls").join(&request.actor);
     std::fs::create_dir_all(&dir)?;
@@ -141,7 +142,7 @@ impl Transaction {
         tip: &str,
     ) -> Result<()> {
         ensure!(
-            head == self.request.head,
+            head.starts_with(&self.request.head),
             "retained HEAD changed since the owner request"
         );
         ensure!(

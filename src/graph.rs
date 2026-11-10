@@ -1425,8 +1425,16 @@ impl Runner {
         );
         if let Some(control) = control.as_ref() {
             anyhow::ensure!(
-                head == control.request.head,
+                head.starts_with(&control.request.head),
                 "retained HEAD changed since the owner request"
+            );
+            anyhow::ensure!(
+                state
+                    .base_sync_recovery
+                    .stop
+                    .as_ref()
+                    .is_none_or(|stop| stop.head == head),
+                "retained HEAD differs from the recorded stop head; inspect it first"
             );
         }
         state.ensure_base_episode();

@@ -751,7 +751,7 @@ enum ControlCmd {
         /// Unique request ID; repeat the same ID and arguments after interruption.
         #[arg(long)]
         request: String,
-        /// Full retained HEAD SHA inspected for the owner's request.
+        /// Retained HEAD inspected for the owner's request (full SHA or 7+ hex digits).
         #[arg(long)]
         head: String,
     },

@@ -116,7 +116,7 @@ pub enum Operation {
     RecoverBase {
         /// Exact retained run ID.
         run: String,
-        /// Full retained HEAD inspected for the owner's request.
+        /// Retained HEAD inspected for the owner's request (full SHA or 7+ hex digits).
         head: String,
         /// Durable idempotency key; reuse only for identical arguments.
         request: String,
