@@ -85,6 +85,8 @@ pub struct BlockerView {
     pub reason: Option<String>,
     /// Explanation of the supported next step.
     pub next: String,
+    /// True when progress or scheduler reconciliation needs no operator action.
+    pub resolves_itself: bool,
     /// Existing read-only page route and record id; never a control endpoint.
     pub destination: Option<(&'static str, String)>,
 }
@@ -104,7 +106,7 @@ impl Inventory {
         task.blocked_by.iter().map(|id| {
             let mut view = BlockerView {
                 id: id.clone(), kind: "unavailable", state: self.chain(id, &mut vec![task.id.clone()]),
-                reason: None,
+                reason: None, resolves_itself: false,
                 next: "Inspect the dependency reference with magi task triage; unavailable or ambiguous records cannot safely be treated as resolved.".into(),
                 destination: None,
             };
@@ -113,10 +115,13 @@ impl Inventory {
                     view.id = t.id.clone();
                     view.kind = "task";
                     view.reason = Some(t.title.clone());
+                    view.resolves_itself = matches!(t.status, TaskStatus::Queued | TaskStatus::Running | TaskStatus::Failed | TaskStatus::Parked | TaskStatus::Done);
                     view.next = if t.status == TaskStatus::Done {
                         "Completed; waiting for the scheduler to reconcile this dependency."
                     } else if view.state.contains("cycle") {
                         "Dependency cycle: inspect the linked task and use task triage or its owning chat to correct the wait. A cycle cannot complete on its own."
+                    } else if view.resolves_itself {
+                        "This dependency is still progressing or awaiting scheduler retry. No operator action is needed for this blocker; wait for it to complete."
                     } else {
                         "Open the dependency task to inspect its status, blockers and recovery controls. It must complete before this dependency resolves."
                     }.into();
@@ -133,6 +138,7 @@ impl Inventory {
                         view.id = q.id.clone();
                         view.kind = "decision";
                         view.state = status.as_str().into();
+                        view.resolves_itself = status == QuestionStatus::Answered;
                         view.reason = Some(q.summary.clone());
                         view.next = match status {
                             QuestionStatus::Answered => "Decision recorded; waiting for the scheduler to reconcile this dependency.",
@@ -491,9 +497,13 @@ mod tests {
         let views = inventory.blocker_views(&waiting);
         assert_eq!(views.len(), 4);
         assert_eq!(views[0].destination, Some(("tasks", held.id.clone())));
+        assert!(!views[0].resolves_itself);
+        assert!(views[1].resolves_itself);
         assert!(views[1].next.contains("reconcile"));
         assert_eq!(views[2].state, "missing");
         assert!(views[2].destination.is_none());
+        assert!(!views[2].resolves_itself);
+        assert!(!views[3].resolves_itself);
         assert!(views[3].next.contains("delivery"));
         assert!(views[3].destination.is_none());
         assert!(inventory.blocker_views(&held).is_empty());
@@ -506,6 +516,7 @@ mod tests {
             decision.routed_chat = Some("owning-chat".into());
             let inventory = Inventory::new(vec![waiting.clone()], std::slice::from_ref(&decision));
             let views = inventory.blocker_views(&waiting);
+            assert_eq!(views[3].resolves_itself, status == QuestionStatus::Answered);
             assert_eq!(views[3].id, decision.id);
             assert_eq!(views[3].destination, Some(("chat", "owning-chat".into())));
             assert_eq!(views[3].reason.as_deref(), Some("Choose recovery"));
@@ -518,6 +529,37 @@ mod tests {
             inventory.blocker_views(&waiting)[3].destination,
             Some(("questions", decision.id))
         );
+    }
+
+    #[test]
+    fn blocker_views_distinguish_automatic_progress_from_operator_recovery() {
+        for status in [
+            TaskStatus::Queued,
+            TaskStatus::Running,
+            TaskStatus::Failed,
+            TaskStatus::Parked,
+            TaskStatus::Done,
+            TaskStatus::Held,
+            TaskStatus::Blocked,
+        ] {
+            let dependency = t("dependency", status, &[]);
+            let waiting = t("waiting", TaskStatus::Blocked, &["dependency"]);
+            let inventory = inv(vec![dependency, waiting.clone()]);
+            let views = inventory.blocker_views(&waiting);
+            assert_eq!(
+                views[0].resolves_itself,
+                !matches!(status, TaskStatus::Held | TaskStatus::Blocked),
+                "{status:?}"
+            );
+            if status == TaskStatus::Running {
+                assert!(views[0].next.contains("No operator action"));
+            }
+        }
+        let waiting = t("waiting", TaskStatus::Blocked, &["waiting"]);
+        let inventory = inv(vec![waiting.clone()]);
+        let views = inventory.blocker_views(&waiting);
+        assert!(!views[0].resolves_itself);
+        assert!(views[0].next.contains("cycle"));
     }
 
     #[test]

@@ -6929,6 +6929,14 @@ async fn task_blocker_actions_are_mobile_read_only_navigation() {
     decision.routed_task = Some(held.id.clone());
     decision.routed_chat = Some(chat.id.clone());
     questions.put(&mut decision).unwrap();
+    let mut running = Task::new(
+        "Progressing dependency".into(),
+        "Inspect".into(),
+        fx.repo.clone(),
+        Source::Human,
+    );
+    running.status = TaskStatus::Running;
+    queue.put(&mut running).unwrap();
     let mut blocked = Task::new(
         "Blocked task".into(),
         "Inspect".into(),
@@ -6941,6 +6949,7 @@ async fn task_blocker_actions_are_mobile_read_only_navigation() {
             held.id.clone(),
             decision.id.clone(),
             "missing-record".into(),
+            running.id.clone(),
         ],
         Some("Waiting for recovery decision".into()),
     );
@@ -6954,7 +6963,7 @@ async fn task_blocker_actions_are_mobile_read_only_navigation() {
     browser
         .wait_for(
             &page,
-            "document.querySelectorAll('#task-actions-blockers li').length === 3",
+            "document.querySelectorAll('#task-actions-blockers li').length === 4",
             Duration::from_secs(30),
         )
         .await
@@ -6974,7 +6983,12 @@ async fn task_blocker_actions_are_mobile_read_only_navigation() {
         check(box.textContent.includes('Waiting for recovery decision'), 'dependency reason');
         check(box.textContent.includes('2667941888') && box.textContent.includes('3221225472'), 'disk evidence');
         check(box.textContent.includes('restores held') && box.textContent.includes('not current capacity'), 'recovery semantics');
-        check(box.querySelectorAll('li').length === 3, 'all blockers');
+        check(box.querySelectorAll('li').length === 4, 'all blockers');
+        check(box.textContent.includes('Hold or Cancel do not remove these dependencies'), 'hold is not unblock');
+        check(box.querySelector('h3').textContent === 'Machine hold recovery', 'machine hold heading');
+        const progress = box.querySelectorAll('li')[3].textContent;
+        check(progress.includes('No operator action needed') && progress.includes('wait for it to complete'), 'progressing blocker only needs waiting');
+        check(box.querySelectorAll('li')[0].textContent.includes('Inspect this blocker for resolution or recovery'), 'held dependency needs inspection');
         check(box.querySelectorAll('li')[2].querySelector('a') === null, 'missing record has no guessed link');
         check(box.querySelector('a[href^="#/chat/"]'), 'owning chat navigation');
         check(box.textContent === document.querySelector('#task-blockers').textContent, 'shared detail explanation');
@@ -6991,7 +7005,7 @@ async fn task_blocker_actions_are_mobile_read_only_navigation() {
     browser
         .wait_for(
             &page,
-            "document.querySelector('#task-h').textContent === 'Manually held dependency' && document.querySelector('#task-actions-blockers').textContent.includes('Hold recovery')",
+            "document.querySelector('#task-h').textContent === 'Manually held dependency' && document.querySelector('#task-actions-blockers').textContent.includes('Held, not blocked')",
             Duration::from_secs(30),
         )
         .await
@@ -7001,7 +7015,12 @@ async fn task_blocker_actions_are_mobile_read_only_navigation() {
         const box = document.querySelector('#task-actions-blockers');
         return {text: box.textContent, links: box.querySelectorAll('a').length, writes: window.blockerWrites};
     })()"##).await.unwrap();
-    assert!(result["text"].as_str().unwrap().contains("Hold recovery"));
+    assert!(
+        result["text"]
+            .as_str()
+            .unwrap()
+            .contains("Held, not blocked")
+    );
     assert!(
         result["text"]
             .as_str()
@@ -7014,6 +7033,12 @@ async fn task_blocker_actions_are_mobile_read_only_navigation() {
             .unwrap()
             .contains("Resolve blockers")
     );
+    assert!(
+        result["text"]
+            .as_str()
+            .unwrap()
+            .contains("Manual hold recovery")
+    );
     assert_eq!(result["links"], 0);
     assert_eq!(result["writes"], serde_json::json!([]));
     browser
@@ -7023,7 +7048,7 @@ async fn task_blocker_actions_are_mobile_read_only_navigation() {
     browser
         .wait_for(
             &page,
-            "document.querySelectorAll('#task-actions-blockers li').length === 3",
+            "document.querySelectorAll('#task-actions-blockers li').length === 4",
             Duration::from_secs(30),
         )
         .await

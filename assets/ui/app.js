@@ -11717,8 +11717,12 @@ function renderTaskBlockers(task, box) {
   const visible = status === "blocked" || status === "held";
   show(box, visible);
   if (!visible) return;
-  box.append(el("h2", { text: status === "blocked" ? "Resolve blockers" : "Hold recovery" }));
+  box.append(el("h2", { text: status === "blocked" ? "Resolve blockers" : "Held, not blocked" }));
   if (task.block_reason && status === "blocked") box.append(el("p", { text: `Dependency reason: ${task.block_reason}` }));
+  if (status === "blocked") box.append(el("p", { text: "Hold or Cancel do not remove these dependencies. Each dependency must resolve through its existing controls or finish before the scheduler clears it." }));
+  if (status === "held" || task.hold_reason || task.hold_source) {
+    box.append(el("h3", { text: task.hold_source === "machine" ? "Machine hold recovery" : task.hold_source === "manual" ? "Manual hold recovery" : "Hold recovery" }));
+  }
   if (task.hold_reason) box.append(el("p", { text: `Recorded hold reason: ${task.hold_reason}` }));
   else if (task.last_error) box.append(el("p", { text: `Last recorded failure: ${task.last_error}` }));
   if (task.recovery) box.append(el("p", { text: task.recovery }));
@@ -11731,6 +11735,7 @@ function renderTaskBlockers(task, box) {
     const item = el("li", {},
       el("p", { text: `${blocker.kind}: ${blocker.id} (${blocker.state})` }),
       blocker.reason ? el("p", { text: blocker.reason }) : null,
+      el("p", { text: blocker.resolves_itself ? "No operator action needed for this blocker." : "Inspect this blocker for resolution or recovery." }),
       el("p", { text: blocker.next }));
     const [route, id] = blocker.destination || [];
     if (["tasks", "chat", "questions"].includes(route) && id) {
