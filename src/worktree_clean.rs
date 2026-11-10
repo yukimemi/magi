@@ -71,9 +71,10 @@ pub(crate) async fn reset(state: &mut RunState, wt: &Path, rev: Option<&str>) ->
         crate::repo_lock::SeatLease::operation_with(wt, state.config.coordination.as_ref(), &wait)
             .await?;
     if let Some(rev) = rev {
-        git::git(wt, &["checkout", "--detach", rev]).await?;
+        git::reset_detached_keep_ignored(wt, rev).await?;
+    } else {
+        git::reset_hard_head(wt).await?;
     }
-    git::git(wt, &["reset", "--hard", rev.unwrap_or("HEAD")]).await?;
     drop(coordination);
     let reason = if rev.is_some() {
         "reviewer reset"
@@ -129,7 +130,7 @@ pub(crate) async fn reset(state: &mut RunState, wt: &Path, rev: Option<&str>) ->
             true,
         )
         .await
-        .with_context(|| context.clone());
+        .with_context(|| format!("{context}: git clean was not run"));
         if let Err(error) = result {
             state.event("pre-clean", format!("{error:#}"));
             if let Err(save) = state.save() {
@@ -141,7 +142,7 @@ pub(crate) async fn reset(state: &mut RunState, wt: &Path, rev: Option<&str>) ->
     let _coordination =
         crate::repo_lock::SeatLease::operation_with(wt, state.config.coordination.as_ref(), &wait)
             .await?;
-    git::git(wt, &["clean", "-fdx"])
+    git::clean_all(wt)
         .await
         .with_context(|| format!("{reason}: git clean after pre-clean in {}", wt.display()))?;
     if rev.is_none() {
@@ -304,7 +305,9 @@ mod tests {
         std::fs::write(wt.join("junk"), "keep").unwrap();
         let error = format!("{:#}", reset(&mut state, &wt, None).await.unwrap_err());
         assert!(
-            error.contains("step 1/2") && error.contains("diagnostic"),
+            error.contains("step 1/2")
+                && error.contains("diagnostic")
+                && error.contains("git clean was not run"),
             "{error}"
         );
         assert!(wt.join("junk").exists());
@@ -495,7 +498,9 @@ mod tests {
         std::fs::write(wt.join("junk"), "keep").unwrap();
         let error = format!("{:#}", reset(&mut state, &wt, None).await.unwrap_err());
         assert!(
-            error.contains("timed out") && error.contains("partial"),
+            error.contains("timed out")
+                && error.contains("partial")
+                && error.contains("git clean was not run"),
             "{error}"
         );
         assert!(wt.join("junk").exists());
