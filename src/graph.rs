@@ -1827,6 +1827,12 @@ impl Runner {
                     if grant.receipt.request.kind == Kind::BaseConflict {
                         self.state.base_sync_recovery.stop = None;
                         if let Some(sync) = &mut self.state.base_sync {
+                            sync.tip = grant
+                                .receipt
+                                .request
+                                .tip
+                                .clone()
+                                .context("repair base tip missing")?;
                             sync.conflict = None;
                             sync.behind = 0;
                         }

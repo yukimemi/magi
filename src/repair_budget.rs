@@ -51,7 +51,7 @@ pub struct Request {
     /// Operator's reason, retained verbatim in the receipt.
     #[arg(long)]
     pub reason: String,
-    /// Exact recorded base tip, required for base-conflict repair.
+    /// Exact owner-approved base tip, required for base-conflict repair.
     #[arg(long)]
     #[serde(default)]
     pub tip: Option<String>,
@@ -59,6 +59,10 @@ pub struct Request {
     #[arg(long)]
     #[serde(default)]
     pub instruction: Option<String>,
+    /// Explicitly supersede this unimported base-conflict request after its tip moved.
+    #[arg(long)]
+    #[serde(default)]
+    pub replace_request: Option<String>,
 }
 
 /// Accepted grant and the control state against which it was authorized.
@@ -314,7 +318,7 @@ fn evidence(state: &RunState, request: &Request) -> Result<()> {
             ensure!(
                 stop.kind == crate::base_sync_recovery::StopKind::Conflict
                     && stop.head == request.head
-                    && request.tip.as_ref() == Some(&stop.tip)
+                    && request.tip.is_some()
                     && state.base_sync.as_ref().is_some_and(
                         |s| s.tip == stop.tip && s.conflict.as_ref() == Some(&stop.detail)
                     ),
@@ -356,6 +360,10 @@ fn evidence(state: &RunState, request: &Request) -> Result<()> {
 /// changed here, so a crash cannot leave an unqueued budget mutation.
 pub async fn grant(queue: &Queue, home: &Path, mut request: Request) -> Result<Receipt> {
     ensure!((1..=3).contains(&request.rounds), "rounds must be 1..=3");
+    ensure!(
+        request.replace_request.is_none() || request.kind == Kind::BaseConflict,
+        "only base-conflict grants support --replace-request"
+    );
     ensure!(
         !request.reason.trim().is_empty() && request.reason.len() <= 4096,
         "reason must contain 1..=4096 bytes"
@@ -421,14 +429,55 @@ pub async fn grant(queue: &Queue, home: &Path, mut request: Request) -> Result<R
         state.status.resumable(),
         "repair grant refused: run is final"
     );
-    ensure!(
-        !task
+    let queued: Vec<_> = task
+        .repair_grants
+        .iter()
+        .filter(|receipt| {
+            receipt.request.run == state.id
+                && !superseded(&task, receipt)
+                && !state
+                    .repair_grants
+                    .iter()
+                    .any(|applied| applied.receipt == **receipt)
+        })
+        .collect();
+    if let Some(replaced) = &request.replace_request {
+        let old = task
             .repair_grants
-            .iter()
-            .any(|g| g.request.run == state.id
-                && !state.repair_grants.iter().any(|a| a.receipt == *g)),
-        "repair grant refused: another grant is queued"
-    );
+            .last()
+            .context("replacement refused: no queued grant")?;
+        ensure!(
+            queued.len() == 1
+                && queued[0] == old
+                && old.request.request == *replaced
+                && old.request.kind == Kind::BaseConflict,
+            "replacement refused: --replace-request must name the latest unimported base-conflict grant; imported or dispatched grants cannot be replaced"
+        );
+        ensure!(
+            old.request.head == request.head
+                && old.stop == state.base_sync_recovery.stop
+                && old.request.tip != request.tip,
+            "replacement refused: retained stop/head changed or the approved tip has not moved"
+        );
+        let old_tip = old
+            .request
+            .tip
+            .as_deref()
+            .context("replacement refused: old approval has no base tip")?;
+        let new_tip = request
+            .tip
+            .as_deref()
+            .context("replacement requires --tip")?;
+        ensure!(
+            git::is_ancestor(&state.repo, old_tip, new_tip).await,
+            "replacement refused: new base tip must descend from the old approved tip; reconcile rewritten upstream history explicitly"
+        );
+    } else {
+        ensure!(
+            queued.is_empty(),
+            "repair grant refused: another grant is queued; a stale unimported base-conflict approval requires explicit --replace-request <old-request-id>"
+        );
+    }
     evidence(&state, &request)?;
     head_and_public(&state, &request.head).await?;
     conflict_target(&state, &request, None).await?;
@@ -559,7 +608,7 @@ pub(crate) async fn apply(home: &Path, state: &mut RunState, disk: &RunState) ->
     }
     let id = state.id.clone();
     for receipt in task.repair_grants.iter().filter(|r| r.request.run == id) {
-        if state.repair_grants.iter().any(|g| g.receipt == *receipt) {
+        if superseded(&task, receipt) || state.repair_grants.iter().any(|g| g.receipt == *receipt) {
             continue;
         }
         controls(home, &task, disk, receipt.request.kind)?;
@@ -655,9 +704,40 @@ async fn conflict_target(
         "refs/remotes/{}/{}",
         state.config.merge.remote, state.base_branch
     );
+    let live = git::rev_parse(&state.repo, &tracking).await?;
+    if request.tip.as_ref() != Some(&live) {
+        let imported = state
+            .repair_grants
+            .iter()
+            .any(|grant| grant.receipt.request == *request);
+        ensure!(
+            !imported,
+            "base-conflict repair held: recorded base tip moved to {live}; request {} is already imported. Its reserved operation cannot be retargeted with --replace-request; inspect the saved conflict checkpoint and retained scratch before manual reconciliation",
+            request.request
+        );
+        if stop.is_none() {
+            anyhow::bail!(
+                "base-conflict repair refused: recorded base tip moved to {live}; inspect this target and explicitly request --tip {live}. An already queued approval additionally requires --replace-request <old-request-id>"
+            );
+        }
+        anyhow::bail!(
+            "base-conflict repair held: recorded base tip moved to {live}. Inspect the new target, then explicitly replace the unimported approval with `magi task grant-repair {} --run {} --kind base-conflict --rounds 1 --head {} --tip {live} --expect-pass {} --replace-request {} --request <new-id> --reason <reason> --instruction <approved-resolution>`. No edit or synchronization budget was granted",
+            request.task,
+            request.run,
+            request.head,
+            state.passes.last().map_or(0, |pass| pass.index),
+            request.request
+        );
+    }
+    let stopped = state
+        .base_sync_recovery
+        .stop
+        .as_ref()
+        .context("base-conflict repair requires the retained textual stop")?;
     ensure!(
-        Some(git::rev_parse(&state.repo, &tracking).await?) == request.tip,
-        "base-conflict repair held: recorded base tip moved; inspect the new target and authorize again"
+        git::is_ancestor(&state.repo, &stopped.tip, &live).await,
+        "base-conflict repair refused: current base {live} does not descend from recorded stop tip {}; reconcile the rewritten base explicitly before granting repair",
+        stopped.tip
     );
     Ok(())
 }
@@ -749,4 +829,13 @@ fn failed_conflict_repair_at(state: &RunState, head: &str) -> bool {
         && state.repair_grants.last().is_some_and(|grant| {
             grant.phase == Phase::Complete && !grant.succeeded && grant.head == head
         })
+}
+
+/// A replacement is an append-only task receipt; the old approval is never
+/// imported or dispatched, including after a stale queue writer or restart.
+fn superseded(task: &Task, receipt: &Receipt) -> bool {
+    task.repair_grants.iter().any(|newer| {
+        newer.request.run == receipt.request.run
+            && newer.request.replace_request.as_ref() == Some(&receipt.request.request)
+    })
 }

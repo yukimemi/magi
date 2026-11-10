@@ -93,7 +93,8 @@ not a new branch review. It does not change the saved runtime configuration.
 
 The grant binds the exact stop, HEAD, recorded base tip, pass, task contract and
 owner decision. Admission and execution recheck checkout and PR ownership. A
-moved tracking tip requires inspection and a new authorization; this transition
+moved tracking tip requires inspection and a new authorization; use the explicit
+replacement workflow below if an old approval is still queued. This transition
 does not fetch or grant synchronization budget. Existing episode and lifetime
 synchronization counters remain unchanged.
 
@@ -132,3 +133,38 @@ or `gate` grant can authorize bounded attempts even if the ordinary allowance
 was not exhausted. This exception is confined to that repair lineage and current
 failed head; it neither resets ordinary counters nor authorizes generic release.
 Successful follow-ups also owe guarded delivery to the original checkout.
+
+## Replacing an unused approval after the base advances
+
+If the base advances before a conflict grant is imported, resume refuses with the
+current tip and an explicit replacement command. Inspect that new base and use a
+new request ID, restating the narrow instruction:
+
+```sh
+magi task grant-repair <task> --run <same-run> --kind base-conflict --rounds 1 \
+  --head <same-retained-head> --tip <current-base-tip> \
+  --expect-pass <current-last-pass> --replace-request <old-request-id> \
+  --request <new-request-id> --reason "Inspected the advanced base" \
+  --instruction "Resolve only the approved conflict; preserve both histories"
+```
+
+The chat control command accepts the same options. Replacement is one atomic
+task-ledger append: the old receipt remains immutable and is never imported or
+dispatched. Repeating either request returns its own original receipt and does
+not queue it again. Stale queue writers cannot drop the replacement. A further
+base advancement requires another explicit replacement naming the latest unused
+request. No tracking ref is rewound, no run or stop is replaced, and no ordinary
+synchronization allowance is renewed.
+
+Acceptance repeats the task claim, owner lock, proven-dead driver, execution and
+output leases, HEAD, pass, task criteria, checkout and PR ownership checks. The
+new target must be the observed current tip and descend from both the recorded
+stop tip and the old approval's tip. Rewritten upstream history requires separate
+reconciliation. Imported or dispatched grants cannot be replaced through this
+option: their saved operations and any partial work must be inspected. The refusal
+identifies that restriction rather than claiming a new request will retarget them.
+
+Before any grant has been accepted, the owner may explicitly approve a current
+descendant tip with `--tip`; the original textual stop remains bound as evidence.
+The repaired merge records the newly approved tip and still owes fresh review,
+E2E and gate checks on the same retained run.
