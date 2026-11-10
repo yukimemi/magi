@@ -223,7 +223,9 @@ pub fn post(
     // Fresh consent can predate task ownership. Once the inquiry has its
     // owner, bind that exact response before chat creation/delivery can fail.
     // Saved replies without the live acceptance generation remain history.
-    if q.answer.is_some() && q.accepted_answer_at.is_some() && q.accepted_answer_at == q.answered_at
+    if q.resolution().is_some()
+        && q.accepted_answer_at.is_some()
+        && q.accepted_answer_at == q.answered_at
     {
         accept_fresh_reply(home, q)?;
     }
@@ -1042,6 +1044,17 @@ fn effect_receipt(
             }
         }
         return Ok(None);
+    }
+    if matches!(
+        q.chosen_action(),
+        Some(crate::ask::ChoiceAction::RecoverBase { .. })
+    ) {
+        return crate::base_recovery_control::effect_receipt(
+            home,
+            task.as_ref()
+                .context("base recovery decision has no owning task")?,
+            q,
+        );
     }
     if let Some(action) = q.chosen_action().filter(|a| a.maintenance()) {
         let path = home.join("choice-actions").join(format!("{}.json", q.id));

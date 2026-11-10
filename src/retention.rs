@@ -6531,7 +6531,9 @@ mod tests {
                 // before already visited records makes its next 64 slots revisit
                 // those roots, excluding the eligible tail again. Repeating this
                 // bookkeeping permutation can keep the tail out indefinitely.
-                let older = Timestamp::now() - jiff::SignedDuration::from_secs(100);
+                // Anchor the permutation to the saved tail, so a slow scan
+                // cannot move these records past it as wall-clock time advances.
+                let older = state.updated_at - jiff::SignedDuration::from_secs(100);
                 for old in history.iter_mut().take(128) {
                     if f.home.join("runs").join(&old.id).exists() {
                         old.save_under_at(&f.home, older).unwrap();

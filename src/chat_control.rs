@@ -38,6 +38,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail, ensure};
 
+/// Immutable synchronization stop evidence offered by a recovery decision.
+pub use crate::base_sync_recovery::Stop as BaseRecoveryStop;
 use crate::queue::{Queue, Task, TaskStatus};
 use crate::talk::{Talk, Talks};
 
@@ -108,6 +110,15 @@ pub enum Operation {
         /// Full head SHA the chat just read from the forge.
         head: String,
         /// Idempotency key minted by the chat agent.
+        request: String,
+    },
+    /// Authorize one bounded base-recovery interval and queue the existing run.
+    RecoverBase {
+        /// Exact retained run ID.
+        run: String,
+        /// Retained HEAD inspected for the owner's request (full SHA or 7+ hex digits).
+        head: String,
+        /// Durable idempotency key; reuse only for identical arguments.
         request: String,
     },
     /// 既存 run の再開を queue に登録する。
@@ -243,14 +254,17 @@ pub async fn dispatch(
     talk: &str,
     operation: Operation,
 ) -> Result<String> {
-    if matches!(&operation, Operation::Reassign { .. }) {
+    if matches!(
+        &operation,
+        Operation::Reassign { .. } | Operation::RecoverBase { .. }
+    ) {
         #[cfg(unix)]
         {
-            return bridge::request(&operation).context("repository reassignment requires the authenticated chat control channel; restart this chat turn through the launcher");
+            return bridge::request(&operation).context("this operation requires the authenticated chat control channel; restart this chat turn through the launcher");
         }
         #[cfg(windows)]
         {
-            return bridge::request(&operation).await.context("repository reassignment requires the authenticated chat control channel; restart this chat turn through the launcher");
+            return bridge::request(&operation).await.context("this operation requires the authenticated chat control channel; restart this chat turn through the launcher");
         }
         #[cfg(not(any(unix, windows)))]
         {
@@ -410,6 +424,32 @@ async fn execute(
             serde_json::to_string(
                 &Box::pin(crate::repair_budget::grant(queue, home, request)).await?,
             )?
+        }
+        Operation::RecoverBase { run, head, request } => {
+            let result = Box::pin(crate::base_recovery_control::recover(
+                queue,
+                home,
+                crate::base_recovery_control::Request {
+                    run,
+                    head,
+                    request,
+                    actor: talk.to_owned(),
+                    decision: None,
+                    expected_stop: None,
+                },
+            ))
+            .await?;
+            if result.repeated {
+                format!(
+                    "This base-recovery request was already applied to task {}; inspect its current status before continuing",
+                    result.task.id
+                )
+            } else {
+                format!(
+                    "{}; bounded base recovery authorized; the daemon resumes the exact run under its execution lease",
+                    describe(&result.task, "recovery queued for")
+                )
+            }
         }
         Operation::Resume { run } => {
             let t = resume(queue, home, &run)?;

@@ -2877,6 +2877,10 @@ pub fn conduct(
          {\"do\":\"releasetask\",\"task\":\"<task id>\",\"held_at\":\"<hold timestamp>\",\"reason\":\"<exact hold reason>\"}, \
          {\"do\":\"rerunchecks\",\"repo\":\"<repo>\",\"pr\":\"<PR URL>\",\"head\":\"<head SHA>\",\"runs\":[\"<failed workflow run id>\"]}, \
          or {\"do\":\"abandonrun\",\"run\":\"<stale predecessor id>\"}. \
+         Exhausted base movement requires an explicit recovery choice, never generic resume: \
+         {\"do\":\"recoverbase\",\"run\":\"<exact run id>\",\"stop\":<exact base_sync_recovery.stop object>,\"episode\":<current episode id>}. \
+         Copy the recorded exhausted stop and active episode; missing evidence permits hold only. \
+         This queues the existing owner through bounded base recovery, never a second driver. \
          Never offer operator record edits, shell commands, or an unmapped choice. \
          When facts needed to bind an action are unknown, offer hold only. \
          The daemon applies the chosen queue operation; neither answer overrides the liveness judge.\n\n\

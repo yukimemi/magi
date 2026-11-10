@@ -983,7 +983,8 @@ where
     }
     match action {
         a if a.maintenance() => ActionDecision::Skip,
-        ask::ChoiceAction::ResumeRun { .. }
+        ask::ChoiceAction::RecoverBase { .. }
+        | ask::ChoiceAction::ResumeRun { .. }
         | ask::ChoiceAction::ReleaseTask { .. }
         | ask::ChoiceAction::RerunChecks { .. }
         | ask::ChoiceAction::AbandonRun { .. } => unreachable!(),
@@ -1273,6 +1274,37 @@ async fn apply_maintenance_choices(queue: &Queue, questions: &Questions, home: &
                 || q.routed_task.as_deref() == Some(&task.id))
                 && task.stale_question(&q)
         }) {
+            continue;
+        }
+        if let ask::ChoiceAction::RecoverBase { run, stop, episode } = action {
+            let tasks = queue.list();
+            let owner = crate::task_chat::task_of(&q, &tasks);
+            if let Some(owner) = owner
+                && q.routed_task
+                    .as_deref()
+                    .is_none_or(|routed| routed == owner)
+            {
+                let result = crate::base_recovery_control::recover(
+                    queue,
+                    home,
+                    crate::base_recovery_control::Request {
+                        run: run.clone(),
+                        head: stop.head.clone(),
+                        actor: "decisions".into(),
+                        request: q.id.clone(),
+                        decision: Some((owner, q.answered_at.unwrap_or(q.asked_at))),
+                        expected_stop: Some((stop.clone(), *episode)),
+                    },
+                )
+                .await;
+                if let Err(error) = result {
+                    tracing::warn!(question = %q.id, %error, "base recovery decision refused");
+                    notices::raise_in(home, Notice::warn(
+                        &format!("base-recovery:{}", q.id),
+                        format!("Base recovery decision {} was refused: {error:#}. Inspect the existing run and request; no replacement run was started.", q.id),
+                    ).link(Link::Run { id: run.clone() }));
+                }
+            }
             continue;
         }
         let dir = home.join("choice-actions");

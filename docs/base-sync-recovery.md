@@ -34,8 +34,32 @@ Inspect the retained changes and ownership, then authorize a new finite interval
 magi run --resume <saved-run> --recover-base
 ```
 
-A new explicit owner queue resumption after an exhaustion stop uses the same
-recovery machinery. A generic release or idle polling cannot authorize it.
+From a standing chat, on the owner's explicit recovery request, use the inherited
+control channel instead of starting another run driver:
+
+```sh
+magi task control recover-base <saved-run> --request <unique-id> --head <retained-head-sha>
+```
+
+`--head` accepts the full retained SHA or a prefix of at least seven hex digits.
+The actual HEAD must also match the recorded stop HEAD when present.
+
+This uses the same validated maintenance transition and queues the exact existing
+run for the daemon. Ordinary `task control resume`, generic release and idle
+polling cannot authorize exhaustion recovery. A typed decision can offer
+`{"do":"recoverbase","run":"<saved-run>","stop":<exact saved stop>,"episode":<active interval id>}`;
+its answer must still belong to the eligible owning task, agree with routed
+ownership and remain newer than other owner decisions.
+
+The request receipt records `started` evidence before authorization, saves the
+request key on the authorization, then atomically saves an exact-run pin and a
+completion marker on the task before recording completion. Repeat the same ID
+and arguments after interruption. An unconsumed matching authorization can
+complete queue publication; changed stop, HEAD, fetched base, instructions or
+owner decisions refuse it. A completed request returns its prior result without
+re-authorizing or queueing again, even after consumption or a later hold. Never
+reuse an ID with changed arguments. Receipts live in `base-recovery-controls/`.
+
 Authorization takes the existing owner lock and execution maintenance lease and
 rejects live/unknown drivers (including descendants), transferred ownership,
 non-latest runs, dirty trees and branch/worktree mismatches. Publication and
@@ -112,7 +136,10 @@ or incomplete evidence stays intact for inspection and grants no new attempt.
 
 ## Verification
 
-Run `cargo test --locked --lib base_recovery` for the recovery state-machine and
-real-Git scratch-rebase scenarios, then the full `cargo make check` gate. The
+Run `RUSTUP_TOOLCHAIN=stable cargo test --locked --test chat_base_recovery` for
+the inherited standing-control bridge, request receipts, crash boundaries,
+routed decisions and refusal guards. Run `cargo test --locked --lib base_recovery`
+for the recovery state-machine and real-Git scratch-rebase scenarios, then the
+full `cargo make check` gate. The
 legacy paused-conflict fixture has no recorded agent outage; it must retain
 `RebaseFixRecord::outage = None` when the record gains outage bookkeeping.

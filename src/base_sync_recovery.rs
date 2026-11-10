@@ -48,6 +48,15 @@ pub struct Stop {
 pub struct Authorization {
     #[serde(default)]
     pub scope: Option<Scope>,
+    /// Standing-control request key, absent for terminal recovery.
+    #[serde(default)]
+    pub request: Option<String>,
+    /// Owner decision retained by the exact queue transition.
+    #[serde(default)]
+    pub decision: Option<Timestamp>,
+    /// Exact routed decision, when recovery came from a typed owner choice.
+    #[serde(default)]
+    pub question: Option<String>,
     /// Older approvals authorized one attempt only.
     #[serde(default)]
     pub interval: bool,
@@ -216,7 +225,7 @@ impl RunState {
                 if self.base_recovery_pending() {
                     format!("{why}Approval recorded; resume the retained run to open the approved bounded synchronization interval")
                 } else {
-                    format!("{why}Authorize a new bounded synchronization interval with `magi run --resume {} --recover-base`, or a new owner resumption approval", self.id)
+                    format!("{why}Authorize a new bounded synchronization interval with `magi run --resume {} --recover-base`, or, from a standing chat, `magi task control recover-base {} --request <unique-id> --head {}`", self.id, self.id, self.base_sync_recovery.stop.as_ref().unwrap().head)
                 }
             },
             Some(StopKind::Conflict) => {
@@ -521,6 +530,9 @@ impl RunState {
         );
         self.base_sync_recovery.authorizations.push(Authorization {
             scope: None,
+            request: None,
+            decision: None,
+            question: None,
             interval: true,
             invalidated: None,
             task: task.to_owned(),

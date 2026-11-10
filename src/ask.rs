@@ -253,6 +253,15 @@ pub enum ChoiceAction {
         /// The run to continue. Must still be the task's latest run.
         run: String,
     },
+    /// Authorize exhausted base movement on this exact stop and queue its owner.
+    RecoverBase {
+        /// Full retained execution ID.
+        run: String,
+        /// Immutable stop including the retained HEAD and stop kind.
+        stop: crate::chat_control::BaseRecoveryStop,
+        /// Active synchronization interval observed when offering the choice.
+        episode: usize,
+    },
     /// Resume a named execution through the shared driver service.
     ResumeRun {
         /// Exact run ID; never a prefix resolved at application time.
@@ -296,7 +305,8 @@ impl ChoiceAction {
     pub fn maintenance(&self) -> bool {
         matches!(
             self,
-            Self::ResumeRun { .. }
+            Self::RecoverBase { .. }
+                | Self::ResumeRun { .. }
                 | Self::ReleaseTask { .. }
                 | Self::RerunChecks { .. }
                 | Self::AbandonRun { .. }
@@ -391,6 +401,10 @@ impl ChoiceAction {
     pub fn describe(&self) -> String {
         match self {
             Self::Resume { run } => format!("resume run {}", short(run)),
+            Self::RecoverBase { run, .. } => format!(
+                "authorize bounded base recovery and queue run {}",
+                short(run)
+            ),
             Self::ResumeRun { run } => format!("resume run {}", short(run)),
             Self::ReleaseTask { task, .. } => format!("release held task {}", short(task)),
             Self::RerunChecks { pr, .. } => format!("rerun failed checks of {pr} once"),

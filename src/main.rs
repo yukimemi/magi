@@ -744,7 +744,18 @@ enum ControlCmd {
         #[arg(long)]
         request: String,
     },
-    /// Queue a stopped, blocked or parked run to be resumed by the loop.
+    /// Explicitly authorize bounded recovery of exhausted base movement and queue this run.
+    RecoverBase {
+        /// Full retained run ID; must still be its task's latest execution.
+        run: String,
+        /// Unique request ID; repeat the same ID and arguments after interruption.
+        #[arg(long)]
+        request: String,
+        /// Retained HEAD inspected for the owner's request (full SHA or 7+ hex digits).
+        #[arg(long)]
+        head: String,
+    },
+    /// Queue a stopped, blocked or parked run (does not recover exhausted base movement).
     Resume {
         /// Full run id.
         run: String,
@@ -3681,6 +3692,9 @@ async fn task_cmd_inner(command: TaskCmd, q: Queue) -> Result<()> {
                     request,
                 },
                 ControlCmd::Resume { run } => cc::Operation::Resume { run },
+                ControlCmd::RecoverBase { run, head, request } => {
+                    cc::Operation::RecoverBase { run, head, request }
+                }
                 ControlCmd::Hold { id, reason } => cc::Operation::Hold {
                     task: id,
                     reason: reason.join(" "),

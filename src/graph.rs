@@ -1341,10 +1341,10 @@ impl Runner {
         Ok(())
     }
 
-    /// Authorize exactly one additional rebase, under the caller's queue task
+    /// Authorize one bounded synchronization interval, under the caller's queue task
     /// claim and the same owner/execution locks used by run maintenance.
     pub async fn authorize_base_recovery(home: &Path, id: &str, task: &str) -> Result<()> {
-        Self::authorize_base_recovery_request(home, id, task, false).await
+        Self::authorize_base_recovery_request(home, id, task, false, None).await
     }
 
     /// Queue release uses its durable approval generation exactly once.
@@ -1353,7 +1353,16 @@ impl Runner {
         id: &str,
         task: &str,
     ) -> Result<()> {
-        Self::authorize_base_recovery_request(home, id, task, true).await
+        Self::authorize_base_recovery_request(home, id, task, true, None).await
+    }
+
+    pub(crate) async fn authorize_base_recovery_control(
+        home: &Path,
+        task: &str,
+        control: &mut crate::base_recovery_control::Transaction,
+    ) -> Result<()> {
+        let id = control.request.run.clone();
+        Self::authorize_base_recovery_request(home, &id, task, false, Some(control)).await
     }
 
     async fn authorize_base_recovery_request(
@@ -1361,6 +1370,7 @@ impl Runner {
         id: &str,
         task: &str,
         resumption: bool,
+        mut control: Option<&mut crate::base_recovery_control::Transaction>,
     ) -> Result<()> {
         let _owner = crate::pr_head::owner_lock(home, id)?;
         let mut state = RunState::load_under(id, home)?;
@@ -1413,9 +1423,23 @@ impl Runner {
             git::rev_parse(&state.repo, &format!("refs/heads/{}", winner.branch)).await? == head,
             "retained worktree does not match the winner branch"
         );
+        if let Some(control) = control.as_ref() {
+            anyhow::ensure!(
+                head.starts_with(&control.request.head),
+                "retained HEAD changed since the owner request"
+            );
+            anyhow::ensure!(
+                state
+                    .base_sync_recovery
+                    .stop
+                    .as_ref()
+                    .is_none_or(|stop| stop.head == head),
+                "retained HEAD differs from the recorded stop head; inspect it first"
+            );
+        }
         state.ensure_base_episode();
         state.record_base_sync_stop(&head);
-        state.save()?;
+        state.save_under(home)?;
         let fetched =
             git::fetch(&state.repo, &state.config.merge.remote, &state.base_branch).await?;
         anyhow::ensure!(
@@ -1427,6 +1451,22 @@ impl Runner {
             &format!("{}/{}", state.config.merge.remote, state.base_branch),
         )
         .await?;
+        if let Some(control) = control.as_deref_mut() {
+            let queue = crate::queue::Queue::at(home.join("queue"));
+            control.prepare(&queue, &state, &queued, &head, &approved_tip)?;
+            if let Some(prior) = state
+                .base_sync_recovery
+                .authorizations
+                .iter()
+                .find(|a| a.request.as_deref() == Some(&control.key()))
+            {
+                anyhow::ensure!(
+                    !prior.consumed && prior.invalidated.is_none() && state.base_recovery_pending(),
+                    "recovery request was consumed or invalidated; it cannot queue again"
+                );
+                return control.enqueue(&queue);
+            }
+        }
         if resumption {
             anyhow::ensure!(
                 crate::daemon::compatible_run_instruction(&state, &queued),
@@ -1455,11 +1495,25 @@ impl Runner {
             instruction: queued.instruction.clone(),
             episode,
         });
+        if let Some(control) = control.as_deref_mut() {
+            let authorization = state.base_sync_recovery.authorizations.last_mut().unwrap();
+            authorization.request = Some(control.key());
+            authorization.generation = control.generation();
+            authorization.decision = control.decision();
+            authorization.question = control
+                .request
+                .decision
+                .as_ref()
+                .map(|_| control.request.request.clone());
+        }
         state.event(
             "base-recovery",
             "owner authorized a bounded base synchronization interval; fresh verification required",
         );
-        state.save()?;
+        state.save_under(home)?;
+        if let Some(control) = control {
+            control.enqueue(&crate::queue::Queue::at(home.join("queue")))?;
+        }
         Ok(())
     }
 
@@ -5605,6 +5659,21 @@ impl Runner {
                     .is_none_or(|g| t.resumption.as_ref().is_some_and(|r| r.generation == g))
             }) {
                 Some("owner approval generation changed")
+            } else if authorization.question.as_ref().is_some_and(|question| {
+                !crate::base_recovery_control::decision_current(
+                    &crate::queue::Queue::at(crate::run::home().join("queue")),
+                    &self.state,
+                    &authorization.task,
+                    question,
+                )
+            }) {
+                Some("recovery decision ownership, routing or stop evidence changed")
+            } else if authorization.request.is_some()
+                && !owner
+                    .as_ref()
+                    .is_ok_and(|t| t.operator_decided_at == authorization.decision)
+            {
+                Some("owner decision changed")
             } else if let Some(scope) = &authorization.scope {
                 if scope.tip != tip {
                     Some("fetched base changed")
@@ -16670,6 +16739,94 @@ mod tests {
         runner.sync_to_base().await.unwrap();
         assert_eq!(runner.state.status, RunStatus::Blocked);
         (tmp, runner, head, task.id)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn base_recovery_control_rechecks_owner_decision_and_routing_at_consumption() {
+        for routed in [false, true] {
+            let (_tmp, mut runner, head, owner) = exhausted_base_fixture().await;
+            let home = crate::run::home();
+            let queue = crate::queue::Queue::open();
+            let task = queue.get(&owner).unwrap();
+            runner.state.task_instruction = Some(task.instruction.clone());
+            runner.state.driver_exited = true;
+            runner.state.save().unwrap();
+            let questions = crate::ask::Questions::at(home.join("questions"));
+            let mut q = crate::ask::Question::new(
+                runner.state.id.clone(),
+                "base-recovery".into(),
+                "owner".into(),
+                "Recover bounded base movement?".into(),
+                String::new(),
+                vec!["recover".into()],
+            );
+            q.actions.insert(
+                "recover".into(),
+                crate::ask::ChoiceAction::RecoverBase {
+                    run: runner.state.id.clone(),
+                    stop: runner.state.base_sync_recovery.stop.clone().unwrap(),
+                    episode: runner.state.base_sync_recovery.episodes.last().unwrap().id,
+                },
+            );
+            q.routed_task = Some(owner.clone());
+            q.answer(crate::ask::Answer::Choice("recover".into()))
+                .unwrap();
+            questions.put(&mut q).unwrap();
+            crate::base_recovery_control::recover(
+                &queue,
+                &home,
+                crate::base_recovery_control::Request {
+                    run: runner.state.id.clone(),
+                    head: head.clone(),
+                    actor: "decisions".into(),
+                    request: q.id.clone(),
+                    decision: Some((owner.clone(), q.answered_at.unwrap())),
+                    expected_stop: Some((
+                        runner.state.base_sync_recovery.stop.clone().unwrap(),
+                        runner.state.base_sync_recovery.episodes.last().unwrap().id,
+                    )),
+                },
+            )
+            .await
+            .unwrap();
+            if routed {
+                questions
+                    .update(&q.id, |q| {
+                        q.routed_task = Some("another-owner".into());
+                        Ok(())
+                    })
+                    .unwrap();
+            } else {
+                let mut task = queue.get(&owner).unwrap();
+                task.hold_manual(Some("new owner decision".into()));
+                // Keep the generation to exercise the separate owner-decision binding.
+                task.status = crate::queue::TaskStatus::Queued;
+                queue.put(&mut task).unwrap();
+            }
+            runner.state = RunState::load(&runner.state.id).unwrap();
+            runner.sync_to_base().await.unwrap();
+            let approval = runner
+                .state
+                .base_sync_recovery
+                .authorizations
+                .last()
+                .unwrap();
+            assert!(approval.consumed);
+            assert!(approval.invalidated.as_ref().unwrap().contains(if routed {
+                "routing"
+            } else {
+                "owner decision"
+            }));
+            assert_eq!(
+                runner.state.base_sync.as_ref().unwrap().attempts,
+                BASE_SYNC_ROUNDS
+            );
+            assert_eq!(
+                git::rev_parse(&runner.state.repo, "HEAD").await.unwrap(),
+                head
+            );
+        }
     }
 
     #[cfg(unix)]
