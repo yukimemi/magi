@@ -6894,3 +6894,249 @@ async fn long_chat_open_and_switch_position_immediately() {
     }
 }
 }
+
+#[tokio::test]
+async fn task_blocker_actions_are_mobile_read_only_navigation() {
+    let Some(chrome) = cdp::find_chrome() else {
+        assert!(std::env::var_os("CI").is_none(), "Chrome required in CI");
+        eprintln!("SKIP task blockers: no Chrome");
+        return;
+    };
+    let guard = common::home_lock().await;
+    let fx = common::fixture(guard, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("magi-home");
+    let queue = Queue::at(home.join("queue"));
+    let talks = Talks::at(home.join("talks"));
+    let chat = talk::begin(&talks, &fx.config, fx.repo.clone(), None).unwrap();
+    let mut held = Task::new(
+        "Manually held dependency".into(),
+        "Inspect".into(),
+        fx.repo.clone(),
+        Source::Human,
+    );
+    held.hold_manual(Some("Operator maintenance".into()));
+    held.chat = Some(chat.id.clone());
+    queue.put(&mut held).unwrap();
+    let questions = magi::ask::Questions::at(home.join("questions"));
+    let mut decision = magi::ask::Question::new(
+        "run".into(),
+        "node".into(),
+        "seat".into(),
+        "Choose recovery".into(),
+        "Recovery context".into(),
+        vec![],
+    );
+    decision.routed_task = Some(held.id.clone());
+    decision.routed_chat = Some(chat.id.clone());
+    questions.put(&mut decision).unwrap();
+    let mut running = Task::new(
+        "Progressing dependency".into(),
+        "Inspect".into(),
+        fx.repo.clone(),
+        Source::Human,
+    );
+    running.status = TaskStatus::Running;
+    queue.put(&mut running).unwrap();
+    let mut blocked = Task::new(
+        "Blocked task".into(),
+        "Inspect".into(),
+        fx.repo.clone(),
+        Source::Human,
+    );
+    blocked.hold_machine(magi::disk::gate(2_667_941_888, 3_221_225_472));
+    blocked.block(
+        vec![
+            held.id.clone(),
+            decision.id.clone(),
+            "missing-record".into(),
+            running.id.clone(),
+        ],
+        Some("Waiting for recovery decision".into()),
+    );
+    queue.put(&mut blocked).unwrap();
+    let mut disk_held = Task::new(
+        "Held disk recovery".into(),
+        "Inspect".into(),
+        fx.repo.clone(),
+        Source::Human,
+    );
+    disk_held.hold_machine(magi::disk::gate(2_667_941_888, 3_221_225_472));
+    disk_held.chat = Some(chat.id.clone());
+    queue.put(&mut disk_held).unwrap();
+    let mut recovery = magi::ask::Question::new(
+        disk_held.id.clone(),
+        magi::triage::NODE.into(),
+        "triage".into(),
+        "Resume disk recovery?".into(),
+        String::new(),
+        vec![],
+    );
+    recovery.routed_task = Some(disk_held.id.clone());
+    recovery.routed_chat = Some(chat.id.clone());
+    questions.put(&mut recovery).unwrap();
+    let base = serve(&home, queue.clone(), talks, home.join("runs"), &fx.repo).await;
+    let mut browser = cdp::Browser::launch(&chrome).await.unwrap();
+    let page = browser
+        .open_page(&format!("{base}#/tasks/{}", blocked.id), 390, 844, true)
+        .await
+        .unwrap();
+    browser
+        .wait_for(
+            &page,
+            "document.querySelectorAll('#task-actions-blockers li').length === 4",
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+    let result = browser.eval(&page, r##"(() => {
+        const check = (ok, msg) => { if (!ok) throw new Error(msg); };
+        window.blockerWrites = [];
+        const fetch = window.fetch;
+        window.fetch = (url, options) => {
+            // Reference lookup uses a read-only bulk POST while rendering text.
+            if (options?.method && options.method !== 'GET' && url !== '/api/references') window.blockerWrites.push([url, options.method]);
+            return fetch(url, options);
+        };
+        document.querySelector('#task-actions-fab').click();
+        const box = document.querySelector('#task-actions-blockers');
+        check(box.getBoundingClientRect().top < innerHeight, 'blockers first in sheet');
+        check(box.textContent.includes('Waiting for recovery decision'), 'dependency reason');
+        check(box.textContent.includes('2667941888') && box.textContent.includes('3221225472'), 'disk evidence');
+        check(box.textContent.includes('restores held') && box.textContent.includes('not current capacity'), 'recovery semantics');
+        check(box.querySelectorAll('li').length === 4, 'all blockers');
+        check(box.textContent.includes('Hold overrides this dependency wait and clears its dependency references'), 'hold overrides rather than preserves dependencies');
+        check(box.querySelector('h3').textContent === 'Machine hold recovery', 'machine hold heading');
+        const progress = box.querySelectorAll('li')[3].textContent;
+        check(progress.includes('No operator action needed') && progress.includes('wait for it to complete'), 'progressing blocker only needs waiting');
+        check(box.querySelectorAll('li')[0].textContent.includes('Inspect this blocker for resolution or recovery'), 'held dependency needs inspection');
+        check(box.querySelectorAll('li')[2].querySelector('a') === null, 'missing record has no guessed link');
+        check(box.querySelector('a[href^="#/chat/"]'), 'owning chat navigation');
+        check(box.textContent === document.querySelector('#task-blockers').textContent, 'shared detail explanation');
+        for (const a of box.querySelectorAll('a')) {
+            const r = a.getBoundingClientRect();
+            check(r.left >= 0 && r.right <= innerWidth && r.height >= 44, 'mobile tap target fits');
+        }
+        check(document.documentElement.scrollWidth <= innerWidth, 'no overflow');
+        box.querySelector('a[href^="#/tasks/"]').click();
+        check(!document.querySelector('#task-actions-sheet').open, 'navigation closes modal');
+        return true;
+    })()"##).await.unwrap();
+    assert_eq!(result, true);
+    browser
+        .wait_for(
+            &page,
+            "document.querySelector('#task-h').textContent === 'Manually held dependency' && document.querySelector('#task-actions-blockers').textContent.includes('Held, not blocked')",
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+    let result = browser.eval(&page, r##"(() => {
+        document.querySelector('#task-actions-fab').click();
+        const box = document.querySelector('#task-actions-blockers');
+        return {text: box.textContent, links: box.querySelectorAll('a').length, writes: window.blockerWrites};
+    })()"##).await.unwrap();
+    assert!(
+        result["text"]
+            .as_str()
+            .unwrap()
+            .contains("Held, not blocked")
+    );
+    assert!(
+        result["text"]
+            .as_str()
+            .unwrap()
+            .contains("explicitly Release")
+    );
+    assert!(
+        !result["text"]
+            .as_str()
+            .unwrap()
+            .contains("Resolve blockers")
+    );
+    assert!(
+        result["text"]
+            .as_str()
+            .unwrap()
+            .contains("Manual hold recovery")
+    );
+    assert_eq!(result["links"], 0);
+    assert_eq!(result["writes"], serde_json::json!([]));
+    browser
+        .eval(&page, &format!("location.hash = '#/tasks/{}'", blocked.id))
+        .await
+        .unwrap();
+    browser
+        .wait_for(
+            &page,
+            "document.querySelectorAll('#task-actions-blockers li').length === 4",
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+    // A decision can settle before the scheduler changes the blocked task.
+    // Its own revision must refresh the explanation and destination in place.
+    questions
+        .update(&decision.id, |q| {
+            q.status = magi::ask::QuestionStatus::Answered;
+            Ok(())
+        })
+        .unwrap();
+    browser.wait_for(&page,
+        "document.querySelector('#task-actions-blockers').textContent.includes('Decision recorded; waiting for the scheduler')",
+        Duration::from_secs(30)).await.unwrap();
+    browser
+        .eval(
+            &page,
+            r##"(() => {
+        document.querySelector('#task-actions-fab').click();
+        document.querySelector('#task-actions-blockers a[href^="#/chat/"]').click();
+    })()"##,
+        )
+        .await
+        .unwrap();
+    browser
+        .wait_for(
+            &page,
+            "!document.querySelector('#view-talk').hidden",
+            Duration::from_secs(30),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        browser.eval(&page, "window.blockerWrites").await.unwrap(),
+        serde_json::json!([])
+    );
+    assert_eq!(
+        browser
+            .eval(&page, "document.querySelector('#task-actions-sheet').open")
+            .await
+            .unwrap(),
+        false
+    );
+    assert_eq!(
+        queue.get(&blocked.id).unwrap().blocked_by,
+        blocked.blocked_by
+    );
+    assert_eq!(queue.get(&held.id).unwrap().status, TaskStatus::Held);
+    browser
+        .eval(
+            &page,
+            &format!("location.hash = '#/tasks/{}'", disk_held.id),
+        )
+        .await
+        .unwrap();
+    browser.wait_for(&page, "document.querySelector('#task-actions-blockers').textContent.includes('Resume disk recovery?')", Duration::from_secs(30)).await.unwrap();
+    let result = browser.eval(&page, r##"(() => {
+        document.querySelector('#task-actions-fab').click();
+        const box = document.querySelector('#task-actions-blockers');
+        const text = box.textContent;
+        if (!text.includes('Held, not blocked') || !text.includes('Disk recovery alone will not resume')) throw new Error('pending recovery must gate disk recovery');
+        const link = box.querySelector('a[href^="#/chat/"]');
+        if (!link || !text.includes('Recovery decision pending')) throw new Error('owning chat recovery route missing');
+        link.click();
+        return window.blockerWrites;
+    })()"##).await.unwrap();
+    assert_eq!(result, serde_json::json!([]));
+    assert_eq!(queue.get(&disk_held.id).unwrap().status, TaskStatus::Held);
+    browser.close_page(&page).await;
+}

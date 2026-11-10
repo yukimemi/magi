@@ -1232,12 +1232,27 @@ pub fn open_question_for(questions: &Questions, task_id: &str) -> Option<Questio
 /// apply, the same failure mode this function exists to keep `crate::conduct`
 /// out of. `crate::conduct::apply_one` is exactly that caller.
 pub fn pending_for(questions: &Questions, task: &Task) -> bool {
-    let own = match latest_triage_question(questions, &task.id) {
-        Some(q) if q.status.open() || awaiting_task_chat(&q, task) => true,
-        Some(q) if q.status == QuestionStatus::Answered => !already_applied(task, &q),
-        _ => false,
-    };
-    own || deps_pending(questions, task)
+    !pending_recovery_questions(questions, task).is_empty()
+}
+
+/// The exact recovery decisions that prevent triage/conductor progress,
+/// including routed decisions and answers not yet applied to this task.
+pub(crate) fn pending_recovery_questions(questions: &Questions, task: &Task) -> Vec<Question> {
+    [NODE, DEPS_NODE]
+        .into_iter()
+        .filter_map(|node| {
+            latest_question(questions, node, &task.id).filter(|q| {
+                q.status.open()
+                    || awaiting_task_chat(q, task)
+                    || (q.status == QuestionStatus::Answered
+                        && if node == NODE {
+                            !already_applied(task, q)
+                        } else {
+                            !task.triage_applied(&q.id)
+                        })
+            })
+        })
+        .collect()
 }
 
 fn awaiting_task_chat(q: &Question, task: &Task) -> bool {

@@ -1678,6 +1678,9 @@ li[data-tone="wait"] > .card-tail { border-left-color: var(--gold-line); border-
    behind it. */
 #view-run,
 #view-task { padding-bottom: calc(var(--tap) + var(--s6)); }
+.task-blockers { overflow-wrap: anywhere; }
+.task-blockers li + li { margin-top: var(--s4); }
+.task-blockers .btn { white-space: normal; min-height: var(--tap); }
 
 /* The fab's sheet has no <form> — its content is built and rerendered
    from JS — so it gets its own head/body padding instead of borrowing a

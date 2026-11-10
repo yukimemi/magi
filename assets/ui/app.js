@@ -10581,7 +10581,8 @@ async function applyRevisions_(source) {
     && (queueRev !== state.rev.queue || runsRev !== state.rev.runs);
 
   /* Same reason, read before the revisions are overwritten. */
-  const taskStale = queueRev !== state.rev.queue || runsRev !== state.rev.runs;
+  const taskStale = queueRev !== state.rev.queue || runsRev !== state.rev.runs
+    || questionsRev !== state.rev.questions;
   const talkStale = queueRev !== state.rev.queue || talksRev !== state.rev.talks;
 
   if (notificationsRev !== state.rev.notifications || questionsRev !== state.rev.questions) {
@@ -10599,7 +10600,8 @@ async function applyRevisions_(source) {
       || [...delta.changed, ...delta.removed].includes(state.detail.id);
     if (detailChanged) runDetailStale = true;
   }
-  /* A task's page lists its runs' statuses, so either stream moving can stale it. */
+  /* Task detail also contains decision delivery/status, so question-only
+     changes must refresh blockers even before the scheduler updates the task. */
   if (taskStale && state.taskDetail.id) {
     jobs.push(loadTask(state.taskDetail.id, { background: true }));
   }
@@ -11474,6 +11476,7 @@ function renderTask() {
       setText($("task-meta"), error || "");
     }
     show($("task-why-panel"), false);
+    renderTaskBlockers(null, $("task-blockers"));
     renderTaskFollowup(null);
     clear($("task-instruction"));
     delete $("task-instruction").dataset.forTask;
@@ -11508,13 +11511,16 @@ function renderTask() {
   $("task-meta").replaceChildren(...metaKids);
   setAttr($("task-meta"), "title", task.id);
 
-  const waitingOn = task.hold_reason || task.block_reason;
-  const noteBits = [(TASK_STATUS[status] || {}).note, waitingOn ? `Waiting on: ${waitingOn}` : "", status === "parked" ? task.park_reason : ""].filter(Boolean);
+  const noteBits = [(TASK_STATUS[status] || {}).note,
+    status === "blocked" && task.block_reason ? `Dependency reason: ${task.block_reason}` : "",
+    task.hold_reason ? `Hold reason: ${task.hold_reason}` : "",
+    status === "parked" ? task.park_reason : ""].filter(Boolean);
   linkify($("task-note"), noteBits.join(" "), { replace: true });
   show($("task-note"), noteBits.length > 0);
   linkify($("task-error"), task.last_error || "", { replace: true });
   show($("task-error"), Boolean(task.last_error));
   show($("task-why-panel"), noteBits.length > 0 || Boolean(task.last_error));
+  renderTaskBlockers(task, $("task-blockers"));
 
   const box = $("task-instruction");
   const stamp = `${task.id}:${task.instruction_md || task.instruction || ""}`;
@@ -11705,7 +11711,48 @@ function taskSheetHost(id) {
   };
 }
 
+function renderTaskBlockers(task, box) {
+  clear(box);
+  const status = task && String(task.status_str || task.status || "");
+  const visible = status === "blocked" || status === "held";
+  show(box, visible);
+  if (!visible) return;
+  box.append(el("h2", { text: status === "blocked" ? "Resolve blockers" : "Held, not blocked" }));
+  if (task.block_reason && status === "blocked") box.append(el("p", { text: `Dependency reason: ${task.block_reason}` }));
+  if (status === "blocked") box.append(el("p", { text: "Hold overrides this dependency wait and clears its dependency references. A later Release can queue the task even if those dependencies are unfinished. Use the blocker controls below to resolve the actual dependencies." }));
+  if (status === "held" || task.hold_reason || task.hold_source) {
+    box.append(el("h3", { text: task.hold_source === "machine" ? "Machine hold recovery" : task.hold_source === "manual" ? "Manual hold recovery" : "Hold recovery" }));
+  }
+  if (task.hold_reason) box.append(el("p", { text: `Recorded hold reason: ${task.hold_reason}` }));
+  else if (task.last_error) box.append(el("p", { text: `Last recorded failure: ${task.last_error}` }));
+  if (task.recovery) box.append(el("p", { text: task.recovery }));
+  const blockers = Array.isArray(task.blockers) ? task.blockers : [];
+  if (status === "blocked" && !blockers.length) {
+    box.append(el("p", { text: "Blocker details are unavailable. Refresh or inspect task triage; do not assume the dependencies are resolved." }));
+  }
+  const list = el("ul");
+  for (const blocker of blockers) {
+    const item = el("li", {},
+      el("p", { text: `${blocker.kind}: ${blocker.id} (${blocker.state})` }),
+      blocker.reason ? el("p", { text: blocker.reason }) : null,
+      el("p", { text: blocker.resolves_itself ? "No operator action needed for this blocker." : "Inspect this blocker for resolution or recovery." }),
+      el("p", { text: blocker.next }));
+    const [route, id] = blocker.destination || [];
+    if (["tasks", "chat", "questions"].includes(route) && id) {
+      item.append(el("a", {
+        class: "btn btn-quiet",
+        href: `#/${route}/${encodeURIComponent(id)}`,
+        text: route === "chat" ? "Open owning task chat" : route === "tasks" ? "Inspect dependency task" : "Inspect existing decision",
+        onclick: closeTaskActions,
+      }));
+    }
+    list.append(item);
+  }
+  if (blockers.length) box.append(list);
+}
+
 function renderTaskActions(task) {
+  renderTaskBlockers(task, $("task-actions-blockers"));
   const boxes = ["priority", "urgent", "edit", "hold", "done", "delete"].map((k) => $(`task-actions-${k}`));
   if (!task || task.id !== taskSheet.id) {
     taskSheet.id = task ? task.id : null;
