@@ -20,7 +20,8 @@ magi show <run> --json
 `gate` grants repair of an ordinary nonzero gate failure with diagnostic output,
 including a failed landing gate. `review` grants repair of the final unfixed
 exhausted review's blocking findings or failed E2E. `--rounds` is required and
-must be 1 through 3. Budgets that are not exhausted, timeouts, infrastructure
+must be 1 through 3. Budgets that are not exhausted are refused except for the
+explicit conflict-repair follow-ups described below. Timeouts, infrastructure
 failures and missing current-head failure evidence are refused. Existing run
 configuration and its provenance stay unchanged; this command cannot change
 timeouts or recover conversations. The separate `base-conflict` kind below
@@ -123,3 +124,11 @@ blocked. Generic retry and release refuse before changing the task, rather than
 converting its retained review selection into a successor. Inspect the fresh
 failure and explicitly authorize its remaining repair through the existing
 review or gate repair workflow.
+
+Follow-up review or gate grants accept the same retained review selection only
+while its original criteria and branch ownership still match. After a completed
+conflict repair leaves a head-bound confirmation failure, an explicit `review`
+or `gate` grant can authorize bounded attempts even if the ordinary allowance
+was not exhausted. This exception is confined to that repair lineage and current
+failed head; it neither resets ordinary counters nor authorizes generic release.
+Successful follow-ups also owe guarded delivery to the original checkout.

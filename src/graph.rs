@@ -1915,8 +1915,9 @@ impl Runner {
                         return Ok(());
                     }
                     let passed = outcomes.iter().all(CommandOutcome::ok);
+                    // Follow-up grants owe the same guarded checkout delivery
+                    // as the conflict repair that introduced the new head.
                     if passed
-                        && grant.receipt.request.kind == Kind::BaseConflict
                         && !crate::foreign_checkout::write_back(&mut self.state, &head).await?
                     {
                         return Ok(());

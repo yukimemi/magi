@@ -131,7 +131,7 @@ fn contract(task: &Task, kind: Kind) -> Result<String> {
         &task.pr_recovery,
         &task.replacement,
     ))?;
-    if kind == Kind::BaseConflict {
+    if kind == Kind::BaseConflict || task.review_branch.is_some() {
         Ok(serde_json::to_string(&(
             original,
             &task.review_of,
@@ -150,7 +150,7 @@ fn controls(home: &Path, task: &Task, state: &RunState, kind: Kind) -> Result<()
             && state.origin.as_ref().and_then(|o| o.task.as_deref()) == Some(task.id.as_str()),
         "repair grant refused: run task ownership changed"
     );
-    if kind == Kind::BaseConflict {
+    if kind == Kind::BaseConflict || conflict_lineage(state) {
         ensure!(
             crate::daemon::compatible_run_instruction(state, task),
             "base-conflict repair refused: task instructions differ from retained review criteria {:?}; restore those criteria with task edit, then put only the narrow repair instruction in grant-repair --instruction",
@@ -163,7 +163,12 @@ fn controls(home: &Path, task: &Task, state: &RunState, kind: Kind) -> Result<()
     ensure!(
         !task.fresh_start
             && (task.review_branch.is_none()
-                || (kind == Kind::BaseConflict
+                || ((kind == Kind::BaseConflict || conflict_lineage(state))
+                    && crate::daemon::compatible_run_instruction(state, task)
+                    && task
+                        .review_instruction
+                        .as_ref()
+                        .is_none_or(|criteria| criteria == &task.instruction)
                     && state.reviewed_commits.is_some()
                     && task.review_branch.as_ref().is_some_and(|branch| state
                         .foreign_checkout
@@ -220,6 +225,9 @@ fn controls(home: &Path, task: &Task, state: &RunState, kind: Kind) -> Result<()
 }
 
 async fn head_and_public(state: &RunState, head: &str) -> Result<()> {
+    if let Some(checkout) = &state.foreign_checkout {
+        checkout.validate(&state.repo).await?;
+    }
     let winner = state
         .winner()
         .context("repair grant refused: no retained winner")?;
@@ -315,7 +323,8 @@ fn evidence(state: &RunState, request: &Request) -> Result<()> {
         }
         Kind::Gate => {
             ensure!(
-                state.gate_fixes.len() >= state.config.graph.gate_fix_rounds,
+                state.gate_fixes.len() >= state.config.graph.gate_fix_rounds
+                    || failed_conflict_repair_at(state, &request.head),
                 "repair grant refused: gate repair budget is not exhausted"
             );
             ensure!(
@@ -327,7 +336,8 @@ fn evidence(state: &RunState, request: &Request) -> Result<()> {
         }
         Kind::Review => {
             ensure!(
-                state.reviews.len() >= state.config.graph.review_rounds,
+                state.reviews.len() >= state.config.graph.review_rounds
+                    || failed_conflict_repair_at(state, &request.head),
                 "repair grant refused: review budget is not exhausted"
             );
             ensure!(
@@ -629,6 +639,9 @@ async fn conflict_target(
     request: &Request,
     stop: Option<&crate::base_sync_recovery::Stop>,
 ) -> Result<()> {
+    if let Some(checkout) = &state.foreign_checkout {
+        checkout.validate(&state.repo).await?;
+    }
     if request.kind != Kind::BaseConflict {
         return Ok(());
     }
@@ -646,9 +659,6 @@ async fn conflict_target(
         Some(git::rev_parse(&state.repo, &tracking).await?) == request.tip,
         "base-conflict repair held: recorded base tip moved; inspect the new target and authorize again"
     );
-    if let Some(checkout) = &state.foreign_checkout {
-        checkout.validate(&state.repo).await?;
-    }
     Ok(())
 }
 
@@ -707,7 +717,7 @@ pub(crate) fn conflict_failure(task: &Task, state: &RunState) -> Option<String> 
     if task.runs.last() == Some(&state.id)
         && !pending(task, state)
         && state.repair_grants.last().is_some_and(|g| {
-            g.receipt.request.kind == Kind::BaseConflict
+            (g.receipt.request.kind == Kind::BaseConflict || conflict_lineage(state))
                 && g.phase == Phase::Complete
                 && !g.succeeded
         })
@@ -719,4 +729,24 @@ pub(crate) fn conflict_failure(task: &Task, state: &RunState) -> Option<String> 
     } else {
         None
     }
+}
+
+// Follow-up grants remain explicit and head-bound even when the conflict's
+// confirmation failed before ordinary review/gate allowances were exhausted.
+fn conflict_lineage(state: &RunState) -> bool {
+    state.repair_grants.iter().any(|grant| {
+        grant.receipt.request.kind == Kind::BaseConflict
+            && grant.phase == Phase::Complete
+            && grant
+                .conflict
+                .as_ref()
+                .is_some_and(|operation| operation.result.is_some())
+    })
+}
+
+fn failed_conflict_repair_at(state: &RunState, head: &str) -> bool {
+    conflict_lineage(state)
+        && state.repair_grants.last().is_some_and(|grant| {
+            grant.phase == Phase::Complete && !grant.succeeded && grant.head == head
+        })
 }

@@ -4432,7 +4432,7 @@ async fn attempt(
     // attempt - see `queue::Task::review_branch`.
     let review_branch = if previous
         .as_ref()
-        .is_some_and(|state| crate::repair_budget::conflict_pending(task, state))
+        .is_some_and(|state| crate::repair_budget::pending(task, state))
     {
         None
     } else {

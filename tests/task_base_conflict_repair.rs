@@ -129,32 +129,37 @@ async fn stopped() -> (common::Fixture, Task, Runner, Request) {
 }
 
 async fn grant(request: &Request) -> magi::repair_budget::Receipt {
-    let out = magi_cli(&magi::run::home())
-        .args([
-            "task",
-            "grant-repair",
-            &request.task,
-            "--run",
-            &request.run,
-            "--kind",
-            "base-conflict",
-            "--rounds",
-            &request.rounds.to_string(),
-            "--head",
-            &request.head,
-            "--tip",
-            request.tip.as_deref().unwrap(),
-            "--expect-pass",
-            &request.expect_pass.to_string(),
-            "--request",
-            &request.request,
-            "--reason",
-            &request.reason,
-            "--instruction",
-            request.instruction.as_deref().unwrap(),
-        ])
-        .output()
-        .unwrap();
+    let mut command = magi_cli(&magi::run::home());
+    command.args([
+        "task",
+        "grant-repair",
+        &request.task,
+        "--run",
+        &request.run,
+        "--kind",
+        match request.kind {
+            Kind::BaseConflict => "base-conflict",
+            Kind::Gate => "gate",
+            Kind::Review => "review",
+        },
+        "--rounds",
+        &request.rounds.to_string(),
+        "--head",
+        &request.head,
+        "--expect-pass",
+        &request.expect_pass.to_string(),
+        "--request",
+        &request.request,
+        "--reason",
+        &request.reason,
+    ]);
+    if let Some(tip) = &request.tip {
+        command.args(["--tip", tip]);
+    }
+    if let Some(instruction) = &request.instruction {
+        command.args(["--instruction", instruction]);
+    }
+    let out = command.output().unwrap();
     assert!(
         out.status.success(),
         "{}",
@@ -419,5 +424,97 @@ async fn conflict_grant_is_bound_to_the_owner_generation_and_unique_task_owner()
     assert!(resumed.execute().await.unwrap_err().to_string().contains("multiple tasks claim"));
     assert!(RunState::load(&request.run).unwrap().repair_grants.is_empty());
     assert_eq!(git_ok(&runner.state.winner().unwrap().worktree, &["rev-parse", "HEAD"]).await.trim(), request.head);
+}
+}
+
+common::e2e! {
+async fn explicit_followup_review_retains_selection_and_rejects_changed_scope() {
+    let (fx, task, mut runner, request) = stopped().await;
+    // The confirmation can fail before the ordinary review budget is spent.
+    runner.state.config.graph.review_rounds = 4;
+    for spec in &mut runner.state.config.agents { spec.env.insert("MOCK_FINDING".into(), "1".into()); }
+    runner.state.save().unwrap(); grant(&request).await;
+    let mut resumed = Runner::resume(&request.run).unwrap(); resumed.execute().await.unwrap();
+    assert!(!resumed.state.repair_grants[0].succeeded);
+    assert!(resumed.state.reviews.len() < resumed.state.config.graph.review_rounds);
+    let mut followup = request.clone();
+    followup.kind = Kind::Review; followup.tip = None; followup.instruction = None;
+    followup.request = "explicit-review-followup".into();
+    followup.head = git_ok(&resumed.state.winner().unwrap().worktree, &["rev-parse", "HEAD"]).await.trim().to_owned();
+    followup.expect_pass = resumed.state.passes.last().unwrap().index;
+    let queue = Queue::open();
+    let original = queue.get(&task.id).unwrap();
+    let mut changed = original.clone(); changed.review_branch = Some("fix/another-selection".into()); queue.put(&mut changed).unwrap();
+    assert!(magi::repair_budget::grant(&queue, &magi::run::home(), followup.clone()).await.unwrap_err().to_string().contains("different continuation"));
+    changed = original.clone(); changed.instruction.push_str(" and implement unrelated changes"); queue.put(&mut changed).unwrap();
+    assert!(magi::repair_budget::grant(&queue, &magi::run::home(), followup.clone()).await.unwrap_err().to_string().contains("retained review criteria"));
+    let mut restored = original; queue.put(&mut restored).unwrap();
+    std::fs::write(fx.repo.join("README.md"), "owner changes in progress\n").unwrap();
+    assert!(magi::repair_budget::grant(&queue, &magi::run::home(), followup.clone()).await.unwrap_err().to_string().contains("checkout is dirty"));
+    std::fs::write(fx.repo.join("README.md"), "timeout = 7200\n").unwrap();
+    let receipt = grant(&followup).await;
+    assert_eq!(grant(&followup).await, receipt);
+    let config = fx.tmp.path().join("followup.toml");
+    std::fs::write(&config, toml::to_string(&fx.config).unwrap()).unwrap();
+    let opts = magi::daemon::Opts { repo: fx.repo.clone(), config: Some(config), once: true,
+        poll: std::time::Duration::from_millis(20), ..Default::default() };
+    tokio::time::timeout(std::time::Duration::from_secs(120), magi::daemon::serve(opts)).await.unwrap().unwrap();
+    let after = RunState::load(&request.run).unwrap();
+    let owner = queue.get(&task.id).unwrap();
+    assert_eq!(owner.status, TaskStatus::Done, "{:?}", owner.last_error);
+    assert_eq!(owner.runs, vec![request.run.clone()]);
+    assert_eq!(owner.review_branch, task.review_branch);
+    assert_eq!(owner.instruction, task.instruction);
+    assert!(after.repair_grants[1].succeeded);
+    assert_eq!(after.repair_grants[1].spent, 1);
+    assert!(after.reviews.last().unwrap().clean);
+    assert!(fx.repo.join("fixed.txt").exists(), "verified follow-up reaches the original checkout");
+}
+}
+
+common::e2e! {
+async fn explicit_followup_gate_repairs_a_confirmation_failure_with_unused_budget() {
+    let (fx, task, mut runner, request) = stopped().await;
+    runner.state.config.graph.gate_fix_rounds = 2;
+    runner.state.save().unwrap();
+    runner.state.config.verify.gate = vec!["test -f gatefix.txt || { echo 'gatefix.txt missing'; exit 1; }".into()];
+    runner.state.save().unwrap(); grant(&request).await;
+    let mut resumed = Runner::resume(&request.run).unwrap(); resumed.execute().await.unwrap();
+    assert!(!resumed.state.repair_grants[0].succeeded);
+    assert!(resumed.state.gate_ran);
+    assert!(resumed.state.gate_fixes.is_empty());
+    assert_eq!(resumed.state.repair_grants[0].phase, Phase::Complete);
+    assert!(magi::chat_control::release(&Queue::open(), &task.id).is_err());
+    let mut followup = request.clone();
+    followup.kind = Kind::Gate; followup.tip = None; followup.instruction = None;
+    followup.request = "explicit-gate-followup".into();
+    followup.head = resumed.state.gate_head.clone().unwrap();
+    followup.expect_pass = resumed.state.passes.last().unwrap().index;
+    // A failed explicit follow-up must retain the same refusal and allow a
+    // new head-bound owner grant, rather than falling back to a successor.
+    let mut failed = RunState::load(&request.run).unwrap();
+    for spec in &mut failed.config.agents { spec.env.insert("MOCK_GATE_FIX_NOOP".into(), "1".into()); }
+    failed.save().unwrap();
+    let receipt = grant(&followup).await;
+    let mut no_op = Runner::resume(&request.run).unwrap(); no_op.execute().await.unwrap();
+    assert!(!no_op.state.repair_grants[1].succeeded);
+    assert!(magi::chat_control::release(&Queue::open(), &task.id).unwrap_err().to_string().contains("cannot select a successor"));
+    assert_eq!(no_op.state.gate_fixes.len(), 1);
+    assert_eq!(grant(&followup).await, receipt);
+    for spec in &mut no_op.state.config.agents { spec.env.remove("MOCK_GATE_FIX_NOOP"); }
+    no_op.state.save().unwrap();
+    followup.request = "second-explicit-gate-followup".into();
+    followup.expect_pass = no_op.state.passes.last().unwrap().index;
+    let receipt = grant(&followup).await;
+    let mut again = Runner::resume(&request.run).unwrap(); again.execute().await.unwrap();
+    assert!(again.state.repair_grants[2].succeeded);
+    assert_eq!(again.state.repair_grants[2].spent, 1);
+    assert_eq!(again.state.gate_fixes.len(), 2);
+    assert_eq!(again.state.config.graph.gate_fix_rounds, 2, "ordinary allowance is not reset or extended");
+    assert!(again.state.reviews.len() > resumed.state.reviews.len());
+    assert!(again.state.gate.iter().all(|outcome| outcome.ok()));
+    assert!(fx.repo.join("gatefix.txt").is_file());
+    assert_eq!(Queue::open().get(&task.id).unwrap().review_branch, task.review_branch);
+    assert_eq!(grant(&followup).await, receipt);
 }
 }

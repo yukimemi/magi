@@ -562,3 +562,13 @@ async fn retained_reviewer_descendant_refuses_grant_and_resume_without_mutation(
     assert!(resumed.state.repair_grants[0].succeeded);
 }
 }
+
+common::e2e! {
+async fn ordinary_gate_failure_with_unused_budget_still_refuses_an_extra_grant() {
+    let (_fx, _task, mut runner, request) = stopped(false).await;
+    runner.state.config.graph.gate_fix_rounds = 2;
+    runner.state.save().unwrap();
+    assert!(runner.state.gate_fixes.is_empty());
+    refused(&request, "gate repair budget is not exhausted");
+}
+}
