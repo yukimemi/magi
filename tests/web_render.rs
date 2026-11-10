@@ -6267,6 +6267,24 @@ async fn run_progress_live_pipeline_observation_and_phone_layout() {
           });
           await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
           summary.focus({preventScroll: true});
+          // Keep the individual layout and scroll contributions in the failure
+          // report: a final summary coordinate alone cannot identify which
+          // live clock or asynchronous observation moved the disclosure.
+          const layout = () => ({
+            scrollY, viewport: [innerWidth, innerHeight],
+            document: [document.documentElement.clientWidth, document.documentElement.scrollHeight],
+            nodes: Object.fromEntries([
+              '#run-progress', '#progress-freshness', '#progress-recent',
+              '#run-active-panel', '#run-active > li', '#progress-pipeline',
+              '#progress-pipeline summary'
+            ].map(selector => {
+              const node = document.querySelector(selector), rect = node.getBoundingClientRect();
+              const style = getComputedStyle(node);
+              return [selector, {top: rect.top, height: rect.height, width: rect.width,
+                font: style.font, lineHeight: style.lineHeight, text: node.textContent.slice(0, 600)}];
+            }))
+          });
+          const beforeLayout = layout();
           const top = summary.getBoundingClientRect().top;
           const beforeFreshness = document.getElementById("progress-freshness").textContent;
           deck.tickActive();
@@ -6279,7 +6297,7 @@ async fn run_progress_live_pipeline_observation_and_phone_layout() {
           const stable = !pipeline.open && document.activeElement === summary
             && Math.abs(summary.getBoundingClientRect().top - top) < 1;
           const stability = stable || {closed: !pipeline.open, focused: document.activeElement === summary,
-            top, after: summary.getBoundingClientRect().top, beforeFreshness,
+            top, after: summary.getBoundingClientRect().top, beforeLayout, afterLayout: layout(), beforeFreshness,
             freshness: document.getElementById("progress-freshness").textContent};
           pipeline.open = true;
           return {noOverflow, parallel: actual.includes('implement-A') && actual.includes('implement-B'),
