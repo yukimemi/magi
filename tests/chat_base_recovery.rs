@@ -149,6 +149,35 @@ print('control completed')
         }
     }
 
+    fn route_recovery_decision(&self) -> magi::ask::Question {
+        let mut task = self.queue.get(&self.task.id).unwrap();
+        task.chat = Some(self.talk.clone());
+        self.queue.put(&mut task).unwrap();
+        let questions = magi::ask::Questions::at(self.tmp.path().join("questions"));
+        let mut q = magi::ask::Question::new(
+            self.run.id.clone(),
+            "recover-base".into(),
+            "owner".into(),
+            "Recover bounded base movement?".into(),
+            String::new(),
+            vec!["recover".into()],
+        );
+        q.actions.insert(
+            "recover".into(),
+            magi::ask::ChoiceAction::RecoverBase {
+                run: self.run.id.clone(),
+                stop: self.state().base_sync_recovery.stop.unwrap(),
+                episode: 1,
+            },
+        );
+        questions.put_executable(&mut q).unwrap();
+        magi::task_chat::sweep(&self.queue, &self.talks, &questions, self.tmp.path());
+        let q = questions.get(&q.id).unwrap();
+        assert_eq!(q.routed_task.as_deref(), Some(self.task.id.as_str()));
+        assert_eq!(q.routed_chat.as_deref(), Some(self.talk.as_str()));
+        q
+    }
+
     async fn control(&mut self, args: Vec<String>) -> serde_json::Value {
         self.config.agents[0]
             .env
@@ -618,6 +647,143 @@ fn standing_base_recovery_stale_owner_decision_and_instruction_cannot_finish_que
             assert_eq!(response["ok"], false, "{response}");
             assert!(response["err"].as_str().unwrap().contains("stale"));
             assert_eq!(f.queue.get(&f.task.id).unwrap().status, TaskStatus::Held);
+            assert_eq!(f.state().base_sync_recovery.authorizations.len(), 1);
+        },
+    );
+}
+
+#[test]
+fn standing_base_recovery_routed_decision_resolves_only_after_queue_commit() {
+    common::isolated(
+        "standing_base_recovery_routed_decision_resolves_only_after_queue_commit",
+        || async {
+            use magi::task_decision::Status;
+            let _home = common::home_lock().await;
+            let mut f = Fixture::new(false);
+            let q = f.route_recovery_decision();
+            let questions = magi::ask::Questions::at(f.tmp.path().join("questions"));
+            assert_eq!(
+                magi::task_inquiry::Outbox::at(f.tmp.path())
+                    .get(&q.id)
+                    .unwrap()
+                    .decision
+                    .unwrap()
+                    .status,
+                Status::AwaitingOwner
+            );
+            let response = f
+                .control(vec!["decide".into(), q.id.clone(), "recover".into()])
+                .await;
+            assert_eq!(response["ok"], true, "{response}");
+            let decision = || {
+                magi::task_inquiry::Outbox::at(f.tmp.path())
+                    .get(&q.id)
+                    .unwrap()
+                    .decision
+                    .unwrap()
+            };
+            let sweep = || magi::task_chat::sweep(&f.queue, &f.talks, &questions, f.tmp.path());
+            sweep();
+            assert_eq!(decision().status, Status::Queued);
+            let obstruction = f.queue.path_of(&f.task.id).with_extension("json.tmp");
+            std::fs::create_dir(&obstruction).unwrap();
+            magi::daemon::apply_choice_actions(&f.queue, &questions, f.tmp.path()).await;
+            assert_eq!(f.state().base_sync_recovery.authorizations.len(), 1);
+            assert_eq!(f.queue.get(&f.task.id).unwrap().status, TaskStatus::Held);
+            sweep();
+            assert_eq!(decision().status, Status::Queued); // Authorization alone is not queueing.
+            std::fs::remove_dir(obstruction).unwrap();
+            magi::daemon::apply_choice_actions(&f.queue, &questions, f.tmp.path()).await;
+            sweep();
+            let completed = decision();
+            assert_eq!(completed.status, Status::Resolved);
+            assert!(completed.error.is_none());
+            assert!(
+                completed
+                    .history
+                    .last()
+                    .unwrap()
+                    .evidence
+                    .contains("base-recovery-controls/decisions/")
+            );
+            assert!(
+                !f.tmp
+                    .path()
+                    .join("choice-actions")
+                    .join(format!("{}.json", q.id))
+                    .exists()
+            );
+            magi::chat_control::reconcile_decisions(&f.queue, f.tmp.path()).unwrap();
+            magi::daemon::apply_choice_actions(&f.queue, &questions, f.tmp.path()).await;
+            sweep();
+            assert_eq!(decision(), completed);
+            assert_eq!(f.state().base_sync_recovery.authorizations.len(), 1);
+            let task = f.queue.get(&f.task.id).unwrap();
+            assert_eq!(task.base_recovery_requests.len(), 1);
+            assert_eq!(
+                task.resume_override.unwrap().pinned_run.as_deref(),
+                Some(f.run.id.as_str())
+            );
+        },
+    );
+}
+
+#[test]
+fn standing_base_recovery_decision_reconciles_matching_queue_marker_after_restart() {
+    common::isolated(
+        "standing_base_recovery_decision_reconciles_matching_queue_marker_after_restart",
+        || async {
+            use magi::task_decision::Status;
+            let _home = common::home_lock().await;
+            let mut f = Fixture::new(false);
+            let q = f.route_recovery_decision();
+            let response = f
+                .control(vec!["decide".into(), q.id.clone(), "recover".into()])
+                .await;
+            assert_eq!(response["ok"], true, "{response}");
+            let questions = magi::ask::Questions::at(f.tmp.path().join("questions"));
+            magi::daemon::apply_choice_actions(&f.queue, &questions, f.tmp.path()).await;
+            let path = f
+                .tmp
+                .path()
+                .join("base-recovery-controls/decisions")
+                .join(format!("{}.json", q.id));
+            let mut receipt: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            receipt["applied"] = false.into(); // Queue saved, final receipt save interrupted.
+            let matching = receipt.clone();
+            receipt["request"]["head"] = "a".repeat(40).into();
+            std::fs::write(&path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+            magi::task_chat::sweep(&f.queue, &f.talks, &questions, f.tmp.path());
+            let decision = magi::task_inquiry::Outbox::at(f.tmp.path())
+                .get(&q.id)
+                .unwrap()
+                .decision
+                .unwrap();
+            assert_eq!(decision.status, Status::RetryNeeded);
+            assert!(decision.error.unwrap().contains("different decision"));
+            // Completion evidence survives consumption and a later owner hold.
+            let mut task = f.queue.get(&f.task.id).unwrap();
+            task.hold_manual(Some("later owner decision".into()));
+            f.queue.put(&mut task).unwrap();
+            let mut state = f.state();
+            state.base_sync_recovery.authorizations[0].consumed = true;
+            state.save_under(f.tmp.path()).unwrap();
+            std::fs::write(&path, serde_json::to_vec(&matching).unwrap()).unwrap();
+            for _ in 0..2 {
+                let queue = Queue::at(f.tmp.path().join("queue"));
+                let questions = magi::ask::Questions::at(f.tmp.path().join("questions"));
+                magi::task_chat::sweep(&queue, &f.talks, &questions, f.tmp.path());
+                magi::chat_control::reconcile_decisions(&queue, f.tmp.path()).unwrap();
+                let decision = magi::task_inquiry::Outbox::at(f.tmp.path())
+                    .get(&q.id)
+                    .unwrap()
+                    .decision
+                    .unwrap();
+                assert_eq!(decision.status, Status::Resolved);
+                assert!(decision.error.is_none());
+            }
+            assert_eq!(f.queue.get(&task.id).unwrap().status, TaskStatus::Held);
             assert_eq!(f.state().base_sync_recovery.authorizations.len(), 1);
         },
     );

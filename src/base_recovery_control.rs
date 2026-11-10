@@ -242,6 +242,66 @@ impl Transaction {
     }
 }
 
+/// Project only the durable authorization-and-queue effect of this exact choice.
+/// Current HEAD, driver progress and later holds cannot erase a committed effect.
+pub(crate) fn effect_receipt(
+    home: &Path,
+    task: &Task,
+    q: &crate::ask::Question,
+) -> Result<Option<String>> {
+    let Some(crate::ask::ChoiceAction::RecoverBase { run, stop, episode }) = q.chosen_action()
+    else {
+        return Ok(None);
+    };
+    ensure!(
+        crate::ask::valid_asset_name(&q.id),
+        "invalid recovery decision id"
+    );
+    let path = home
+        .join("base-recovery-controls")
+        .join("decisions")
+        .join(format!("{}.json", q.id));
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let receipt: Receipt = serde_json::from_slice(&bytes)?;
+    let expected = Request {
+        run: run.clone(),
+        head: stop.head.clone(),
+        actor: "decisions".into(),
+        request: q.id.clone(),
+        decision: Some((task.id.clone(), q.answered_at.unwrap_or(q.asked_at))),
+        expected_stop: Some((stop.clone(), *episode)),
+    };
+    let key = format!("decisions/{}", q.id);
+    ensure!(
+        receipt.request == expected
+            && receipt.queued.id == task.id
+            && q.routed_task
+                .as_deref()
+                .is_none_or(|owner| owner == task.id)
+            && receipt.queued.base_recovery_requests.contains(&key)
+            && receipt
+                .queued
+                .resume_override
+                .as_ref()
+                .is_some_and(|pin| pin.question_id == q.id && pin.pinned_run.as_ref() == Some(run)),
+        "base recovery receipt targets a different decision, owner, stop or run"
+    );
+    // The task marker and exact-run pin are one atomic save, after authorization.
+    // It also proves completion if the process stopped before marking the receipt.
+    if receipt.applied || task.base_recovery_requests.contains(&key) {
+        Ok(Some(format!(
+            "base-recovery-controls/decisions/{}.json: authorization and exact-run queueing committed",
+            q.id
+        )))
+    } else {
+        Ok(None)
+    }
+}
+
 /// Recheck the recorded choice both at admission and at live-driver consumption.
 pub(crate) fn decision_current(
     queue: &Queue,

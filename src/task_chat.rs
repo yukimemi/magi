@@ -1043,6 +1043,17 @@ fn effect_receipt(
         }
         return Ok(None);
     }
+    if matches!(
+        q.chosen_action(),
+        Some(crate::ask::ChoiceAction::RecoverBase { .. })
+    ) {
+        return crate::base_recovery_control::effect_receipt(
+            home,
+            task.as_ref()
+                .context("base recovery decision has no owning task")?,
+            q,
+        );
+    }
     if let Some(action) = q.chosen_action().filter(|a| a.maintenance()) {
         let path = home.join("choice-actions").join(format!("{}.json", q.id));
         let bytes = match std::fs::read(path) {
