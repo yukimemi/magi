@@ -788,3 +788,81 @@ async fn historical_unspent_receipt_recovers_only_the_exact_original_answer_once
     assert_eq!(magi::repair_budget::reconcile::apply(&queue, &magi::run::home(), recovery).await.unwrap(), receipt);
 }
 }
+
+common::e2e! {
+async fn superseded_dependency_question_does_not_deadlock_triage_after_repair_fails_again() {
+    let (fx, task, mut runner, request) = stopped(false).await;
+    // Make the authorized attempt fail its existing gate without changing the
+    // retained failure/head/pass that the original receipt authorizes.
+    for agent in &mut runner.state.config.agents {
+        agent.env.insert("MOCK_GATE_FIX_NOOP".into(), "1".into());
+    }
+    runner.state.save().unwrap();
+    accepted(&request);
+    let queue = Queue::open();
+    let questions = magi::ask::Questions::open();
+    let mut historical = queue.get(&task.id).unwrap();
+    let original = dependency_question(&historical);
+    let talk = decide_dependency(&fx, &original);
+    let original = questions.get(&original.id).unwrap();
+    // Recreate only the old answer-before-acceptance/effect-after-acceptance
+    // ordering in this isolated fixture, as in the successful recovery test.
+    historical.repair_grants[0].at = jiff::Timestamp::now();
+    queue.put(&mut historical).unwrap();
+    magi::triage::apply_answers(&queue, &questions);
+    settle_worker_projection();
+    let generic = dependency_question(&queue.get(&task.id).unwrap());
+    let mut dependent = Task::new("dependent".into(), "wait".into(), fx.repo.clone(), Source::Human);
+    dependent.block(vec![task.id.clone()], Some("retained dependency".into()));
+    queue.put(&mut dependent).unwrap();
+    let recovery = magi::repair_budget::reconcile::Request {
+        task: task.id.clone(), run: request.run.clone(), head: request.head.clone(), expect_pass: request.expect_pass,
+        receipt: request.request.clone(), question: original.id.clone(), answer_at: original.answered_at.unwrap(),
+        request: "recover-before-red-repair".into(), reason: "owner authorized the original receipt reconciliation".into(),
+    };
+    let receipt = magi::repair_budget::reconcile::apply(&queue, &magi::run::home(), recovery).await.unwrap();
+    assert!(receipt.superseded_questions.iter().any(|(id, _)| id == &generic.id));
+    // The source stays Open for audit, but neither a restarted conductor's
+    // pending gate nor task-list recovery indicators may call it actionable.
+    let recovered = Queue::open().get(&task.id).unwrap();
+    assert!(questions.get(&generic.id).unwrap().status.open());
+    assert!(!magi::triage::pending_for(&magi::ask::Questions::open(), &recovered));
+    assert!(!magi::triage::open_task_ids(&questions).contains(&task.id));
+    let out = magi_cli(&magi::run::home()).args(["task", "control", "decide", &generic.id, &generic.choices[0]])
+        .env("MAGI_NODE", "chat").env("MAGI_RUN", &talk).output().unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("superseded"));
+    // Supersession is exact, not a blanket exclusion for this task or id.
+    let mut changed = questions.get(&generic.id).unwrap(); changed.detail.push_str(" changed source");
+    questions.put(&mut changed).unwrap();
+    assert!(magi::triage::pending_for(&questions, &recovered));
+    assert!(magi::triage::open_task_ids(&questions).contains(&task.id));
+    let mut restore = generic.clone(); questions.put(&mut restore).unwrap();
+
+    let mut resumed = Runner::resume(&request.run).unwrap(); resumed.execute().await.unwrap();
+    assert_eq!(resumed.state.status, RunStatus::Blocked);
+    assert_eq!(resumed.state.repair_grants[0].phase, Phase::Complete);
+    assert_eq!(resumed.state.repair_grants[0].spent, 1);
+    assert!(!resumed.state.repair_grants[0].succeeded);
+    let mut held = queue.get(&task.id).unwrap();
+    held.hold_machine(Some("authorized repair failed its gate".into())); queue.put(&mut held).unwrap();
+    assert_eq!(queue.get(&dependent.id).unwrap().blocked_by, [task.id.clone()]);
+    assert!(!magi::triage::pending_for(&questions, &held));
+    let report = magi::triage::run_once(&queue, &questions, None, jiff::Timestamp::now());
+    assert!(report.asked.contains(&task.id), "{report:?}");
+    let fresh = questions.list().into_iter().find(|q| q.run == task.id && q.node == magi::triage::DEPS_NODE
+        && q.id != generic.id && q.id != original.id && q.status.open()).unwrap();
+    assert!(magi::triage::pending_for(&questions, &queue.get(&task.id).unwrap()));
+    assert!(magi::triage::open_task_ids(&questions).contains(&task.id));
+    assert_eq!(queue.get(&dependent.id).unwrap().blocked_by, [task.id.clone()]);
+    // The replacement question can be answered through the real control route.
+    decide_dependency(&fx, &fresh);
+    magi::triage::apply_answers(&queue, &questions);
+    settle_worker_projection();
+    let after = queue.get(&task.id).unwrap();
+    assert!(!magi::triage::pending_for(&questions, &after));
+    assert_eq!(after.repair_grants.len(), 1);
+    assert_eq!(RunState::load(&request.run).unwrap().repair_grants[0].spent, 1);
+    assert_eq!(questions.get(&generic.id).unwrap().answer, None);
+}
+}

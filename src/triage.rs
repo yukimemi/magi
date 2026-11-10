@@ -498,12 +498,25 @@ fn latest_triage_question(questions: &Questions, task_id: &str) -> Option<Questi
     latest_question(questions, NODE, task_id)
 }
 
+/// Read-only views must use the same exact supersession evidence as grant
+/// admission and answer recording. Missing task evidence keeps the question
+/// actionable; changed question contents invalidate the exemption.
+fn superseded_recovery_question(questions: &Questions, q: &Question) -> bool {
+    questions
+        .root()
+        .parent()
+        .and_then(|home| Queue::at(home.join("queue")).get(&q.run).ok())
+        .is_some_and(|task| crate::repair_budget::reconcile::superseded_question(&task, q))
+}
+
 /// [`latest_triage_question`] for any of this module's nodes.
 fn latest_question(questions: &Questions, node: &str, task_id: &str) -> Option<Question> {
     questions
         .list()
         .into_iter()
-        .filter(|q| q.node == node && q.run == task_id)
+        .filter(|q| {
+            q.node == node && q.run == task_id && !superseded_recovery_question(questions, q)
+        })
         // `asked_at` first: ids carry only whole seconds plus a random
         // suffix, so two questions filed in the same second order randomly.
         .max_by(|a, b| a.asked_at.cmp(&b.asked_at).then_with(|| a.id.cmp(&b.id)))
@@ -1019,7 +1032,11 @@ fn ask_about_stuck_roots(
         }
         let latest = all
             .iter()
-            .filter(|q| q.node == DEPS_NODE && q.run == *root_id)
+            .filter(|q| {
+                q.node == DEPS_NODE
+                    && q.run == *root_id
+                    && !crate::repair_budget::reconcile::superseded_question(root, q)
+            })
             .max_by(|a, b| a.asked_at.cmp(&b.asked_at).then_with(|| a.id.cmp(&b.id)));
         match latest {
             Some(q) if q.status.open() || awaiting_task_chat(q, root) => continue,
@@ -1368,7 +1385,11 @@ pub fn open_task_ids(questions: &Questions) -> std::collections::BTreeSet<String
     questions
         .list()
         .into_iter()
-        .filter(|q| (q.node == NODE || q.node == DEPS_NODE) && q.status.open())
+        .filter(|q| {
+            (q.node == NODE || q.node == DEPS_NODE)
+                && q.status.open()
+                && !superseded_recovery_question(questions, q)
+        })
         .map(|q| q.run)
         .collect()
 }
