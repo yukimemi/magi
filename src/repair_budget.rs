@@ -5,6 +5,8 @@ use std::path::Path;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
+pub use crate::base_sync_recovery::{Stop, StopKind, ensure_generic_release};
+
 use crate::{
     git,
     queue::{Queue, Task, TaskStatus},
@@ -19,6 +21,8 @@ pub enum Kind {
     Gate,
     /// Repair the last exhausted review's findings or failed E2E.
     Review,
+    /// Resolve one retained textual base conflict without rewriting history.
+    BaseConflict,
 }
 
 /// Immutable request identity, also retained in the task's durable receipt.
@@ -47,6 +51,18 @@ pub struct Request {
     /// Operator's reason, retained verbatim in the receipt.
     #[arg(long)]
     pub reason: String,
+    /// Exact owner-approved base tip, required for base-conflict repair.
+    #[arg(long)]
+    #[serde(default)]
+    pub tip: Option<String>,
+    /// Narrow owner-approved conflict resolution instruction, separate from review criteria.
+    #[arg(long)]
+    #[serde(default)]
+    pub instruction: Option<String>,
+    /// Explicitly supersede this unimported base-conflict request after its tip moved.
+    #[arg(long)]
+    #[serde(default)]
+    pub replace_request: Option<String>,
 }
 
 /// Accepted grant and the control state against which it was authorized.
@@ -60,6 +76,9 @@ pub struct Receipt {
     pub decision: Option<jiff::Timestamp>,
     /// Task instruction, sources and configuration selection at acceptance.
     pub contract: String,
+    /// Immutable textual stop; no synchronization budget is renewed.
+    #[serde(default)]
+    pub stop: Option<crate::base_sync_recovery::Stop>,
 }
 
 /// Durable execution checkpoint; consumed attempts never reset historical counters.
@@ -78,6 +97,9 @@ pub struct Applied {
     /// Fresh review, E2E and final gate all cleared the repaired head.
     #[serde(default)]
     pub succeeded: bool,
+    /// Write-ahead merge checkpoint, retained across interrupted delivery.
+    #[serde(default)]
+    pub conflict: Option<crate::base_conflict::Operation>,
 }
 
 /// Checkpoint saved before each potentially interrupted operation.
@@ -104,25 +126,62 @@ pub fn authorize_terminal() -> Result<()> {
     Ok(())
 }
 
-fn contract(task: &Task) -> Result<String> {
-    Ok(serde_json::to_string(&(
+fn contract(task: &Task, kind: Kind) -> Result<String> {
+    let original = serde_json::to_string(&(
         &task.instruction,
         &task.sources,
         &task.overrides,
         &task.repo,
         &task.pr_recovery,
         &task.replacement,
-    ))?)
+    ))?;
+    if kind == Kind::BaseConflict || task.review_branch.is_some() {
+        Ok(serde_json::to_string(&(
+            original,
+            &task.review_of,
+            &task.review_branch,
+            &task.review_instruction,
+            &task.resumption,
+        ))?)
+    } else {
+        Ok(original)
+    }
 }
 
-fn controls(home: &Path, task: &Task, state: &RunState) -> Result<()> {
+fn controls(home: &Path, task: &Task, state: &RunState, kind: Kind) -> Result<()> {
     ensure!(
         task.runs.last() == Some(&state.id)
             && state.origin.as_ref().and_then(|o| o.task.as_deref()) == Some(task.id.as_str()),
         "repair grant refused: run task ownership changed"
     );
+    if kind == Kind::BaseConflict || conflict_lineage(state) {
+        ensure!(
+            crate::daemon::compatible_run_instruction(state, task),
+            "base-conflict repair refused: task instructions differ from retained review criteria {:?}; restore those criteria with task edit, then put only the narrow repair instruction in grant-repair --instruction",
+            state
+                .task_instruction
+                .as_ref()
+                .unwrap_or(&state.instruction)
+        );
+    }
     ensure!(
-        !task.fresh_start && task.review_branch.is_none() && task.replacement.is_none(),
+        !task.fresh_start
+            && (task.review_branch.is_none()
+                || ((kind == Kind::BaseConflict || conflict_lineage(state))
+                    && crate::daemon::compatible_run_instruction(state, task)
+                    && task
+                        .review_instruction
+                        .as_ref()
+                        .is_none_or(|criteria| criteria == &task.instruction)
+                    && state.reviewed_commits.is_some()
+                    && task.review_branch.as_ref().is_some_and(|branch| state
+                        .foreign_checkout
+                        .as_ref()
+                        .is_some_and(|checkout| &checkout.branch == branch)
+                        || state
+                            .winner()
+                            .is_some_and(|winner| &winner.branch == branch))))
+            && task.replacement.is_none(),
         "repair grant refused: task has a different continuation selected"
     );
     ensure!(
@@ -137,7 +196,7 @@ fn controls(home: &Path, task: &Task, state: &RunState) -> Result<()> {
     ensure!(
         state.released_to.is_none()
             && state.merge_decision.is_none()
-            && !state.base_sync_blocked()
+            && (!state.base_sync_blocked() || kind == Kind::BaseConflict)
             && state.github_text.as_ref().is_none_or(|t| t.resolved)
             && state
                 .merge_repairs
@@ -170,6 +229,9 @@ fn controls(home: &Path, task: &Task, state: &RunState) -> Result<()> {
 }
 
 async fn head_and_public(state: &RunState, head: &str) -> Result<()> {
+    if let Some(checkout) = &state.foreign_checkout {
+        checkout.validate(&state.repo).await?;
+    }
     let winner = state
         .winner()
         .context("repair grant refused: no retained winner")?;
@@ -236,9 +298,37 @@ fn evidence(state: &RunState, request: &Request) -> Result<()> {
         "repair grant refused: another repair grant is unfinished"
     );
     match request.kind {
+        Kind::BaseConflict => {
+            ensure!(
+                request.rounds == 1,
+                "base-conflict repair permits exactly one attempt"
+            );
+            ensure!(
+                request
+                    .instruction
+                    .as_ref()
+                    .is_some_and(|s| !s.trim().is_empty() && s.len() <= 16384),
+                "base-conflict repair requires --instruction with the narrow owner-approved repair (1..=16384 bytes)"
+            );
+            let stop = state
+                .base_sync_recovery
+                .stop
+                .as_ref()
+                .context("no recorded textual stop")?;
+            ensure!(
+                stop.kind == crate::base_sync_recovery::StopKind::Conflict
+                    && stop.head == request.head
+                    && request.tip.is_some()
+                    && state.base_sync.as_ref().is_some_and(
+                        |s| s.tip == stop.tip && s.conflict.as_ref() == Some(&stop.detail)
+                    ),
+                "base-conflict repair refused: textual stop, head or --tip changed"
+            );
+        }
         Kind::Gate => {
             ensure!(
-                state.gate_fixes.len() >= state.config.graph.gate_fix_rounds,
+                state.gate_fixes.len() >= state.config.graph.gate_fix_rounds
+                    || failed_conflict_repair_at(state, &request.head),
                 "repair grant refused: gate repair budget is not exhausted"
             );
             ensure!(
@@ -250,7 +340,8 @@ fn evidence(state: &RunState, request: &Request) -> Result<()> {
         }
         Kind::Review => {
             ensure!(
-                state.reviews.len() >= state.config.graph.review_rounds,
+                state.reviews.len() >= state.config.graph.review_rounds
+                    || failed_conflict_repair_at(state, &request.head),
                 "repair grant refused: review budget is not exhausted"
             );
             ensure!(
@@ -269,6 +360,10 @@ fn evidence(state: &RunState, request: &Request) -> Result<()> {
 /// changed here, so a crash cannot leave an unqueued budget mutation.
 pub async fn grant(queue: &Queue, home: &Path, mut request: Request) -> Result<Receipt> {
     ensure!((1..=3).contains(&request.rounds), "rounds must be 1..=3");
+    ensure!(
+        request.replace_request.is_none() || request.kind == Kind::BaseConflict,
+        "only base-conflict grants support --replace-request"
+    );
     ensure!(
         !request.reason.trim().is_empty() && request.reason.len() <= 4096,
         "reason must contain 1..=4096 bytes"
@@ -317,18 +412,8 @@ pub async fn grant(queue: &Queue, home: &Path, mut request: Request) -> Result<R
     }
     let _owner = crate::pr_head::owner_lock(home, &request.run)?;
     let state = RunState::load_under(&request.run, home)?;
-    controls(home, &task, &state)?;
-    ensure!(
-        queue.unreadable().is_empty(),
-        "repair grant refused: unreadable task records prevent proving unique ownership"
-    );
-    ensure!(
-        !queue
-            .list()
-            .iter()
-            .any(|other| other.id != task.id && other.runs.contains(&state.id)),
-        "repair grant refused: multiple tasks claim this run"
-    );
+    controls(home, &task, &state, request.kind)?;
+    unique_owner(queue, &task, &state)?;
     ensure!(
         task.status != TaskStatus::Running,
         "repair grant refused: task driver is running"
@@ -344,21 +429,74 @@ pub async fn grant(queue: &Queue, home: &Path, mut request: Request) -> Result<R
         state.status.resumable(),
         "repair grant refused: run is final"
     );
-    ensure!(
-        !task
+    let queued: Vec<_> = task
+        .repair_grants
+        .iter()
+        .filter(|receipt| {
+            receipt.request.run == state.id
+                && !superseded(&task, receipt)
+                && !state
+                    .repair_grants
+                    .iter()
+                    .any(|applied| applied.receipt == **receipt)
+        })
+        .collect();
+    if let Some(replaced) = &request.replace_request {
+        let old = task
             .repair_grants
-            .iter()
-            .any(|g| g.request.run == state.id
-                && !state.repair_grants.iter().any(|a| a.receipt == *g)),
-        "repair grant refused: another grant is queued"
-    );
+            .last()
+            .context("replacement refused: no queued grant")?;
+        ensure!(
+            queued.len() == 1
+                && queued[0] == old
+                && old.request.request == *replaced
+                && old.request.kind == Kind::BaseConflict,
+            "replacement refused: --replace-request must name the latest unimported base-conflict grant; imported or dispatched grants cannot be replaced"
+        );
+        ensure!(
+            old.request.head == request.head
+                && old.stop == state.base_sync_recovery.stop
+                && old.request.tip != request.tip,
+            "replacement refused: retained stop/head changed or the approved tip has not moved"
+        );
+        let old_tip = old
+            .request
+            .tip
+            .as_deref()
+            .context("replacement refused: old approval has no base tip")?;
+        let new_tip = request
+            .tip
+            .as_deref()
+            .context("replacement requires --tip")?;
+        ensure!(
+            git::is_ancestor(&state.repo, old_tip, new_tip).await,
+            "replacement refused: new base tip must descend from the old approved tip; reconcile rewritten upstream history explicitly"
+        );
+    } else {
+        ensure!(
+            queued.is_empty(),
+            "repair grant refused: another grant is queued; a stale unimported base-conflict approval requires explicit --replace-request <old-request-id>"
+        );
+    }
     evidence(&state, &request)?;
     head_and_public(&state, &request.head).await?;
+    conflict_target(&state, &request, None).await?;
+    if request.kind == Kind::BaseConflict {
+        ensure!(
+            git::toplevel(&task.repo).await?.canonicalize()?
+                == git::toplevel(&state.repo).await?.canonicalize()?,
+            "base-conflict repair refused: task repository ownership changed"
+        );
+    }
+    let task_contract = contract(&task, request.kind)?;
     let receipt = Receipt {
+        stop: (request.kind == Kind::BaseConflict)
+            .then(|| state.base_sync_recovery.stop.clone())
+            .flatten(),
         request,
         at: jiff::Timestamp::now(),
         decision: task.operator_decided_at,
-        contract: contract(&task)?,
+        contract: task_contract,
     };
     task.repair_grants.push(receipt.clone());
     task.status = TaskStatus::Queued;
@@ -425,6 +563,14 @@ pub(crate) async fn apply(home: &Path, state: &mut RunState, disk: &RunState) ->
         Err(_) if state.repair_grants.is_empty() && !queue.path_of(owner).exists() => return Ok(()),
         Err(error) => return Err(error).context("repair task record unavailable"),
     };
+    if pending(&task, disk)
+        && task
+            .repair_grants
+            .last()
+            .is_some_and(|r| r.request.kind == Kind::BaseConflict)
+    {
+        unique_owner(&queue, &task, disk)?;
+    }
     if !state.repair_grants.is_empty() || pending(&task, disk) {
         ensure!(
             state.updated_at == disk.updated_at,
@@ -436,13 +582,16 @@ pub(crate) async fn apply(home: &Path, state: &mut RunState, disk: &RunState) ->
         .last()
         .filter(|g| g.phase != Phase::Complete)
     {
-        controls(home, &task, disk)?;
+        controls(home, &task, disk, active.receipt.request.kind)?;
         ensure!(
             task.operator_decided_at == active.receipt.decision
-                && contract(&task)? == active.receipt.contract,
+                && contract(&task, active.receipt.request.kind)? == active.receipt.contract,
             "repair grant held: task contract or owner decision changed after acceptance"
         );
         let _outputs = output_leases(disk)?;
+        if matches!(active.phase, Phase::Pending | Phase::Fixing) {
+            conflict_target(disk, &active.receipt.request, active.receipt.stop.as_ref()).await?;
+        }
         if active.phase != Phase::Fixing {
             head_and_public(disk, &active.head).await?;
         } else {
@@ -459,15 +608,17 @@ pub(crate) async fn apply(home: &Path, state: &mut RunState, disk: &RunState) ->
     }
     let id = state.id.clone();
     for receipt in task.repair_grants.iter().filter(|r| r.request.run == id) {
-        if state.repair_grants.iter().any(|g| g.receipt == *receipt) {
+        if superseded(&task, receipt) || state.repair_grants.iter().any(|g| g.receipt == *receipt) {
             continue;
         }
-        controls(home, &task, disk)?;
+        controls(home, &task, disk, receipt.request.kind)?;
         ensure!(
-            task.operator_decided_at == receipt.decision && contract(&task)? == receipt.contract,
+            task.operator_decided_at == receipt.decision
+                && contract(&task, receipt.request.kind)? == receipt.contract,
             "repair grant held: owner decision changed after acceptance"
         );
         evidence(disk, &receipt.request)?;
+        conflict_target(disk, &receipt.request, receipt.stop.as_ref()).await?;
         let _outputs = output_leases(disk)?;
         head_and_public(disk, &receipt.request.head).await?;
         state.repair_grants.push(Applied {
@@ -477,6 +628,7 @@ pub(crate) async fn apply(home: &Path, state: &mut RunState, disk: &RunState) ->
             review_start: state.reviews.len(),
             head: receipt.request.head.clone(),
             succeeded: false,
+            conflict: None,
         });
         state.event(
             "repair-grant",
@@ -516,10 +668,11 @@ pub fn queue_resumption(queue: &Queue, task: &mut Task, run: &str) -> Result<boo
     if !pending(task, &state) {
         return Ok(false);
     }
-    controls(home, task, &state)?;
     let receipt = task.repair_grants.last().expect("pending receipt");
+    controls(home, task, &state, receipt.request.kind)?;
     ensure!(
-        task.operator_decided_at == receipt.decision && contract(task)? == receipt.contract,
+        task.operator_decided_at == receipt.decision
+            && contract(task, receipt.request.kind)? == receipt.contract,
         "repair grant held: owner decision or task contract changed after acceptance"
     );
     task.status = TaskStatus::Queued;
@@ -527,4 +680,162 @@ pub fn queue_resumption(queue: &Queue, task: &mut Task, run: &str) -> Result<boo
     task.hold_reason = None;
     task.held_at = None;
     Ok(true)
+}
+
+/// Recheck the recorded target without fetching or renewing a synchronization interval.
+async fn conflict_target(
+    state: &RunState,
+    request: &Request,
+    stop: Option<&crate::base_sync_recovery::Stop>,
+) -> Result<()> {
+    if let Some(checkout) = &state.foreign_checkout {
+        checkout.validate(&state.repo).await?;
+    }
+    if request.kind != Kind::BaseConflict {
+        return Ok(());
+    }
+    if let Some(stop) = stop {
+        ensure!(
+            state.base_sync_recovery.stop.as_ref() == Some(stop),
+            "base-conflict repair held: stopped synchronization changed"
+        );
+    }
+    let tracking = format!(
+        "refs/remotes/{}/{}",
+        state.config.merge.remote, state.base_branch
+    );
+    let live = git::rev_parse(&state.repo, &tracking).await?;
+    if request.tip.as_ref() != Some(&live) {
+        let imported = state
+            .repair_grants
+            .iter()
+            .any(|grant| grant.receipt.request == *request);
+        ensure!(
+            !imported,
+            "base-conflict repair held: recorded base tip moved to {live}; request {} is already imported. Its reserved operation cannot be retargeted with --replace-request; inspect the saved conflict checkpoint and retained scratch before manual reconciliation",
+            request.request
+        );
+        if stop.is_none() {
+            anyhow::bail!(
+                "base-conflict repair refused: recorded base tip moved to {live}; inspect this target and explicitly request --tip {live}. An already queued approval additionally requires --replace-request <old-request-id>"
+            );
+        }
+        anyhow::bail!(
+            "base-conflict repair held: recorded base tip moved to {live}. Inspect the new target, then explicitly replace the unimported approval with `magi task grant-repair {} --run {} --kind base-conflict --rounds 1 --head {} --tip {live} --expect-pass {} --replace-request {} --request <new-id> --reason <reason> --instruction <approved-resolution>`. No edit or synchronization budget was granted",
+            request.task,
+            request.run,
+            request.head,
+            state.passes.last().map_or(0, |pass| pass.index),
+            request.request
+        );
+    }
+    let stopped = state
+        .base_sync_recovery
+        .stop
+        .as_ref()
+        .context("base-conflict repair requires the retained textual stop")?;
+    ensure!(
+        git::is_ancestor(&state.repo, &stopped.tip, &live).await,
+        "base-conflict repair refused: current base {live} does not descend from recorded stop tip {}; reconcile the rewritten base explicitly before granting repair",
+        stopped.tip
+    );
+    Ok(())
+}
+
+/// Only a typed exact-run grant can pass the textual-stop admission fence.
+pub(crate) fn conflict_pending(task: &Task, state: &RunState) -> bool {
+    pending(task, state)
+        && task
+            .repair_grants
+            .last()
+            .is_some_and(|r| r.request.kind == Kind::BaseConflict)
+}
+
+/// Repeat external ownership checks immediately before fast-forward delivery.
+pub(crate) async fn recheck_conflict_delivery(state: &RunState, request: &Request) -> Result<()> {
+    let home = crate::run::home();
+    let task = Queue::at(home.join("queue")).get(&request.task)?;
+    controls(&home, &task, state, request.kind)?;
+    unique_owner(&Queue::at(home.join("queue")), &task, state)?;
+    ensure!(
+        git::toplevel(&task.repo).await?.canonicalize()?
+            == git::toplevel(&state.repo).await?.canonicalize()?,
+        "base-conflict repair refused: task repository ownership changed"
+    );
+    let receipt = task
+        .repair_grants
+        .iter()
+        .find(|r| r.request == *request)
+        .context("repair receipt disappeared")?;
+    ensure!(
+        task.operator_decided_at == receipt.decision
+            && contract(&task, receipt.request.kind)? == receipt.contract,
+        "base-conflict repair held: task contract or owner decision changed"
+    );
+    conflict_target(state, request, receipt.stop.as_ref()).await?;
+    crate::pr_head::ensure_owner_record(state, Some(state))?;
+    public_lease(state).await
+}
+
+fn unique_owner(queue: &Queue, task: &Task, state: &RunState) -> Result<()> {
+    ensure!(
+        queue.unreadable().is_empty(),
+        "repair grant refused: unreadable task records prevent proving unique ownership"
+    );
+    ensure!(
+        !queue
+            .list()
+            .iter()
+            .any(|other| other.id != task.id && other.runs.contains(&state.id)),
+        "repair grant refused: multiple tasks claim this run"
+    );
+    Ok(())
+}
+
+/// A settled red conflict repair remains owned by this run, not a successor review.
+pub(crate) fn conflict_failure(task: &Task, state: &RunState) -> Option<String> {
+    if task.runs.last() == Some(&state.id)
+        && !pending(task, state)
+        && state.repair_grants.last().is_some_and(|g| {
+            (g.receipt.request.kind == Kind::BaseConflict || conflict_lineage(state))
+                && g.phase == Phase::Complete
+                && !g.succeeded
+        })
+    {
+        Some(format!(
+            "Conflict repair on run {} completed without clearing fresh review or verification. Inspect its repair_grants, reviews and gate; authorize the specific remaining failure explicitly. A generic release cannot select a successor review or implementation.",
+            state.id
+        ))
+    } else {
+        None
+    }
+}
+
+// Follow-up grants remain explicit and head-bound even when the conflict's
+// confirmation failed before ordinary review/gate allowances were exhausted.
+fn conflict_lineage(state: &RunState) -> bool {
+    state.repair_grants.iter().any(|grant| {
+        grant.receipt.request.kind == Kind::BaseConflict
+            && grant.phase == Phase::Complete
+            && grant
+                .conflict
+                .as_ref()
+                .is_some_and(|operation| operation.result.is_some())
+    })
+}
+
+fn failed_conflict_repair_at(state: &RunState, head: &str) -> bool {
+    conflict_lineage(state)
+        && state.repair_grants.last().is_some_and(|grant| {
+            grant.phase == Phase::Complete && !grant.succeeded && grant.head == head
+        })
+}
+
+/// A replacement is an append-only task receipt; the old approval is never
+/// imported or dispatched, including after a stale queue writer or restart.
+fn superseded(task: &Task, receipt: &Receipt) -> bool {
+    task.repair_grants.iter().any(|newer| {
+        newer.request.run == receipt.request.run
+            && newer.request.replace_request.as_ref() == Some(&receipt.request.request)
+    })
 }

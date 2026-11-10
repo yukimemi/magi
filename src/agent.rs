@@ -157,7 +157,7 @@ fn repository_writer(inv: &Invocation<'_>) -> bool {
     inv.allow_write
         && (matches!(
             inv.node,
-            "implement" | "fix" | "graft" | "gate-fix" | "land" | "rebase"
+            "implement" | "fix" | "graft" | "gate-fix" | "land" | "rebase" | "base-conflict"
         ) || inv.node == crate::queue::CHAT_NODE)
 }
 
@@ -2179,6 +2179,7 @@ mod tests {
                 "gate-fix",
                 "land",
                 "rebase",
+                "base-conflict",
                 crate::queue::CHAT_NODE,
             ] {
                 let mut invocation = inv(Path::new("."), Path::new("/art"), true);
@@ -2483,6 +2484,7 @@ mod tests {
             "gate-fix",
             "land",
             "rebase",
+            "base-conflict",
             "chat",
         ] {
             i.node = node;
@@ -2519,6 +2521,7 @@ mod tests {
             "gate-fix",
             "land",
             "rebase",
+            "base-conflict",
             "review",
             "judge",
             "advise",

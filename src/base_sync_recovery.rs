@@ -219,7 +219,11 @@ impl RunState {
                     format!("{why}Authorize a new bounded synchronization interval with `magi run --resume {} --recover-base`, or a new owner resumption approval", self.id)
                 }
             },
-            Some(StopKind::Conflict) => "Inspect and resolve the retained textual conflict; base-budget recovery cannot resolve it".into(),
+            Some(StopKind::Conflict) => {
+                let stop = self.base_sync_recovery.stop.as_ref().unwrap();
+                let task = self.origin.as_ref().and_then(|origin| origin.task.as_deref()).unwrap_or("<task>");
+                format!("Authorize a narrow history-preserving repair with `magi task grant-repair {task} --run {} --kind base-conflict --rounds 1 --head {} --tip {} --expect-pass {} --request <unique-id> --reason <reason> --instruction <approved-resolution>`; retain the original review criteria. Base-budget recovery cannot resolve a textual conflict", self.id, stop.head, stop.tip, self.passes.last().map_or(0, |p| p.index))
+            },
             Some(StopKind::Divergence) => "Reconcile foreign remote branch commits before resuming; do not overwrite them".into(),
             Some(StopKind::Publication) => "Inspect the retained publication failure and remote lease before resuming".into(),
             Some(StopKind::ClosingIntegratedPr) => "Resume to retry closing the already integrated pull request".into(),
@@ -635,4 +639,33 @@ impl crate::queue::Task {
             });
         }
     }
+}
+
+/// Refuse a generic release at a textual stop before changing queue state.
+pub fn ensure_generic_release(
+    queue: &crate::queue::Queue,
+    task: &crate::queue::Task,
+) -> Result<()> {
+    if let Some(state) = task
+        .runs
+        .last()
+        .and_then(|id| RunState::load_under(id, queue.root().parent()?).ok())
+        && let Some(reason) = crate::repair_budget::conflict_failure(task, &state)
+    {
+        anyhow::bail!(reason);
+    }
+    if let Some(state) = held_run(queue, task)
+        && state
+            .base_sync_recovery
+            .stop
+            .as_ref()
+            .is_some_and(|s| s.kind == StopKind::Conflict)
+        && !crate::repair_budget::conflict_pending(task, &state)
+    {
+        anyhow::bail!(
+            "generic release cannot authorize textual conflict editing. {}",
+            state.base_sync_next_action()
+        );
+    }
+    Ok(())
 }

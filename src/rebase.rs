@@ -318,7 +318,7 @@ fn block(state: &mut RunState, kind: &str, detail: String) -> anyhow::Error {
 }
 
 /// Status entries `(XY, path)` of the worktree, renames split.
-async fn status_entries(scratch: &Path) -> Result<Vec<(String, String)>> {
+pub(crate) async fn status_entries(scratch: &Path) -> Result<Vec<(String, String)>> {
     let out = git::git_raw(
         scratch,
         &[
@@ -341,7 +341,7 @@ async fn status_entries(scratch: &Path) -> Result<Vec<(String, String)>> {
 
 /// Index-side changes against HEAD outside `expected` (what Git applied
 /// cleanly), as a comparable string.
-async fn index_outside(scratch: &Path, expected: &[String]) -> Result<String> {
+pub(crate) async fn index_outside(scratch: &Path, expected: &[String]) -> Result<String> {
     let out = git::git_raw(
         scratch,
         &[
@@ -1322,7 +1322,7 @@ async fn subjects(worktree: &Path, range: &str) -> Vec<String> {
 /// A separator alone is ambiguous (for example a Setext heading). Allow
 /// separators already present under the same heading on either side, while
 /// rejecting new ones left by a resolution. Opening, closing and diff3 markers stand on their own.
-async fn has_markers(worktree: &Path, path: &str, sides: &[&str]) -> Result<bool> {
+pub(crate) async fn has_markers(worktree: &Path, path: &str, sides: &[&str]) -> Result<bool> {
     let Ok(text) = std::fs::read_to_string(worktree.join(path)) else {
         return Ok(false);
     };

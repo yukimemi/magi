@@ -4182,14 +4182,23 @@ async fn attempt(
         return Vec::new();
     }
 
+    if let Some(state) = task.runs.last().and_then(|id| RunState::load(id).ok())
+        && let Some(reason) = crate::repair_budget::conflict_failure(task, &state)
+    {
+        task.hold_machine(Some(reason));
+        record(queue, task);
+        return Vec::new();
+    }
+
     if let Some(held) = crate::base_sync_recovery::held_run(queue, task)
         && !task.fresh_start
-        && task.review_branch.is_none()
         && task.pr_recovery.is_none()
     {
         // Authorization still takes the owner lock and execution lease and
         // rechecks liveness, retained HEAD and ownership before saving.
-        let authorized = if task.resumption.is_some() && compatible_run_instruction(&held, task) {
+        let authorized = if crate::repair_budget::conflict_pending(task, &held) {
+            true
+        } else if task.resumption.is_some() && compatible_run_instruction(&held, task) {
             let home = queue.root().parent().expect("queue has a home");
             match Runner::authorize_base_recovery_from_resumption(home, &held.id, &task.id).await {
                 Ok(()) => true,
@@ -4421,7 +4430,14 @@ async fn attempt(
     // review-only pass rather than resuming or competing again. Consumed
     // (cleared) here whichever way this goes, so it never outlives this one
     // attempt - see `queue::Task::review_branch`.
-    let review_branch = take_review_branch(task, previous.as_ref());
+    let review_branch = if previous
+        .as_ref()
+        .is_some_and(|state| crate::repair_budget::pending(task, state))
+    {
+        None
+    } else {
+        take_review_branch(task, previous.as_ref())
+    };
     let branch_exists = match &review_branch {
         Some(branch) => crate::git::branch_exists(&repo, branch)
             .await

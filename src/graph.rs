@@ -1698,6 +1698,30 @@ impl Runner {
         Ok(execution)
     }
 
+    /// No conflict checkpoint proves dispatch was never reached. End that
+    /// consumed generation so an owner can explicitly authorize a fresh one.
+    async fn repair_base_conflict(&mut self, dispatch: bool) -> Result<()> {
+        let result = crate::base_conflict::repair(&mut self.state, dispatch).await;
+        if let Err(error) = &result
+            && !error.is::<crate::repo_lock::ResourceBlocked>()
+            && self
+                .state
+                .repair_grants
+                .last()
+                .is_some_and(|g| g.conflict.is_none())
+        {
+            self.state.repair_grants.last_mut().unwrap().phase =
+                crate::repair_budget::Phase::Complete;
+            self.state.status = RunStatus::Blocked;
+            self.state.save()?;
+            bail!(
+                "{error:#}. The consumed reservation ended before editing-seat dispatch. Inspect its scratch tree, then authorize a new base-conflict grant with a new request ID and current --expect-pass {}; the old request will not dispatch again",
+                self.state.passes.last().map_or(0, |p| p.index)
+            );
+        }
+        result
+    }
+
     /// A grant owns only these repair attempts. Confirmation reviews cannot
     /// create another fixer allowance, and every operation is restart-checkpointed.
     async fn execute_granted_repair(&mut self) -> Result<()> {
@@ -1724,6 +1748,7 @@ impl Runner {
                     self.state.repair_grants[index].phase = Phase::Fixing;
                     self.state.save()?;
                     match grant.receipt.request.kind {
+                        Kind::BaseConflict => self.repair_base_conflict(true).await?,
                         Kind::Gate => {
                             let failed = self.state.gate.clone();
                             let _ = self.gate_fix_round(&winner, &failed).await?;
@@ -1757,6 +1782,9 @@ impl Runner {
                     }
                 }
                 Phase::Fixing => {
+                    if grant.receipt.request.kind == Kind::BaseConflict {
+                        self.repair_base_conflict(false).await?;
+                    }
                     // Interrupted fixers may have left source changes or an
                     // unpushed commit. Preserve them before fresh assessment.
                     let _coordination = self.coordinate(&winner.worktree).await?;
@@ -1796,6 +1824,20 @@ impl Runner {
                     self.state.repair_grants[index].head =
                         git::rev_parse(&winner.worktree, "HEAD").await?;
                     self.state.repair_grants[index].phase = Phase::Reviewing;
+                    if grant.receipt.request.kind == Kind::BaseConflict {
+                        self.state.base_sync_recovery.stop = None;
+                        if let Some(sync) = &mut self.state.base_sync {
+                            sync.tip = grant
+                                .receipt
+                                .request
+                                .tip
+                                .clone()
+                                .context("repair base tip missing")?;
+                            sync.conflict = None;
+                            sync.behind = 0;
+                        }
+                        refresh_reviewed_commits(&mut self.state, &winner.branch).await;
+                    }
                     self.state.save()?;
                 }
                 Phase::Reviewing => {
@@ -1879,6 +1921,13 @@ impl Runner {
                         return Ok(());
                     }
                     let passed = outcomes.iter().all(CommandOutcome::ok);
+                    // Follow-up grants owe the same guarded checkout delivery
+                    // as the conflict repair that introduced the new head.
+                    if passed
+                        && !crate::foreign_checkout::write_back(&mut self.state, &head).await?
+                    {
+                        return Ok(());
+                    }
                     self.state.repair_grants[index].succeeded = passed;
                     self.state.gate = outcomes;
                     self.state.gate_ran = true;

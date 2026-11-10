@@ -3768,7 +3768,14 @@ async fn task_cmd_inner(command: TaskCmd, q: Queue) -> Result<()> {
                 .claim(&resolved)
                 .with_context(|| format!("task {resolved} is claimed by a running daemon"))?;
             let mut t = q.get(&resolved)?;
-            t.release_operator("cli", None);
+            magi::repair_budget::ensure_generic_release(&q, &t)?;
+            let preserved = match t.runs.last().cloned() {
+                Some(run) => magi::repair_budget::queue_resumption(&q, &mut t, &run)?,
+                None => false,
+            };
+            if !preserved {
+                t.release_operator("cli", None);
+            }
             q.put(&mut t)?;
             println!("queued {} {}", t.short(), t.title);
             Ok(())

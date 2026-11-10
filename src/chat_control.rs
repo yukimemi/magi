@@ -535,7 +535,15 @@ pub fn hold(queue: &Queue, reference: &str, reason: &str) -> Result<Task> {
 pub fn release(queue: &Queue, reference: &str) -> Result<Task> {
     let (_claim, mut task) = claimed(queue, reference)?;
     check_hold_release(&task, "release")?;
-    task.release_operator("chat", None);
+    crate::base_sync_recovery::ensure_generic_release(queue, &task)?;
+    let run = task.runs.last().cloned();
+    let preserved = match run {
+        Some(run) => crate::repair_budget::queue_resumption(queue, &mut task, &run)?,
+        None => false,
+    };
+    if !preserved {
+        task.release_operator("chat", None);
+    }
     queue.put(&mut task)?;
     Ok(task)
 }
@@ -555,6 +563,19 @@ pub fn retry(
         "the new instruction is empty"
     );
     let (_claim, mut task) = claimed(queue, reference)?;
+    if let Some(state) = crate::base_sync_recovery::held_run(queue, &task)
+        && state
+            .base_sync_recovery
+            .stop
+            .as_ref()
+            .is_some_and(|stop| stop.kind == crate::base_sync_recovery::StopKind::Conflict)
+    {
+        anyhow::bail!(
+            "retry cannot authorize editing a retained base-sync stop. {} Keep the retained review criteria and use a dedicated repair grant for the narrow resolution.",
+            state.base_sync_next_action()
+        );
+    }
+    crate::base_sync_recovery::ensure_generic_release(queue, &task)?;
     let title = title.unwrap_or_else(|| crate::queue::title_from(instruction, 72));
     task.edit(title, instruction.to_owned())?;
     task.release_operator("chat", None);

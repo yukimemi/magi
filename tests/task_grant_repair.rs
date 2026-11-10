@@ -49,6 +49,9 @@ async fn stopped(review: bool) -> (common::Fixture, Task, Runner, Request) {
     task.status = TaskStatus::Failed;
     Queue::open().put(&mut task).unwrap();
     let request = Request {
+        replace_request: None,
+        tip: None,
+        instruction: None,
         task: task.id.clone(),
         run: runner.state.id.clone(),
         kind: if review { Kind::Review } else { Kind::Gate },
@@ -258,7 +261,7 @@ async fn reserved_attempt_after_crash_preserves_work_and_is_never_dispatched_twi
     // The reservation is consumed even if its result was never persisted.
     runner.state.repair_grants.push(magi::repair_budget::Applied {
         receipt, spent: 1, phase: Phase::Fixing, review_start: runner.state.reviews.len(),
-        head: request.head.clone(), succeeded: false,
+        head: request.head.clone(), succeeded: false, conflict: None,
     });
     let worktree = runner.state.winner().unwrap().worktree.clone();
     std::fs::write(worktree.join("gatefix.txt"), "work retained across driver exit\n").unwrap();
@@ -496,7 +499,7 @@ async fn granted_confirmation_review_recovers_cleanliness_after_unresolved_e2e_o
     runner.state.reviews.push(round);
     runner.state.repair_grants.push(magi::repair_budget::Applied {
         receipt, spent: 1, phase: Phase::Reviewing, review_start,
-        head: head.clone(), succeeded: false,
+        head: head.clone(), succeeded: false, conflict: None,
     });
     runner.state.status = RunStatus::Reviewing;
     runner.state.save().unwrap();
@@ -558,5 +561,15 @@ async fn retained_reviewer_descendant_refuses_grant_and_resume_without_mutation(
     let mut resumed = Runner::resume(&request.run).unwrap();
     resumed.execute().await.unwrap();
     assert!(resumed.state.repair_grants[0].succeeded);
+}
+}
+
+common::e2e! {
+async fn ordinary_gate_failure_with_unused_budget_still_refuses_an_extra_grant() {
+    let (_fx, _task, mut runner, request) = stopped(false).await;
+    runner.state.config.graph.gate_fix_rounds = 2;
+    runner.state.save().unwrap();
+    assert!(runner.state.gate_fixes.is_empty());
+    refused(&request, "gate repair budget is not exhausted");
 }
 }

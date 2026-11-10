@@ -660,7 +660,7 @@ Unix のチャット席では継承 FD、Windows ではローカル名前付き�
 
 | command | effect |
 |---|---|
-| `magi task grant-repair <task> --run <run> --kind gate\|review --rounds <1..=3> --head <sha> --expect-pass <n> --request <id> --reason <text>` | Queue an additional bounded repair on the exact stopped run. The chat equivalent is `magi task control grant-repair` with the same arguments. See [repair budget workflow](docs/repair-budget.md) for receipts, retries and ownership checks. No merge approval is granted. |
+| `magi task grant-repair <task> --run <run> --kind gate\|review\|base-conflict --rounds <1..=3> --head <sha> --expect-pass <n> --request <id> --reason <text>` | Queue an additional bounded repair on the exact stopped run. The chat equivalent is `magi task control grant-repair` with the same arguments. See [repair budget workflow](docs/repair-budget.md) for receipts, retries and ownership checks. No merge approval is granted. |
 | `magi task control resume <full run id>` | pins the owning task to that run and queues it; the loop resumes it under the graph's execution lease (same checks as the Web resume). It starts no driver itself, so it needs `magi serve` |
 | `magi task control hold <task> [reason]` / `release <task>` | the same transitions as `magi task hold` / `release` |
 | `magi task control retry <task> <instruction>` | replaces a queued or held task's instruction and queues it in one save; attempts restart as for any release, runs and history are kept |

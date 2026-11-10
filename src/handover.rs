@@ -497,6 +497,9 @@ impl ResumeRefusal {
             " Inspect `magi show {}` for retained work and ownership.",
             state.id
         ));
+        if matches!(self, Self::BaseSyncStop) {
+            detail.push_str(&format!(" {}", state.base_sync_next_action()));
+        }
         if matches!(self, Self::ReviewBudget { .. } | Self::ReviewDisabled) {
             detail.push_str(" To continue the retained implementation, first confirm its saved candidate branch and owning task with `magi task show <task-id>`. When the task is eligible and no driver is live, explicitly use `magi review <saved-branch> --task <task-id> --merge none --review-rounds <positive-rounds>`. This creates a review-only successor with a new review budget; it does not resume this run or start a new implementation competition. Existing ownership and checkpoint checks still apply.");
         }
@@ -530,7 +533,16 @@ pub(crate) fn resume_refusal_under(state: &RunState, home: Option<&Path>) -> Opt
         return Some(ResumeRefusal::OwnershipTransferred(to.clone()));
     }
     if state.base_sync_blocked() {
-        return if state.base_recovery_pending() || state.base_sync_closure_pending() {
+        return if state.base_recovery_pending()
+            || state.base_sync_closure_pending()
+            || home.is_some_and(|home| {
+                state
+                    .origin
+                    .as_ref()
+                    .and_then(|o| o.task.as_ref())
+                    .and_then(|id| crate::queue::Queue::at(home.join("queue")).get(id).ok())
+                    .is_some_and(|task| crate::repair_budget::conflict_pending(&task, state))
+            }) {
             None
         } else {
             Some(ResumeRefusal::BaseSyncStop)

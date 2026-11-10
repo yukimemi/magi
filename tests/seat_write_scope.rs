@@ -234,7 +234,7 @@ printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"f
     };
     let artifacts = fx._tmp.path().join("artifacts");
     let roots = worktree_writable_roots(&fx.seat, &fx.home).await.unwrap();
-    for node in ["implement", "fix", "graft", "gate-fix", "land", "rebase", "chat"] {
+    for node in ["implement", "fix", "graft", "gate-fix", "land", "rebase", "base-conflict", "chat"] {
         let mut seat = SeatState::new("fixture-seat", "fixture", 1);
         for resumed in [false, true] {
             if resumed {
@@ -607,6 +607,25 @@ mod coordination {
         )
         .unwrap();
         fx
+    }
+
+    common::e2e! {
+    async fn conflict_resolver_receives_editing_scope_and_takes_registered_lock() {
+        let _home = common::home_lock().await;
+        let fx = registered();
+        magi::run::set_home(fx.home.clone());
+        let editor = spec(&fx, "editor");
+        let artifacts = fx._tmp.path().join("conflict-artifacts");
+        let inv = Invocation { node: "base-conflict", ..invocation(&fx, &artifacts, true) };
+        let mut seat = SeatState::new("conflict-resolver", "fixture", 1);
+        let out = invoke(&editor, &mut seat, &inv).await.unwrap();
+        assert!(out.usable(), "{out:?}");
+        assert_eq!(std::fs::read_to_string(fx.seat.join("editor")).unwrap(), "edited");
+        let access: serde_json::Value = serde_json::from_slice(&std::fs::read(artifacts.join("fixture.access.json")).unwrap()).unwrap();
+        assert_eq!(access["unsandboxed"], true);
+        assert_eq!(access["writable_roots"], serde_json::json!(worktree_writable_roots(&fx.seat, &fx.home).await.unwrap()));
+        assert!(take_lock(&fx.primary.join(".git/updater.lock")).is_some());
+    }
     }
 
     fn alive(pid: i32) -> bool {
