@@ -6954,6 +6954,26 @@ async fn task_blocker_actions_are_mobile_read_only_navigation() {
         Some("Waiting for recovery decision".into()),
     );
     queue.put(&mut blocked).unwrap();
+    let mut disk_held = Task::new(
+        "Held disk recovery".into(),
+        "Inspect".into(),
+        fx.repo.clone(),
+        Source::Human,
+    );
+    disk_held.hold_machine(magi::disk::gate(2_667_941_888, 3_221_225_472));
+    disk_held.chat = Some(chat.id.clone());
+    queue.put(&mut disk_held).unwrap();
+    let mut recovery = magi::ask::Question::new(
+        disk_held.id.clone(),
+        magi::triage::NODE.into(),
+        "triage".into(),
+        "Resume disk recovery?".into(),
+        String::new(),
+        vec![],
+    );
+    recovery.routed_task = Some(disk_held.id.clone());
+    recovery.routed_chat = Some(chat.id.clone());
+    questions.put(&mut recovery).unwrap();
     let base = serve(&home, queue.clone(), talks, home.join("runs"), &fx.repo).await;
     let mut browser = cdp::Browser::launch(&chrome).await.unwrap();
     let page = browser
@@ -6984,7 +7004,7 @@ async fn task_blocker_actions_are_mobile_read_only_navigation() {
         check(box.textContent.includes('2667941888') && box.textContent.includes('3221225472'), 'disk evidence');
         check(box.textContent.includes('restores held') && box.textContent.includes('not current capacity'), 'recovery semantics');
         check(box.querySelectorAll('li').length === 4, 'all blockers');
-        check(box.textContent.includes('Hold or Cancel do not remove these dependencies'), 'hold is not unblock');
+        check(box.textContent.includes('Hold overrides this dependency wait and clears its dependency references'), 'hold overrides rather than preserves dependencies');
         check(box.querySelector('h3').textContent === 'Machine hold recovery', 'machine hold heading');
         const progress = box.querySelectorAll('li')[3].textContent;
         check(progress.includes('No operator action needed') && progress.includes('wait for it to complete'), 'progressing blocker only needs waiting');
@@ -7098,5 +7118,25 @@ async fn task_blocker_actions_are_mobile_read_only_navigation() {
         blocked.blocked_by
     );
     assert_eq!(queue.get(&held.id).unwrap().status, TaskStatus::Held);
+    browser
+        .eval(
+            &page,
+            &format!("location.hash = '#/tasks/{}'", disk_held.id),
+        )
+        .await
+        .unwrap();
+    browser.wait_for(&page, "document.querySelector('#task-actions-blockers').textContent.includes('Resume disk recovery?')", Duration::from_secs(30)).await.unwrap();
+    let result = browser.eval(&page, r##"(() => {
+        document.querySelector('#task-actions-fab').click();
+        const box = document.querySelector('#task-actions-blockers');
+        const text = box.textContent;
+        if (!text.includes('Held, not blocked') || !text.includes('Disk recovery alone will not resume')) throw new Error('pending recovery must gate disk recovery');
+        const link = box.querySelector('a[href^="#/chat/"]');
+        if (!link || !text.includes('Recovery decision pending')) throw new Error('owning chat recovery route missing');
+        link.click();
+        return window.blockerWrites;
+    })()"##).await.unwrap();
+    assert_eq!(result, serde_json::json!([]));
+    assert_eq!(queue.get(&disk_held.id).unwrap().status, TaskStatus::Held);
     browser.close_page(&page).await;
 }

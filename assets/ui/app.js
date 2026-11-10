@@ -11719,7 +11719,7 @@ function renderTaskBlockers(task, box) {
   if (!visible) return;
   box.append(el("h2", { text: status === "blocked" ? "Resolve blockers" : "Held, not blocked" }));
   if (task.block_reason && status === "blocked") box.append(el("p", { text: `Dependency reason: ${task.block_reason}` }));
-  if (status === "blocked") box.append(el("p", { text: "Hold or Cancel do not remove these dependencies. Each dependency must resolve through its existing controls or finish before the scheduler clears it." }));
+  if (status === "blocked") box.append(el("p", { text: "Hold overrides this dependency wait and clears its dependency references. A later Release can queue the task even if those dependencies are unfinished. Use the blocker controls below to resolve the actual dependencies." }));
   if (status === "held" || task.hold_reason || task.hold_source) {
     box.append(el("h3", { text: task.hold_source === "machine" ? "Machine hold recovery" : task.hold_source === "manual" ? "Manual hold recovery" : "Hold recovery" }));
   }

@@ -96,6 +96,33 @@ fn short(id: &str) -> &str {
     id.split('-').next_back().unwrap_or(id)
 }
 
+fn decision_view(q: &DecisionRecord) -> BlockerView {
+    let mut view = BlockerView {
+        id: q.id.clone(),
+        kind: "decision",
+        state: q.status.as_str().into(),
+        reason: Some(q.summary.clone()),
+        next: String::new(),
+        resolves_itself: q.status == QuestionStatus::Answered,
+        destination: None,
+    };
+    view.next = match q.status {
+        QuestionStatus::Answered => "Decision recorded; waiting for the scheduler to reconcile this dependency.",
+        QuestionStatus::Abandoned => "This record no longer accepts answers. If forwarded, continue in its owning task chat; otherwise inspect magi task triage for recovery. The record does not prove the dependency completed.",
+        QuestionStatus::Open if q.routed_task.is_some() && q.routed_chat.is_none() => "Waiting for delivery to the owning task chat. The scheduler must deliver the decision before it can be handled there.",
+        QuestionStatus::Open if q.routed_task.is_some() => "Open the owning task chat to review and resolve this decision through its existing controls. Availability and approval are checked there.",
+        QuestionStatus::Open => "Open the existing decision to inspect its context and available controls. A historical or unavailable waiter may no longer accept an answer.",
+    }.into();
+    view.destination = if q.routed_task.is_some() {
+        q.routed_chat.clone().map(|id| ("chat", id))
+    } else if q.status == QuestionStatus::Open {
+        Some(("questions", q.id.clone()))
+    } else {
+        None
+    };
+    view
+}
+
 impl Inventory {
     /// All direct blockers, including settled and unavailable records. Task
     /// links let the operator follow chains without hiding sibling blockers.
@@ -127,7 +154,7 @@ impl Inventory {
                     }.into();
                     view.destination = Some(("tasks", t.id.clone()));
                 }
-                Dep::Question(status) => {
+                Dep::Question(_) => {
                     // Compatibility with existing decision outbox records;
                     // do not create a decision or derive a chat from ancestry.
                     let full = match crate::queue::resolve_reference(id, self.ids.iter().map(String::as_str)) {
@@ -135,30 +162,35 @@ impl Inventory {
                         _ => id.clone(),
                     };
                     if let Some(q) = self.questions.get(&full) {
-                        view.id = q.id.clone();
-                        view.kind = "decision";
-                        view.state = status.as_str().into();
-                        view.resolves_itself = status == QuestionStatus::Answered;
-                        view.reason = Some(q.summary.clone());
-                        view.next = match status {
-                            QuestionStatus::Answered => "Decision recorded; waiting for the scheduler to reconcile this dependency.",
-                            QuestionStatus::Abandoned => "This record no longer accepts answers. If forwarded, continue in its owning task chat; otherwise inspect magi task triage for recovery. The record does not prove the dependency completed.",
-                            QuestionStatus::Open if q.routed_task.is_some() && q.routed_chat.is_none() => "Waiting for delivery to the owning task chat. The scheduler must deliver the decision before it can be handled there.",
-                            QuestionStatus::Open if q.routed_task.is_some() => "Open the owning task chat to review and resolve this decision through its existing controls. Availability and approval are checked there.",
-                            QuestionStatus::Open => "Open the existing decision to inspect its context and available controls. A historical or unavailable waiter may no longer accept an answer.",
-                        }.into();
-                        view.destination = if q.routed_task.is_some() {
-                            q.routed_chat.clone().map(|id| ("chat", id))
-                        } else if status == QuestionStatus::Open {
-                            Some(("questions", q.id.clone()))
-                        } else {
-                            None
-                        };
+                        view = decision_view(q);
                     }
                 }
                 Dep::Missing => view.state = "missing".into(),
                 Dep::Unknown => {},
             }
+            view
+        }).collect()
+    }
+
+    /// Pending held-task recovery decisions use the same compatibility
+    /// navigation as dependencies, with triage's exact pending predicate.
+    pub(crate) fn recovery_views(
+        task: &Task,
+        questions: &crate::ask::Questions,
+    ) -> Vec<BlockerView> {
+        crate::triage::pending_recovery_questions(questions, task).iter().map(|q| {
+            let mut view = decision_view(&DecisionRecord::from(q));
+            view.kind = "recovery decision";
+            view.next = if q.status.open() {
+                if q.routed_task.is_some() && q.routed_chat.is_none() {
+                    "Recovery decision pending delivery to the owning task chat. Disk recovery alone will not resume this task; wait for delivery and resolve the decision there."
+                } else {
+                    "Recovery decision pending. Open its existing controls to review and resolve it. Disk recovery alone will not resume this task while the decision remains pending."
+                }
+            } else {
+                "Recovery decision recorded but not yet applied. Its existing task-chat controls or triage must apply it before recovery can proceed; disk recovery alone will not resume this task."
+            }.into();
+            view.resolves_itself = q.status == QuestionStatus::Answered && q.routed_chat.is_none();
             view
         }).collect()
     }
