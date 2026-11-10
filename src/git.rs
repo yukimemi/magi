@@ -331,10 +331,15 @@ pub async fn worktree_add_detached(repo: &Path, path: &Path, rev: &str) -> Resul
 
 /// Move an existing detached worktree to `rev`, discarding local state.
 pub async fn reset_detached(worktree: &Path, rev: &str) -> Result<()> {
+    reset_detached_keep_ignored(worktree, rev).await?;
+    clean_all(worktree).await
+}
+
+/// [`reset_detached`] without its final `clean -fdx`, so a caller can run
+/// project cleanup between the reset and the clean.
+pub async fn reset_detached_keep_ignored(worktree: &Path, rev: &str) -> Result<()> {
     git(worktree, &["checkout", "--detach", rev]).await?;
-    git(worktree, &["reset", "--hard", rev]).await?;
-    git(worktree, &["clean", "-fdx"]).await?;
-    Ok(())
+    git(worktree, &["reset", "--hard", rev]).await.map(|_| ())
 }
 
 /// Where `branch` is checked out, if some worktree holds it.
@@ -1334,9 +1339,20 @@ pub async fn rebase_branch_in_temp(
 /// as an unstaged diff, and the next commit would be staged against stale
 /// content.
 pub async fn sync_to_head(worktree: &Path) -> Result<()> {
-    git(worktree, &["reset", "--hard", "HEAD"]).await?;
-    git(worktree, &["clean", "-fdx"]).await?;
-    Ok(())
+    reset_hard_head(worktree).await?;
+    clean_all(worktree).await
+}
+
+/// The first half of [`sync_to_head`]: tracked files back on `HEAD`.
+pub async fn reset_hard_head(worktree: &Path) -> Result<()> {
+    git(worktree, &["reset", "--hard", "HEAD"])
+        .await
+        .map(|_| ())
+}
+
+/// Remove untracked and ignored files after any project cleanup has finished.
+pub async fn clean_all(worktree: &Path) -> Result<()> {
+    git(worktree, &["clean", "-fdx"]).await.map(|_| ())
 }
 
 /// Fetch one branch from `remote`, updating its remote-tracking ref.

@@ -81,8 +81,29 @@ use std::{
 /// reparented tools retaining the inherited liveness witness.
 #[derive(Debug)]
 pub(crate) struct OutputLease {
-    _file: File,
+    _file: std::sync::Arc<OutputFile>,
     _activity: bool,
+}
+
+#[derive(Debug)]
+struct OutputFile(File);
+
+impl std::ops::Deref for OutputFile {
+    type Target = File;
+    fn deref(&self) -> &File {
+        &self.0
+    }
+}
+
+#[cfg(unix)]
+impl Drop for OutputFile {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        // SAFETY: the final shared owner releases this live descriptor's lock.
+        unsafe {
+            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
 }
 
 impl OutputLease {
@@ -90,6 +111,29 @@ impl OutputLease {
     pub(crate) fn descriptor(&self) -> std::os::fd::RawFd {
         use std::os::fd::AsRawFd;
         self._file.as_raw_fd()
+    }
+
+    /// A separate exclusive lock prevents nested/concurrent pre-clean operations.
+    pub(crate) fn pre_clean(dir: &Path) -> Result<Self> {
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(dir.join("magi-pre-clean.lock"))?;
+        crate::pr_head::try_lock_file(&file)
+            .context("pre-clean already running; retry after descendants terminate")?;
+        Ok(Self {
+            _file: std::sync::Arc::new(OutputFile(file)),
+            _activity: false,
+        })
+    }
+
+    pub(crate) fn duplicate(&self) -> Self {
+        Self {
+            _file: std::sync::Arc::clone(&self._file),
+            _activity: false,
+        }
     }
 
     pub(crate) fn borrow(worktree: &Path) -> Result<Option<Self>> {
@@ -175,7 +219,7 @@ impl OutputLease {
             // inherit this descriptor before exec closes it; closing only the
             // parent's copy would leave the namespace spuriously busy.
             let admission = Self {
-                _file: open(&dir.join(format!("{device}.lock")))?,
+                _file: std::sync::Arc::new(OutputFile(open(&dir.join(format!("{device}.lock")))?)),
                 _activity: false,
             };
             let started = std::time::Instant::now();
@@ -224,7 +268,7 @@ impl OutputLease {
             let file = open(&available.context("disk admission reservation slots exhausted")?)?;
             crate::pr_head::try_lock_file(&file)?;
             reservations.push(Self {
-                _file: file,
+                _file: std::sync::Arc::new(OutputFile(file)),
                 _activity: false,
             });
         }
@@ -282,7 +326,7 @@ impl OutputLease {
                 .with_context(|| format!("record output activity {}", path.display()))?;
         }
         Ok(Self {
-            _file: file,
+            _file: std::sync::Arc::new(OutputFile(file)),
             _activity: !exclusive,
         })
     }
@@ -290,7 +334,6 @@ impl OutputLease {
 #[cfg(unix)]
 impl Drop for OutputLease {
     fn drop(&mut self) {
-        use std::os::fd::AsRawFd;
         if self._activity
             && let Err(error) = self._file.set_modified(std::time::SystemTime::now())
         {
@@ -298,10 +341,6 @@ impl Drop for OutputLease {
             // witness rather than trusting the old acquisition timestamp.
             let _ = self._file.set_len(2);
             tracing::warn!("could not record output lease release activity: {error}");
-        }
-        // SAFETY: unlock this guard's live descriptor, including inherited copies.
-        unsafe {
-            libc::flock(self._file.as_raw_fd(), libc::LOCK_UN);
         }
     }
 }

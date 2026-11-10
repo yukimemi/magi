@@ -5381,6 +5381,8 @@ impl Runner {
             return Ok(());
         };
 
+        crate::worktree_clean::resume_pending(&mut self.state, &winner.worktree).await?;
+
         let repo = self.state.repo.clone();
         let remote = self.state.config.merge.remote.clone();
         let base_branch = self.state.base_branch.clone();
@@ -5536,7 +5538,7 @@ impl Runner {
                 return Ok(());
             }
             if head != op.head {
-                git::sync_to_head(&winner.worktree).await?;
+                crate::worktree_clean::reset(&mut self.state, &winner.worktree, None).await?;
             }
             tip = op.tip.clone();
         }
@@ -5671,7 +5673,7 @@ impl Runner {
                     .await
                     .is_ok_and(|o| o.ok())
             {
-                git::sync_to_head(&winner.worktree).await?;
+                crate::worktree_clean::reset(&mut self.state, &winner.worktree, None).await?;
             }
             // An earlier attempt may have rebased the branch locally and died
             // before pushing it (only the fresh-rebase arm below pushes).
@@ -5873,7 +5875,7 @@ impl Runner {
                 // The branch ref moved, but a worktree that already had it
                 // checked out (the winner's) was not told; sync its index and
                 // files before anything reads them.
-                git::sync_to_head(&winner.worktree).await?;
+                crate::worktree_clean::reset(&mut self.state, &winner.worktree, None).await?;
                 let fresh = git::rev_parse(&winner.worktree, "HEAD").await?;
                 self.state.finish_base_operation(Some(&fresh));
                 refresh_reviewed_commits(&mut self.state, &winner.branch).await;
@@ -7152,16 +7154,30 @@ impl Runner {
             // commit: nobody can perturb the winner's tree, and the fixer can
             // keep working without racing a reviewer.
             let mut jobs = Vec::new();
-            let coordination = self.coordinate(&repo).await?;
+            let coordination = if self.state.config.worktree.pre_clean.is_empty() {
+                self.coordinate(&repo).await?
+            } else {
+                None
+            };
             for (r, spec) in reviewers.iter().cloned().enumerate() {
                 let wt = root.join(format!("review-{}", r + 1));
                 // `clean -fdx` in a reset wipes setup's products, so every
                 // round sets the seat up again.
                 if wt.exists() {
-                    git::reset_detached(&wt, &head).await?;
+                    crate::worktree_clean::reset(&mut self.state, &wt, Some(&head)).await?;
                 } else {
+                    let _lease = if self.state.config.worktree.pre_clean.is_empty() {
+                        None
+                    } else {
+                        self.coordinate(&repo).await?
+                    };
                     git::worktree_add_detached(&repo, &wt, &head).await?;
                 }
+                let _setup_lease = if self.state.config.worktree.pre_clean.is_empty() {
+                    None
+                } else {
+                    self.coordinate(&repo).await?
+                };
                 self.setup_seat_worktree(&repo, &wt, false).await?;
                 let seat_key = format!("review-{}", r + 1);
                 // The seat starts the round on whoever answered it last, not

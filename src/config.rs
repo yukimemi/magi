@@ -822,6 +822,18 @@ pub struct Worktree {
     /// Ordered steps. Declare in one layer only. Empty (the default) changes
     /// nothing. See [`crate::worktree_setup`].
     pub setup: Vec<SetupStep>,
+    /// Ordered, repeatable commands before owned destructive worktree cleaning.
+    pub pre_clean: Vec<PreCleanStep>,
+}
+
+/// A required shell command; unknown keys and missing commands are errors.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreCleanStep {
+    /// Shell command executed in the target worktree after reset.
+    pub run: String,
+    /// Defaults to the verification timeout.
+    pub timeout_secs: Option<u64>,
 }
 
 /// One setup step: exactly one of `copy` / `run`.
@@ -843,6 +855,14 @@ pub struct SetupStep {
 impl Worktree {
     /// Refuse a malformed step at load time rather than in the middle of a run.
     pub fn validate(&self) -> Result<()> {
+        for (i, step) in self.pre_clean.iter().enumerate() {
+            if step.run.trim().is_empty() || step.timeout_secs == Some(0) {
+                bail!(
+                    "[worktree] pre_clean step {} requires a nonempty run and positive timeout",
+                    i + 1
+                );
+            }
+        }
         for (i, step) in self.setup.iter().enumerate() {
             let n = i + 1;
             match (&step.copy, &step.run) {
@@ -2520,7 +2540,8 @@ impl Config {
              #   { copy = \".env.example -> .env\" },\n\
              #   { copy = \".env.local\", optional = true },\n\
              #   { run = \"pnpm install --frozen-lockfile\", timeout_secs = 900 },\n\
-             # ]\n\n\
+             # ]\n\
+             # pre_clean = [] # Repeatable cleanup before owned clean -fdx.\n\n\
              [merge]\n\
              # none | local | pr\n\
              mode = \"none\"\n\
@@ -4185,6 +4206,40 @@ lock_file = "{{ vars.bad }}"
         let path = dir.path().join("magi.toml");
         std::fs::write(&path, body).unwrap();
         Config::load_layers(&[path])
+    }
+
+    #[test]
+    fn pre_clean_config_is_strict_and_single_layer() {
+        assert!(Config::default().worktree.pre_clean.is_empty());
+        let good = load_one("[worktree]\npre_clean = [{run = 'cleanup', timeout_secs = 60}]\n");
+        assert_eq!(good.unwrap().worktree.pre_clean[0].timeout_secs, Some(60));
+        for bad in [
+            "{}",
+            "{run = ''}",
+            "{run = ' ', timeout_secs = 2}",
+            "{run = 'x', timeout_secs = 0}",
+            "{run = 'x', timeout_secs = -1}",
+            "{copy = 'cache'}",
+            "{run = 'x', optional = true}",
+            "'x'",
+        ] {
+            assert!(
+                load_one(&format!("[worktree]\npre_clean = [{bad}]\n")).is_err(),
+                "{bad}"
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.toml");
+        let b = dir.path().join("b.toml");
+        for path in [&a, &b] {
+            std::fs::write(path, "[worktree]\npre_clean = [{run = 'cleanup'}]\n").unwrap();
+        }
+        assert!(
+            Config::load_layers(&[a, b])
+                .unwrap_err()
+                .to_string()
+                .contains("worktree.pre_clean")
+        );
     }
 
     #[test]
