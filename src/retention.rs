@@ -6304,7 +6304,10 @@ mod tests {
                 .join(&state.id)
                 .join("artifacts/eviction-review-1.json");
             let record: serde_json::Value =
-                serde_json::from_slice(&std::fs::read(&ledger).unwrap()).unwrap();
+                serde_json::from_slice(&std::fs::read(&ledger).unwrap_or_else(|error| {
+                    panic!("{stage}: missing pending ledger: {error}; {interrupted:?}")
+                }))
+                .unwrap();
             assert_eq!(record["phase"], "pending");
             if stage == "changed-admin" {
                 std::fs::write(admin.join("owner-note"), "keep").unwrap();

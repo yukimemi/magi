@@ -24358,11 +24358,14 @@ mod tests {
         // Refreshed whenever the detail redraws, including the loading state.
         assert!(APP_JS.contains("renderTaskActions(task.coreOnly || error ? null : task);"));
         assert!(APP_JS.contains("renderTaskActions(null);"));
-        // Same renderers and routes as the Queue card, no new endpoint.
-        let sheet = APP_JS
-            .find("function renderTaskActions")
+        // Same action renderers as the Queue card. Bound this check by the
+        // next function, since additional task controls can grow the sheet.
+        let (_, sheet) = APP_JS
+            .split_once("function renderTaskActions(task) {")
             .expect("sheet renderer");
-        let body = &APP_JS[sheet..sheet + 3000];
+        let (body, _) = sheet
+            .split_once("\nfunction openTaskActions() {")
+            .expect("end of sheet renderer");
         assert!(body.contains("changePriority("));
         assert!(body.contains("openTaskEdit(task)"));
         assert!(body.contains("renderTaskHoldBox(host"));
