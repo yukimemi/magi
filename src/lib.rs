@@ -26,6 +26,7 @@ pub mod agent;
 pub mod already;
 pub mod ask;
 mod base_conflict;
+mod base_recovery_control;
 mod base_sync_recovery;
 pub mod blind;
 pub mod blockers;

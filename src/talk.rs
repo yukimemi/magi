@@ -3261,7 +3261,13 @@ pub fn briefing_for(
          nor a successfully registered watch.\n\n\
          You can act on any task or run directly, whoever filed it: `magi task \
          control resume <full run id>` (queues the run for the loop to resume; \
-         it starts nothing itself), `magi task control hold <task id> \
+         it starts nothing itself). Exhausted base movement needs the owner's explicit \
+         recovery request: `magi task control recover-base <full run id> \
+         --request <unique-id> --head <retained-head-sha>` through this inherited \
+         control channel. Inspect the retained HEAD first; reuse the same request \
+         ID and arguments after interruption. This authorizes one bounded interval \
+         and queues the exact existing run; generic resume/release cannot renew it. \
+         Do not start a separate run driver. `magi task control hold <task id> \
          [reason]`, `magi task control release <task id>`, `magi task control \
          reassign <task id> --repo <path-or-owner/repo>` (moves future execution \
          to that repository while preserving identity, chat and history; never \

@@ -475,6 +475,9 @@ pub struct Task {
     /// Retained across recovery and stale writers until that pass can consume it.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub dispatched_resumes: std::collections::BTreeMap<String, String>,
+    /// Durable base-recovery request keys saved atomically with the exact-run pin.
+    #[serde(default)]
+    pub base_recovery_requests: Vec<String>,
     /// The operator's "resume" answer to a triage question, kept until the
     /// task actually runs (or is done) so `crate::conduct` cannot silently
     /// undo it and `crate::triage` can tell that a hold it sees now came
@@ -987,6 +990,7 @@ impl Task {
             decision_effects: Default::default(),
             superseded_resumes: Default::default(),
             dispatched_resumes: Default::default(),
+            base_recovery_requests: Vec::new(),
             resume_override: None,
             repair_grants: Vec::new(),
             resumption: None,
@@ -2690,6 +2694,21 @@ impl Queue {
         self.write_record(task)
     }
 
+    /// Save an exact-run recovery pin only if its admitted owner snapshot is current.
+    pub(crate) fn commit_base_recovery(
+        &self,
+        task: &mut Task,
+        expected: &serde_json::Value,
+    ) -> Result<()> {
+        let _lock = self.lock_task(&task.id)?;
+        anyhow::ensure!(
+            serde_json::to_value(self.get(&task.id)?)? == *expected,
+            "task changed during base recovery; inspect the pending authorization"
+        );
+        // Retain the ordinary merge evidence when replacing an earlier decision pin.
+        self.put_unlocked(task)
+    }
+
     /// Commit one validated reassignment under the task write lock.
     pub(crate) fn commit_reassignment(&self, task: &mut Task, expected: &Task) -> Result<()> {
         let _lock = self.lock_task(&task.id)?;
@@ -2716,6 +2735,11 @@ impl Queue {
                     if !task.answers.contains(&answer) {
                         task.answers.push(answer);
                     }
+                }
+            }
+            for key in &stored.base_recovery_requests {
+                if !task.base_recovery_requests.contains(key) {
+                    task.base_recovery_requests.push(key.clone());
                 }
             }
             for receipt in &stored.repair_grants {
@@ -3997,6 +4021,49 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let q = Queue::at(dir.path().join("queue"));
         (dir, q)
+    }
+
+    #[test]
+    fn base_recovery_commit_retains_decision_and_superseded_resume_evidence() {
+        let (_dir, q) = queue();
+        let mut original = task("base recovery");
+        original
+            .decision_effects
+            .insert("old-effect".into(), "receipt".into());
+        original
+            .dispatched_resumes
+            .insert("dispatched".into(), "prior-run".into());
+        original.resume_override = Some(OperatorResume {
+            question_id: "prior-decision".into(),
+            at: Timestamp::now(),
+            conductor_rehold: None,
+            forced: true,
+            pinned_run: Some("retained-run".into()),
+        });
+        q.put(&mut original).unwrap();
+        let expected = serde_json::to_value(&original).unwrap();
+        let mut recovered = original.clone();
+        recovered.base_recovery_requests.push("chat/request".into());
+        recovered
+            .resume_override
+            .as_mut()
+            .unwrap()
+            .question_id
+            .clear();
+        q.commit_base_recovery(&mut recovered, &expected).unwrap();
+        let saved = q.get(&original.id).unwrap();
+        assert_eq!(saved.decision_effects, original.decision_effects);
+        assert_eq!(saved.dispatched_resumes, original.dispatched_resumes);
+        assert_eq!(
+            saved
+                .superseded_resumes
+                .get("prior-decision")
+                .map(String::as_str),
+            Some("retained-run")
+        );
+        assert_eq!(saved.base_recovery_requests, ["chat/request"]);
+        assert!(saved.resume_override.unwrap().question_id.is_empty());
+        assert!(q.commit_base_recovery(&mut recovered, &expected).is_err());
     }
 
     #[test]

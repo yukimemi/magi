@@ -2679,7 +2679,13 @@ own turn machinery runs it. No new seat, no new waiter, never a fresh agent.
 
 ### The chat controls tasks and runs directly
 
-`src/chat_control.rs`, `magi task control resume|hold|release|retry|rerun-checks|decide|abandon`.
+`src/chat_control.rs`, `magi task control resume|recover-base|hold|release|retry|rerun-checks|decide|abandon`.
+`recover-base` alone bridges an explicit standing-chat exhaustion recovery to
+`Runner::authorize_base_recovery_request`; `src/base_recovery_control.rs` owns
+request receipts and the exact-run queue marker. Keep its owner/execution locks
+through authorization and queue publication. Ordinary resume never grants a new
+base interval. Persisted decision actions carry the exact stop and episode and
+must agree with the eligible and routed task owner.
 It adds who-may-ask and what-about, nothing else: every effect reuses an
 existing transition (`resume::pin_queued`, extracted from the daemon's
 `ResumeRun` branch; `Task::hold_manual`; `Task::release_operator`;
