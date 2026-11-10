@@ -1367,7 +1367,7 @@ impl Runner {
         crate::pr_head::ensure_owner(&state)?;
         let queued = crate::queue::Queue::at(home.join("queue")).get(task)?;
         anyhow::ensure!(
-            queued.runs.last().is_some_and(|run| run == id)
+            queued.execution_runs().last().is_some_and(|run| run == id)
                 && queued.status != crate::queue::TaskStatus::Done
                 && !queued.fresh_start
                 && queued.review_branch.is_none(),
@@ -1465,6 +1465,7 @@ impl Runner {
 
     /// Reopen an existing run.
     pub fn resume(id: &str) -> Result<Self> {
+        crate::task_reassign::ensure_current(&crate::queue::Queue::open(), id)?;
         let state = RunState::load(id)?;
         if state.startup.as_ref().is_some_and(|s| !s.complete)
             || (state.status == RunStatus::Prep
@@ -1532,6 +1533,7 @@ impl Runner {
             || (self.state.status == RunStatus::Landing && land::repair_available(&self.state))
         {
             let claim = FixClaim::acquire(&self.state.dir())?;
+            crate::task_reassign::ensure_current(&crate::queue::Queue::open(), &self.state.id)?;
             let disk = RunState::load(&self.state.id)?;
             let checkpoint = |s: &RunState| {
                 (
@@ -5553,7 +5555,7 @@ impl Runner {
                 .is_some_and(|e| e.boundary.is_some())
             && let Some(task) = self.state.origin.as_ref().and_then(|o| o.task.clone())
             && let Ok(owner) = crate::queue::Queue::open().get(&task)
-            && owner.runs.last() == Some(&self.state.id)
+            && owner.execution_runs().last() == Some(&self.state.id)
             && owner.status != crate::queue::TaskStatus::Done
             && !owner.fresh_start
             && owner.review_branch.is_none()
@@ -5588,7 +5590,7 @@ impl Runner {
             let owner =
                 crate::queue::Queue::at(crate::run::home().join("queue")).get(&authorization.task);
             let owner_valid = owner.as_ref().is_ok_and(|t| {
-                t.runs.last() == Some(&self.state.id)
+                t.execution_runs().last() == Some(&self.state.id)
                     && t.status != crate::queue::TaskStatus::Done
                     && !t.fresh_start
                     && t.review_branch.is_none()
@@ -5637,7 +5639,7 @@ impl Runner {
             if !fetched_base
                 || git::rev_parse(&repo, &format!("refs/heads/{}", winner.branch)).await? != head
                 || !git::is_clean(&winner.worktree).await?
-                || !owner.is_ok_and(|t| t.runs.last() == Some(&self.state.id))
+                || !owner.is_ok_and(|t| t.execution_runs().last() == Some(&self.state.id))
             {
                 return Ok(());
             }

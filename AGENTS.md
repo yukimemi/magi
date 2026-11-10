@@ -3504,3 +3504,18 @@ unlink. `fold --show-seats` and `fold --restore-seat <head> --dest <new-path>`
 inspect/restore recorded tips without the original repository. `source-evidence --restore`
 creates an inspection repository only and must never transfer recovery/public
 authority or approval. See `docs/checkout-eviction.md` for limits and accounting.
+
+### Task repository reassignment
+
+`task_reassign::reassign` is the shared CLI/chat/Web transaction. Assignment
+history length is its monotonic generation, and each boundary excludes all
+previous runs from execution, including when moving back to the original repo.
+Use `Task::execution_runs` for execution/recovery candidates and
+`Task::assignment_accepts` at admission. Keep `Task::runs` intact for history,
+publication ownership and duplicate-work checks; those checks must use each
+run's original repository. Never adopt historical branches across assignments.
+Question actions must check `Task::stale_question`, including conductor and
+maintenance questions. Chat reassignment requires its authenticated bridge and
+must never fall back to direct store writes. Reassignment holds task claims,
+run owner/execution leases and output reservations until its atomic task save;
+new execution discovers destination config and takes destination coordination.

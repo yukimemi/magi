@@ -461,7 +461,7 @@ fn severity_str(s: crate::verdict::Severity) -> &'static str {
 /// alone, never from anything the conductor wrote, so a hallucinated branch
 /// name can never reach `crate::graph::Runner::review`.
 fn surviving_branch(task: &Task) -> Option<String> {
-    let last = task.runs.last()?;
+    let last = task.execution_runs().last()?;
     let state = RunState::load(last).ok()?;
     if !crate::daemon::compatible_run_instruction(&state, task) {
         return None;
@@ -539,7 +539,7 @@ fn hold_note(d: &Decision) -> String {
 
 /// Everything the conductor is shown about a `failed`/`held` task's last run.
 async fn outcome_for(task: &Task, repo: &Path) -> prompt::ConductOutcome {
-    let Some(run_id) = task.runs.last().cloned() else {
+    let Some(run_id) = task.execution_runs().last().cloned() else {
         return prompt::ConductOutcome {
             run_id: "(none)".to_owned(),
             unreadable: Some("this task has not produced a run yet".to_owned()),
@@ -650,7 +650,7 @@ async fn outcome_for(task: &Task, repo: &Path) -> prompt::ConductOutcome {
 /// request into the run's own base - a fact the repository can answer, so the
 /// operator is never asked it. `None` when there is no run or winner to check.
 async fn open_pr_fact(task: &Task, repo: &Path) -> Option<String> {
-    let id = task.runs.last()?;
+    let id = task.execution_runs().last()?;
     let state = match RunState::load(id) {
         Ok(s) => s,
         Err(e) => return Some(format!("could not check open pull requests: {e:#}")),

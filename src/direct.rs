@@ -249,10 +249,7 @@ pub fn claim_resume_owner(
     if let Some(listed) = resume_owner(queue, run) {
         let claim = queue.claim(&listed.id)?;
         let task = queue.get(&listed.id)?;
-        anyhow::ensure!(
-            task.runs.iter().any(|id| id == run),
-            "run queue owner changed"
-        );
+        anyhow::ensure!(task.execution_run(run), "run queue owner changed");
         return Ok((task, claim));
     }
     let mut task = Task::new(

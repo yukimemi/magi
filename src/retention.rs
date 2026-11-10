@@ -456,7 +456,7 @@ fn run_paths_missing(state: &RunState) -> Result<bool> {
 }
 
 /// Enumerate actual registered worktrees, not just candidates in run.json.
-async fn worktrees(state: &RunState) -> Result<Vec<PathBuf>> {
+pub(crate) async fn worktrees(state: &RunState) -> Result<Vec<PathBuf>> {
     let root = state.worktree_root();
     if !plain_dir(&root) {
         return Ok(Vec::new());

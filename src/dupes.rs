@@ -585,6 +585,7 @@ pub fn check_with(
     let own_prs: BTreeSet<u64> = own_runs
         .iter()
         .filter_map(|id| RunView::read(runs_root, id))
+        .filter(|v| idents.of(&v.repo) == here)
         .filter_map(|v| v.pr.map(|p| p.number))
         .collect();
 
@@ -827,8 +828,15 @@ fn task_claims(
             pr: None,
         });
     }
+    let mut idents = Idents::default();
+    let here = idents.of(repo);
     for rid in &t.runs {
         if let Some(view) = RunView::read(runs_root, rid) {
+            // Reassigned tasks retain runs from other repositories as history.
+            // Those claims must still be checked in their original repository.
+            if idents.of(&view.repo) != here {
+                continue;
+            }
             seen.insert(rid.clone());
             // A merged or closed pull request is not in flight, even when the
             // task that owns it is.
@@ -1322,6 +1330,49 @@ mod tests {
         assert!(
             msg.contains("--force") && msg.contains("magi/aaaa/A"),
             "{msg}"
+        );
+    }
+
+    #[test]
+    fn reassigned_history_keeps_original_claims_and_pr_numbers_are_repository_scoped() {
+        let (f, base, _) = fx();
+        write_run(&f, RID, "blocked", &base, Some((48, "open")));
+        let mut task = file_task(&f, TaskStatus::Held, &[RID]);
+        let other = f.repo.parent().unwrap().join("other-repository");
+        std::fs::create_dir(&other).unwrap();
+        task.repo = other.clone();
+        f.q.put(&mut task).unwrap();
+        let hits = check_with(
+            &f.q,
+            &f.runs,
+            &other,
+            "land magi/aaaa/A",
+            None,
+            None,
+            &|_, _| None,
+            &|_, _| Some(PrLifecycle::Open),
+        );
+        assert!(
+            hits.is_empty(),
+            "old branch must not be claimed in the destination: {hits:?}"
+        );
+        assert!(
+            !run(&f, "land magi/aaaa/A", None).is_empty(),
+            "history still claims the original repository"
+        );
+        let hits = check_with(
+            &f.q,
+            &f.runs,
+            &other,
+            "finish PR #48",
+            None,
+            Some(&task.id),
+            &|_, _| Some("https://example.test/pull/48".into()),
+            &|_, _| Some(PrLifecycle::Open),
+        );
+        assert!(
+            hits.iter().any(|hit| hit.owner == Owner::Pr),
+            "an unrelated destination PR cannot be ignored: {hits:?}"
         );
     }
 

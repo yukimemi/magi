@@ -421,7 +421,7 @@ fn machine_cause_resolved_with_admission(
         .is_some_and(|r| r.starts_with(crate::cache::RESOURCE_HOLD))
     {
         // Require evidence from the exact latest run before auto-releasing.
-        let id = task.runs.last()?;
+        let id = task.execution_runs().last()?;
         let state = crate::run::RunState::load_under(id, home).ok()?;
         let block = state.resource_block.as_ref()?;
         if state.id != *id {

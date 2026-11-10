@@ -1620,6 +1620,7 @@ impl Ui {
             .route("/api/settings", get(settings_get))
             .route("/api/settings/roles", put(settings_put_roles))
             .route("/api/queue/{id}/hold", post(queue_hold))
+            .route("/api/queue/{id}/reassign", post(queue_reassign))
             .route("/api/queue/{id}/release", post(queue_release))
             .route("/api/queue/{id}/priority", post(queue_priority))
             .route("/api/queue/{id}/urgent", post(queue_urgent))
@@ -7366,6 +7367,24 @@ async fn queue_hold(
         Ok(())
     })
     .await
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReassignBody {
+    repo: PathBuf,
+}
+
+async fn queue_reassign(
+    State(ui): State<Arc<Ui>>,
+    Path(id): Path<String>,
+    Json(body): Json<ReassignBody>,
+) -> ApiResult<Json<TaskView>> {
+    let home = ui.home.clone();
+    let task = crate::task_reassign::reassign(&ui.queue, &home, &ui.repo, &id, &body.repo, "web")
+        .await
+        .map_err(ApiError::bad_request_from)?;
+    Ok(Json(TaskView::from(task)))
 }
 
 async fn queue_release(

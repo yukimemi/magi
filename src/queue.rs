@@ -131,7 +131,8 @@ use crate::id_reserve::{IdSource, path_exists};
 /// 19: persist settled pass start times for upgrade-resume scheduling.
 /// Old passes default to unknown and use settlement order as an approximation.
 /// 20: persist the task decision chat destination, defaulting to absent.
-pub const SCHEMA: u32 = 20;
+/// 21: repository assignment history and execution boundaries, empty on old tasks.
+pub const SCHEMA: u32 = 21;
 
 /// Candidate order only: all claims, lanes and eligibility gates still apply.
 /// Upgrade-parked runs retain their pass-start order ahead of ordinary work,
@@ -297,6 +298,21 @@ impl TaskCounts {
     }
 }
 
+/// Audit record and execution boundary for a repository reassignment.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Reassignment {
+    /// Original repository.
+    pub from: PathBuf,
+    /// Newly selected repository.
+    pub to: PathBuf,
+    /// Control surface or conversation that requested this change.
+    pub actor: String,
+    /// Time of the operator decision.
+    pub at: Timestamp,
+    /// Runs before this boundary can never execute for this assignment.
+    pub run_boundary: usize,
+}
+
 /// One unit of work.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -314,6 +330,9 @@ pub struct Task {
     pub sources: crate::refs::Sources,
     /// Repository to work in.
     pub repo: PathBuf,
+    /// Repository assignment boundaries; historical runs remain in `runs`.
+    #[serde(default)]
+    pub reassignments: Vec<Reassignment>,
     /// Who asked.
     pub source: Source,
     /// Durable destination for task decision messages (including tasks filed outside chat).
@@ -929,6 +948,7 @@ impl Task {
             instruction,
             sources: crate::refs::Sources::default(),
             repo,
+            reassignments: Vec::new(),
             source,
             chat: None,
             priority: 0,
@@ -982,8 +1002,62 @@ impl Task {
         }
     }
 
-    /// The chat this task itself says it came from: the recorded
-    /// [`Task::origin_chat`], else its own source when a chat filed it.
+    /// Apply a validated idle-task assignment, preserving evidence and history.
+    pub(crate) fn reassign_repository(&mut self, repo: PathBuf, actor: &str) {
+        self.stamp_schema();
+        if matches!(self.status, TaskStatus::Failed | TaskStatus::Parked) {
+            self.hold_manual(Some(
+                "Repository reassigned; inspect history and release to start fresh.".into(),
+            ));
+        }
+        let at = Timestamp::now();
+        self.reassignments.push(Reassignment {
+            from: self.repo.clone(),
+            to: repo.clone(),
+            actor: actor.to_owned(),
+            at,
+            run_boundary: self.runs.len(),
+        });
+        self.repo = repo;
+        self.resume_override = None;
+        self.fresh_start = true;
+        self.operator_decided_at = Some(at);
+    }
+
+    /// Runs eligible for execution in the current assignment only.
+    pub fn execution_runs(&self) -> &[String] {
+        let boundary = self.reassignments.last().map_or(0, |r| r.run_boundary);
+        self.runs.get(boundary..).unwrap_or_default()
+    }
+
+    /// Whether a historical run still belongs to this execution assignment.
+    pub fn execution_run(&self, run: &str) -> bool {
+        self.execution_runs().iter().any(|id| id == run)
+    }
+
+    /// Check both the assignment boundary and the saved repository before execution.
+    pub(crate) fn assignment_accepts(&self, run: &crate::run::RunState) -> bool {
+        self.reassignments.last().is_none_or(|boundary| {
+            self.execution_run(&run.id)
+                && run.created_at > boundary.at
+                && run
+                    .repo
+                    .canonicalize()
+                    .ok()
+                    .zip(self.repo.canonicalize().ok())
+                    .is_some_and(|(run_repo, task_repo)| run_repo == task_repo)
+        })
+    }
+
+    /// Questions issued before reassignment cannot control the new assignment.
+    pub(crate) fn stale_question(&self, q: &crate::ask::Question) -> bool {
+        self.reassignments
+            .last()
+            .is_some_and(|r| q.asked_at <= r.at)
+            || (self.runs.contains(&q.run) && !self.execution_run(&q.run))
+    }
+
+    /// The chat this task itself says it came from, including its original source.
     pub fn chat_talk(&self) -> Option<&str> {
         if let Some(id) = &self.origin_chat {
             return Some(id);
@@ -1328,10 +1402,11 @@ impl Task {
     /// `daemon::supersede_prior_runs`, the caller that turns this list into
     /// rewritten `run.json` files.
     pub fn superseded_attempts(&self, last_run_succeeded: bool) -> &[String] {
-        if self.status != TaskStatus::Done || !last_run_succeeded || self.runs.len() < 2 {
+        if self.status != TaskStatus::Done || !last_run_succeeded || self.execution_runs().len() < 2
+        {
             return &[];
         }
-        &self.runs[..self.runs.len() - 1]
+        &self.execution_runs()[..self.execution_runs().len() - 1]
     }
 
     /// The attempt right after the last occurrence of `run`, if there is one.
@@ -1342,18 +1417,19 @@ impl Task {
     /// note) read it, and so does [`Task::earlier_attempts`], so what is shown
     /// and what `crate::handover` acts on cannot disagree.
     pub fn successor_of(&self, run: &str) -> Option<&String> {
-        let pos = self.runs.iter().rposition(|r| r == run)?;
-        self.runs.get(pos + 1)
+        let runs = self.execution_runs();
+        let pos = runs.iter().rposition(|r| r == run)?;
+        runs.get(pos + 1)
     }
 
-    /// Every run already recorded for this task, i.e. every run that an
+    /// Every run in this assignment, i.e. every run that an
     /// attempt being minted *right now* supersedes.
     ///
     /// The new run is not in [`Task::runs`] yet when it decides what to take
     /// over (`Task::start` pushes it afterwards), so "has a later attempt" is
     /// true of everything listed here by the time the new run exists.
     pub fn earlier_attempts(&self) -> &[String] {
-        &self.runs
+        self.execution_runs()
     }
 
     /// Stamp [`Task::held_at`] on the way into [`TaskStatus::Held`]; a task
@@ -1495,7 +1571,7 @@ impl Task {
             return None;
         }
         let pass = self.passes.last()?;
-        if self.runs.last() != Some(&pass.run)
+        if self.execution_runs().last() != Some(&pass.run)
             || !matches!(pass.parked, Some(crate::run::ParkCause::Upgrade { .. }))
         {
             return None;
@@ -2564,7 +2640,35 @@ impl Queue {
 
     /// [`Queue::put`] for a caller already holding [`Queue::lock_task`].
     fn put_unlocked(&self, task: &mut Task) -> Result<()> {
+        if let Ok(stored) = self.get(&task.id) {
+            anyhow::ensure!(
+                stored.reassignments.len() == task.reassignments.len(),
+                "task repository assignment changed; reload the task before saving"
+            );
+            if let Some(boundary) = stored.reassignments.last() {
+                anyhow::ensure!(
+                    task.repo == stored.repo
+                        && task.runs.get(..boundary.run_boundary)
+                            == stored.runs.get(..boundary.run_boundary),
+                    "historical repository execution cannot be restarted; reload the task"
+                );
+            }
+        }
         self.merge_stored(task);
+        self.write_record(task)
+    }
+
+    /// Commit one validated reassignment under the task write lock.
+    pub(crate) fn commit_reassignment(&self, task: &mut Task, expected: &Task) -> Result<()> {
+        let _lock = self.lock_task(&task.id)?;
+        let stored = self.get(&task.id)?;
+        anyhow::ensure!(
+            serde_json::to_value(&stored)? == serde_json::to_value(expected)?
+                && stored.reassignments.len() + 1 == task.reassignments.len()
+                && stored.repo == task.reassignments.last().expect("new boundary").from
+                && stored.runs == task.runs,
+            "task changed during reassignment; retry after inspecting it"
+        );
         self.write_record(task)
     }
 

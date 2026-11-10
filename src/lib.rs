@@ -139,3 +139,6 @@ pub(crate) fn standalone_test(name: &str) -> bool {
     );
     false
 }
+
+pub mod repo_selector;
+pub mod task_reassign;

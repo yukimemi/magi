@@ -40,6 +40,7 @@ const API = {
   settingsRoles: "/api/settings/roles",
   deleteTask: (id) => `/api/queue/${encodeURIComponent(id)}`,
   hold: (id) => `/api/queue/${encodeURIComponent(id)}/hold`,
+  reassign: (id) => `/api/queue/${encodeURIComponent(id)}/reassign`,
   release: (id) => `/api/queue/${encodeURIComponent(id)}/release`,
   attemptLimit: (id) => `/api/queue/${encodeURIComponent(id)}/attempt-limit`,
   implementers: (id) => `/api/queue/${encodeURIComponent(id)}/implementers`,
@@ -11514,6 +11515,7 @@ function renderTask() {
   const noteBits = [(TASK_STATUS[status] || {}).note,
     status === "blocked" && task.block_reason ? `Dependency reason: ${task.block_reason}` : "",
     task.hold_reason ? `Hold reason: ${task.hold_reason}` : "",
+    ...(task.reassignments || []).map((r) => `Repository reassigned: ${r.from} → ${r.to} (${r.at}, ${r.actor}). Earlier runs remain historical.`),
     status === "parked" ? task.park_reason : ""].filter(Boolean);
   linkify($("task-note"), noteBits.join(" "), { replace: true });
   show($("task-note"), noteBits.length > 0);
@@ -11676,7 +11678,7 @@ function closeRunActions() {
  * Queue card offers, through the same renderers and handlers, with a host
  * that keeps its two-step state here and shows a refusal inside the sheet
  * (the banner from fail() would sit behind the open dialog). */
-const taskSheet = { id: null, armed: {}, reason: "", focus: false };
+const taskSheet = { id: null, armed: {}, reason: "", repo: "", focus: false };
 
 function taskSheetHost(id) {
   return {
@@ -11758,6 +11760,7 @@ function renderTaskActions(task) {
     taskSheet.id = task ? task.id : null;
     taskSheet.armed = {};
     taskSheet.reason = "";
+    taskSheet.repo = "";
     taskSheet.focus = false;
     show($("task-actions-error"), false);
     setText($("task-actions-error"), "");
@@ -11802,6 +11805,26 @@ function renderTaskActions(task) {
     });
     editBox.append(edit);
     if (!editable) editBox.append(el("p", { class: "hint", text: "Only a queued or held task's instruction can be edited." }));
+  }
+
+  if (["queued", "held", "failed", "parked"].includes(status)) {
+    const repo = el("input", { type: "text", placeholder: "Repository path or owner/repo" });
+    setAttr(repo, "aria-label", "New repository");
+    repo.value = taskSheet.repo;
+    repo.addEventListener("input", () => { taskSheet.repo = repo.value; });
+    const reassign = el("button", { class: "btn btn-quiet", type: "button", text: "Reassign repository", onclick: async () => {
+      if (!repo.value.trim()) return;
+      reassign.disabled = true;
+      try {
+        await postJson(API.reassign(task.id), { repo: repo.value.trim() });
+        taskSheet.repo = "";
+        closeTaskActions();
+        await host.refresh(task.id);
+      } catch (error) {
+        host.error(error.message || String(error));
+      } finally { reassign.disabled = false; }
+    } });
+    editBox.append(repo, reassign, el("p", { class: "hint", text: "Keeps task history and branches. Future work starts fresh in the new repository; held tasks remain held. Resolve retained PRs and active work first." }));
   }
 
   renderTaskHoldBox(host, task, holdBox);
