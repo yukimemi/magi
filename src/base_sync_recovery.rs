@@ -609,7 +609,7 @@ pub(crate) fn held_task(queue: &crate::queue::Queue, task: &crate::queue::Task) 
 
 pub(crate) fn held_run(queue: &crate::queue::Queue, task: &crate::queue::Task) -> Option<RunState> {
     let home = queue.root().parent()?;
-    task.runs
+    task.execution_runs()
         .last()
         .and_then(|id| RunState::load_under(id, home).ok())
         .filter(|state| {
@@ -647,7 +647,7 @@ pub fn ensure_generic_release(
     task: &crate::queue::Task,
 ) -> Result<()> {
     if let Some(state) = task
-        .runs
+        .execution_runs()
         .last()
         .and_then(|id| RunState::load_under(id, queue.root().parent()?).ok())
         && let Some(reason) = crate::repair_budget::conflict_failure(task, &state)

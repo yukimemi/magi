@@ -267,9 +267,11 @@ preserves a reviewed fix independently of the public-head lease. See
 This queues a single review candidate from the fetched public commit with its
 complete ancestry, preserving the task's instructions. The selection overrides
 historical review branches and resume pins.
-The PR must be the unique open PR for `magi/task-<task-id>` in the task's
-repository, targeting the configured base. Active or unknown previous
-publishers prevent takeover; historical source branches and worktrees remain.
+The PR must be the unique open PR for the task's current assignment head:
+`magi/task-<task-id>` initially, or `magi/task-<task-id>-assignment-<generation>`
+after reassignment, targeting the configured base in the task's repository.
+Active or unknown previous publishers prevent takeover; historical source
+branches and worktrees remain.
 
 Recovery synchronizes through the ordinary current-base path and still needs
 verification, review and owner merge approval. Publication checks ownership
@@ -661,6 +663,8 @@ Unix のチャット席では継承 FD、Windows ではローカル名前付き�
 | command | effect |
 |---|---|
 | `magi task grant-repair <task> --run <run> --kind gate\|review\|base-conflict --rounds <1..=3> --head <sha> --expect-pass <n> --request <id> --reason <text>` | Queue an additional bounded repair on the exact stopped run. The chat equivalent is `magi task control grant-repair` with the same arguments. See [repair budget workflow](docs/repair-budget.md) for receipts, retries and ownership checks. No merge approval is granted. |
+| `magi task reassign <task> --repo <selector>` | changes the repository for future execution, preserving task identity, conversation, evidence and run history. Accepts the same paths, owner/repo and unique short names as task add. Queued tasks remain queued; held tasks remain held; stopped failed/parked tasks become held and need release. Active or unknown drivers, retained PRs, unfinished receipts and repository-bound review/import selections must be resolved first. Old runs and questions cannot resume the previous repository, even after moving back. Branches and PRs are never moved or adopted. |
+| `magi task control reassign <task> --repo <selector>` | the same transaction through the authenticated standing-chat bridge. Use it for a clear owner request to move implementation elsewhere; if the channel is unavailable, restart the chat turn through the launcher. Never edit queue files or repeatedly resume the old run. Queue task actions also offer repository reassignment. |
 | `magi task control resume <full run id>` | pins the owning task to that run and queues it; the loop resumes it under the graph's execution lease (same checks as the Web resume). It starts no driver itself, so it needs `magi serve` |
 | `magi task control hold <task> [reason]` / `release <task>` | the same transitions as `magi task hold` / `release` |
 | `magi task control retry <task> <instruction>` | replaces a queued or held task's instruction and queues it in one save; attempts restart as for any release, runs and history are kept |

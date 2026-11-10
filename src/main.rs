@@ -705,6 +705,15 @@ enum TalkCmd {
 /// Direct control of this chat's own tasks and runs (standing chat seat only).
 #[derive(Debug, Subcommand)]
 enum ControlCmd {
+    /// Reassign an idle task; keep history and start future work in the selected repository.
+    Reassign {
+        /// Task id or unambiguous prefix.
+        id: String,
+        /// Path, owner/repo, or unique short name (same selectors as task add).
+        #[arg(long)]
+        repo: PathBuf,
+    },
+
     /// Grant bounded repair budget on the owner's explicit request.
     GrantRepair {
         #[command(flatten)]
@@ -793,12 +802,21 @@ enum ControlCmd {
 /// Operations on the queue.
 #[derive(Debug, Subcommand)]
 enum TaskCmd {
+    /// Reassign an idle task; keep history and start future work in the selected repository.
+    Reassign {
+        /// Task id or unambiguous prefix.
+        id: String,
+        /// Path, owner/repo, or unique short name (same selectors as task add).
+        #[arg(long)]
+        repo: PathBuf,
+    },
+
     /// Grant 1..=3 additional repairs and queue the exact stopped run (not merge approval).
     GrantRepair {
         #[command(flatten)]
         request: magi::repair_budget::Request,
     },
-    /// Resume, hold, release, retry, rerun checks, decide or abandon tasks
+    /// Reassign, resume, hold, release, retry, rerun checks, decide or abandon tasks
     /// and runs. Only the standing chat seat (`MAGI_NODE=chat`, `MAGI_RUN` =
     /// an open conversation) may use it.
     /// Direct PR merges require the current forge head SHA.
@@ -3195,6 +3213,31 @@ fn task_cmd_on(command: TaskCmd, q: Queue) -> impl std::future::Future<Output = 
 
 async fn task_cmd_inner(command: TaskCmd, q: Queue) -> Result<()> {
     match command {
+        TaskCmd::Reassign { id, repo } => {
+            if std::env::var("MAGI_NODE").as_deref() == Ok("chat") {
+                println!(
+                    "{}",
+                    control_from_chat(magi::chat_control::Operation::Reassign { task: id, repo })
+                        .await?
+                );
+            } else {
+                magi::repair_budget::authorize_terminal()?;
+                let task = magi::task_reassign::reassign(
+                    &q,
+                    &magi::run::home(),
+                    &std::env::current_dir()?,
+                    &id,
+                    &repo,
+                    "terminal",
+                )
+                .await?;
+                println!("{} -> {}", task.short(), task.repo.display());
+                for note in magi::task_reassign::advisory_notes(&task, &magi::run::home()) {
+                    println!("  {note}");
+                }
+            }
+            Ok(())
+        }
         TaskCmd::Add {
             sources,
             instruction,
@@ -3549,6 +3592,7 @@ async fn task_cmd_inner(command: TaskCmd, q: Queue) -> Result<()> {
             let talk_id = talk.id.as_str();
             use magi::chat_control as cc;
             let operation = match op {
+                ControlCmd::Reassign { id, repo } => cc::Operation::Reassign { task: id, repo },
                 ControlCmd::GrantRepair { request } => cc::Operation::GrantRepair { request },
                 ControlCmd::MergePr {
                     repo,
@@ -3769,7 +3813,7 @@ async fn task_cmd_inner(command: TaskCmd, q: Queue) -> Result<()> {
                 .with_context(|| format!("task {resolved} is claimed by a running daemon"))?;
             let mut t = q.get(&resolved)?;
             magi::repair_budget::ensure_generic_release(&q, &t)?;
-            let preserved = match t.runs.last().cloned() {
+            let preserved = match t.execution_runs().last().cloned() {
                 Some(run) => magi::repair_budget::queue_resumption(&q, &mut t, &run)?,
                 None => false,
             };
@@ -3848,7 +3892,7 @@ async fn task_cmd_inner(command: TaskCmd, q: Queue) -> Result<()> {
             );
             let mut selected = magi::pr_recovery::Selection {
                 url: pr,
-                branch: format!("magi/task-{}", t.id),
+                branch: t.publication_branch(),
                 head,
                 source_head,
                 source_run,
@@ -3857,7 +3901,7 @@ async fn task_cmd_inner(command: TaskCmd, q: Queue) -> Result<()> {
                 instruction: t.instruction.clone(),
                 approved_at: jiff::Timestamp::now(),
             };
-            selected.check_task(&t.id, &t.instruction)?;
+            selected.check_task_assignment(&t.id, &t.instruction, t.reassignments.len())?;
             let overrides = t
                 .overrides
                 .get_or_insert_with(|| magi::queue::RunOverrides {
@@ -4122,7 +4166,7 @@ fn asking_is_not_this_seat_s_job(node: &str) -> Option<String> {
 /// fail in the first place - so it is re-checked with `git::toplevel`
 /// before ever replacing the operator's own directory.
 async fn resolve_repo(repo: &Path, cwd: &Path, hint: Option<&str>) -> Result<PathBuf> {
-    resolve_repo_with_clone(repo, cwd, hint, true).await
+    magi::repo_selector::resolve_repo(repo, cwd, hint).await
 }
 
 async fn resolve_repo_with_clone(
@@ -4131,9 +4175,10 @@ async fn resolve_repo_with_clone(
     hint: Option<&str>,
     allow_clone: bool,
 ) -> Result<PathBuf> {
-    resolve_repo_with_gh(repo, cwd, hint, allow_clone, "gh").await
+    magi::repo_selector::resolve_repo_with_clone(repo, cwd, hint, allow_clone).await
 }
 
+#[cfg(all(test, unix))]
 async fn resolve_repo_with_gh(
     repo: &Path,
     cwd: &Path,
@@ -4141,125 +4186,12 @@ async fn resolve_repo_with_gh(
     allow_clone: bool,
     gh: &str,
 ) -> Result<PathBuf> {
-    match repo.canonicalize() {
-        Ok(canonical) => {
-            let top = match magi::git::toplevel(&canonical).await {
-                Ok(top) => top,
-                Err(e) => {
-                    if repo == Path::new(".") {
-                        if let Some(home) = dirs::home_dir() {
-                            if let Some(found) = repos::discover_verified(
-                                &home,
-                                &[],
-                                hint,
-                                magi::updater::repo_name(),
-                            )
-                            .await
-                            {
-                                eprintln!(
-                                    "the default --repo `.` ({}) is not a git checkout; using {} \
-                                 instead - {}",
-                                    canonical.display(),
-                                    found.path.display(),
-                                    found.reason,
-                                );
-                                return Ok(found.path);
-                            }
-                        }
-                    }
-                    return Err(e).with_context(|| {
-                        format!("--repo {} is not a git working tree", canonical.display())
-                    });
-                }
-            };
-            anyhow::ensure!(
-                !magi::repo_clone::acquisition_incomplete(&canonical)
-                    && !magi::repo_clone::acquisition_incomplete(&top),
-                "--repo {} has an incomplete acquisition; inspect the checkout and its acquisition marker before using it",
-                canonical.display()
-            );
-            Ok(canonical)
-        }
-        Err(_) => {
-            // `[repos] roots` is a machine fact, most often declared in the
-            // machine config layer - see `repos_cmd`, which reads it the same
-            // way for the same reason. A repository's own `magi.toml` may add
-            // to it too (`Config::refuse_split_arrays`'s append policy), which
-            // is what lets a test supply roots without touching the machine
-            // layer at all.
-            let (cfg, _) = Config::discover(cwd, None)
-                .with_context(|| format!("--repo {} does not exist", repo.display()))?;
-            match local_repo_by_name(repo, &cfg.repos.roots) {
-                Lookup::Found(path) => Ok(path),
-                Lookup::Ambiguous(error) => Err(error),
-                Lookup::Missing(error) => {
-                    if allow_clone && cfg.repos.auto_clone {
-                        let query = repo.to_string_lossy();
-                        if query.contains('/') && !repo.is_absolute() {
-                            magi::repo_clone::validate_github_name(&query)?;
-                            let _lock = magi::repo_clone::clone_lock(&cfg.repos).await?;
-                            match local_repo_by_name(repo, &cfg.repos.roots) {
-                                Lookup::Found(path) => return Ok(path),
-                                Lookup::Ambiguous(error) => return Err(error),
-                                Lookup::Missing(_) => {}
-                            }
-                            return magi::repo_clone::clone_github_with_gh(&query, &cfg.repos, gh)
-                                .await;
-                        }
-                    }
-                    Err(error)
-                }
-            }
-        }
-    }
+    magi::repo_selector::resolve_repo_with_gh(repo, cwd, hint, allow_clone, gh).await
 }
 
-/// Resolve a `--repo` value that is not an existing path at all against
-/// `[repos] roots`'s ghq-layout scan - the same one `magi repos` prints -
-/// letting a caller name a local checkout as `owner/repo` or a bare `repo`
-/// instead of a full path.
-///
-/// A miss or an ambiguous match is refused rather than guessed at: silently
-/// picking one of several checkouts sharing a name would file work against
-/// the wrong repository with nothing on screen to say so, and the whole
-/// point of this path is to save a round trip asking the operator, not to
-/// remove the one case that genuinely needs to ask.
 #[cfg(test)]
 fn resolve_repo_by_name(repo: &Path, roots: &[PathBuf]) -> Result<PathBuf> {
-    match local_repo_by_name(repo, roots) {
-        Lookup::Found(path) => Ok(path),
-        Lookup::Missing(error) | Lookup::Ambiguous(error) => Err(error),
-    }
-}
-
-/// Only a true local miss permits acquisition; ambiguity remains an error.
-enum Lookup {
-    Found(PathBuf),
-    Missing(anyhow::Error),
-    Ambiguous(anyhow::Error),
-}
-
-fn local_repo_by_name(repo: &Path, roots: &[PathBuf]) -> Lookup {
-    let query = repo.to_string_lossy().replace('\\', "/");
-    let hits: Vec<repos::Repo> = repos::scan(roots)
-        .into_iter()
-        .filter(|r| r.name == query || r.name.rsplit('/').next() == Some(query.as_str()))
-        .collect();
-    match hits.len() {
-        1 => Lookup::Found(hits.into_iter().next().expect("exactly one hit").path),
-        0 => Lookup::Missing(anyhow::anyhow!(
-            "--repo {} does not exist, and no checkout named `{query}` was found under [repos] roots",
-            repo.display()
-        )),
-        n => Lookup::Ambiguous(anyhow::anyhow!(
-            "--repo `{query}` matches {n} checkouts under [repos] roots ({}); use a full path \
-             or the exact owner/repo name to disambiguate",
-            hits.iter()
-                .map(|r| r.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )),
-    }
+    magi::repo_selector::resolve_repo_by_name(repo, roots)
 }
 
 /// Resolve `magi stats --repo <value>` the same way `--repo` is resolved
@@ -4487,7 +4419,7 @@ async fn run_as_task(queue: &Queue, filing: magi::direct::Filing, dry_run: bool)
 /// Print the newest run of `task` and turn its outcome into this command's
 /// exit status, exactly as `magi run` always did.
 fn report_task_outcome(task: &magi::queue::Task) -> Result<()> {
-    let Some(run) = task.runs.last() else {
+    let Some(run) = task.execution_runs().last() else {
         bail!(
             "no run was started for task {}: {}",
             task.short(),
@@ -4667,9 +4599,9 @@ async fn resume_run(id: &str, dry_run: bool, recover_base: bool) -> Result<()> {
     if recover_base {
         Runner::authorize_base_recovery(&home, &run_id, &task.id).await?;
     }
-    // The loop picks `task.runs.last()`, so it only resumes *this* run when it
+    // The loop picks `task.execution_runs().last()`, so it only resumes *this* run when it
     // is that one and nothing else steers the attempt elsewhere.
-    let loop_resumes = task.runs.last() == Some(&run_id)
+    let loop_resumes = task.execution_runs().last() == Some(&run_id)
         && !task.fresh_start
         && task.review_branch.is_none()
         && magi::daemon::loop_would_resume(&run_id);
@@ -7728,6 +7660,17 @@ command = ['sh', '-c', 'cat >/dev/null; printf "%s" "{\"duplicate\":true,\"reaso
             magi::retention::reconcile::run(Path::new("unused-home"), "task", "run", None);
         let bytes = std::mem::size_of_val(&reconciliation);
         assert!(bytes < 1024, "reconciliation entry occupies {bytes} bytes");
+        let queue = Queue::at(PathBuf::from("unused-queue"));
+        let reassignment = magi::task_reassign::reassign(
+            &queue,
+            Path::new("unused-home"),
+            Path::new("unused-repo"),
+            "task",
+            Path::new("destination"),
+            "test",
+        );
+        let bytes = std::mem::size_of_val(&reassignment);
+        assert!(bytes < 1024, "reassignment entry occupies {bytes} bytes");
     }
 
     #[tokio::test]

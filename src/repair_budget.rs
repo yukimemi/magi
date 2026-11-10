@@ -150,7 +150,7 @@ fn contract(task: &Task, kind: Kind) -> Result<String> {
 
 fn controls(home: &Path, task: &Task, state: &RunState, kind: Kind) -> Result<()> {
     ensure!(
-        task.runs.last() == Some(&state.id)
+        task.execution_runs().last() == Some(&state.id)
             && state.origin.as_ref().and_then(|o| o.task.as_deref()) == Some(task.id.as_str()),
         "repair grant refused: run task ownership changed"
     );
@@ -647,7 +647,7 @@ pub(crate) async fn apply(home: &Path, state: &mut RunState, disk: &RunState) ->
 /// An exact-run reservation keeps exhausted runs in the existing worker path.
 /// Admission still validates all control state under the owner/execution locks.
 pub(crate) fn pending(task: &Task, state: &RunState) -> bool {
-    task.runs.last() == Some(&state.id)
+    task.execution_runs().last() == Some(&state.id)
         && task.repair_grants.last().is_some_and(|receipt| {
             receipt.request.run == state.id
                 && !state
@@ -794,7 +794,7 @@ fn unique_owner(queue: &Queue, task: &Task, state: &RunState) -> Result<()> {
 
 /// A settled red conflict repair remains owned by this run, not a successor review.
 pub(crate) fn conflict_failure(task: &Task, state: &RunState) -> Option<String> {
-    if task.runs.last() == Some(&state.id)
+    if task.execution_runs().last() == Some(&state.id)
         && !pending(task, state)
         && state.repair_grants.last().is_some_and(|g| {
             (g.receipt.request.kind == Kind::BaseConflict || conflict_lineage(state))

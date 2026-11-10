@@ -495,7 +495,7 @@ fn run_paths_missing(state: &RunState) -> Result<bool> {
 }
 
 /// Enumerate actual registered worktrees, not just candidates in run.json.
-async fn worktrees(state: &RunState) -> Result<Vec<PathBuf>> {
+pub(crate) async fn worktrees(state: &RunState) -> Result<Vec<PathBuf>> {
     let root = state.worktree_root();
     if !plain_dir(&root) {
         return Ok(Vec::new());
@@ -6343,7 +6343,10 @@ mod tests {
                 .join(&state.id)
                 .join("artifacts/eviction-review-1.json");
             let record: serde_json::Value =
-                serde_json::from_slice(&std::fs::read(&ledger).unwrap()).unwrap();
+                serde_json::from_slice(&std::fs::read(&ledger).unwrap_or_else(|error| {
+                    panic!("{stage}: missing pending ledger: {error}; {interrupted:?}")
+                }))
+                .unwrap();
             assert_eq!(record["phase"], "pending");
             if stage == "changed-admin" {
                 std::fs::write(admin.join("owner-note"), "keep").unwrap();

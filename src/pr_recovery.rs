@@ -215,11 +215,21 @@ impl Selection {
         }
     }
 
-    /// Confirm task identity and immutable criteria before starting work.
+    /// Confirm initial-assignment task identity and immutable criteria.
     pub fn check_task(&self, task: &str, instruction: &str) -> Result<()> {
+        self.check_task_assignment(task, instruction, 0)
+    }
+
+    /// Confirm the exact repository assignment as well as task and criteria.
+    pub fn check_task_assignment(
+        &self,
+        task: &str,
+        instruction: &str,
+        assignment: usize,
+    ) -> Result<()> {
         ensure!(
-            self.branch == format!("magi/task-{task}"),
-            "recovery head belongs to another task"
+            self.branch == crate::run::task_pr_branch_name(task, assignment),
+            "recovery head belongs to another task or repository assignment"
         );
         ensure!(
             self.instruction == instruction,
@@ -465,5 +475,15 @@ mod tests {
                 .is_err()
         );
         assert!(selected.check_task("other", "approved").is_err());
+        assert!(selected.check_task_assignment("t", "approved", 2).is_err());
+        let mut reassigned = selected;
+        reassigned.branch = "magi/task-t-assignment-2".into();
+        assert!(reassigned.check_task_assignment("t", "approved", 2).is_ok());
+        assert!(
+            reassigned
+                .check_task_assignment("t", "approved", 1)
+                .is_err()
+        );
+        assert!(reassigned.check_task("t", "approved").is_err());
     }
 }

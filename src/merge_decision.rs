@@ -152,7 +152,9 @@ pub(crate) fn dismiss(home: &std::path::Path, q: &crate::ask::Question) -> anyho
     for owner in owners {
         let mut task = queue.get(&owner.id)?;
         // A later attempt or an already completed task owns its own outcome.
-        if task.runs.last() == Some(&q.run) && task.status != crate::queue::TaskStatus::Done {
+        if task.execution_runs().last() == Some(&q.run)
+            && task.status != crate::queue::TaskStatus::Done
+        {
             task.succeed();
             task.mark_action_applied(&q.id);
             queue.put(&mut task)?;

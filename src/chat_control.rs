@@ -49,6 +49,13 @@ pub(crate) mod bridge;
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "operation", deny_unknown_fields)]
 pub enum Operation {
+    /// Reassign an idle task to a different repository without migrating runs.
+    Reassign {
+        /// Task id or unambiguous prefix.
+        task: String,
+        /// Repository path, owner/repo, or unique short name.
+        repo: std::path::PathBuf,
+    },
     /// Authorize bounded repair through the same transaction as the terminal.
     GrantRepair {
         /// Head-bound operator request.
@@ -215,6 +222,20 @@ pub async fn dispatch(
     talk: &str,
     operation: Operation,
 ) -> Result<String> {
+    if matches!(&operation, Operation::Reassign { .. }) {
+        #[cfg(unix)]
+        {
+            return bridge::request(&operation).context("repository reassignment requires the authenticated chat control channel; restart this chat turn through the launcher");
+        }
+        #[cfg(windows)]
+        {
+            return bridge::request(&operation).await.context("repository reassignment requires the authenticated chat control channel; restart this chat turn through the launcher");
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            bail!("authenticated chat control channel is unavailable on this platform");
+        }
+    }
     #[cfg(unix)]
     if std::env::var_os(bridge::CHANNEL_ENV).is_some() {
         // The launcher sets this flag for writable seats, including effective
@@ -242,6 +263,23 @@ async fn execute(
 ) -> Result<String> {
     authorize(talks, talk, crate::queue::CHAT_NODE)?;
     Ok(match operation {
+        Operation::Reassign { task, repo } => {
+            let cwd = &talks.get(talk)?.repo;
+            let task = crate::task_reassign::reassign(
+                queue,
+                home,
+                cwd,
+                &task,
+                &repo,
+                &format!("chat:{talk}"),
+            )
+            .await?;
+            let mut message = describe(&task, "reassigned");
+            for note in crate::task_reassign::advisory_notes(&task, home) {
+                message.push_str(&format!("\n  {note}"));
+            }
+            message
+        }
         Operation::Add { filing } => {
             let mut task = Task::new(filing.title, filing.instruction, filing.repo, filing.source);
             task.sources = filing.sources;
@@ -409,6 +447,18 @@ fn record_decision(
     let questions = Questions::at(home.join("questions"));
     let id = questions.resolve_id(question)?;
     let q = questions.get(&id)?;
+    let queue = Queue::at(home.join("queue"));
+    for task in queue.list() {
+        if q.run == task.id
+            || task.runs.contains(&q.run)
+            || q.routed_task.as_deref() == Some(&task.id)
+        {
+            ensure!(
+                !task.stale_question(&q),
+                "question predates task repository reassignment; inspect the current task and release it for fresh execution"
+            );
+        }
+    }
     ensure!(
         crate::task_chat::awaits_decision(&q),
         "question {} is not a decision the machinery waits on; answer it with `magi answer`",
@@ -536,7 +586,7 @@ pub fn release(queue: &Queue, reference: &str) -> Result<Task> {
     let (_claim, mut task) = claimed(queue, reference)?;
     check_hold_release(&task, "release")?;
     crate::base_sync_recovery::ensure_generic_release(queue, &task)?;
-    let run = task.runs.last().cloned();
+    let run = task.execution_runs().last().cloned();
     let preserved = match run {
         Some(run) => crate::repair_budget::queue_resumption(queue, &mut task, &run)?,
         None => false,
@@ -588,7 +638,7 @@ pub fn retry(
 pub fn resume(queue: &Queue, home: &Path, run: &str) -> Result<Task> {
     let task = run_task(queue, run)?;
     ensure!(
-        task.runs.last().map(String::as_str) == Some(run),
+        task.execution_runs().last().map(String::as_str) == Some(run),
         "only the task's latest run can be resumed"
     );
     crate::resume::validate(home, run)?;

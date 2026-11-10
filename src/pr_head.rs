@@ -6,7 +6,7 @@ use crate::{
     git, land,
     run::{self, Candidate, Liveness, PrRecord, RunState},
 };
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 
 /// Serializes driver claims with publication takeover. The file stays in place:
 /// unlinking a locked inode would let a second caller lock a different one.
@@ -225,6 +225,11 @@ fn validate_predecessor(
     home: &Path,
     claimed: bool,
 ) -> Result<()> {
+    ensure!(
+        old.task_assignment == next.task_assignment,
+        "public head belongs to run {} from a previous repository assignment; preserve that branch and publish using the current assignment head",
+        old.id
+    );
     match old.liveness_under(home, claimed) {
         Liveness::Live => bail!(
             "previous public head owner {} still has a live driver",
@@ -560,6 +565,29 @@ mod tests {
         s.status = crate::run::RunStatus::Ready;
         s.save_under(home).unwrap();
         s
+    }
+
+    #[test]
+    fn public_head_cannot_inherit_a_previous_assignment_lease() {
+        let home = tempfile::tempdir().unwrap();
+        let mut old = predecessor(home.path());
+        old.origin = Some(crate::run::Origin::queue("same-task"));
+        old.driver_exited = true;
+        old.pr_pushed_head = Some("historical-head".into());
+        old.save_under(home.path()).unwrap();
+        let original =
+            std::fs::read(home.path().join("runs").join(&old.id).join("run.json")).unwrap();
+        let mut next = predecessor(home.path());
+        next.origin = old.origin.clone();
+        next.task_assignment = 2;
+        let error = validate_predecessor(&mut old, &next, home.path(), false).unwrap_err();
+        assert!(error.to_string().contains("previous repository assignment"));
+        assert_eq!(
+            std::fs::read(home.path().join("runs").join(&old.id).join("run.json")).unwrap(),
+            original
+        );
+        next.task_assignment = 0;
+        assert!(validate_predecessor(&mut old, &next, home.path(), false).is_ok());
     }
 
     #[test]

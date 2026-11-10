@@ -483,7 +483,7 @@ pub fn current_work(home: &Path, now: Timestamp) -> Vec<Current> {
                 let run = Queue::at(request.queue)
                     .get(&request.task)
                     .ok()
-                    .and_then(|task| task.runs.last().cloned())
+                    .and_then(|task| task.execution_runs().last().cloned())
                     .unwrap_or_default();
                 Ok(Current {
                     worker: Some(job.id),
@@ -515,8 +515,8 @@ pub fn current_work(home: &Path, now: Timestamp) -> Vec<Current> {
                     .into_iter()
                     .map(|task| Current {
                         worker: None,
-                        task: task.id,
-                        run: task.runs.last().cloned().unwrap_or_default(),
+                        task: task.id.clone(),
+                        run: task.execution_runs().last().cloned().unwrap_or_default(),
                     }),
             );
             current.extend(
@@ -883,11 +883,13 @@ impl ActionStanding {
 /// `Busy`: a question about an earlier attempt must be stopped even while a
 /// newer competition is running.
 pub(crate) fn action_standing(task: &Task, q: &ask::Question) -> ActionStanding {
-    if q.chosen_action().is_none() {
+    if task.stale_question(q) {
+        ActionStanding::Stale
+    } else if q.chosen_action().is_none() {
         ActionStanding::NoAction
     } else if task.action_applied(&q.id) {
         ActionStanding::Applied
-    } else if q.node != crate::conduct::NODE && task.runs.last() != Some(&q.run) {
+    } else if q.node != crate::conduct::NODE && task.execution_runs().last() != Some(&q.run) {
         ActionStanding::Stale
     } else if matches!(
         task.status,
@@ -938,6 +940,9 @@ fn decide_action<F>(
 where
     F: FnOnce(&str) -> Result<RunState>,
 {
+    if task.stale_question(q) {
+        return ActionDecision::Stale;
+    }
     let Some(action) = q.chosen_action() else {
         return ActionDecision::Skip;
     };
@@ -951,7 +956,7 @@ where
     }
     // A question about an earlier attempt must not act on a newer one. A
     // conductor question is keyed by the task id, not a run, so it is exempt.
-    if q.node != crate::conduct::NODE && task.runs.last() != Some(&q.run) {
+    if q.node != crate::conduct::NODE && task.execution_runs().last() != Some(&q.run) {
         return ActionDecision::Stale;
     }
     let repair = q.node == land::APPROVAL_NODE && q.resolution().as_deref() == Some(land::REPAIR);
@@ -986,7 +991,7 @@ where
         ask::ChoiceAction::Hold => ActionDecision::Hold,
         ask::ChoiceAction::Done => ActionDecision::Done,
         ask::ChoiceAction::Resume { run } => {
-            if task.runs.last() != Some(run) {
+            if task.execution_runs().last() != Some(run) {
                 return ActionDecision::Refuse((p.resume_not_latest)(
                     q.short(),
                     ask::short_id(run),
@@ -1253,6 +1258,14 @@ async fn apply_maintenance_choices(queue: &Queue, questions: &Questions, home: &
         // Receipt paths use question IDs, whose format is independent of run
         // IDs. Apply the question store's filename safety rule to both eras.
         if asker_may_still_read(questions, &q, home) || !ask::valid_asset_name(&q.id) {
+            continue;
+        }
+        if queue.list().iter().any(|task| {
+            (task.id == q.run
+                || task.runs.contains(&q.run)
+                || q.routed_task.as_deref() == Some(&task.id))
+                && task.stale_question(&q)
+        }) {
             continue;
         }
         let dir = home.join("choice-actions");
@@ -1953,7 +1966,11 @@ fn settle_and_diagnose(
     // No new attempt can own the task until the old driver has exited.
     if let Some(d) = &state.merge_decision {
         use crate::merge_decision as md;
-        if task.runs.last().is_some_and(|id| id != &state.id) {
+        if task
+            .execution_runs()
+            .last()
+            .is_some_and(|id| id != &state.id)
+        {
             return;
         }
         if (d.choice == md::WITHDRAW && d.closed) || d.choice == md::DISMISS {
@@ -2087,7 +2104,7 @@ fn settle_and_diagnose(
                 .pr_pushed_head
                 .as_ref()
                 .is_none_or(|h| h == &hold.head)
-            && task.runs.last() == Some(&state.id)
+            && task.execution_runs().last() == Some(&state.id)
     }) {
         // Settlement and crash recovery share this idempotency key. A later
         // explicit resume is a new pass and may refund its own attempt once.
@@ -2312,7 +2329,10 @@ fn reclaim_orphaned_running(
         if task.status != TaskStatus::Running {
             continue;
         }
-        let last_run = task.runs.last().and_then(|id| RunState::load(id).ok());
+        let last_run = task
+            .execution_runs()
+            .last()
+            .and_then(|id| RunState::load(id).ok());
         // `execute` normally abandons a run's own open questions the moment
         // `status` lands somewhere non-resumable (see `graph::Runner::settle_questions`),
         // but a daemon that crashed *inside* that path - mid `land`'s CI wait,
@@ -3022,7 +3042,7 @@ enum LandResume {
 /// approval. Read-only - no claim taken, nothing written - so it is cheap
 /// enough to call on every candidate, every poll.
 fn land_resume_state(task: &Task) -> LandResume {
-    let Some(run_id) = task.runs.last() else {
+    let Some(run_id) = task.execution_runs().last() else {
         return LandResume::NotLanding;
     };
     let Ok(state) = RunState::load(run_id) else {
@@ -3795,7 +3815,7 @@ async fn poll(
                 run: queue
                     .get(&request.task)
                     .ok()
-                    .and_then(|task| task.runs.last().cloned())
+                    .and_then(|task| task.execution_runs().last().cloned())
                     .unwrap_or_default(),
             })
             .collect();
@@ -4111,7 +4131,7 @@ async fn attempt(
     let resume_runs = public_owner
         .as_ref()
         .map(|s| vec![s.id.clone()])
-        .unwrap_or_else(|| task.runs.clone());
+        .unwrap_or_else(|| task.execution_runs().to_vec());
 
     // A stop spends no agent resources and uses the saved landing owner.
     // Current roster edits, missing attachments or a failed config fetch must
@@ -4182,7 +4202,10 @@ async fn attempt(
         return Vec::new();
     }
 
-    if let Some(state) = task.runs.last().and_then(|id| RunState::load(id).ok())
+    if let Some(state) = task
+        .execution_runs()
+        .last()
+        .and_then(|id| RunState::load(id).ok())
         && let Some(reason) = crate::repair_budget::conflict_failure(task, &state)
     {
         task.hold_machine(Some(reason));
@@ -4241,7 +4264,9 @@ async fn attempt(
     let saved_recovery = previous.as_ref().filter(|run| {
         task.replacement.is_none()
             && task.pr_recovery.as_ref().is_some_and(|selected| {
-                selected.check_task(&task.id, &task.instruction).is_ok()
+                selected
+                    .check_task_assignment(&task.id, &task.instruction, task.reassignments.len())
+                    .is_ok()
                     && selected_starter(selected, Some(run), unfinished.as_deref())
                         == Starter::Resume(run.id.clone())
             })
@@ -4311,7 +4336,7 @@ async fn attempt(
                     d.closed
                         && d.question == replacement.question
                         && d.replacement_run.as_ref().is_none_or(|run| {
-                            task.runs.last() == Some(run)
+                            task.execution_runs().last() == Some(run)
                                 && RunState::load(run).is_ok_and(|current| {
                                     current.replaces.as_ref().is_some_and(|pin| {
                                         pin.question == replacement.question
@@ -4489,7 +4514,10 @@ async fn attempt(
     } else if retry_selected {
         Starter::Resume(previous.as_ref().unwrap().id.clone())
     } else if let Some(selected) = &task.pr_recovery {
-        if selected.check_task(&task.id, &task.instruction).is_ok() {
+        if selected
+            .check_task_assignment(&task.id, &task.instruction, task.reassignments.len())
+            .is_ok()
+        {
             selected_starter(selected, previous.as_ref(), unfinished.as_deref())
         } else {
             Starter::Review(selected.branch.clone())
@@ -4564,7 +4592,7 @@ async fn attempt(
     let started = wait.scope(Box::pin(async { match &starter {
         Starter::Review(_) if task.pr_recovery.is_some() => {
             let selected = task.pr_recovery.clone().expect("selected recovery");
-            match selected.check_task(&task.id, &task.instruction) {
+            match selected.check_task_assignment(&task.id, &task.instruction, task.reassignments.len()) {
                 Ok(()) => Runner::recover_pr(&repo, &task.id, selected, config)
                     .await
                     .map(|mut r| {
@@ -5101,7 +5129,7 @@ const WITHHELD_POLL: Duration = Duration::from_secs(15);
 /// The `answer_timeout` (seconds) of the task's last run when that run is
 /// parked on an unresolved withheld-text question; `None` otherwise.
 fn withheld_text_wait(task: &Task) -> Option<u64> {
-    let id = task.runs.last()?;
+    let id = task.execution_runs().last()?;
     let s = RunState::load(id).ok()?;
     (s.parked && s.github_text.as_ref().is_some_and(|g| !g.resolved))
         .then_some(s.config.graph.answer_timeout)
@@ -5758,7 +5786,7 @@ where
     {
         return false;
     }
-    let Some(id) = task.runs.last() else {
+    let Some(id) = task.execution_runs().last() else {
         return false;
     };
     load(id).is_ok_and(|s| s.parked && crate::handover::can_resume(&s))
@@ -5923,6 +5951,9 @@ fn take_review_branch(task: &mut Task, previous: Option<&RunState>) -> Option<St
 /// A current explicit pin can select an otherwise incompatible run. Edits
 /// and subsequent approvals invalidate pins selected for earlier criteria.
 fn may_resume_run(run: &RunState, task: &Task) -> bool {
+    if !task.assignment_accepts(run) {
+        return false;
+    }
     task.resume_override
         .as_ref()
         .is_some_and(|r| r.pinned_run.as_ref() == Some(&run.id))

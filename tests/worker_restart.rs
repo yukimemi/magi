@@ -80,7 +80,31 @@ async fn wait_for(mut predicate: impl FnMut() -> bool, what: &str) {
         }
     })
     .await
-    .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+    .unwrap_or_else(|_| panic!("timed out waiting for {what}\n{}", completion_diagnostics()));
+}
+
+fn completion_diagnostics() -> String {
+    let home = magi::run::home();
+    let tasks: Vec<_> = Queue::open()
+        .list()
+        .into_iter()
+        .map(|task| (task.id, task.status, task.last_error, task.runs))
+        .collect();
+    let mut details = format!("tasks: {tasks:?}");
+    if let Ok(entries) = std::fs::read_dir(home.join("workers/jobs")) {
+        for entry in entries.flatten() {
+            if let Ok(log) = std::fs::read_to_string(entry.path().join("worker.log")) {
+                let mut tail: Vec<_> = log.lines().rev().take(40).collect();
+                tail.reverse();
+                details.push_str(&format!(
+                    "\nworker {}:\n{}",
+                    entry.file_name().to_string_lossy(),
+                    tail.join("\n")
+                ));
+            }
+        }
+    }
+    details
 }
 
 fn file(queue: &Queue, repo: &Path, config: &Path, title: &str) -> Task {

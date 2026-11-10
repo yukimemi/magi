@@ -1620,6 +1620,7 @@ impl Ui {
             .route("/api/settings", get(settings_get))
             .route("/api/settings/roles", put(settings_put_roles))
             .route("/api/queue/{id}/hold", post(queue_hold))
+            .route("/api/queue/{id}/reassign", post(queue_reassign))
             .route("/api/queue/{id}/release", post(queue_release))
             .route("/api/queue/{id}/priority", post(queue_priority))
             .route("/api/queue/{id}/urgent", post(queue_urgent))
@@ -5001,6 +5002,7 @@ struct TaskView {
     #[serde(flatten)]
     task: Task,
     source_label: String,
+    reassignment_notes: Vec<String>,
     source_link: Option<SourceLink>,
     status_str: &'static str,
     /// The instruction, parsed as markdown, for the Queue card's "Full
@@ -5022,6 +5024,7 @@ impl From<Task> for TaskView {
     fn from(task: Task) -> Self {
         Self {
             source_label: task.source.label(),
+            reassignment_notes: Vec::new(),
             source_link: source_link(&task.source),
             status_str: task.status.as_str(),
             instruction_md: md::to_nodes(&task.instruction, &md::ImageBase::None),
@@ -7366,6 +7369,27 @@ async fn queue_hold(
         Ok(())
     })
     .await
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReassignBody {
+    repo: PathBuf,
+}
+
+async fn queue_reassign(
+    State(ui): State<Arc<Ui>>,
+    Path(id): Path<String>,
+    Json(body): Json<ReassignBody>,
+) -> ApiResult<Json<TaskView>> {
+    let home = ui.home.clone();
+    let task = crate::task_reassign::reassign(&ui.queue, &home, &ui.repo, &id, &body.repo, "web")
+        .await
+        .map_err(ApiError::bad_request_from)?;
+    let notes = crate::task_reassign::advisory_notes(&task, &home);
+    let mut view = TaskView::from(task);
+    view.reassignment_notes = notes;
+    Ok(Json(view))
 }
 
 async fn queue_release(
@@ -24334,11 +24358,14 @@ mod tests {
         // Refreshed whenever the detail redraws, including the loading state.
         assert!(APP_JS.contains("renderTaskActions(task.coreOnly || error ? null : task);"));
         assert!(APP_JS.contains("renderTaskActions(null);"));
-        // Same renderers and routes as the Queue card, no new endpoint.
-        let sheet = APP_JS
-            .find("function renderTaskActions")
+        // Same action renderers as the Queue card. Bound this check by the
+        // next function, since additional task controls can grow the sheet.
+        let (_, sheet) = APP_JS
+            .split_once("function renderTaskActions(task) {")
             .expect("sheet renderer");
-        let body = &APP_JS[sheet..sheet + 3000];
+        let (body, _) = sheet
+            .split_once("\nfunction openTaskActions() {")
+            .expect("end of sheet renderer");
         assert!(body.contains("changePriority("));
         assert!(body.contains("openTaskEdit(task)"));
         assert!(body.contains("renderTaskHoldBox(host"));

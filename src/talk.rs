@@ -3258,6 +3258,9 @@ pub fn briefing_for(
          control resume <full run id>` (queues the run for the loop to resume; \
          it starts nothing itself), `magi task control hold <task id> \
          [reason]`, `magi task control release <task id>`, `magi task control \
+         reassign <task id> --repo <path-or-owner/repo>` (moves future execution \
+         to that repository while preserving identity, chat and history; never \
+         resumes an old worktree), `magi task control \
          retry <task id> <new instruction>` (replaces a queued or held task's \
          instruction and queues it again; its runs stay on record), `magi task \
          control rerun-checks <full run id> --request <id> --head <sha> \
@@ -3267,7 +3270,11 @@ pub fn briefing_for(
          control abandon <full run id>` (ends a run whose driver is proven \
          dead; one that might still be driven is refused). Do these when the \
          operator asks or the situation clearly calls for it, and say what you \
-         did. For retention maintenance, `magi task control \
+         did. When the owner clearly asks to move a task to another repository, \
+         use reassign instead of generic resume prompts. Reassignment requires \
+         the authenticated control bridge; if unavailable, report the channel \
+         error and restart the turn through the launcher, never edit stores. \
+         Resolve reported retained PR or execution conflicts first. For retention maintenance, `magi task control \
          reconcile-retention <task> --authority-run <full run id>` saves a \
          reviewable plan and retires nothing; present its complete summary, \
          including protected sources, candidates, refusals and expiry. When \

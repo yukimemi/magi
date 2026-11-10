@@ -3638,11 +3638,11 @@ async fn owner_stop<F: Forge>(state: &mut RunState, pr: &mut PrState, forge: &F)
         let owners: Vec<_> = crate::queue::Queue::open()
             .list()
             .into_iter()
-            .filter(|task| task.runs.last() == Some(&state.id))
+            .filter(|task| task.execution_runs().last() == Some(&state.id))
             .collect();
         let owner = (owners.len() == 1).then(|| &owners[0]);
         if !owner.is_some_and(|task| {
-            task.runs.last() == Some(&state.id)
+            task.execution_runs().last() == Some(&state.id)
                 && (!task
                     .operator_decided_at
                     .is_some_and(|at| at > q.answered_at.unwrap_or(q.asked_at))
@@ -4619,7 +4619,7 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
                         let task = crate::queue::Queue::open()
                             .get(task_id)
                             .context("cannot verify the task owner immediately before merge")?;
-                        if task.runs.last() != Some(&state.id)
+                        if task.execution_runs().last() != Some(&state.id)
                             || task.operator_held()
                             || task.status == crate::queue::TaskStatus::Done
                         {

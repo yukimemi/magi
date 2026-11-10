@@ -1005,6 +1005,7 @@ upstream CRLF, not drift worth committing — normalise back to LF and
 
 - Competition branch names carry the **label**, never the agent id
   (`RunState::branch_for`). Queue competitions publish to `magi/task-<task id>`
+  initially, then `magi/task-<task id>-assignment-<generation>` after reassignment
   (`RunState::task_pr_branch`); neither label nor agent identity appears in
   that public head. Review-only and taskless runs keep their existing head;
   an invalid task ref falls back to the candidate branch.
@@ -3504,3 +3505,25 @@ unlink. `fold --show-seats` and `fold --restore-seat <head> --dest <new-path>`
 inspect/restore recorded tips without the original repository. `source-evidence --restore`
 creates an inspection repository only and must never transfer recovery/public
 authority or approval. See `docs/checkout-eviction.md` for limits and accounting.
+
+### Task repository reassignment
+
+`task_reassign::reassign` is the shared CLI/chat/Web transaction. Assignment
+history length is its monotonic generation, and each boundary excludes all
+previous runs from execution, including when moving back to the original repo.
+Use `Task::execution_runs` for execution/recovery candidates and
+`Task::assignment_accepts` at admission. Keep `Task::runs` intact for history,
+publication ownership and duplicate-work checks; those checks must use each
+run's original repository. Never adopt historical branches across assignments.
+Question actions must check `Task::stale_question`, including conductor and
+maintenance questions. Chat reassignment requires its authenticated bridge and
+must never fall back to direct store writes. Reassignment holds task claims,
+run owner/execution leases and output reservations until its atomic task save;
+new execution discovers destination config and takes destination coordination.
+
+Targeted `Runner::fix_selected` operations hold the same `FixClaim` as repository
+reassignment, including preflight and follow-up review. Recheck the canonical
+full run ID inside that claim before awaiting or editing. New runs snapshot
+`task_assignment` before startup: their public heads use that durable generation,
+not the task's later assignment. Legacy generation zero keeps its original head.
+Publication takeover and explicit PR recovery must not cross assignment generations.

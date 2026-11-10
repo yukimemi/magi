@@ -6,6 +6,7 @@ use std::path::Path;
 /// any graph state is changed. A queued response is never evidence of a claim.
 pub(crate) fn validate(home: &Path, id: &str) -> Result<crate::run::RunState> {
     ensure!(crate::run::is_run_id(id), "invalid run id");
+    crate::task_reassign::ensure_current(&crate::queue::Queue::at(home.join("queue")), id)?;
     let _owner = crate::pr_head::owner_lock(home, id)?;
     let state = crate::run::RunState::load_under(id, home)?;
     if let Some(reason) = crate::handover::resume_refusal_under(&state, Some(home)) {
@@ -54,7 +55,7 @@ pub(crate) async fn spawn_detached(home: &Path, id: &str) -> Result<crate::worke
         &state.sources,
     )?;
     ensure!(
-        task.runs.last().is_some_and(|run| run == id)
+        task.execution_runs().last().is_some_and(|run| run == id)
             && task.status != crate::queue::TaskStatus::Done,
         "run queue owner changed"
     );
@@ -104,6 +105,7 @@ pub(crate) fn pin_queued(
     applied: Option<&str>,
 ) -> Result<bool> {
     use crate::queue::TaskStatus;
+    crate::task_reassign::ensure_current(queue, run)?;
     let Some(listed) = queue
         .list()
         .into_iter()
@@ -114,7 +116,7 @@ pub(crate) fn pin_queued(
     let _claim = queue.claim(&listed.id)?;
     let mut task = queue.get(&listed.id)?;
     ensure!(
-        task.runs.last().map(String::as_str) == Some(run)
+        task.execution_runs().last().map(String::as_str) == Some(run)
             && !matches!(task.status, TaskStatus::Running | TaskStatus::Done),
         "run queue owner changed"
     );

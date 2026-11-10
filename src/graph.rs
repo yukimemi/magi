@@ -530,8 +530,8 @@ enum FixStep {
     Recorded { report_lost: bool },
 }
 
-/// Exclusive claim on one run's repair or `magi fix`, released on drop — including
-/// on an early return or a panic.
+/// Exclusive claim shared by targeted repairs and repository reassignment.
+/// Held before asynchronous fix preflight and released on every return or panic.
 ///
 /// `daemon::is_working_on` only sees a heartbeat-publishing daemon; two
 /// manual `magi fix` invocations against the same run are otherwise
@@ -546,12 +546,12 @@ enum FixStep {
 /// conservative PID-liveness policy `sweep_stale_claims` and `cache`'s own
 /// lease use: an unreadable or unparsable pid, or a liveness query the
 /// platform cannot answer, reads as alive and the lock is left in place.
-struct FixClaim {
+pub(crate) struct FixClaim {
     path: PathBuf,
 }
 
 impl FixClaim {
-    fn acquire(dir: &Path) -> Result<Self> {
+    pub(crate) fn acquire(dir: &Path) -> Result<Self> {
         std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
         let path = dir.join("fix.lock");
         let retry = crate::lock_file::Retry::new(None);
@@ -769,11 +769,10 @@ impl Runner {
         let roles = config.resolve_roles()?;
         let max_parallel = config.graph.max_parallel.max(1);
         let mut state = RunState::new(repo, base_branch, base_commit, instruction, config);
-        // Recorded before the first save, so a crash right after minting
-        // cannot leave a run with no origin. Legibility only: nothing reads it
-        // to decide anything.
+        // Capture task identity and repository assignment before the first
+        // save, so publication scope survives crashes and later task moves.
         state.fetched_base = Some(fetched_base);
-        state.origin = Some(origin);
+        state.set_origin(origin)?;
         let startup = StartupGuard::reserve(&mut state, "implementation", None)?;
         state.status = RunStatus::Prep;
         state.event("start", format!("run {} created", state.id));
@@ -851,7 +850,7 @@ impl Runner {
             config,
         );
         state.fetched_base = Some(fetched_base);
-        state.origin = Some(origin);
+        state.set_origin(origin)?;
         state.task_instruction = takeover.as_ref().and_then(|t| t.task_instruction.clone());
         let startup = StartupGuard::reserve(&mut state, "review", Some(branch))?;
         let opened = async {
@@ -986,7 +985,8 @@ impl Runner {
         mut config: Config,
     ) -> Result<Self> {
         selection.configure(&mut config)?;
-        selection.check_task(task, &selection.instruction)?;
+        let assignment = crate::run::task_assignment_for(task)?;
+        selection.check_task_assignment(task, &selection.instruction, assignment)?;
         let base_branch =
             git::merge_base_branch(repo, &config.merge.remote, config.merge.base.as_deref())
                 .await?;
@@ -1018,7 +1018,7 @@ impl Runner {
             config,
         );
         state.fetched_base = Some(fetched_base);
-        state.origin = Some(crate::run::Origin::queue(task));
+        state.set_origin(crate::run::Origin::queue(task))?;
         state.pr_head = Some(selection.branch.clone());
         state.pr_recovery = Some(selection.clone());
         Self::open_selected(repo, state, roles, max_parallel, base_commit, selection).await
@@ -1367,7 +1367,7 @@ impl Runner {
         crate::pr_head::ensure_owner(&state)?;
         let queued = crate::queue::Queue::at(home.join("queue")).get(task)?;
         anyhow::ensure!(
-            queued.runs.last().is_some_and(|run| run == id)
+            queued.execution_runs().last().is_some_and(|run| run == id)
                 && queued.status != crate::queue::TaskStatus::Done
                 && !queued.fresh_start
                 && queued.review_branch.is_none(),
@@ -1466,6 +1466,7 @@ impl Runner {
     /// Reopen an existing run.
     pub fn resume(id: &str) -> Result<Self> {
         let state = RunState::load(id)?;
+        crate::task_reassign::ensure_current(&crate::queue::Queue::open(), &state.id)?;
         if state.startup.as_ref().is_some_and(|s| !s.complete)
             || (state.status == RunStatus::Prep
                 && state.instruction.trim().is_empty()
@@ -1532,6 +1533,7 @@ impl Runner {
             || (self.state.status == RunStatus::Landing && land::repair_available(&self.state))
         {
             let claim = FixClaim::acquire(&self.state.dir())?;
+            crate::task_reassign::ensure_current(&crate::queue::Queue::open(), &self.state.id)?;
             let disk = RunState::load(&self.state.id)?;
             let checkpoint = |s: &RunState| {
                 (
@@ -5555,7 +5557,7 @@ impl Runner {
                 .is_some_and(|e| e.boundary.is_some())
             && let Some(task) = self.state.origin.as_ref().and_then(|o| o.task.clone())
             && let Ok(owner) = crate::queue::Queue::open().get(&task)
-            && owner.runs.last() == Some(&self.state.id)
+            && owner.execution_runs().last() == Some(&self.state.id)
             && owner.status != crate::queue::TaskStatus::Done
             && !owner.fresh_start
             && owner.review_branch.is_none()
@@ -5590,7 +5592,7 @@ impl Runner {
             let owner =
                 crate::queue::Queue::at(crate::run::home().join("queue")).get(&authorization.task);
             let owner_valid = owner.as_ref().is_ok_and(|t| {
-                t.runs.last() == Some(&self.state.id)
+                t.execution_runs().last() == Some(&self.state.id)
                     && t.status != crate::queue::TaskStatus::Done
                     && !t.fresh_start
                     && t.review_branch.is_none()
@@ -5639,7 +5641,7 @@ impl Runner {
             if !fetched_base
                 || git::rev_parse(&repo, &format!("refs/heads/{}", winner.branch)).await? != head
                 || !git::is_clean(&winner.worktree).await?
-                || !owner.is_ok_and(|t| t.runs.last() == Some(&self.state.id))
+                || !owner.is_ok_and(|t| t.execution_runs().last() == Some(&self.state.id))
             {
                 return Ok(());
             }
@@ -6184,6 +6186,10 @@ impl Runner {
                 self.state.status.as_str()
             );
         }
+        // Reassignment shares this claim through its atomic task save. Check
+        // the canonical run identity inside it, before preflight or any await.
+        let _claim = FixClaim::acquire(&self.state.dir())?;
+        crate::task_reassign::ensure_current(&crate::queue::Queue::open(), &self.state.id)?;
         let Some(winner) = self.state.winner().cloned() else {
             bail!("run {} has no winning candidate to fix", self.state.id);
         };
@@ -6200,13 +6206,6 @@ impl Runner {
                 self.state.id
             );
         }
-        // Held for the rest of this call, including the follow-up review
-        // below: two `magi fix` invocations against the same run must not
-        // both reach the worktree manipulation further down, which would
-        // otherwise race to remove and recreate the same directory — see
-        // [`FixClaim`]'s own doc.
-        let _claim = FixClaim::acquire(&self.state.dir())?;
-
         // Resolve every id before spending anything — an unknown id refuses
         // the whole request rather than silently dropping it — and dedup
         // while keeping the operator's own order.
