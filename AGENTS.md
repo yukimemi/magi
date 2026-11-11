@@ -1735,7 +1735,9 @@ remain outside those lanes and global queue-worker park requests.
   its writes; remaining reconciliation is retried by the next scheduler.
   Older generations without these checks can finish their lap while the upgraded
   web is already serving. Health/banner and `upgrade.note.json` report the old
-  scheduler PID, elapsed wait and handover bound; a completed web upgrade can
+  scheduler PID, current `Status::lap_step` name/start time (when the status
+  PID matches), elapsed wait and handover bound. Stop exits the poll loop through
+  its bookkeeping cleanup; a completed web upgrade can
   still have a scheduler restart pending. This does not change poll costs.
 - **Release, then spawn.** Remember the installed executable path before update,
   request scheduler replacement, release the listener, then start the successor web.
