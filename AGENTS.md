@@ -3681,3 +3681,13 @@ native 判断の実行も `Outbox::execution_claim` を受理前から保持す�
 `actions_applied`（pin と同じ queue 書込み）、pin、`dispatched_resumes`、
 `superseded_resumes` と run の開始受領記録で判定する。未公開と証明できる場合だけ
 再試行・取消可能にする。公開済みの pin が消費されたことを未公開の証拠にしない。
+
+### Chat search navigation evidence
+
+`src/web.rs::chat_text_key` and `assets/ui/app.js::chatTextKey` must use the
+same fingerprint: FNV-1a with 32-bit wrapping over Unicode scalar values,
+formatted as eight lowercase hex digits plus `:` and the scalar count. Search
+message URLs carry this fingerprint and the turn timestamp to detect shifted
+transcript indices without putting message bodies in browser history. This is
+navigation evidence, not an authentication or integrity check. Search leaves
+must mirror the UI's message rows (`messages` when present, otherwise the turn).

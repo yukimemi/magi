@@ -6722,6 +6722,135 @@ async fn health_recovery_continues_while_revision_loader_is_pending() {
 }
 
 common::e2e! {
+async fn chat_search_click_waits_for_early_message_in_long_transcript() {
+    let Some(chrome) = cdp::find_chrome() else {
+        assert!(std::env::var_os("CI").is_none(), "CI requires Chrome");
+        return;
+    };
+    let guard = common::home_lock().await;
+    let fx = common::fixture(guard, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("magi-home");
+    let talks = Talks::at(home.join("talks"));
+    let mut chat = talk::begin(&talks, &fx.config, fx.repo.clone(), None).unwrap();
+    for i in 0..240 {
+        let body = if i == 0 { "運用について".to_owned() }
+            else if i == 18 { "Second needle 別の検索".to_owned() }
+            else { format!("Question {i}\n\n{}", "Transcript paragraph.\n\n".repeat(4)) };
+        talk::record(&mut chat, &talks, &body, Vec::new()).unwrap();
+    }
+    let base = serve_with_client_probe(&home, Queue::at(home.join("queue")), talks,
+        home.join("runs"), &fx.repo, ClientProbe::TalkScroll).await;
+    let mut browser = cdp::Browser::launch(&chrome).await.unwrap();
+    for (width, height, mobile) in [(390, 844, true), (1280, 900, false)] {
+        let page = browser.open_page(&format!("{base}#/chat"), width, height, mobile).await.unwrap();
+        browser.wait_for(&page, "document.querySelector('#talks-list .card') !== null", Duration::from_secs(30)).await.unwrap();
+        browser.eval(&page, r#"(() => {
+          const input = document.getElementById('talks-search-input');
+          input.value = '運用'; input.dispatchEvent(new Event('input', {bubbles:true}));
+        })()"#).await.unwrap();
+        browser.wait_for(&page, "document.querySelector('#talks-list .card[href*=message]') !== null", Duration::from_secs(30)).await.unwrap();
+        browser.eval(&page, r#"(() => {
+          if (document.querySelector('#talks-list .snippet-field').textContent !== 'title')
+            throw new Error('expected an opener-derived title snippet');
+          const native = window.fetch;
+          window.fetch = async (...args) => {
+            if (String(args[0]).endsWith('/core')) {
+              window.coreHeld = true;
+              await new Promise(resolve => window.releaseCore = resolve);
+            }
+            return native(...args);
+          };
+          window.restoreFetch = () => window.fetch = native;
+          document.querySelector('#talks-list .card').click();
+        })()"#).await.unwrap();
+        browser.wait_for(&page, "window.coreHeld === true", Duration::from_secs(10)).await.unwrap();
+        let before = browser.eval(&page, "scrollCalls.length").await.unwrap();
+        assert_eq!(before, 0, "must not place at the bottom while core is pending");
+        browser.eval(&page, "restoreFetch(); releaseCore()").await.unwrap();
+        browser.wait_for(&page, "document.getElementById('talk-message-0-0') && scrollCalls.length > 0", Duration::from_secs(30)).await.unwrap();
+        let result = browser.eval(&page, r#"(async () => {
+          const frame = () => new Promise(requestAnimationFrame);
+          const visible = () => {
+            const r = document.getElementById('talk-message-0-0').getBoundingClientRect();
+            const pane = document.getElementById('view-talk');
+            return r.top >= document.querySelector('.top').getBoundingClientRect().bottom
+              && r.top < (document.getElementById('main').dataset.split === '1' ? pane.getBoundingClientRect().bottom : innerHeight);
+          };
+          await frame(); await frame();
+          if (!visible()) return 'target hidden after core: ' + JSON.stringify({rect:document.getElementById('talk-message-0-0').getBoundingClientRect().toJSON(), header:document.querySelector('.top').getBoundingClientRect().toJSON(), y:scrollY, calls:scrollCalls});
+          const matched = document.getElementById('talk-message-0-0');
+          if (!matched.classList.contains('reply-highlight')) return 'target not highlighted';
+          await new Promise(resolve => setTimeout(resolve, 1900));
+          if (matched.classList.contains('reply-highlight')) return 'target highlight did not expire';
+          // Late sections above the opener must not hide the search target.
+          document.getElementById('talk-task-progress').style.minHeight = '240px';
+          await frame(); await frame(); await frame();
+          if (!visible()) return 'header layout shift hid opener';
+          const calls = scrollCalls.length;
+          for (let i = 0; i < 3; i++) deck.renderTalk();
+          deck.state.talkDetail.talk.turns.push({who:'agent', body:'Subsequent reply', at:new Date().toISOString()});
+          deck.renderTalk(); await frame(); await frame();
+          if (!visible() || scrollCalls.length !== calls) return 'render overrode target: ' + JSON.stringify({rect:document.getElementById('talk-message-0-0').getBoundingClientRect().toJSON(), header:document.querySelector('.top').getBoundingClientRect().toJSON(), calls, scrollCalls});
+          // Re-clicking an identical result must explicitly reposition it.
+          window.dispatchEvent(new WheelEvent('wheel'));
+          const pane = document.getElementById('view-talk');
+          if (document.getElementById('main').dataset.split === '1') pane.scrollTop = pane.scrollHeight;
+          else window.scrollTo({top:document.documentElement.scrollHeight, behavior:'instant'});
+          document.querySelector('#talks-list .card').click();
+          await frame(); await frame();
+          if (!visible()) return 'repeat click did not reposition';
+          const input = document.getElementById('talks-search-input');
+          input.value = '別の検索'; input.dispatchEvent(new Event('input', {bubbles:true}));
+          let card;
+          for (let i = 0; i < 600; i++) {
+            await frame();
+            card = document.querySelector('#talks-list .card[href*="message/18/0"]');
+            if (card) break;
+          }
+          if (!card) return 'second search did not resolve';
+          card.click(); await frame(); await frame();
+          const second = document.getElementById('talk-message-18-0').getBoundingClientRect();
+          if (second.top < document.querySelector('.top').getBoundingClientRect().bottom || second.top >= innerHeight)
+            return 'same conversation target change did not reposition';
+          // A normal link to this same conversation restores tail placement.
+          const plain = document.createElement('a');
+          plain.href = '#/chat/' + deck.state.talkDetail.id;
+          document.body.append(plain); plain.click(); plain.remove();
+          for (let i = 0; i < 120 && location.hash.includes('/message/'); i++) await frame();
+          await frame(); await frame();
+          if (location.hash.includes('/message/')) return 'plain link did not navigate';
+          const tailAfterPlain = document.getElementById('talk-turns').lastElementChild.getBoundingClientRect();
+          const bottom = document.getElementById('main').dataset.split === '1'
+            ? pane.getBoundingClientRect().bottom : innerHeight;
+          if (tailAfterPlain.top < document.querySelector('.top').getBoundingClientRect().bottom || tailAfterPlain.top >= bottom)
+            return 'plain link did not restore tail';
+          if (visible()) return 'plain link retained search target';
+          card.click();
+          for (let i = 0; i < 120 && !location.hash.includes('/message/'); i++) await frame();
+          await frame(); await frame();
+          // A transcript edit can shift array positions. Re-identify only an
+          // unambiguous message with the original timestamp and text evidence.
+          const chat = deck.state.talkDetail.talk;
+          chat.turns.unshift({who:'operator', body:'Inserted history', at:'2020-01-01T00:00:00Z'});
+          card.click(); await frame(); await frame();
+          const relocated = document.getElementById('talk-message-19-0').getBoundingClientRect();
+          if (relocated.top < document.querySelector('.top').getBoundingClientRect().bottom || relocated.top >= innerHeight)
+            return 'shifted target was not recovered';
+          chat.turns[19].body = 'Replaced history';
+          if (chat.turns[19].messages?.length) chat.turns[19].messages[0].body = 'Replaced history';
+          card.click(); await frame(); await frame();
+          const tail = document.getElementById('talk-turns').lastElementChild.getBoundingClientRect();
+          if (tail.top >= innerHeight || !document.getElementById('talk-error').textContent.includes('matching message'))
+            return 'missing target did not report and fall back';
+          return 'ok';
+        })()"#).await.unwrap();
+        assert_eq!(result, "ok", "@{width}: {result}");
+        browser.close_page(&page).await;
+    }
+}
+}
+
+common::e2e! {
 async fn long_chat_open_and_switch_position_immediately() {
     let Some(chrome) = cdp::find_chrome() else {
         assert!(std::env::var_os("CI").is_none(), "CI requires Chrome");
