@@ -10223,6 +10223,23 @@ const decisionLabels = {
   awaiting_owner: "Awaiting owner", queued: "Queued", in_progress: "In progress",
   retry_needed: "Needs retry or result check", resolved: "Resolved",
 };
+// Pure: the phase comes only from status / retry_safe / legacy_settled.
+function decisionPhase(d) {
+  switch (d.status) {
+    case "awaiting_owner": return { key: "awaiting", label: decisionLabels.awaiting_owner, glyph: "?", tone: "waiting" };
+    case "queued": return { key: "queued", label: decisionLabels.queued, glyph: "\u2026", tone: "prep" };
+    case "in_progress": return { key: "progress", label: decisionLabels.in_progress, glyph: "\u25b6", tone: "prep" };
+    case "retry_needed":
+      return d.retry_safe
+        ? { key: "retry", label: "Retry needed", glyph: "!", tone: "blocked" }
+        : { key: "check", label: "Result check needed", glyph: "!", tone: "blocked" };
+    case "resolved":
+      return d.legacy_settled
+        ? { key: "settled", label: "Resolved: settled by owner", glyph: "\u2713", tone: "answered" }
+        : { key: "done", label: "Resolved: effect confirmed", glyph: "\u2713", tone: "answered" };
+    default: return { key: "unknown", label: String(d.status), glyph: "?", tone: "waiting" };
+  }
+}
 function decisionGuidance(d) {
   switch (d.status) {
     case "awaiting_owner": return "Open the owning chat to discuss or request an operation. A reply alone is not a confirmed outcome.";
@@ -10242,9 +10259,9 @@ function decisionChatLink(item) {
 }
 function decisionCard(item, tag = "li") {
   const d = item.decision;
-  const tone = { awaiting_owner: "waiting", queued: "prep", in_progress: "prep", retry_needed: "blocked", resolved: "answered" }[d.status];
-  const card = el(tag, { class: "decision-card panel", "data-decision-id": item.id },
-    el("span", { class: "chip decision-status", "data-status": tone, text: decisionLabels[d.status] || d.status }),
+  const phase = decisionPhase(d);
+  const card = el(tag, { class: "decision-card panel", "data-decision-id": item.id, "data-phase": phase.key },
+    el("span", { class: "chip decision-status", "data-status": phase.tone, "data-glyph": phase.glyph, text: phase.label }),
     el("h2", { text: d.reason }),
     el("p", { class: "decision-meta", text: `Inquiry ${item.id}${item.task ? ` · Task ${item.task}` : " · Owning task unavailable"}` }),
     el("p", { class: "decision-guidance", text: decisionGuidance(d) }));

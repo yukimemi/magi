@@ -48,7 +48,7 @@ test('all phases explain progress and preserve unresolved saved replies', () => 
   assert.equal(f.get('decisions-count').textContent, '4 unresolved · 1 resolved (history)');
   assert.equal(f.get('decisions-history').querySelector('summary').textContent, 'Resolved history (1)');
   assert.equal(f.get('decisions-list').children.length, 4);
-  for (const [i, label] of ['Awaiting owner', 'Queued', 'In progress', 'Needs retry or result check', 'Resolved'].entries()) {
+  for (const [i, label] of ['Awaiting owner', 'Queued', 'In progress', 'Result check needed', 'Resolved: effect confirmed'].entries()) {
     assert.ok(f.decisionCard(item(statuses[i])).textContent.includes(label));
     assert.doesNotMatch(f.decisionCard(item(statuses[i])).textContent, /[\u3040-\u30ff\u3400-\u9fff]/u);
   }
@@ -59,6 +59,8 @@ test('all phases explain progress and preserve unresolved saved replies', () => 
   assert.match(f.decisionGuidance({ ...saved.decision, request: 'resume', retry_safe: true }), /retry the same recorded request/);
   assert.doesNotMatch(f.decisionGuidance({ ...saved.decision, request: 'resume' }), /retry the same recorded request/);
   assert.match(f.decisionGuidance({ status: 'resolved', legacy_settled: true }), /does not confirm/);
+  assert.equal(f.decisionPhase({ status: 'retry_needed', retry_safe: true }).label, 'Retry needed');
+  assert.equal(f.decisionPhase({ status: 'resolved', legacy_settled: true }).label, 'Resolved: settled by owner');
 });
 
 test('owner titles, context and literal outcome evidence remain unchanged', () => {
@@ -105,7 +107,7 @@ test('navigation, title and decision product copy are English', () => {
   assert.doesNotMatch(section, /[\u3040-\u30ff\u3400-\u9fff]/u);
   assert.doesNotMatch(html.slice(html.indexOf('<section class="view" id="view-decisions"'), html.indexOf('<!-- QUESTIONS')), /[\u3040-\u30ff\u3400-\u9fff]/u);
   assert.match(source, /Pending decisions \\u2014 magi/);
-  assert.equal((html.match(/<span>Pending decisions<\/span>/g) || []).length, 1);
+  assert.equal((html.match(/<span>Decisions<\/span>/g) || []).length, 1);
   assert.match(source, /Back to pending decisions/);
 });
 
@@ -175,7 +177,7 @@ test('inquiry uses shared status and evidence while retaining the owning-chat ch
   inquiry.display = '所有者の問い合わせ';
   const f = fixture(async () => inquiry);
   await f.loadInquiry('chat', inquiry.id);
-  assert.match(f.get('talk-inquiry').textContent, /Needs retry or result check/);
+  assert.match(f.get('talk-inquiry').textContent, /Result check needed/);
   assert.match(f.get('talk-inquiry').textContent, /所有者の問い合わせ/);
   assert.match(f.get('talk-inquiry').textContent, /Back to pending decisions/);
   await f.loadInquiry('another-chat', inquiry.id);
