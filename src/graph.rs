@@ -1439,7 +1439,14 @@ impl Runner {
         }
         state.ensure_base_episode();
         state.record_base_sync_stop(&head);
-        state.save_under(home)?;
+        anyhow::ensure!(
+            state
+                .base_sync_recovery
+                .stop
+                .as_ref()
+                .is_some_and(|s| s.kind == crate::base_sync_recovery::StopKind::Exhausted),
+            "base recovery refused: missing eligible movement-exhaustion evidence; inspect with `magi task inspect-base-stop {task} --run {id}`. Textual stops require an evidence-bound base-conflict grant"
+        );
         let fetched =
             git::fetch(&state.repo, &state.config.merge.remote, &state.base_branch).await?;
         anyhow::ensure!(

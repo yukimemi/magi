@@ -6070,7 +6070,10 @@ async fn run_detail_pulse_tabs_and_content_share_one_column() {
             )
             .await
             .unwrap();
-        browser.wait_for(&page, "window.deck && deck.state.detail.evidenceError === false && !document.getElementById('run-progress').hidden", Duration::from_secs(30)).await.unwrap();
+        // Evidence can arrive before SSE opens. Measure the pulse only after
+        // its connection label has settled, so a reconnect-to-open update is
+        // not mistaken for a layout shift caused by switching tabs.
+        browser.wait_for(&page, "window.deck && deck.state.detail.evidenceError === false && !document.getElementById('run-progress').hidden && deck.state.streamOpen && document.getElementById('progress-connection').textContent === 'Stream connected'", Duration::from_secs(30)).await.unwrap();
         let out = browser.eval(&page, r#"(() => {
           const r = id => document.getElementById(id).getBoundingClientRect();
           const pulse = r('run-progress'), tabs = r('run-tabs'), active = r('run-active-panel'), pipe = r('progress-pipeline');

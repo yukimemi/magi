@@ -220,3 +220,73 @@ Before any grant has been accepted, the owner may explicitly approve a current
 descendant tip with `--tip`; the original textual stop remains bound as evidence.
 The repaired merge records the newly approved tip and still owes fresh review,
 E2E and gate checks on the same retained run.
+
+## Legacy diagnostic-only textual stops
+
+Inspect the actual owner and retained Git state before granting recovery:
+
+```sh
+magi task inspect-base-stop <task> --run <exact-run>
+```
+
+This read-only command does not fetch, release a hold, edit records or start a
+worker. It reports `modern-textual-conflict`, `legacy-textual-conflict`,
+`movement-exhaustion` or `insufficient-evidence`, the retained branch HEAD,
+current tracking base, scratch presence, and precise admission blockers. Tracking
+refs are a local snapshot: the grant rechecks them and never silently retargets
+an approval. The launcher remains responsible for fetching the prepared base.
+
+Legacy compatibility requires the exact known terminal conflict diagnostic,
+matching terminal land event, saved base reservation, and a complete unambiguous
+set of unfinished old-format repair records with identical `from` HEAD and paths.
+A later `Conflict` label does not replace that provenance. An empty repair list
+does not establish modern provenance either: a structured synchronization
+operation or sequencer stop must bind the retained HEAD. When that structured
+proof matches the current stop, unrelated historical legacy repair records stay
+historical and do not force legacy admission or block an interrupted grant.
+Missing textual evidence is distinct from spending the movement budget;
+`recover-base` cannot repair it.
+
+For eligible legacy evidence, inspection prints the exact owner command:
+
+```sh
+magi task grant-repair <task> --run <exact-run> --kind base-conflict --rounds 1 \
+  --head <inspected-full-head> --tip <inspected-current-base> \
+  --expect-pass <inspected-pass> --evidence-digest <inspected-digest> \
+  --request legacy-conflict-1 --reason "Owner authorized inspected legacy recovery" \
+  --instruction "Resolve only the inspected conflict; preserve both histories"
+```
+
+A standing chat uses `magi task control grant-repair` with the same arguments,
+through its existing control bridge. Obtain explicit owner approval for the
+printed evidence and narrow instruction. Resolve owner holds and pending
+decisions with their existing controls first; this operation does not bypass
+them. Do not change the original task's review criteria to encode the repair.
+
+The receipt atomically retains legacy provenance, derived stop identity and its
+SHA-256 digest alongside the existing owner generation and task contract. It does
+not manufacture a modern sequencer checkpoint. Grant, import and interrupted
+execution revalidate the evidence, HEAD and base under the existing leases and
+ownership guards. Retry the identical request after interruption; a receipt replay
+does not queue again. If the base moves before import, inspect again and use the
+existing `--replace-request` workflow with the new digest. Imported operations
+cannot be retargeted.
+
+The original scratch may be absent. Recovery creates a new scratch and uses the
+existing one-attempt merge repair with the retained HEAD and approved base as
+parents. This preserves all existing commits, but does not claim to restore lost
+resolved contents. Conflict reproduction is an additional live check, not proof
+of a historical rebase stop. Existing scratch contents and unrelated dirty work
+are never overwritten. Launcher-owned validation, staging and delivery retain
+their existing behavior. A consumed attempt never redispatches its fixer after
+restart. Fresh review, E2E and gate are mandatory; merge consent remains separate.
+
+If inspection reports insufficient or contradictory evidence, keep the original
+records and retained branch intact. Locate the original terminal event, base
+reservation or missing repair provenance named in `missing_evidence`, then repeat
+inspection. If these cannot be recovered, present that diagnostic to the owner
+through the task's existing conversation for explicit reconciliation; no safe
+automatic grant is supported for that record. Do not hand-edit JSON, invent stop
+fields, reset counters or history, start a replacement competition or run another
+driver. Neither old artifacts nor a present-day merge conflict supply missing
+historical evidence.

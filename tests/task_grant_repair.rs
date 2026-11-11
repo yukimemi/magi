@@ -50,6 +50,7 @@ async fn stopped(review: bool) -> (common::Fixture, Task, Runner, Request) {
     Queue::open().put(&mut task).unwrap();
     let request = Request {
         replace_request: None,
+        evidence_digest: None,
         tip: None,
         instruction: None,
         task: task.id.clone(),

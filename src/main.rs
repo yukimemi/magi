@@ -848,6 +848,14 @@ enum TaskCmd {
         #[command(flatten)]
         request: magi::repair_budget::reconcile::Request,
     },
+    /// Inspect stopped base evidence and current retained Git state without mutation.
+    InspectBaseStop {
+        /// Owning task id or unambiguous prefix.
+        task: String,
+        /// Exact retained run id.
+        #[arg(long)]
+        run: String,
+    },
     /// Grant 1..=3 additional repairs and queue the exact stopped run (not merge approval).
     GrantRepair {
         #[command(flatten)]
@@ -3731,6 +3739,17 @@ async fn task_cmd_inner(command: TaskCmd, q: Queue) -> Result<()> {
                 .await?;
                 println!("{}", serde_json::to_string_pretty(&receipt)?);
             }
+            Ok(())
+        }
+        TaskCmd::InspectBaseStop { task, run } => {
+            let result = Box::pin(magi::repair_budget::legacy::inspect(
+                &q,
+                &magi::run::home(),
+                &task,
+                &run,
+            ))
+            .await?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
             Ok(())
         }
         TaskCmd::GrantRepair { request } => {

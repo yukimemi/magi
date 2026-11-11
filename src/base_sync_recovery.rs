@@ -215,6 +215,23 @@ impl RunState {
                 op.id, op.tip
             );
         }
+        if self.base_sync_blocked()
+            && (self.base_sync_recovery.stop.is_none()
+                || self
+                    .rebase_fixes
+                    .iter()
+                    .any(|r| r.stop.is_none() && !r.finished))
+        {
+            let task = self
+                .origin
+                .as_ref()
+                .and_then(|o| o.task.as_deref())
+                .unwrap_or("<task>");
+            return format!(
+                "Inspect legacy or missing structured stop evidence with `magi task inspect-base-stop {task} --run {}`; diagnostic-only textual stops require explicit evidence-bound base-conflict authorization, not movement budget recovery",
+                self.id
+            );
+        }
         match self.base_sync_recovery.stop.as_ref().map(|s| &s.kind) {
             Some(StopKind::Exhausted) => {
                 let why = if self.base_sync_recovery.stop.as_ref().is_some_and(|s| s.unverified_sync) {

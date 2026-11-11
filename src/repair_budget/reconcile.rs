@@ -290,7 +290,7 @@ async fn apply_inner(queue: &Queue, home: &Path, mut request: Request) -> Result
         "recovery requires exactly one retained unimported grant"
     );
     let _execution = crate::driver::maintenance(home, &state.id)?;
-    let _outputs = output_leases(&state)?;
+    let _outputs = output_leases(home, &state)?;
     ensure!(
         !state.repair_grants.iter().any(|r| r.receipt == grant),
         "receipt was already imported; recovery requires an unimported, unspent receipt"
@@ -397,11 +397,13 @@ mod tests {
                 tip: None,
                 instruction: None,
                 replace_request: None,
+                evidence_digest: None,
             },
             at: "2026-01-01T00:00:02Z".parse().unwrap(),
             decision: None,
             contract: contract(&task, Kind::Review).unwrap(),
             stop: None,
+            legacy: None,
         };
         // The old worker committed the response and release together, without
         // the modern full-source receipt. This is durable application evidence,
