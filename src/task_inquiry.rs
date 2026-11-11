@@ -358,6 +358,66 @@ impl Outbox {
         Ok(inquiry)
     }
 
+    /// Correct only passive compatibility imports, under delivery and execution
+    /// fences. Accepted requests, explicit outcomes and delivered prose survive.
+    pub(crate) fn reclassify_history(&self, incoming: Inquiry) -> Result<()> {
+        let _execution = self.execution_claim(&incoming.id)?;
+        let _lock = self.lock(&incoming.id)?;
+        let mut saved = match self.get(&incoming.id) {
+            Ok(saved) => saved,
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+            {
+                return self.save(&incoming);
+            }
+            Err(error) => return Err(error),
+        };
+        ensure!(
+            saved.source == incoming.source && saved.key == incoming.key,
+            "history correction source identity changed"
+        );
+        if saved.decision.as_ref().is_some_and(|d| {
+            d.request.is_some() || d.status == crate::task_decision::Status::Resolved
+        }) {
+            return Ok(());
+        }
+        ensure!(
+            saved.task.is_empty()
+                || incoming.task.is_empty()
+                || (saved.task == incoming.task
+                    && saved.repo == incoming.repo
+                    && saved.run == incoming.run),
+            "history correction ownership changed; reconcile the original owner"
+        );
+        if saved.task.is_empty() && !incoming.task.is_empty() && saved.delivered_to.is_none() {
+            saved.task = incoming.task.clone();
+            saved.run = incoming.run.clone();
+            saved.repo = incoming.repo.clone();
+        }
+        // Never replace a conversation already delivered. Updating lifecycle
+        // visibility does not acknowledge or redeliver its prose.
+        saved.archived = incoming.archived;
+        match (&mut saved.decision, incoming.decision) {
+            (Some(saved), Some(next)) => {
+                if next.status == crate::task_decision::Status::Resolved {
+                    let evidence = next
+                        .history
+                        .last()
+                        .context("completed history has no receipt")?;
+                    saved.applied(&evidence.evidence)?;
+                } else if let Some(error) = next.error {
+                    saved.fail(&error)?;
+                }
+            }
+            (decision @ None, next) => *decision = next,
+            _ => {}
+        }
+        saved.delivery_error = incoming.delivery_error;
+        self.save(&saved)
+    }
+
     /// Deliver under a per-inquiry lease, releasing the task lock before any
     /// conversation operation. The transcript key repairs a lost final receipt.
     pub fn deliver(&self, queue: &Queue, talks: &Talks, id: &str) -> Result<String> {
@@ -449,18 +509,6 @@ impl Outbox {
                 self.get(id).with_context(|| format!("read inquiry {id}"))
             })
             .collect())
-    }
-
-    /// Stop compatibility/history delivery without manufacturing resolution.
-    pub(crate) fn suspend_delivery(&self, id: &str, reason: &str) -> Result<()> {
-        let _lock = self.lock(id)?;
-        let mut record = self.get(id)?;
-        if !record.archived || record.delivery_error.as_deref() != Some(reason) {
-            record.archived = true;
-            record.delivery_error = Some(reason.to_owned());
-            self.save(&record)?;
-        }
-        Ok(())
     }
 
     /// Read all durable inquiries, including completed decision history.

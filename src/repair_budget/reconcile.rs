@@ -171,7 +171,8 @@ pub(super) fn decision_matches(home: &Path, task: &Task, grant: &super::Receipt)
     }
     for receipt in &task.repair_reconciliations {
         if &receipt.grant == grant && task.operator_decided_at == Some(receipt.decision) {
-            let q = Questions::at(home.join("questions")).get(&receipt.request.question)?;
+            let q =
+                Questions::at(home.join("questions")).get_for_effects(&receipt.request.question)?;
             return Ok(
                 source(&q)? == receipt.source && prove(task, grant, &q)? == receipt.application
             );
@@ -251,7 +252,7 @@ async fn apply_inner(queue: &Queue, home: &Path, mut request: Request) -> Result
             superseded_questions.push((q.id.clone(), source(&q)?));
         }
     }
-    let q = questions.get(&request.question)?;
+    let q = questions.get_for_effects(&request.question)?;
     ensure!(
         q.answered_at == Some(request.answer_at),
         "source answer generation changed"
@@ -339,7 +340,11 @@ pub(crate) fn blocker(queue: &Queue, task: &Task) -> Option<String> {
         .resumption
         .as_ref()
         .and_then(|r| r.question_id.as_ref())
-        .and_then(|id| Questions::at(home.join("questions")).get(id).ok());
+        .and_then(|id| {
+            Questions::at(home.join("questions"))
+                .get_for_effects(id)
+                .ok()
+        });
     let Some(q) = original.filter(|q| q.answered_at.is_some()) else {
         return Some(format!(
             "Retained repair receipt {} is blocked by a changed owner decision, but its original question/application evidence is missing. Keep the retained task/run/receipt and inspect its decision history; generic resume and a new grant cannot reconcile missing authority.",

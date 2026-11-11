@@ -227,7 +227,7 @@ impl Inventory {
         questions: &crate::ask::Questions,
         tasks: Vec<Task>,
     ) -> Self {
-        let mut inventory = Self::new(tasks, &questions.list());
+        let mut inventory = Self::new(tasks, &questions.list_for_effects());
         let ids = (|| -> anyhow::Result<Vec<String>> {
             let mut ids = crate::queue::record_ids(queue.root(), "json")?;
             ids.extend(crate::queue::record_ids(questions.root(), "json")?);
@@ -306,7 +306,7 @@ impl Inventory {
                 inventory.tasks.insert(full.clone(), t);
             }
             if questions.path_of(&full).is_file()
-                && let Ok(q) = questions.get(&full)
+                && let Ok(q) = questions.get_for_effects(&full)
             {
                 inventory.questions.insert(full, DecisionRecord::from(&q));
             }

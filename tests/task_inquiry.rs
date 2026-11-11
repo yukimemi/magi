@@ -303,7 +303,7 @@ async fn migrating_answered_unapplied_decisions_never_replays_or_approves_them()
     assert!(decision.request.is_none(), "migration never manufactures an owner request");
     assert_eq!(before, std::fs::read(queue.path_of(&task.id)).unwrap());
     assert_eq!(talks.get(&chat.id).unwrap().pending_messages.len(), 1);
-    assert!(questions.get(&old.id).unwrap().answer.is_none(), "operational readers must not consume saved replies");
+    assert!(questions.get_for_effects(&old.id).unwrap().answer.is_none(), "operational readers must not consume saved replies");
     let raw: magi::ask::Question = serde_json::from_slice(&std::fs::read(questions.path_of(&old.id)).unwrap()).unwrap();
     assert!(raw.answer.is_some(), "the passive source history remains intact");
 }
@@ -811,6 +811,54 @@ async fn task_claim_contention_is_durably_retryable_and_safe_to_cancel_before_ef
 }
 
 common::e2e! {
+async fn answered_sources_never_read_as_open_cards_before_during_or_after_partial_migration() {
+    use magi::ask::{Answer, ChoiceAction, Question, QuestionStatus, Questions};
+    let fx = common::fixture(common::home_lock().await, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("answered-not-open");
+    let queue = Queue::at(home.join("queue")); let talks = Talks::at(home.join("talks"));
+    let chat = talk::begin(&talks, &fx.config, fx.repo.clone(), Some("alpha")).unwrap();
+    let mut task = Task::new("work".into(), "work".into(), fx.repo.clone(), Source::Human);
+    task.chat = Some(chat.id.clone()); task.runs.push("run-a".into()); queue.put(&mut task).unwrap();
+    let questions = Questions::at(home.join("questions"));
+    let mut ids = Vec::new();
+    for index in 0..65 {
+        let mut q = Question::new("run-a".into(), "implement".into(), "impl-A".into(), format!("Saved hold {index}"), "history".into(), vec!["hold".into()]);
+        q.actions.insert("hold".into(), ChoiceAction::Hold);
+        q.answer(Answer::Choice("hold".into())).unwrap(); questions.put(&mut q).unwrap(); ids.push(q.id);
+    }
+    // An upgraded installation has already snapshotted these saved sources,
+    // while the first bounded batch may still be pending.
+    let migration = home.join("notifications/task-chat-migration-v1");
+    std::fs::create_dir_all(&migration).unwrap();
+    std::fs::write(migration.join("state.json"), serde_json::to_vec(&serde_json::json!({
+        "schema": 1, "sources": ids, "pending": ids
+    })).unwrap()).unwrap();
+    let before = std::fs::read(queue.path_of(&task.id)).unwrap();
+    for count in [0, 64, 65, 65] {
+        // Reopen stores to exercise the persisted partial migration boundary.
+        let questions = Questions::at(home.join("questions"));
+        if count > 0 { magi::task_chat::sweep(&queue, &talks, &questions, &home); }
+        assert_eq!(Outbox::at(&home).list().unwrap().len(), count);
+        for id in &ids {
+            let q = questions.get(id).unwrap();
+            assert_eq!(q.status, QuestionStatus::Answered);
+            assert_eq!(q.resolution().as_deref(), Some("hold"));
+            assert!(q.clone().answer(Answer::Choice("hold".into())).is_err(), "view and answer agree");
+            assert!(questions.update(id, |q| q.answer(Answer::Choice("hold".into()))).is_err(), "persisted answers cannot be replaced");
+        }
+        assert!(questions.list().iter().all(|q| !q.status.open()));
+        assert!(questions.list_for_effects().iter().all(|q| q.chosen_action().is_none()));
+        assert_eq!(std::fs::read(queue.path_of(&task.id)).unwrap(), before);
+        magi::daemon::apply_choice_actions(&queue, &questions, &home).await;
+        assert_eq!(std::fs::read(queue.path_of(&task.id)).unwrap(), before);
+    }
+    let raw: Question = serde_json::from_slice(&std::fs::read(questions.path_of(&ids[0])).unwrap()).unwrap();
+    assert_eq!(raw.status, QuestionStatus::Answered);
+    assert_eq!(raw.resolution().as_deref(), Some("hold"), "the source history stays intact");
+}
+}
+
+common::e2e! {
 async fn scheduler_effect_consumers_never_replay_migrated_or_deferred_saved_answers() {
     use magi::{ask::{Question, Questions, Answer, ChoiceAction}, task_decision::Status};
     let fx = common::fixture(common::home_lock().await, common::Judges::Unanimous, false);
@@ -835,7 +883,7 @@ async fn scheduler_effect_consumers_never_replay_migrated_or_deferred_saved_answ
         magi::daemon::apply_choice_actions(&queue, &questions, &home).await;
         assert_eq!(std::fs::read(queue.path_of(&task.id)).unwrap(), before);
         assert_eq!(outbox.list().unwrap().len(), count);
-        assert!(questions.list().iter().all(|q| q.chosen_action().is_none()));
+        assert!(questions.list_for_effects().iter().all(|q| q.chosen_action().is_none()));
         assert!(outbox.list().unwrap().iter().all(|q| q.decision.as_ref().unwrap().request.is_none()));
     }
     // Even an accepted native command cannot expose the *old* source payload
@@ -891,7 +939,7 @@ async fn imported_effect_receipts_recover_from_delay_and_unreadable_receipts_wit
         let pending = outbox.get(&q.id).unwrap().decision.unwrap();
         assert_eq!(pending.status, Status::RetryNeeded);
         assert!(pending.request.is_none());
-        assert!(questions.get(&q.id).unwrap().resolution().is_none(), "execution view must still quarantine the saved reply");
+        assert!(questions.get_for_effects(&q.id).unwrap().resolution().is_none(), "execution view must still quarantine the saved reply");
         let before_source = std::fs::read(questions.path_of(&q.id)).unwrap();
         // An already-running legacy consumer can commit this receipt later;
         // migration and subsequent reconciliation may only observe it.
@@ -902,7 +950,7 @@ async fn imported_effect_receipts_recover_from_delay_and_unreadable_receipts_wit
             let decision = Outbox::at(&home).get(&q.id).unwrap().decision.unwrap();
             assert_eq!(decision.status, Status::Resolved);
             assert!(decision.request.is_none(), "receipt observation must not manufacture owner authority");
-            assert!(questions.get(&q.id).unwrap().resolution().is_none());
+            assert!(questions.get_for_effects(&q.id).unwrap().resolution().is_none());
             assert_eq!(std::fs::read(questions.path_of(&q.id)).unwrap(), before_source);
             assert_eq!(std::fs::read(queue.path_of(&task.id)).unwrap(), before_task);
             assert!(magi::worker::active(&home).unwrap().is_empty());
@@ -1440,6 +1488,93 @@ esac
 }
 
 common::e2e! {
+async fn task_owned_historical_replies_support_explicit_settlement_without_acceptance_or_replay() {
+    use magi::{ask::{Answer, Question, Questions}, chat_control::{self, Operation}, task_decision::Status};
+    let fx = common::fixture(common::home_lock().await, common::Judges::Unanimous, false);
+    for (node, seat, run) in [
+        (magi::land::APPROVAL_NODE, "land", "run-a"),
+        (magi::bump::NOTICE_NODE, "release-watch", ""),
+    ] {
+        let home = fx.tmp.path().join(seat);
+        let queue = Queue::at(home.join("queue"));
+        let talks = Talks::at(home.join("talks"));
+        let questions = Questions::at(home.join("questions"));
+        let chat = talk::begin(&talks, &fx.config, fx.repo.clone(), Some("alpha")).unwrap();
+        let other = talk::begin(&talks, &fx.config, fx.repo.clone(), Some("alpha")).unwrap();
+        let mut task = Task::new("historical release".into(), "historical release".into(), fx.repo.clone(), Source::Human);
+        task.chat = Some(chat.id.clone()); task.runs.push("run-a".into()); queue.put(&mut task).unwrap();
+        let mut source = Question::new(run.into(), node.into(), seat.into(), "Saved merge approval".into(), "Unknown historical effect".into(), vec!["merge".into(), "hold".into()]);
+        source.routed_task = Some(task.id.clone());
+        source.merge_target = Some(magi::merge_decision::Target {
+            pr: "https://example.test/pull/100".into(), head: "saved-head".into(), language: "en".into(),
+        });
+        source.answer(Answer::Choice("merge".into())).unwrap(); source.answer_delivered = true;
+        questions.put(&mut source).unwrap();
+        if run.is_empty() {
+            // Empty-run release approvals obtain their actual task ownership
+            // from the persisted watch, not the source's routing hint.
+            let watches = home.join("release-watch");
+            std::fs::create_dir_all(&watches).unwrap();
+            std::fs::write(watches.join("saved-watch.json"), serde_json::to_vec(&serde_json::json!({
+                "repo": fx.repo, "url": source.merge_target.as_ref().unwrap().pr,
+                "question": source.id, "run": "run-a", "local": true,
+                "asked_head": "saved-head"
+            })).unwrap()).unwrap();
+        }
+        let source_bytes = std::fs::read(questions.path_of(&source.id)).unwrap();
+        let task_bytes = std::fs::read(queue.path_of(&task.id)).unwrap();
+        magi::task_chat::sweep(&queue, &talks, &questions, &home);
+        let outbox = Outbox::at(&home);
+        let imported = outbox.get(&source.id).unwrap();
+        assert_eq!(imported.delivered_to.as_deref(), Some(chat.id.as_str()), "seat={seat}: {imported:?}");
+        assert_eq!(imported.decision.as_ref().unwrap().status, Status::RetryNeeded);
+        assert!(imported.decision.as_ref().unwrap().request.is_none());
+        assert!(chat_control::dispatch(&queue, &home, &talks, &chat.id, Operation::ReconcileDecision { inquiry: source.id.clone() }).await.is_err());
+        for (speaker, reason) in [(&other.id, "No work remains"), (&chat.id, " ")] {
+            assert!(chat_control::dispatch(&queue, &home, &talks, speaker, Operation::SettleDecision {
+                inquiry: source.id.clone(), reason: reason.into(), replacement: None,
+            }).await.is_err());
+        }
+        let before = outbox.get(&source.id).unwrap();
+        let claim = queue.claim(&task.id).unwrap();
+        assert!(chat_control::dispatch(&queue, &home, &talks, &chat.id, Operation::SettleDecision {
+            inquiry: source.id.clone(), reason: "Consumer is still running".into(), replacement: None,
+        }).await.is_err());
+        assert_eq!(outbox.get(&source.id).unwrap(), before);
+        drop(claim);
+        let reason = "Owner inspected the historical outcome and confirms no remaining work";
+        chat_control::dispatch(&queue, &home, &talks, &chat.id, Operation::SettleDecision {
+            inquiry: source.id.clone(), reason: reason.into(), replacement: None,
+        }).await.unwrap();
+        for _ in 0..2 {
+            magi::task_chat::sweep(&Queue::at(home.join("queue")), &Talks::at(home.join("talks")), &Questions::at(home.join("questions")), &home);
+            magi::daemon::apply_choice_actions(&queue, &questions, &home).await;
+            let decision = outbox.get(&source.id).unwrap().decision.unwrap();
+            assert_eq!(decision.status, Status::Resolved);
+            assert!(decision.request.is_none()); assert!(decision.source_answer_at.is_none());
+            assert!(decision.history.last().unwrap().evidence.contains(reason));
+            assert!(decision.history.iter().any(|event| event.status == Status::RetryNeeded));
+            assert!(questions.get(&source.id).unwrap().answer.is_some());
+            assert!(!questions.get(&source.id).unwrap().can_answer());
+            assert!(questions.get_for_effects(&source.id).unwrap().resolution().is_none());
+            assert_eq!(std::fs::read(questions.path_of(&source.id)).unwrap(), source_bytes);
+            assert_eq!(std::fs::read(queue.path_of(&task.id)).unwrap(), task_bytes);
+        }
+        assert!(chat_control::decide(&talks, &home, &chat.id, &source.id, "merge").is_err());
+        // The exception does not silently settle genuinely unanswered intent.
+        let mut live = Question::new("run-a".into(), node.into(), seat.into(), "Current approval".into(), String::new(), vec!["merge".into()]);
+        questions.put(&mut live).unwrap();
+        magi::task_chat::sweep(&queue, &talks, &questions, &home);
+        assert!(chat_control::dispatch(&queue, &home, &talks, &chat.id, Operation::SettleDecision {
+            inquiry: live.id.clone(), reason: "Do not bypass the current consumer".into(), replacement: None,
+        }).await.is_err());
+        assert!(questions.get(&live.id).unwrap().can_answer());
+        assert_eq!(outbox.get(&live.id).unwrap().decision.unwrap().status, Status::AwaitingOwner);
+    }
+}
+}
+
+common::e2e! {
 async fn accepted_legacy_effects_support_explicit_settlement_without_replay() {
     use magi::{ask::{Question, Questions}, chat_control::{self, Operation}, task_decision::Status};
     let fx = common::fixture(common::home_lock().await, common::Judges::Unanimous, false);
@@ -1491,9 +1626,10 @@ async fn accepted_legacy_effects_support_explicit_settlement_without_replay() {
             assert_eq!(decision.status, Status::Resolved); assert!(decision.legacy_settled);
             assert_eq!(decision.request.as_deref(), Some(format!("decision: {choice}").as_str()));
             if choice == "retry" { assert!(decision.history.iter().any(|e| e.status == Status::RetryNeeded)); }
-            assert!(questions.get(&q.id).unwrap().answer.is_none());
-            assert!(!questions.get(&q.id).unwrap().status.open());
-            assert!(!questions.list().into_iter().any(|q| q.answer.is_some()));
+            assert!(questions.get_for_effects(&q.id).unwrap().answer.is_none());
+            assert!(questions.get_for_effects(&q.id).unwrap().status.open(), "settlement must not activate abandoned-question defaults");
+            assert!(!questions.list_for_effects().into_iter().any(|q| q.answer.is_some()));
+            assert!(questions.get(&q.id).unwrap().answer.is_some(), "presentation retains the recorded answer");
             assert_eq!(std::fs::read(questions.path_of(&q.id)).unwrap(), saved);
             assert!(chat_control::decide(&talks, &home, &chat.id, &q.id, choice).is_err());
         }
@@ -1540,7 +1676,7 @@ async fn fresh_cli_answers_survive_migration_before_and_after_first_sweep() {
             assert_eq!(decision.request.as_deref(), Some("decision: hold"), "migrate_first={migrate_first} associate_later={associate_later} delivery_fails={delivery_fails}: {decision:?}; source={reopened:?}");
             assert_eq!(decision.source_answer_at, reopened.answered_at);
             assert_eq!(decision.status, Status::Queued, "acceptance is not an effect receipt");
-            assert!(questions.get(&historical.id).unwrap().answer.is_none());
+            assert!(questions.get_for_effects(&historical.id).unwrap().answer.is_none());
             assert!(Outbox::at(&home).get(&historical.id).unwrap().decision.unwrap().request.is_none());
         }
         if delivery_fails {

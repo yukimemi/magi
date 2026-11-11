@@ -605,7 +605,7 @@ pub(crate) fn has_resume_checkpoint(state: &RunState, home: &Path) -> bool {
     state.status.resumable()
         && (resume_checkpoint(state)
             || crate::ask::Questions::at(home.join("questions"))
-                .list()
+                .list_for_effects()
                 .iter()
                 .any(|q| q.run == state.id && q.status.open()))
 }

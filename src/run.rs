@@ -3030,7 +3030,7 @@ impl RunState {
             gate.resolved
                 && gate.question.as_ref().is_some_and(|id| {
                     crate::ask::Questions::open()
-                        .get(id)
+                        .get_for_effects(id)
                         .is_ok_and(|q| q.run == self.id && q.resolution().is_some())
                 })
         })
@@ -3147,7 +3147,7 @@ impl RunState {
                     && self.land_approval.as_ref().is_some_and(|a| {
                         a.head == head
                             && crate::ask::Questions::open()
-                                .get(&a.question)
+                                .get_for_effects(&a.question)
                                 .is_ok_and(|q| {
                                     q.run == self.id
                                         && q.node == crate::land::APPROVAL_NODE

@@ -350,7 +350,7 @@ fn new_blocking_evidence(
     d.evidence
         .iter()
         .filter_map(|id| {
-            let version = if let Ok(q) = questions.get(id) {
+            let version = if let Ok(q) = questions.get_for_effects(id) {
                 (q.asked_at > r.at
                     && (q.run == task.id || task.runs.contains(&q.run))
                     && q.node != NODE
@@ -871,7 +871,7 @@ fn apply_one(
             .filter_map(|id| {
                 if let Ok(dep) = queue.get(id) {
                     Some(format!("task:{id}:{:?}", dep.chat_notice_key()))
-                } else if questions.get(id).is_ok() {
+                } else if questions.get_for_effects(id).is_ok() {
                     Some(format!("question:{id}"))
                 } else {
                     None
@@ -896,7 +896,7 @@ fn apply_one(
         // An answer alone does not justify asking the same decision again.
         // New producer evidence, an instruction edit or a different dependency
         // target can open another question; rewording cannot.
-        if questions.list().iter().any(|q| {
+        if questions.list_for_effects().iter().any(|q| {
             q.node == NODE
                 && q.run == task.id
                 && q.status == crate::ask::QuestionStatus::Answered
@@ -925,7 +925,7 @@ fn apply_one(
         // graph questions use it as a run id. A coincidental equality must
         // not block this task on an answer meant for another node.
         let question_id = match questions
-            .list()
+            .list_for_effects()
             .into_iter()
             .find(|q| q.status.open() && q.node == NODE && q.run == task.id)
         {

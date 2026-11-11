@@ -98,7 +98,7 @@ async fn reassign_inner(
         }
         if let Some(approval) = &state.land_approval {
             let question = crate::ask::Questions::at(home.join("questions"))
-                .get(&approval.question)
+                .get_for_effects(&approval.question)
                 .with_context(|| format!("run {run} approval evidence is unavailable"))?;
             ensure!(
                 !question.status.open(),

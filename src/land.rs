@@ -1751,7 +1751,7 @@ async fn approval_gate(
     // a commit the owner has not seen, and their word does not carry over.
     let reusable = state.land_approval.as_ref().and_then(|a| {
         store
-            .list()
+            .list_for_effects()
             .into_iter()
             .find(|q| q.id == a.question)
             .filter(|q| {
@@ -1771,11 +1771,12 @@ async fn approval_gate(
         other => other,
     };
     if reusable.is_none() {
-        for stale in store
-            .list()
-            .into_iter()
-            .filter(|q| q.run == state.id && q.node == APPROVAL_NODE && q.status.open())
-        {
+        for stale in store.list_for_effects().into_iter().filter(|q| {
+            q.run == state.id
+                && q.node == APPROVAL_NODE
+                && q.status.open()
+                && !store.held_reply(&q.id)
+        }) {
             let why =
                 "the pull request head or operator decision changed; asked again for approval";
             if let Err(e) = store.update(&stale.id, |q| {
@@ -3579,7 +3580,7 @@ fn owner_requested_stop(state: &RunState) -> Result<bool> {
     let Some(binding) = &state.land_approval else {
         return Ok(false);
     };
-    let q = ask::Questions::open().get(&binding.question)?;
+    let q = ask::Questions::open().get_for_effects(&binding.question)?;
     Ok(q.run == state.id
         && q.node == APPROVAL_NODE
         && q.resolution()
@@ -3594,7 +3595,7 @@ async fn owner_stop<F: Forge>(state: &mut RunState, pr: &mut PrState, forge: &F)
     let Some(binding) = &state.land_approval else {
         return Ok(false);
     };
-    let q = ask::Questions::open().get(&binding.question)?;
+    let q = ask::Questions::open().get_for_effects(&binding.question)?;
     let Some(choice) = q.resolution().filter(|c| md::stops(c)) else {
         return Ok(false);
     };
@@ -4289,7 +4290,7 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
             let repair_answer = state.land_approval.as_ref().is_some_and(|binding| {
                 binding.head.eq_ignore_ascii_case(&seen.head)
                     && ask::Questions::open()
-                        .get(&binding.question)
+                        .get_for_effects(&binding.question)
                         .is_ok_and(|q| {
                             q.run == state.id
                                 && q.node == APPROVAL_NODE
@@ -4760,7 +4761,7 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
                         }
                     }
                     if let Some(binding) = &state.land_approval {
-                        let current = ask::Questions::open().get(&binding.question)?;
+                        let current = ask::Questions::open().get_for_effects(&binding.question)?;
                         if merge_consent_superseded(state, &current)?
                             || current.run != state.id
                             || !binding.head.eq_ignore_ascii_case(&observed_head)

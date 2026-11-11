@@ -5189,7 +5189,7 @@ function updateAskCard(row, question, { compact = false } = {}) {
   updateQuestionIdentity(r.identity, question.id);
   row.dataset.questionId = question.id;
   const status = String(question.status || "open");
-  const open = status === "open";
+  const open = status === "open" && question.can_answer !== false;
   const choices = (Array.isArray(question.choices) ? question.choices : [])
     .filter(choice => !question.choice_effects || !!question.choice_effects[choice]);
 
@@ -5368,11 +5368,14 @@ function updateAskCard(row, question, { compact = false } = {}) {
   }
   show(r.answer, Boolean(value));
 
-  setText(r.note, status === "abandoned"
+  setText(r.note, question.history_only
+    ? "Saved reply is history, not a new approval. Check the decision inquiry for effect evidence or explicit settlement."
+    : status === "abandoned"
     ? "The run ended before this was answered, so nothing acted on it."
     : row.dataset.raced === "1"
       ? "This was answered elsewhere while you had it open. The recorded answer is above."
       : "");
+  if (question.history_only) r.note.append(" ", el("a", { href: "#/decisions", text: "判断待ち一覧へ" }));
   show(r.note, r.note.textContent !== "");
 }
 

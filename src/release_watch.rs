@@ -927,7 +927,7 @@ impl Watcher {
 
         // The owner's word comes first.
         if let Some(id) = st.question.clone() {
-            match self.questions().get(&id) {
+            match self.questions().get_for_effects(&id) {
                 Ok(q) if q.status.open() => return,
                 Ok(q) => self.apply_answer(&pr, &mut st, &snap, &q, now),
                 Err(_) => st.question = None,
@@ -1027,7 +1027,7 @@ impl Watcher {
                 let consumed = st.question.clone();
                 let approved = match st.question.clone() {
                     None => Approved::NoQuestion,
-                    Some(id) => match self.questions().get(&id) {
+                    Some(id) => match self.questions().get_for_effects(&id) {
                         Ok(q) if q.status.open() => Approved::Open,
                         Ok(q) => match &q.answer {
                             Some(Answer::Choice(c))
@@ -1071,7 +1071,7 @@ impl Watcher {
                         if let Some(id) = consumed
                             && self
                                 .questions()
-                                .get(&id)
+                                .get_for_effects(&id)
                                 .is_ok_and(|q| q.resolution().as_deref() == Some(HOLD))
                             && !st.applied.contains(&id)
                         {
@@ -1441,7 +1441,7 @@ impl Watcher {
     fn settle_job_question(&self, pr: &str, st: &mut WatchState, job: &mut Job) -> bool {
         let why = job.failed.clone().unwrap_or_default();
         if let Some(id) = st.question.clone() {
-            match self.questions().get(&id) {
+            match self.questions().get_for_effects(&id) {
                 Ok(q) if q.status.open() => return false,
                 Ok(q) => {
                     st.question = None;
@@ -2511,6 +2511,61 @@ mod tests {
         assert_eq!(qs.len(), 1, "one approval question, not one per lap");
         assert_eq!(qs[0].choices, vec![land::APPROVE, land::HOLD]);
         assert!(fake.merges.lock().unwrap().is_empty(), "silence is a hold");
+    }
+
+    #[tokio::test]
+    async fn historical_local_approval_never_replays_or_becomes_a_hold_effect() {
+        let (dir, fake, watcher) = rig();
+        *fake.local.lock().unwrap() = true;
+        *fake.snap.lock().unwrap() = Some(open(vec![]));
+        let repo = PathBuf::from("/nowhere");
+        watcher
+            .lap(std::slice::from_ref(&repo), 60, 1, &|| false)
+            .await;
+        let questions = watcher.questions();
+        let mut q = questions.list().pop().unwrap();
+        q.answer(Answer::Choice(land::APPROVE.into())).unwrap();
+        q.answer_delivered = true;
+        questions.put(&mut q).unwrap();
+        let source = std::fs::read(questions.path_of(&q.id)).unwrap();
+        let migration = dir.path().join("notifications/task-chat-migration-v1");
+        std::fs::create_dir_all(&migration).unwrap();
+        std::fs::write(
+            migration.join("state.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema": 1, "sources": [q.id], "pending": [q.id]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let outbox = crate::task_inquiry::Outbox::at(dir.path());
+        for phase in 0..3 {
+            if phase == 1 {
+                crate::task_chat::sweep(
+                    &crate::queue::Queue::at(dir.path().join("queue")),
+                    &crate::talk::Talks::at(dir.path().join("talks")),
+                    &questions,
+                    dir.path(),
+                );
+            } else if phase == 2 {
+                // Even completed native history must not become an abandoned
+                // source that triggers a legacy hold/default branch.
+                outbox
+                    .update_decision(&q.id, |d| d.applied("existing exact effect receipt"))
+                    .unwrap();
+            }
+            let restarted = Watcher::new(Box::new(fake.clone()), dir.path().to_owned());
+            restarted
+                .lap(std::slice::from_ref(&repo), 60, 2 + phase, &|| false)
+                .await;
+            let state = restarted.load("o/r#7");
+            assert_eq!(state.question.as_deref(), Some(q.id.as_str()));
+            assert!(state.held_head.is_none());
+            assert!(state.applied.is_empty());
+            assert!(fake.merges.lock().unwrap().is_empty());
+            assert!(fake.reruns.lock().unwrap().is_empty());
+            assert_eq!(std::fs::read(questions.path_of(&q.id)).unwrap(), source);
+        }
     }
 
     #[tokio::test]

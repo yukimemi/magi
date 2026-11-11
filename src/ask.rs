@@ -905,6 +905,11 @@ impl Question {
         self.answer_inner(answer)
     }
 
+    /// Shared admission rule for answer routes and presentation controls.
+    pub fn can_answer(&self) -> bool {
+        self.status.open()
+    }
+
     /// Optional chat buttons validate the displayed conversation and PR head.
     pub(crate) fn answer_chat_button(
         &mut self,
@@ -924,17 +929,17 @@ impl Question {
     }
 
     fn answer_inner(&mut self, answer: Answer) -> Result<()> {
-        match self.status {
-            QuestionStatus::Answered => bail!(
+        match (self.can_answer(), self.status) {
+            (false, QuestionStatus::Answered) => bail!(
                 "question {} was already answered; the run has moved on and a \
                  second answer would be a decision nobody acted on",
                 self.short()
             ),
-            QuestionStatus::Abandoned => bail!(
+            (false, QuestionStatus::Abandoned) => bail!(
                 "question {} was abandoned and the run behind it is gone",
                 self.short()
             ),
-            QuestionStatus::Open => {}
+            _ => {}
         }
         let body = match &answer {
             Answer::Choice(c) | Answer::Text(c) => c.as_str(),
@@ -1546,6 +1551,21 @@ impl Questions {
     /// previous state readable rather than a truncated file that would strand
     /// the run waiting on it.
     pub fn put(&self, q: &mut Question) -> Result<()> {
+        if self.path_of(&q.id).exists()
+            && let Ok(saved) = self.read_history(&q.id)
+            && self.held_reply(&q.id)
+            && (saved.status != q.status
+                || saved.answer != q.answer
+                || saved.answered_at != q.answered_at)
+            && !(q.answer.is_some()
+                && q.accepted_answer_at.is_some()
+                && q.accepted_answer_at == q.answered_at)
+        {
+            bail!(
+                "historical question {} requires inquiry reconciliation or explicit settlement; its saved reply cannot expire or be overwritten",
+                q.id
+            );
+        }
         if q.status.open()
             && q.routed_task.is_none()
             && let Some(home) = self.root.parent()
@@ -1593,7 +1613,31 @@ impl Questions {
     pub fn get(&self, id: &str) -> Result<Question> {
         let resolved = self.resolve_id(id)?;
         let q = read_path(&self.path_of(&resolved))?;
-        Ok(self.consumption_view(self.with_repair_choice(q)))
+        Ok(self.with_repair_choice(q))
+    }
+
+    /// Execution-only projection: saved consent is never a new request.
+    /// UI and API readers must use `get` / `list`, which retain saved status.
+    pub fn get_for_effects(&self, id: &str) -> Result<Question> {
+        Ok(self.consumption_view(self.get(id)?))
+    }
+
+    /// Whether this source is quarantined saved consent, including history
+    /// without a current consumer. It must not expire into a default action.
+    pub(crate) fn held_reply(&self, id: &str) -> bool {
+        self.read_history(id).is_ok_and(|q| {
+            self.root.parent().is_some_and(|home| {
+                crate::task_chat::saved_reply_requires_confirmation(home, &q)
+                    || crate::task_inquiry::Outbox::at(home)
+                        .get(id)
+                        .is_ok_and(|record| {
+                            record.decision.is_some_and(|d| {
+                                d.legacy_settled
+                                    && d.status == crate::task_decision::Status::Resolved
+                            })
+                        })
+            })
+        })
     }
 
     // Keep the source JSON intact for the passive history decoder. Every
@@ -1617,12 +1661,13 @@ impl Questions {
                     })
                 })
         }) {
-            // Keep the immutable source reply in read_history, while every
-            // operational reader observes the owner's explicit settlement.
+            // Settlement executes nothing, including a consumer's default
+            // branch for abandoned questions. The native decision is resolved;
+            // legacy consumers remain fenced from both consent and fallback.
             q.answer = None;
             q.answered_at = None;
             q.answer_authority = None;
-            q.status = QuestionStatus::Abandoned;
+            q.status = QuestionStatus::Open;
             return q;
         }
         if let Some(home) = self.root.parent()
@@ -1637,18 +1682,9 @@ impl Questions {
             q.answer = None;
             q.answered_at = None;
             q.answer_authority = None;
-            q.status = if crate::task_inquiry::Outbox::at(home)
-                .get(&q.id)
-                .is_ok_and(|record| {
-                    record.archived
-                        || record
-                            .decision
-                            .is_some_and(|d| d.status == crate::task_decision::Status::Resolved)
-                }) {
-                QuestionStatus::Abandoned
-            } else {
-                QuestionStatus::Open
-            };
+            // Archival or a receipt is not a new unanswered question, nor
+            // permission to take a consumer's abandoned/timeout fallback.
+            q.status = QuestionStatus::Open;
         }
         q
     }
@@ -1671,6 +1707,7 @@ impl Questions {
         }
         if (q.status.open() || q.resolution().as_deref() == Some(crate::land::REPAIR))
             && q.node == crate::land::APPROVAL_NODE
+            && !self.held_reply(&q.id)
             && let Some(home) = self.root.parent()
             && let Ok(state) = crate::run::RunState::load_under(&q.run, home)
         {
@@ -1696,6 +1733,15 @@ impl Questions {
     /// corrupt question must not take the web UI down, and must certainly not
     /// hide the open question the operator was looking for.
     pub fn list(&self) -> Vec<Question> {
+        self.list_view(false)
+    }
+
+    /// Execution-only scan; presentation must retain immutable source answers.
+    pub fn list_for_effects(&self) -> Vec<Question> {
+        self.list_view(true)
+    }
+
+    fn list_view(&self, effects: bool) -> Vec<Question> {
         // Parse the immutable boundary once per scan, rather than once per file.
         let sources = self.root.parent().map(crate::task_chat::migration_sources);
         let mut all: Vec<Question> = std::fs::read_dir(&self.root)
@@ -1711,7 +1757,12 @@ impl Questions {
                     Some(_) => true,
                     None => false,
                 };
-                self.consumption_view_in(self.with_repair_choice(q), migrated)
+                let q = self.with_repair_choice(q);
+                if effects {
+                    self.consumption_view_in(q, migrated)
+                } else {
+                    q
+                }
             })
             .collect();
         all.sort_unstable_by(|a, b| {
@@ -1746,7 +1797,7 @@ impl Questions {
     /// non-empty, nothing about the run has changed and no agent should be
     /// spawned for it.
     pub fn open_for(&self, run: &str) -> Vec<Question> {
-        self.list()
+        self.list_for_effects()
             .into_iter()
             .filter(|q| q.status.open() && q.run == run)
             .collect()
@@ -1767,6 +1818,9 @@ impl Questions {
     pub fn abandon_for_run(&self, run: &str, why: &str) -> Result<usize> {
         let mut abandoned = 0;
         for mut q in self.open_for(run) {
+            if self.held_reply(&q.id) {
+                continue;
+            }
             q.abandon(why);
             self.put(&mut q)?;
             abandoned += 1;
@@ -1811,7 +1865,7 @@ impl Questions {
         // only alert the moment the run settles.
         let mut abandoned = 0;
         for mut q in self.open_for(run) {
-            if q.node == crate::bump::NOTICE_NODE {
+            if self.held_reply(&q.id) || q.node == crate::bump::NOTICE_NODE {
                 continue;
             }
             // A routed task decision not yet delivered is a pending message
@@ -2146,6 +2200,9 @@ async fn wait_loop(
     slice: Duration,
     poll: Duration,
 ) -> Result<Wait> {
+    if store.held_reply(&q.id) {
+        return Ok(Wait::Pending);
+    }
     // The owner may already have spoken back before this call ever started -
     // most often because they did so in the gap between an earlier call
     // reporting `Wait::Pending` and this one picking the wait back up with
@@ -2166,7 +2223,7 @@ async fn wait_loop(
     loop {
         let now = tokio::time::Instant::now();
         if now >= deadline {
-            if !is_the_real_deadline {
+            if store.held_reply(&q.id) || !is_the_real_deadline {
                 // The lease is left to age out on purpose: the caller is about
                 // to run `magi ask --wait`, and that gap is what LEASE_TTL
                 // covers.
@@ -2200,7 +2257,7 @@ async fn wait_loop(
         }
         tokio::time::sleep(poll.min(deadline - now)).await;
         store.beat(&q.id, WaiterKind::Asker);
-        match store.get(&q.id) {
+        match store.get_for_effects(&q.id) {
             Ok(fresh) if !fresh.status.open() => {
                 // Whoever answered - the phone, `magi answer`, another daemon -
                 // owns the record now, so adopt theirs wholesale rather than

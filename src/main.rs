@@ -2910,7 +2910,7 @@ async fn ask_wait_cmd(
     }
 
     let resolved = store.resolve_id(id)?;
-    let mut q = store.get(&resolved)?;
+    let mut q = store.get_for_effects(&resolved)?;
     question_belongs_to_this_run(&q, &run, "wait on")?;
     if q.routed_task.is_some() {
         println!(

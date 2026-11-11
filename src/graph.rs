@@ -9254,9 +9254,10 @@ impl Runner {
             let mut standing = g
                 .question
                 .as_ref()
-                .and_then(|id| store.list().into_iter().find(|q| &q.id == id));
+                .and_then(|id| store.list_for_effects().into_iter().find(|q| &q.id == id));
             if let Some(q) = standing.as_ref()
                 && q.status.open()
+                && !store.held_reply(&q.id)
                 && gt::expired(q, timeout)
             {
                 let why = format!("no answer within {}s of asking", timeout.max(1));
@@ -23164,6 +23165,96 @@ esac
                 .any(|e| e.message.contains(&rewrite.title)
                     || e.message.contains("English sentence."))
         );
+    }
+
+    #[tokio::test]
+    async fn historical_posting_reply_never_expires_into_fallback() {
+        crate::run::pin_test_home();
+        let dir = tempfile::tempdir().unwrap();
+        let mut runner = runner_at(RunStatus::Gating);
+        runner.state = state_with_summary("add retries", "TITLE: fix: retries\n日本語の説明です。");
+        runner.state.repo = dir.path().to_owned();
+        runner.state.candidates[0].worktree = dir.path().to_owned();
+        seed_public_summary(&mut runner);
+        let winner = runner.state.candidates[0].clone();
+        assert!(
+            runner
+                .guarded_pr_message(&winner, None, true)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let id = runner
+            .state
+            .github_text
+            .as_ref()
+            .unwrap()
+            .question
+            .clone()
+            .unwrap();
+        let store = ask::Questions::open();
+        let mut q = store.get(&id).unwrap();
+        q.asked_at = "2020-01-01T00:00:00Z".parse().unwrap();
+        q.answer(ask::Answer::Choice(
+            crate::github_text::POST_ORIGINAL.into(),
+        ))
+        .unwrap();
+        q.answer_delivered = true;
+        store.put(&mut q).unwrap();
+        let source = std::fs::read(store.path_of(&id)).unwrap();
+        let migration = crate::run::home().join("notifications/task-chat-migration-v1");
+        std::fs::create_dir_all(&migration).unwrap();
+        std::fs::write(
+            migration.join("state.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema": 1, "sources": [id], "pending": [id]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        for _ in 0..2 {
+            assert!(
+                runner
+                    .guarded_pr_message(&winner, None, true)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(!runner.state.github_text.as_ref().unwrap().resolved);
+            assert_eq!(std::fs::read(store.path_of(&id)).unwrap(), source);
+        }
+        let home = crate::run::home();
+        crate::task_chat::sweep(
+            &crate::queue::Queue::at(home.join("queue")),
+            &crate::talk::Talks::at(home.join("talks")),
+            &store,
+            &home,
+        );
+        let outbox = crate::task_inquiry::Outbox::at(&home);
+        outbox
+            .update_decision(&id, |d| {
+                d.accept(&format!("decision: {}", crate::github_text::POST_ORIGINAL))?;
+                d.source_answer_at = q.answered_at;
+                Ok(true)
+            })
+            .unwrap();
+        outbox
+            .settle(
+                &id,
+                "owner-chat",
+                "Owner confirms no publication remains necessary",
+                None,
+            )
+            .unwrap();
+        assert!(
+            runner
+                .guarded_pr_message(&winner, None, true)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(!runner.state.github_text.as_ref().unwrap().resolved);
+        assert_eq!(std::fs::read(store.path_of(&id)).unwrap(), source);
     }
 
     #[tokio::test]

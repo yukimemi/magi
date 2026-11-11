@@ -370,7 +370,7 @@ impl Deputies {
     /// Admission check for a finite tick; an idle store needs no child process.
     pub fn has_work(&self, now: Timestamp) -> bool {
         self.max > 0
-            && self.store.list().iter().any(|q| {
+            && self.store.list_for_effects().iter().any(|q| {
                 kind_of(q).is_some()
                     && !crate::task_chat::routes(q, &self.home)
                     && !crate::task_chat::migrated_source(&self.home, &q.id)
@@ -496,7 +496,7 @@ impl Deputies {
                     .to_owned()
             })
             .collect();
-        let questions = self.store.list();
+        let questions = self.store.list_for_effects();
         // Keep first-migration/CLI-owned deputy leases in the same capacity
         // accounting, without double-counting a lease owned by a known job.
         occupied.extend(
@@ -544,7 +544,7 @@ impl Deputies {
     /// In-process executor retained for direct runner callers and tests.
     pub fn tick(&mut self, now: Timestamp) {
         self.reap();
-        for q in self.store.list() {
+        for q in self.store.list_for_effects() {
             let Some(q) = self.ready(q, now) else {
                 continue;
             };
@@ -706,7 +706,7 @@ impl Job {
         let release = crate::waiter::Release(claim);
 
         // Decided again under the claim, on the record as it is now.
-        let q = self.store.get(id)?;
+        let q = self.store.get_for_effects(id)?;
         let now = Timestamp::now();
         let Some(dep) = q.deputy.clone() else {
             return Ok(());
@@ -943,7 +943,7 @@ impl Job {
         // measure the long turn from what is left now.
         let left = if early.is_none() && !resumed && cfg.graph.sessions {
             let now = Timestamp::now();
-            let again = self.store.get(&q.id)?;
+            let again = self.store.get_for_effects(&q.id)?;
             let left = (deadline(&again, cfg.graph.answer_timeout) - now.as_second()).max(0) as u64;
             if !again.status.open() || (left == 0 && again.unread_from_owner().is_none()) {
                 self.park_quietly(&q.id);

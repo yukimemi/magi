@@ -7901,6 +7901,9 @@ fn resolve_task(queue: &Queue, id: &str) -> ApiResult<String> {
 /// files magi itself already serves for this question.
 #[derive(Debug, Serialize)]
 struct QuestionView {
+    can_answer: bool,
+    /// Imported consent remains history even while its effect is uncertain.
+    history_only: bool,
     choice_effects: std::collections::BTreeMap<String, String>,
     record_revision: String,
     #[serde(flatten)]
@@ -7995,6 +7998,8 @@ impl QuestionView {
         };
         let holder = holder_of(&question, store.read_lease(&question.id).as_ref());
         Self {
+            can_answer: question.can_answer(),
+            history_only: store.held_reply(&question.id),
             choice_effects: question
                 .choices
                 .iter()
@@ -8421,7 +8426,7 @@ async fn question_answer(
             .questions
             .get(&id)
             .map_err(|e| ApiError::from(e).with_status(StatusCode::INTERNAL_SERVER_ERROR))?;
-        if !q.status.open() {
+        if !q.can_answer() {
             // Answered from the terminal, or by another phone, in between the
             // list and the tap. The UI shows the recorded answer rather than an
             // error, so it needs the record, not just the status.
@@ -13757,6 +13762,68 @@ mod tests {
             )
             .await;
         assert_eq!(res.status, 409, "{}", res.body);
+    }
+
+    #[tokio::test]
+    async fn historical_release_2029_api_retains_answer_and_refuses_controls() {
+        let fx = Fixture::start().await;
+        let questions = fx.questions();
+        let mut q = Question::new(
+            String::new(),
+            crate::bump::NOTICE_NODE.into(),
+            "release-watch".into(),
+            "Release PR approval".into(),
+            "Saved head".into(),
+            vec!["merge".into(), "hold".into()],
+        );
+        q.id = "20261109-014940-871849981cd969b1-0000000000000000-2029".into();
+        q.merge_target = Some(crate::merge_decision::Target {
+            pr: "https://example.test/mebae/pull/100".into(),
+            head: "4d5a46f99a678608d2b883498d8bebd9399c0261".into(),
+            language: "en".into(),
+        });
+        q.answer(Answer::Choice("merge".into())).unwrap();
+        q.answer_delivered = true;
+        questions.put(&mut q).unwrap();
+        let dir = fx.home.path().join("notifications/task-chat-migration-v1");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("state.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema": 1, "sources": [q.id], "pending": [q.id]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let bytes = std::fs::read(questions.path_of(&q.id)).unwrap();
+        for migrated in [false, true] {
+            if migrated {
+                crate::task_chat::sweep(&fx.queue(), &fx.talks(), &questions, fx.home.path());
+            }
+            for endpoint in ["/api/questions", "/api/questions/core"] {
+                let response = fx.get(endpoint).await;
+                assert_eq!(response.status, 200);
+                let rows = response.json();
+                let row = rows
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|r| r["id"] == q.id)
+                    .unwrap();
+                assert_eq!(row["status"], "answered");
+                assert_eq!(row["answer"]["choice"], "merge");
+                assert_eq!(row["can_answer"], false);
+                assert_eq!(row["history_only"], true);
+            }
+            let answer = fx
+                .post(
+                    &format!("/api/questions/{}/answer", q.id),
+                    Some(r#"{"choice":"merge"}"#),
+                )
+                .await;
+            assert_eq!(answer.status, 409, "{}", answer.body);
+            assert_eq!(std::fs::read(questions.path_of(&q.id)).unwrap(), bytes);
+        }
     }
 
     #[tokio::test]
