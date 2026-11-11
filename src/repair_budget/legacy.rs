@@ -138,7 +138,20 @@ fn derive_textual(state: &RunState, head: &str, tip: &str) -> Result<(Stop, Opti
         .iter()
         .filter(|r| r.stop.is_none())
         .collect();
-    if old.is_empty() {
+    // Completed legacy rounds remain in the append-only history. Prefer proof
+    // of the current structured stop; unrelated old rounds cannot downgrade it.
+    let structured = state.base_sync_recovery.stop.as_ref().is_some_and(|stop| {
+        state
+            .base_sync_recovery
+            .operations
+            .iter()
+            .any(|op| op.head == stop.head && op.tip == stop.tip)
+            || state
+                .rebase_fixes
+                .iter()
+                .any(|r| r.stop.is_some() && r.from.as_ref() == Some(&stop.head))
+    });
+    if old.is_empty() || structured {
         let stop = state.base_sync_recovery.stop.as_ref().context(
             "missing structured textual-stop evidence; use task inspect-base-stop <task> --run <run>; movement recovery cannot authorize conflict repair",
         )?;
@@ -148,15 +161,7 @@ fn derive_textual(state: &RunState, head: &str, tip: &str) -> Result<(Stop, Opti
             stop.kind
         );
         ensure!(
-            state
-                .base_sync_recovery
-                .operations
-                .iter()
-                .any(|op| op.head == stop.head && op.tip == stop.tip)
-                || state
-                    .rebase_fixes
-                    .iter()
-                    .any(|r| r.stop.is_some() && r.from.as_deref() == Some(head)),
+            structured,
             "missing structured operation or sequencer evidence; an empty repair list does not prove a modern textual stop"
         );
         ensure!(

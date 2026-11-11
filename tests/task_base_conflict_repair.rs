@@ -943,3 +943,72 @@ async fn legacy_movement_diagnostics_use_recover_base_without_mutation() {
     }
 }
 }
+
+common::e2e! {
+async fn modern_conflict_operation_ignores_legacy_history_on_grant_and_restart() {
+    let (_fx, task, mut runner, request) = stopped().await;
+    // An upgraded run retains both successful and unfinished historical rounds.
+    let old = magi::run::RebaseFixRecord {
+        agent: "fixture".into(), paths: vec!["historical.txt".into()],
+        from: Some(runner.state.base_commit.clone()), finished: true,
+        error: None, stop: None, index_outside: None, launcher: None,
+        infra: None, outage: None,
+    };
+    runner.state.rebase_fixes.push(old.clone());
+    runner.state.rebase_fixes.push(magi::run::RebaseFixRecord { finished: false, ..old });
+    for spec in &mut runner.state.config.agents {
+        spec.env.insert("MOCK_BASE_CONFLICT_STRAY".into(), "1".into());
+    }
+    runner.state.save().unwrap();
+    let history = serde_json::to_value(&runner.state.rebase_fixes).unwrap();
+    assert_eq!(inspect(&request).await["classification"], "modern-textual-conflict");
+    let receipt = grant(&request).await;
+    assert!(receipt.legacy.is_none());
+    let mut resumed = Runner::resume(&request.run).unwrap();
+    assert!(resumed.execute().await.unwrap_err().to_string().contains("unapproved path"));
+    let saved = RunState::load(&request.run).unwrap();
+    assert_eq!(saved.repair_grants[0].spent, 1);
+    assert_eq!(saved.repair_grants[0].phase, Phase::Fixing);
+    let scratch = saved.worktree_root().join(format!("base-conflict-{}", request.request));
+    std::fs::remove_file(scratch.join("stray.txt")).unwrap();
+    let mut restarted = Runner::resume(&request.run).unwrap();
+    restarted.execute().await.unwrap();
+    assert!(restarted.state.repair_grants[0].succeeded);
+    assert_eq!(restarted.state.repair_grants[0].spent, 1);
+    assert_eq!(serde_json::to_value(&restarted.state.rebase_fixes).unwrap(), history);
+    assert_eq!(std::fs::read_to_string(saved.dir().join("artifacts/base-conflict.log")).unwrap().lines().count(), 1);
+    assert_eq!(Queue::open().get(&task.id).unwrap().runs, vec![request.run.clone()]);
+    assert_eq!(grant(&request).await, receipt);
+}
+}
+
+common::e2e! {
+async fn modern_conflict_sequencer_proof_ignores_unrelated_legacy_rounds() {
+    let (_fx, task, mut runner, request) = stopped().await;
+    runner.state.base_sync_recovery.operations.clear();
+    let old = magi::run::RebaseFixRecord {
+        agent: "fixture".into(), paths: vec!["README.md".into()],
+        from: Some(runner.state.base_commit.clone()), finished: true,
+        error: None, stop: None, index_outside: None, launcher: None,
+        infra: None, outage: None,
+    };
+    runner.state.rebase_fixes.push(old.clone());
+    runner.state.rebase_fixes.push(magi::run::RebaseFixRecord {
+        from: Some(request.head.clone()), finished: false, stop: Some(request.head.clone()), ..old
+    });
+    runner.state.save().unwrap();
+    assert_eq!(inspect(&request).await["classification"], "modern-textual-conflict");
+    // A sequencer record for a different HEAD must not prove this stop.
+    runner.state.rebase_fixes[1].from = Some(runner.state.base_commit.clone());
+    runner.state.save().unwrap();
+    let run_before = std::fs::read(runner.state.dir().join("run.json")).unwrap();
+    let task_before = std::fs::read(Queue::open().path_of(&task.id)).unwrap();
+    assert_eq!(inspect(&request).await["classification"], "insufficient-evidence");
+    assert!(!grant_output(&request).status.success());
+    assert_eq!(std::fs::read(runner.state.dir().join("run.json")).unwrap(), run_before);
+    assert_eq!(std::fs::read(Queue::open().path_of(&task.id)).unwrap(), task_before);
+    runner.state.rebase_fixes[1].from = Some(request.head.clone());
+    runner.state.save().unwrap();
+    assert!(grant(&request).await.legacy.is_none());
+}
+}

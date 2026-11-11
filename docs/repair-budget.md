@@ -241,8 +241,11 @@ matching terminal land event, saved base reservation, and a complete unambiguous
 set of unfinished old-format repair records with identical `from` HEAD and paths.
 A later `Conflict` label does not replace that provenance. An empty repair list
 does not establish modern provenance either: a structured synchronization
-operation or sequencer stop must bind the retained HEAD. Missing textual evidence
-is distinct from spending the movement budget; `recover-base` cannot repair it.
+operation or sequencer stop must bind the retained HEAD. When that structured
+proof matches the current stop, unrelated historical legacy repair records stay
+historical and do not force legacy admission or block an interrupted grant.
+Missing textual evidence is distinct from spending the movement budget;
+`recover-base` cannot repair it.
 
 For eligible legacy evidence, inspection prints the exact owner command:
 
