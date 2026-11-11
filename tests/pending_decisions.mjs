@@ -26,7 +26,7 @@ function fixture(getJson = async () => { throw new Error('offline'); }) {
   get('decisions-history').append(new Node('summary'));
   const api = runInNewContext(`${source.slice(source.indexOf('function el('), source.indexOf('/* Where a task'))}
     ${section}
-    ({ decisionCard, decisionGuidance, renderDecisions, loadDecisions, loadInquiry, decisionState })`, {
+    ({ decisionCard, decisionGuidance, decisionPhase, renderDecisions, loadDecisions, loadInquiry, decisionState })`, {
     document: { createElement: tag => new Node(tag), activeElement: null },
     append: (parent, kids) => parent.append(...kids.flat(4).filter(Boolean)),
     $: get, show: (node, visible) => { node.hidden = !visible; },
