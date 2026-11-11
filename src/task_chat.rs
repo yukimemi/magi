@@ -832,14 +832,12 @@ fn task_state(queue: &Queue, id: &str) -> Result<TaskState> {
             }),
             _ => Ok(TaskState::Unknown),
         },
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            match queue.resolve_id(id) {
-                Err(error) if error.to_string().starts_with("no task matches") => {
-                    Ok(TaskState::Missing)
-                }
-                _ => Ok(TaskState::Unknown),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => match queue.resolve_id(id) {
+            Err(error) if error.to_string().starts_with("no task matches") => {
+                Ok(TaskState::Missing)
             }
-        }
+            _ => Ok(TaskState::Unknown),
+        },
         Err(error) => Err(error.into()),
     }
 }
