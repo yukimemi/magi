@@ -761,10 +761,10 @@ fn migrate_batch(
 /// Classification uses saved state only: importing never executes a reply.
 /// Retirement remains distinct from positive application evidence.
 fn history_reason(home: &Path, q: &Question) -> Option<(String, HistoryResolution)> {
-    if q.answer.is_none()
-        && q.status == crate::ask::QuestionStatus::Abandoned
-        && (q.routed_chat.is_none() || awaits_decision(q))
-    {
+    // Every abandoned, unanswered source is history, including one forwarded to
+    // a task chat: abandonment is silence, already settled as a hold, and the
+    // owner is shown the task's own hold/block and current questions instead.
+    if q.answer.is_none() && q.status == crate::ask::QuestionStatus::Abandoned {
         return Some(("Source abandoned: silence already settled as a hold; existing task holds and blocks are unchanged".into(), HistoryResolution::Retired));
     }
     if q.answer.is_none() {
@@ -896,6 +896,16 @@ fn retire_finished_triage(
         ),
         TaskState::Other | TaskState::Unknown => return Ok(q.clone()),
     };
+    // Retire the native inquiry first. A stop between the two writes then leaves
+    // the source open, so the next pass repeats this (idempotent) function; the
+    // reverse order would leave an unresolved inquiry behind a closed source.
+    let mut preview = q.clone();
+    preview.abandon(&reason);
+    let mut record = history_record(&preview, None);
+    let mut decision = crate::task_decision::Decision::awaiting(preview.summary.clone());
+    decision.retire(&reason)?;
+    record.decision = Some(decision);
+    outbox.reclassify_history(record, HistoryResolution::Retired)?;
     let source = questions
         .update(&q.id, |source| {
             if source.status.open()
@@ -908,13 +918,6 @@ fn retire_finished_triage(
             Ok(())
         })?
         .0;
-    if source.status == crate::ask::QuestionStatus::Abandoned && source.answer.is_none() {
-        let mut record = history_record(&source, None);
-        let mut decision = crate::task_decision::Decision::awaiting(source.summary.clone());
-        decision.retire(&reason)?;
-        record.decision = Some(decision);
-        outbox.reclassify_history(record, HistoryResolution::Retired)?;
-    }
     Ok(source)
 }
 
@@ -1926,7 +1929,7 @@ mod tests {
         );
         forwarded.routed_chat = Some("chat".into());
         forwarded.abandon("forwarded to task chat");
-        assert!(history_reason(home, &forwarded).is_none());
+        assert!(history_reason(home, &forwarded).is_some());
     }
 
     #[test]
