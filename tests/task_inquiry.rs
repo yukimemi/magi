@@ -762,6 +762,13 @@ async fn task_claim_contention_is_durably_retryable_and_safe_to_cancel_before_ef
         let failed = Outbox::at(&home).get(&inquiry.id).unwrap().decision.unwrap();
         assert_eq!(failed.status, Status::RetryNeeded);
         assert!(failed.retry_safe);
+        assert_eq!(failed.request.as_deref(), Some(std::str::from_utf8(&bytes).unwrap()));
+        let different = Operation::Hold { task: task.id.clone(), reason: "different request".into() };
+        assert!(chat_control::dispatch(&queue, &home, &talks, &chat.id, Operation::ForDecision {
+            inquiry: inquiry.id.clone(), command: Box::new(different)
+        }).await.is_err());
+        assert_eq!(Outbox::at(&home).get(&inquiry.id).unwrap().decision.unwrap(), failed,
+            "claim contention must not replace the original owner request");
         assert!(queue.get(&task.id).unwrap().decision_effects.is_empty());
         drop(claim);
         chat_control::reconcile_decisions(&queue, &home).unwrap();
@@ -779,6 +786,27 @@ async fn task_claim_contention_is_durably_retryable_and_safe_to_cancel_before_ef
         }
         assert_eq!(Outbox::at(&home).get(&inquiry.id).unwrap().decision.unwrap().status, Status::Resolved);
     }
+    // A new admission failure cannot turn an older uncertain outcome into
+    // proof of non-execution, even though this particular attempt never starts.
+    let mut task = Task::new("uncertain work".into(), "work".into(), fx.repo.clone(), Source::Human);
+    task.chat = Some(chat.id.clone()); queue.put(&mut task).unwrap();
+    let outbox = Outbox::at(&home);
+    let inquiry = outbox.file(&task, None, "implement".into(), "Uncertain hold", "Inspect the prior outcome").unwrap();
+    outbox.deliver(&queue, &talks, &inquiry.id).unwrap();
+    let command = Operation::Hold { task: task.id.clone(), reason: "original owner request".into() };
+    let request = serde_json::to_string(&command).unwrap();
+    outbox.update_decision(&inquiry.id, |d| {
+        d.accept(&request)?; d.start()?; d.fail("prior effect has no confirmed outcome")
+    }).unwrap();
+    let before = outbox.get(&inquiry.id).unwrap().decision.unwrap();
+    let claim = queue.claim(&task.id).unwrap();
+    assert!(chat_control::dispatch(&queue, &home, &talks, &chat.id, Operation::ForDecision {
+        inquiry: inquiry.id.clone(), command: Box::new(command)
+    }).await.is_err());
+    assert_eq!(Outbox::at(&home).get(&inquiry.id).unwrap().decision.unwrap(), before);
+    assert!(!before.retry_safe);
+    assert!(queue.get(&task.id).unwrap().decision_effects.is_empty());
+    drop(claim);
 }
 }
 

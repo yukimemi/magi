@@ -531,7 +531,9 @@ fn read_talk_status(reader: impl std::io::Read) -> Option<talk::TalkStatus> {
 }
 
 fn open_talk_ids(ui: &Ui, ids: &[String]) -> std::collections::HashSet<String> {
-    open_talk_ids_with(ui, ids, |path| {
+    // Without inode/ctime, same-size writes can retain the same timestamp.
+    // Re-read the bounded header rather than reuse an unprovable classification.
+    open_talk_ids_with(ui, ids, cfg!(unix), |path| {
         std::fs::File::open(path).ok().and_then(read_talk_status)
     })
 }
@@ -539,6 +541,7 @@ fn open_talk_ids(ui: &Ui, ids: &[String]) -> std::collections::HashSet<String> {
 fn open_talk_ids_with(
     ui: &Ui,
     ids: &[String],
+    cache_identity: bool,
     mut read_status: impl FnMut(&FsPath) -> Option<talk::TalkStatus>,
 ) -> std::collections::HashSet<String> {
     let mut index = ui
@@ -554,7 +557,8 @@ fn open_talk_ids_with(
             index.records.remove(id);
             continue;
         };
-        let status = if let Some((old, status)) = index.records.get(id)
+        let status = if cache_identity
+            && let Some((old, status)) = index.records.get(id)
             && *old == identity
         {
             *status
@@ -564,7 +568,9 @@ fn open_talk_ids_with(
             {
                 index.parses += 1;
             }
-            if file_identity(&ui.talks.path_of(id)).is_ok_and(|after| after == identity) {
+            if cache_identity
+                && file_identity(&ui.talks.path_of(id)).is_ok_and(|after| after == identity)
+            {
                 index.records.insert(id.clone(), (identity, status));
             } else {
                 index.records.remove(id);
@@ -25549,7 +25555,7 @@ mod tests {
         seed_talk_at(&ui.talks, &ids[0], "closed");
         assert!(open_talk_ids(&ui, &ids).is_empty());
         seed_talk_at(&ui.talks, &ids[0], "open");
-        let open = open_talk_ids_with(&ui, &ids, |path| {
+        let open = open_talk_ids_with(&ui, &ids, cfg!(unix), |path| {
             let value: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
             // Replace the file after parsing, before its identity is checked again.
@@ -25567,6 +25573,51 @@ mod tests {
         );
         assert!(open_talk_ids(&ui, &ids).is_empty());
         assert_eq!(ui.monitor.talk_status_index.lock().unwrap().parses, 3);
+    }
+
+    #[test]
+    fn talk_status_projection_rereads_when_metadata_cannot_prove_identity() {
+        let home = tempfile::tempdir().unwrap();
+        let ui = delta_test_ui(home.path());
+        let ids = vec!["same-stamp-chat".to_owned()];
+        seed_talk_at(&ui.talks, &ids[0], "open");
+        // Model a non-Unix metadata collision deterministically: the old
+        // classification has a fingerprint equal to the current file's.
+        ui.monitor.talk_status_index.lock().unwrap().records.insert(
+            ids[0].clone(),
+            (
+                file_identity(&ui.talks.path_of(&ids[0])).unwrap(),
+                Some(talk::TalkStatus::Closed),
+            ),
+        );
+        let open = open_talk_ids_with(&ui, &ids, false, |path| {
+            std::fs::File::open(path).ok().and_then(read_talk_status)
+        });
+        assert!(
+            open.contains(&ids[0]),
+            "an untrusted cache hit must still read the current header"
+        );
+        assert!(
+            ui.monitor
+                .talk_status_index
+                .lock()
+                .unwrap()
+                .records
+                .is_empty()
+        );
+        seed_talk_at(&ui.talks, &ids[0], "closed");
+        assert!(
+            open_talk_ids_with(&ui, &ids, false, |path| {
+                std::fs::File::open(path).ok().and_then(read_talk_status)
+            })
+            .is_empty()
+        );
+        let index = ui.monitor.talk_status_index.lock().unwrap();
+        assert_eq!(index.parses, 2);
+        assert!(
+            index.records.is_empty(),
+            "untrusted fingerprints must never publish cache entries"
+        );
     }
 
     #[test]
@@ -25649,10 +25700,8 @@ mod tests {
             ids.len()
         );
         assert!(open_talk_ids(&ui, &ids).is_empty());
-        assert_eq!(
-            ui.monitor.talk_status_index.lock().unwrap().parses,
-            ids.len()
-        );
+        let reused = if cfg!(unix) { ids.len() } else { 2 * ids.len() };
+        assert_eq!(ui.monitor.talk_status_index.lock().unwrap().parses, reused);
         std::fs::write(ui.talks.path_of(&ids[0]), r#"{"status":"open"}"#).unwrap();
         std::fs::write(ui.talks.path_of(&ids[1]), "broken").unwrap();
         assert_eq!(
@@ -25660,12 +25709,13 @@ mod tests {
             std::collections::HashSet::from([ids[0].clone()])
         );
         let parsed = ui.monitor.talk_status_index.lock().unwrap().parses;
-        assert_eq!(parsed, ids.len() + 2);
+        let refreshed = if cfg!(unix) { 2 } else { ids.len() };
+        assert_eq!(parsed, reused + refreshed);
         open_talk_ids(&ui, &ids);
         assert_eq!(
             ui.monitor.talk_status_index.lock().unwrap().parses,
-            parsed,
-            "unreadable rows are cached too"
+            parsed + if cfg!(unix) { 0 } else { ids.len() },
+            "only reliable file identity permits caching, including unreadable rows"
         );
         std::fs::remove_file(ui.talks.path_of(&ids[0])).unwrap();
         assert!(open_talk_ids(&ui, &ids[1..]).is_empty());

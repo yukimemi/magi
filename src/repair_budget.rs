@@ -5,6 +5,8 @@ use std::path::Path;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
+pub mod reconcile;
+
 pub use crate::base_sync_recovery::{Stop, StopKind, ensure_generic_release};
 
 use crate::{
@@ -126,7 +128,7 @@ pub fn authorize_terminal() -> Result<()> {
     Ok(())
 }
 
-fn contract(task: &Task, kind: Kind) -> Result<String> {
+pub(crate) fn contract(task: &Task, kind: Kind) -> Result<String> {
     let original = serde_json::to_string(&(
         &task.instruction,
         &task.sources,
@@ -146,6 +148,38 @@ fn contract(task: &Task, kind: Kind) -> Result<String> {
     } else {
         Ok(original)
     }
+}
+
+/// Admission-only fence: execution must remain able to consume its own decisions.
+/// Caller holds the task claim, shared with answer recording and effect writers.
+fn owner_effects_settled(home: &Path, task: &Task, state: &RunState) -> Result<()> {
+    let queue = Queue::at(home.join("queue"));
+    for q in crate::ask::Questions::at(home.join("questions")).snapshot()? {
+        if (q.run == task.id || q.run == state.id || q.routed_task.as_deref() == Some(&task.id))
+            && q.status == crate::ask::QuestionStatus::Answered
+            && crate::task_chat::awaits_decision(&q)
+        {
+            ensure!(
+                crate::task_chat::effect_receipt(home, &queue, &q, Some(&task.id))?.is_some(),
+                "repair grant refused: owner effect {} is pending; wait for its durable application receipt, then retry the same request",
+                q.id
+            );
+        }
+    }
+    for inquiry in crate::task_inquiry::Outbox::at(home).list()? {
+        if inquiry.task == task.id
+            && let Some(d) = inquiry.decision
+        {
+            ensure!(
+                (d.request.is_none() && d.status == crate::task_decision::Status::AwaitingOwner)
+                    || d.status == crate::task_decision::Status::Resolved,
+                "repair grant refused: owner effect {} is {:?}; reconcile its receipt before retrying the same request",
+                inquiry.id,
+                d.status
+            );
+        }
+    }
+    Ok(())
 }
 
 fn controls(home: &Path, task: &Task, state: &RunState, kind: Kind) -> Result<()> {
@@ -220,9 +254,11 @@ fn controls(home: &Path, task: &Task, state: &RunState, kind: Kind) -> Result<()
         );
     }
     ensure!(
-        !questions.iter().any(|q| (q.run == state.id
+        !questions.iter().any(|q| (q.run == task.id
+            || q.run == state.id
             || q.routed_task.as_deref() == Some(&task.id))
-            && q.status.open()),
+            && q.status.open()
+            && !reconcile::superseded_question(task, q)),
         "repair grant refused: unresolved question or approval"
     );
     Ok(())
@@ -413,6 +449,7 @@ pub async fn grant(queue: &Queue, home: &Path, mut request: Request) -> Result<R
     let _owner = crate::pr_head::owner_lock(home, &request.run)?;
     let state = RunState::load_under(&request.run, home)?;
     controls(home, &task, &state, request.kind)?;
+    owner_effects_settled(home, &task, &state)?;
     unique_owner(queue, &task, &state)?;
     ensure!(
         task.status != TaskStatus::Running,
@@ -584,7 +621,7 @@ pub(crate) async fn apply(home: &Path, state: &mut RunState, disk: &RunState) ->
     {
         controls(home, &task, disk, active.receipt.request.kind)?;
         ensure!(
-            task.operator_decided_at == active.receipt.decision
+            reconcile::decision_matches(home, &task, &active.receipt)?
                 && contract(&task, active.receipt.request.kind)? == active.receipt.contract,
             "repair grant held: task contract or owner decision changed after acceptance"
         );
@@ -613,7 +650,7 @@ pub(crate) async fn apply(home: &Path, state: &mut RunState, disk: &RunState) ->
         }
         controls(home, &task, disk, receipt.request.kind)?;
         ensure!(
-            task.operator_decided_at == receipt.decision
+            reconcile::decision_matches(home, &task, receipt)?
                 && contract(&task, receipt.request.kind)? == receipt.contract,
             "repair grant held: owner decision changed after acceptance"
         );
@@ -671,7 +708,7 @@ pub fn queue_resumption(queue: &Queue, task: &mut Task, run: &str) -> Result<boo
     let receipt = task.repair_grants.last().expect("pending receipt");
     controls(home, task, &state, receipt.request.kind)?;
     ensure!(
-        task.operator_decided_at == receipt.decision
+        reconcile::decision_matches(home, task, receipt)?
             && contract(task, receipt.request.kind)? == receipt.contract,
         "repair grant held: owner decision or task contract changed after acceptance"
     );

@@ -69,6 +69,58 @@ modes finish with reviewed work ready for inspection. A grant never approves a
 merge, closes or abandons a PR, or discards work. PR landing requires a fresh
 owner decision after repair, even if the repaired HEAD did not change.
 
+## Standing-chat decision application and receipt recovery
+
+`magi task control decide` records the owner's response; its successful return
+means **recorded, effect pending**, not applied. Inspect the original inquiry's
+`decision.status` and application history. The worker must confirm a durable
+effect receipt before the decision is resolved. An answered dependency question
+can therefore remain queued across restart. Grant admission refuses that pending
+effect under the same task claim used by answer recording and worker application.
+Wait for application (or reconcile an uncertain effect through its own supported
+control), then retry the identical grant request. Do not invent another request
+ID to get past a pending decision. Pending decisions belonging to other tasks do
+not block this task.
+
+An older grant can already be accepted and unspent when a response recorded
+before acceptance is applied afterward. Ordinary resume deliberately refuses the
+changed decision generation. Dependency triage now reports **Retained repair
+receipt needs reconciliation** with the retained IDs and original answer time,
+rather than offering another generic resume. Keep the original receipt and run.
+Inspect the original question, task resumption history and retained outputs, and
+obtain the owner's explicit approval for this specific reconciliation:
+
+```sh
+magi task control reconcile-repair-grant <task> --run <retained-run> \
+  --head <original-full-head> --expect-pass <original-pass> \
+  --receipt <original-grant-request-id> --question <original-question-id> \
+  --answer-at <exact-original-answered_at> \
+  --request reconcile-ticket-1 --reason "Owner authorized the original receipt reconciliation"
+```
+
+The terminal equivalent is `magi task reconcile-repair-grant` with identical
+arguments. The operation atomically appends reconciliation evidence and queues
+that same run. It never replaces the grant, increases its rounds, resets counters
+or starts a replacement competition. A lost response is recovered by repeating
+**the same request ID and arguments**; the original reconciliation receipt is
+returned even after dispatch, without queuing another repair. Confirm the receipt
+before settling the recovery discussion in chat with `settle-decision` if needed.
+
+Recovery requires an unimported, unspent ordinary gate/review receipt and the
+exact original triage release. The question's accepted answer must predate the
+grant, its generation must match the preceding approval, and the durable task
+application must identify that question, response and instruction. Modern task
+records also bind the full source evidence and before/after application record;
+legacy recovery requires the retained answer and resumption history to prove the
+same transition. Missing evidence is refused, never inferred from a timestamp
+alone. Unanswered generic dependency questions filed after this release are
+explicitly superseded in the reconciliation ledger; they cannot authorize an
+additional resume. Later answers, owner holds/refusals, changed source evidence,
+contract, head, pass, ownership, live drivers and uncertain effects still refuse
+execution. Imported receipts and foreign-review/base-conflict selections require
+their own recovery workflow. Do not edit store JSON, issue duplicate grants or
+merge retained feature branches to recover this ordering failure.
+
 ## Repairing a retained textual base conflict
 
 A generic `retry`, release, resume or `--recover-base` does not authorize editing
