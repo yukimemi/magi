@@ -1488,6 +1488,93 @@ esac
 }
 
 common::e2e! {
+async fn task_owned_historical_replies_support_explicit_settlement_without_acceptance_or_replay() {
+    use magi::{ask::{Answer, Question, Questions}, chat_control::{self, Operation}, task_decision::Status};
+    let fx = common::fixture(common::home_lock().await, common::Judges::Unanimous, false);
+    for (node, seat, run) in [
+        (magi::land::APPROVAL_NODE, "land", "run-a"),
+        (magi::bump::NOTICE_NODE, "release-watch", ""),
+    ] {
+        let home = fx.tmp.path().join(seat);
+        let queue = Queue::at(home.join("queue"));
+        let talks = Talks::at(home.join("talks"));
+        let questions = Questions::at(home.join("questions"));
+        let chat = talk::begin(&talks, &fx.config, fx.repo.clone(), Some("alpha")).unwrap();
+        let other = talk::begin(&talks, &fx.config, fx.repo.clone(), Some("alpha")).unwrap();
+        let mut task = Task::new("historical release".into(), "historical release".into(), fx.repo.clone(), Source::Human);
+        task.chat = Some(chat.id.clone()); task.runs.push("run-a".into()); queue.put(&mut task).unwrap();
+        let mut source = Question::new(run.into(), node.into(), seat.into(), "Saved merge approval".into(), "Unknown historical effect".into(), vec!["merge".into(), "hold".into()]);
+        source.routed_task = Some(task.id.clone());
+        source.merge_target = Some(magi::merge_decision::Target {
+            pr: "https://example.test/pull/100".into(), head: "saved-head".into(), language: "en".into(),
+        });
+        source.answer(Answer::Choice("merge".into())).unwrap(); source.answer_delivered = true;
+        questions.put(&mut source).unwrap();
+        if run.is_empty() {
+            // Empty-run release approvals obtain their actual task ownership
+            // from the persisted watch, not the source's routing hint.
+            let watches = home.join("release-watch");
+            std::fs::create_dir_all(&watches).unwrap();
+            std::fs::write(watches.join("saved-watch.json"), serde_json::to_vec(&serde_json::json!({
+                "repo": fx.repo, "url": source.merge_target.as_ref().unwrap().pr,
+                "question": source.id, "run": "run-a", "local": true,
+                "asked_head": "saved-head"
+            })).unwrap()).unwrap();
+        }
+        let source_bytes = std::fs::read(questions.path_of(&source.id)).unwrap();
+        let task_bytes = std::fs::read(queue.path_of(&task.id)).unwrap();
+        magi::task_chat::sweep(&queue, &talks, &questions, &home);
+        let outbox = Outbox::at(&home);
+        let imported = outbox.get(&source.id).unwrap();
+        assert_eq!(imported.delivered_to.as_deref(), Some(chat.id.as_str()), "seat={seat}: {imported:?}");
+        assert_eq!(imported.decision.as_ref().unwrap().status, Status::RetryNeeded);
+        assert!(imported.decision.as_ref().unwrap().request.is_none());
+        assert!(chat_control::dispatch(&queue, &home, &talks, &chat.id, Operation::ReconcileDecision { inquiry: source.id.clone() }).await.is_err());
+        for (speaker, reason) in [(&other.id, "No work remains"), (&chat.id, " ")] {
+            assert!(chat_control::dispatch(&queue, &home, &talks, speaker, Operation::SettleDecision {
+                inquiry: source.id.clone(), reason: reason.into(), replacement: None,
+            }).await.is_err());
+        }
+        let before = outbox.get(&source.id).unwrap();
+        let claim = queue.claim(&task.id).unwrap();
+        assert!(chat_control::dispatch(&queue, &home, &talks, &chat.id, Operation::SettleDecision {
+            inquiry: source.id.clone(), reason: "Consumer is still running".into(), replacement: None,
+        }).await.is_err());
+        assert_eq!(outbox.get(&source.id).unwrap(), before);
+        drop(claim);
+        let reason = "Owner inspected the historical outcome and confirms no remaining work";
+        chat_control::dispatch(&queue, &home, &talks, &chat.id, Operation::SettleDecision {
+            inquiry: source.id.clone(), reason: reason.into(), replacement: None,
+        }).await.unwrap();
+        for _ in 0..2 {
+            magi::task_chat::sweep(&Queue::at(home.join("queue")), &Talks::at(home.join("talks")), &Questions::at(home.join("questions")), &home);
+            magi::daemon::apply_choice_actions(&queue, &questions, &home).await;
+            let decision = outbox.get(&source.id).unwrap().decision.unwrap();
+            assert_eq!(decision.status, Status::Resolved);
+            assert!(decision.request.is_none()); assert!(decision.source_answer_at.is_none());
+            assert!(decision.history.last().unwrap().evidence.contains(reason));
+            assert!(decision.history.iter().any(|event| event.status == Status::RetryNeeded));
+            assert!(questions.get(&source.id).unwrap().answer.is_some());
+            assert!(!questions.get(&source.id).unwrap().can_answer());
+            assert!(questions.get_for_effects(&source.id).unwrap().resolution().is_none());
+            assert_eq!(std::fs::read(questions.path_of(&source.id)).unwrap(), source_bytes);
+            assert_eq!(std::fs::read(queue.path_of(&task.id)).unwrap(), task_bytes);
+        }
+        assert!(chat_control::decide(&talks, &home, &chat.id, &source.id, "merge").is_err());
+        // The exception does not silently settle genuinely unanswered intent.
+        let mut live = Question::new("run-a".into(), node.into(), seat.into(), "Current approval".into(), String::new(), vec!["merge".into()]);
+        questions.put(&mut live).unwrap();
+        magi::task_chat::sweep(&queue, &talks, &questions, &home);
+        assert!(chat_control::dispatch(&queue, &home, &talks, &chat.id, Operation::SettleDecision {
+            inquiry: live.id.clone(), reason: "Do not bypass the current consumer".into(), replacement: None,
+        }).await.is_err());
+        assert!(questions.get(&live.id).unwrap().can_answer());
+        assert_eq!(outbox.get(&live.id).unwrap().decision.unwrap().status, Status::AwaitingOwner);
+    }
+}
+}
+
+common::e2e! {
 async fn accepted_legacy_effects_support_explicit_settlement_without_replay() {
     use magi::{ask::{Question, Questions}, chat_control::{self, Operation}, task_decision::Status};
     let fx = common::fixture(common::home_lock().await, common::Judges::Unanimous, false);

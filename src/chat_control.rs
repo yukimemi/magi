@@ -340,14 +340,28 @@ async fn execute(
         } => {
             let outbox = crate::task_inquiry::Outbox::at(home);
             let record = outbox.get(&inquiry)?;
+            let questions = crate::ask::Questions::at(home.join("questions"));
+            let source = questions.read_history(&inquiry).ok();
+            // A quarantined saved reply is not a live unanswered decision.
+            // The owner can explicitly confirm that its unknown effect needs
+            // no further work without accepting or replaying the old reply.
+            let unaccepted_history = record
+                .decision
+                .as_ref()
+                .is_some_and(|d| d.request.is_none())
+                && source.as_ref().is_some_and(|source| {
+                    source.status == crate::ask::QuestionStatus::Answered
+                        && crate::task_chat::saved_reply_requires_confirmation(home, source)
+                });
             // Task-backed legacy consumers run under the task claim. Hold it
             // through settlement; ownerless release consumers use the inquiry
             // execution fence inside Outbox::settle instead.
             let _task_claim = if !record.task.is_empty()
-                && record
-                    .decision
-                    .as_ref()
-                    .is_some_and(|d| d.request.is_some())
+                && (unaccepted_history
+                    || record
+                        .decision
+                        .as_ref()
+                        .is_some_and(|d| d.request.is_some()))
             {
                 Some(
                     queue
@@ -361,16 +375,13 @@ async fn execute(
                 .decision
                 .as_ref()
                 .is_some_and(|d| d.request.is_none())
+                && let Some(source) = source
+                && !(record.task.is_empty() && record.delivered_to.is_none())
             {
-                let questions = crate::ask::Questions::at(home.join("questions"));
-                if let Ok(source) = questions.get(&inquiry)
-                    && !(record.task.is_empty() && record.delivered_to.is_none())
-                {
-                    ensure!(
-                        !crate::task_chat::awaits_decision(&source),
-                        "a legacy effect still awaits consumer reconciliation; settlement executes no action"
-                    );
-                }
+                ensure!(
+                    unaccepted_history || !crate::task_chat::awaits_decision(&source),
+                    "a legacy effect still awaits consumer reconciliation; settlement executes no action"
+                );
             }
             outbox.settle(&inquiry, talk, &reason, replacement.as_deref())?;
             format!("settled decision {inquiry}: {reason}")
