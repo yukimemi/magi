@@ -1723,22 +1723,25 @@ remain outside those lanes and global queue-worker park requests.
   that the chat answered an operator send.
 - **Bound scheduler retirement, never kill it.** `daemon::restart_detached`
   waits up to 30 seconds for the old scheduler's reservation and singleton lease
-  to retire, then hands `scheduler-restart.json` to the successor web. Startup
-  resumes this durable request in the background and retries failures; the marker
-  is removed only after spawn succeeds or an acknowledged replacement is observed.
-  The coordinator lease serializes restart consumers; the scheduler reservation
-  and lease still prevent overlapping dispatch. No task/chat controls are sent.
+  to retire. A timeout returns an error; web handover restores the UI but records
+  a failed upgrade, never successful scheduler replacement. The durable intent
+  `scheduler-restart.json` remains available for an explicit retry. Startup
+  attempts crash recovery once with the same bound, never an indefinite sequence
+  of zero-duration checks. The coordinator lease serializes restart consumers;
+  the scheduler reservation and lease prevent overlapping dispatch. No task/chat
+  controls are sent.
   Do not signal or cancel a scheduler in a synchronous reconciliation item:
   queue, question and talk updates can span multiple writes. Poll and item
   boundaries observe durable Stop directly, even if a synchronous sweep starves
   the control watcher. Check only before the next complete item, never between
   its writes; remaining reconciliation is retried by the next scheduler.
-  Older generations without these checks can finish their lap while the upgraded
-  web is already serving. Health/banner and `upgrade.note.json` report the old
-  scheduler PID, current `Status::lap_step` name/start time (when the status
-  PID matches), elapsed wait and handover bound. Stop exits the poll loop through
-  its bookkeeping cleanup; a completed web upgrade can
-  still have a scheduler restart pending. This does not change poll costs.
+  Older executable generations without these checks cannot guarantee bounded
+  successful replacement: their retirement timeout is reported as failure and
+  requires retry after they stop. No safe forced-retirement protocol for those
+  generations is implemented. Health/banner and `upgrade.note.json` report the
+  old scheduler PID, current `Status::lap_step` name/start time (when the status
+  PID matches), elapsed wait and retirement bound. Stop exits the poll loop through
+  its bookkeeping cleanup. This does not change poll costs.
 - **Release, then spawn.** Remember the installed executable path before update,
   request scheduler replacement, release the listener, then start the successor web.
   Answer 202 before process exit. A live legacy embedded scheduler requires one
