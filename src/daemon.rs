@@ -2687,7 +2687,7 @@ pub fn request_control(home: &Path, control: crate::worker::Control) -> Result<(
     crate::worker::request(home, "scheduler", control)
 }
 
-/// Maximum time web handover spends waiting for scheduler retirement.
+/// Maximum time spent waiting for scheduler retirement before reporting failure.
 const SCHEDULER_RESTART_WAIT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -2716,7 +2716,7 @@ pub fn scheduler_restart_wait(home: &Path) -> Option<String> {
             format!("; step {} since {}", step.name, step.since)
         });
     Some(format!(
-        "scheduler restart pending: old scheduler pid {} is finishing its lap{step} (waited {elapsed}s; web handover waits at most {}s)",
+        "scheduler restart pending: old scheduler pid {} is finishing its lap{step} (waited {elapsed}s; retirement attempt waits at most {}s)",
         pending
             .pid
             .map_or_else(|| "unknown".into(), |pid| pid.to_string()),
@@ -2724,8 +2724,8 @@ pub fn scheduler_restart_wait(home: &Path) -> Option<String> {
     ))
 }
 
-/// Replace dispatch only. After the bound, the durable request is handed to
-/// the successor web, which resumes it without holding up listener handover.
+/// Replace dispatch only. Reaching the retirement bound is a restart failure,
+/// never evidence that replacement succeeded. Retain the intent for a later retry.
 /// Never kill the scheduler: an item may update queue, question and talk state
 /// across several writes. It retires at an item boundary; its singleton lease
 /// and reservation prevent overlap until then. No execution controls are sent.
@@ -2768,10 +2768,19 @@ where
         std::fs::write(&temporary, serde_json::to_vec(&request)?)?;
         std::fs::rename(temporary, path)?;
     }
+    finish_scheduler_restart(home, bound, spawn).await
+}
+
+async fn finish_scheduler_restart<F, Fut>(home: &Path, bound: Duration, spawn: F) -> Result<()>
+where
+    F: FnMut(Opts) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
     if !complete_scheduler_restart(home, bound, spawn).await? {
-        crate::updater::log_step(
-            home,
-            "scheduler retirement wait reached its bound; successor web will resume the durable restart request",
+        bail!(
+            "scheduler retirement timed out after {}s: {}; replacement not confirmed; retry after the old scheduler stops",
+            bound.as_secs_f64(),
+            scheduler_restart_wait(home).unwrap_or_else(|| "old scheduler has not retired".into()),
         );
     }
     Ok(())
@@ -2835,30 +2844,33 @@ where
     }
 }
 
-/// Resume a predecessor's retirement request independently of HTTP startup.
-/// Errors retain the marker, so startup contention and spawn failures retry.
+/// Recover a crashed predecessor's intent with one bounded attempt. A timeout
+/// remains a failure requiring an explicit retry, rather than silently moving
+/// an unbounded retirement wait into the successor web.
 pub fn resume_scheduler_restart(home: PathBuf) {
     tokio::spawn(async move {
-        while scheduler_restart_path(&home).exists() {
-            match crate::worker::try_lease(&home, "scheduler-restart") {
-                Ok(Some(_coordinator)) => {
-                    match complete_scheduler_restart(&home, Duration::ZERO, |opts| {
-                        let home = &home;
-                        async move { spawn_detached(home, &opts).await.map(|_| ()) }
-                    })
-                    .await
-                    {
-                        Ok(true) => break,
-                        Ok(false) => {}
-                        Err(error) => {
-                            tracing::warn!("scheduler restart remains pending: {error:#}")
-                        }
-                    }
-                }
-                Ok(None) => {}
-                Err(error) => tracing::warn!("scheduler restart coordinator: {error:#}"),
+        if !scheduler_restart_path(&home).exists() {
+            return;
+        }
+        let result = async {
+            let Some(_coordinator) = crate::worker::try_lease(&home, "scheduler-restart")? else {
+                // A live predecessor still owns recovery; do not fail its upgrade.
+                return Ok(());
+            };
+            if !scheduler_restart_path(&home).exists() {
+                return Ok(());
             }
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            finish_scheduler_restart(&home, SCHEDULER_RESTART_WAIT, |opts| {
+                let home = &home;
+                async move { spawn_detached(home, &opts).await.map(|_| ()) }
+            })
+            .await
+        }
+        .await;
+        if let Err(error) = result {
+            let detail = format!("scheduler restart recovery failed: {error:#}");
+            tracing::warn!("{detail}");
+            let _ = crate::updater::fail_progress(&home, &detail);
         }
     });
 }
@@ -6861,7 +6873,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scheduler_restart_defers_a_long_lap_without_touching_execution_workers() {
+    async fn scheduler_restart_reports_timeout_without_touching_execution_workers() {
         let home = tempfile::tempdir().unwrap();
         let request = TaskWorker {
             opts: Opts::default(),
@@ -6921,9 +6933,11 @@ mod tests {
             std::future::ready(Ok(()))
         };
         let started = std::time::Instant::now();
-        restart_detached_with(home.path(), Duration::from_millis(20), spawn)
+        let error = restart_detached_with(home.path(), Duration::from_millis(20), spawn)
             .await
-            .unwrap();
+            .unwrap_err();
+        assert!(error.to_string().contains("scheduler retirement timed out"));
+        assert!(error.to_string().contains("4242"));
         assert!(started.elapsed() < Duration::from_secs(2));
         assert_eq!(calls.get(), 0);
         assert!(scheduler_restart_path(home.path()).exists());
@@ -6981,7 +6995,7 @@ mod tests {
         );
         assert_eq!(calls.get(), 0);
         std::fs::remove_dir_all(old_dir).unwrap();
-        // A failed spawn retains the intent for the successor's next retry.
+        // A failed spawn retains the intent for an explicit retry.
         assert!(
             complete_scheduler_restart(home.path(), Duration::ZERO, |_| {
                 std::future::ready(Err(anyhow::anyhow!("injected startup failure")))
@@ -7005,6 +7019,100 @@ mod tests {
         );
         drop(task_lease);
         drop(execution_lease);
+    }
+
+    #[tokio::test]
+    async fn scheduler_restart_completes_during_a_long_lap_without_touching_workers() {
+        let home = tempfile::tempdir().unwrap();
+        let request = TaskWorker {
+            opts: Opts::default(),
+            queue: home.path().join("queue"),
+            task: "still-executing".into(),
+            lane: PermitKind::Ordinary,
+            standalone: false,
+        };
+        let task = starting_task_reservation(home.path(), &request);
+        let task_path = home
+            .path()
+            .join("workers/jobs")
+            .join(&task.id)
+            .join("job.json");
+        let before = std::fs::read(&task_path).unwrap();
+        let execution = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(task_path.with_file_name("live.lock"))
+            .unwrap();
+        crate::pr_head::try_lock_file(&execution).unwrap();
+        let _task_lease = crate::worker::try_lease(home.path(), &task.key)
+            .unwrap()
+            .unwrap();
+        let mut scheduler = task.clone();
+        scheduler.id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".into();
+        scheduler.kind = "scheduler".into();
+        scheduler.key = "scheduler".into();
+        scheduler.payload = serde_json::to_value(Opts::default()).unwrap();
+        let scheduler_dir = home.path().join("workers/jobs").join(&scheduler.id);
+        std::fs::create_dir_all(&scheduler_dir).unwrap();
+        std::fs::write(
+            scheduler_dir.join("job.json"),
+            serde_json::to_vec(&scheduler).unwrap(),
+        )
+        .unwrap();
+        let scheduler_lease = crate::worker::try_lease(home.path(), "scheduler")
+            .unwrap()
+            .unwrap();
+        let calls = std::cell::Cell::new(0);
+        let started = std::time::Instant::now();
+        let lap = LAP_HOME.scope(home.path().to_path_buf(), async {
+            // Inject a five-second lap. Stop may only take effect after both
+            // writes of an item; the rest of the lap must never be awaited.
+            let mut completed = 0;
+            for item in 0..1000 {
+                if lap_stop_requested() {
+                    break;
+                }
+                std::fs::write(home.path().join("first-record"), item.to_string()).unwrap();
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                std::fs::write(home.path().join("second-record"), item.to_string()).unwrap();
+                completed += 1;
+            }
+            assert!((1..1000).contains(&completed));
+            assert_eq!(
+                std::fs::read(home.path().join("first-record")).unwrap(),
+                std::fs::read(home.path().join("second-record")).unwrap()
+            );
+            std::fs::remove_dir_all(scheduler_dir).unwrap();
+            drop(scheduler_lease);
+        });
+        let restart = async {
+            // Begin the restart while the first item's writes are in flight.
+            tokio::task::yield_now().await;
+            restart_detached_with(home.path(), Duration::from_secs(1), |_| {
+                calls.set(calls.get() + 1);
+                std::future::ready(Ok(()))
+            })
+            .await
+            .unwrap();
+        };
+        tokio::join!(lap, restart);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(calls.get(), 1);
+        assert!(!scheduler_restart_path(home.path()).exists());
+        assert_eq!(std::fs::read(&task_path).unwrap(), before);
+        assert!(
+            crate::worker::control(home.path(), &task.key)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            crate::worker::try_lease(home.path(), &task.key)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!home.path().join("worker-parks").exists());
     }
 
     #[tokio::test]
