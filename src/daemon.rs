@@ -139,6 +139,18 @@ pub struct Status {
     /// Independent-worker control protocol supported by this scheduler.
     #[serde(default)]
     pub worker_protocol: Option<u32>,
+    /// The current poll sub-step and its start time, for restart diagnostics.
+    #[serde(default)]
+    pub lap_step: Option<LapStep>,
+}
+
+/// A named sub-step of one scheduler poll lap.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LapStep {
+    /// Name of the sub-step currently running.
+    pub name: String,
+    /// When this sub-step began.
+    pub since: Timestamp,
 }
 
 impl Status {
@@ -157,6 +169,7 @@ impl Status {
             polls: 0,
             question_recovery: None,
             worker_protocol: Some(1),
+            lap_step: None,
         }
     }
 }
@@ -409,6 +422,9 @@ pub struct Reading {
     pub question_recovery: Option<crate::question_delivery::Recovery>,
     /// Independent-worker control protocol, absent on legacy embedded loops.
     pub worker_protocol: Option<u32>,
+    /// The current poll sub-step and its start time, for restart diagnostics.
+    #[serde(default)]
+    pub lap_step: Option<LapStep>,
 }
 
 /// Accept the old single-`Current`-or-absent shape as well as the current
@@ -2691,8 +2707,16 @@ pub fn scheduler_restart_wait(home: &Path) -> Option<String> {
     let pending: SchedulerRestart =
         serde_json::from_slice(&std::fs::read(scheduler_restart_path(home)).ok()?).ok()?;
     let elapsed = (Timestamp::now().as_second() - pending.since.as_second()).max(0);
+    // daemon.json may already describe the replacement. Never attribute its
+    // sub-step to the retiring process (or guess when its PID is unknown).
+    let step = read_status(home)
+        .filter(|status| pending.pid.is_some() && status.pid == pending.pid)
+        .and_then(|status| status.lap_step)
+        .map_or_else(String::new, |step| {
+            format!("; step {} since {}", step.name, step.since)
+        });
     Some(format!(
-        "scheduler restart pending: old scheduler pid {} is finishing its lap (waited {elapsed}s; web handover waits at most {}s)",
+        "scheduler restart pending: old scheduler pid {} is finishing its lap{step} (waited {elapsed}s; web handover waits at most {}s)",
         pending
             .pid
             .map_or_else(|| "unknown".into(), |pid| pid.to_string()),
@@ -4155,10 +4179,22 @@ async fn poll(
         Err(error) => return Err(error.into()),
     };
     let mut previous = std::collections::BTreeSet::<String>::new();
-    while !stop.stopped() {
-        if lap_stop_requested() {
-            return Ok(());
+    // Stop only at complete-item boundaries. Breaking out of the lap also
+    // runs the dispatch-bookkeeping cleanup below; execution workers own
+    // their claims and are never cancelled here.
+    'laps: while !stop.stopped() {
+        macro_rules! step {
+            ($name:expr) => {
+                if stop.stopped() || lap_stop_requested() {
+                    break 'laps;
+                }
+                lock(status).lap_step = Some(LapStep {
+                    name: $name.to_owned(),
+                    since: Timestamp::now(),
+                });
+            };
         }
+        step!("worker inventory");
         let jobs: Vec<_> = crate::worker::active(home)?
             .into_iter()
             .filter(|job| job.kind == "task")
@@ -4206,86 +4242,57 @@ async fn poll(
         let sem = Arc::new(tokio::sync::Semaphore::new(ordinary));
         let urgent_sem = Arc::new(tokio::sync::Semaphore::new(urgent));
         let mut permits = Vec::new();
+        step!("stale claims");
         sweep_stale_claims(queue, STALE_CLAIM);
-        if stop.stopped() || lap_stop_requested() {
-            return Ok(());
-        }
+        step!("orphaned runs");
         reclaim_orphaned_running(queue, opts.max_attempts, &live);
-        if stop.stopped() || lap_stop_requested() {
-            return Ok(());
-        }
+        step!("abandoned runs");
         reclaim_abandoned_runs(home, Timestamp::now());
         let questions = Questions::at(home.join("questions"));
 
         // Deterministic: no model, run before the conductor sees anything so
         // its input reflects the queue's current, already-resolved state.
-        if stop.stopped() || lap_stop_requested() {
-            return Ok(());
-        }
+        step!("task chat");
         crate::task_chat::sweep(
             queue,
             &crate::talk::Talks::at(home.join("talks")),
             &questions,
             home,
         );
-        if stop.stopped() || lap_stop_requested() {
-            return Ok(());
-        }
+        step!("task inquiries");
         if let Err(error) = crate::task_inquiry::Outbox::at(home)
             .sweep(queue, &crate::talk::Talks::at(home.join("talks")))
         {
             tracing::warn!("task inquiry delivery remains pending: {error:#}");
         }
-        if stop.stopped() || lap_stop_requested() {
-            return Ok(());
-        }
+        step!("question offers");
         repair_choice_offers(&questions);
-        if stop.stopped() || lap_stop_requested() {
-            return Ok(());
-        }
+        step!("blockers");
         resolve_blockers(queue, &questions);
-        if stop.stopped() || lap_stop_requested() {
-            return Ok(());
-        }
+        step!("choice actions");
         apply_task_choice_actions(queue, &questions, home);
-        if stop.stopped() || lap_stop_requested() {
-            return Ok(());
-        }
+        step!("triage answers");
         triage::apply_answers(queue, &questions);
-        if stop.stopped() || lap_stop_requested() {
-            return Ok(());
-        }
+        step!("task questions");
         reconcile_task_questions(queue, &questions);
         let talks = crate::talk::Talks::at(home.join("talks"));
-        if stop.stopped() || lap_stop_requested() {
-            return Ok(());
-        }
+        step!("chat notices");
         crate::chat_notify::sweep(queue, &talks, home);
-        if stop.stopped() || lap_stop_requested() {
-            return Ok(());
-        }
+        step!("attention notices");
         crate::notice_delivery::sweep(queue, &talks, home, &opts.repo);
-        if stop.stopped() || lap_stop_requested() {
-            return Ok(());
-        }
+        step!("chat watches");
         crate::chat_watch::sweep(home, &talks);
-        if stop.stopped() || lap_stop_requested() {
-            return Ok(());
-        }
+        step!("decision receipts");
         if let Err(error) = crate::chat_control::reconcile_decisions(queue, home) {
             tracing::warn!("decision receipt reconciliation remains pending: {error:#}");
         }
-        if stop.stopped() || lap_stop_requested() {
-            return Ok(());
-        }
+        step!("chat turns");
         let mut turns = tokio::task::JoinSet::new();
         crate::chat_notify::start_turns(&talks, stop.parking(), &mut turns);
         // start_turns dispatches detached turns; no paid work lives in this set.
         while turns.join_next().await.is_some() {}
 
-        if stop.stopped() || lap_stop_requested() {
-            return Ok(());
-        }
+        step!("consultation services");
         crate::consult::start_services(
             home,
             &opts.repo,
@@ -4305,11 +4312,12 @@ async fn poll(
             // scans only consume their effects. An expired cadence receipt
             // must not start another service and keep the drain alive.
             if stop.stopped() || lap_stop_requested() {
-                return Ok(());
+                break 'laps;
             }
             if settling_once_services {
                 break;
             }
+            step!(operation);
             start_service(
                 home,
                 opts,
@@ -4321,26 +4329,24 @@ async fn poll(
             )
             .await?;
         }
-        if stop.stopped() || lap_stop_requested() {
-            return Ok(());
-        }
+        step!("worker inventory");
         let latest = crate::worker::active(home)?;
         if latest.iter().any(|job| job.key == "service:daemon-cache")
             || latest
                 .iter()
                 .any(|job| job.kind == "task" && !jobs.iter().any(|known| known.id == job.id))
         {
+            lock(status).lap_step = None;
             stop.idle(RECHECK_WHILE_BUSY.min(opts.poll)).await;
             continue;
         }
+        step!("runnable tasks");
         let candidates: Vec<Task> = runnable(queue)
             .into_iter()
             .filter(|task| !live.contains(&task.id))
             .filter(|task| !opts.once || !attempted.contains(&task.id))
             .collect();
-        if stop.stopped() || lap_stop_requested() {
-            return Ok(());
-        }
+        step!("interrupts");
         let in_flight: Vec<_> = owned.iter().cloned().collect();
         let prior_interrupt = std::mem::discriminant(&interrupt);
         interrupt = advance_interrupt_tick(
@@ -4384,6 +4390,7 @@ async fn poll(
         let cooling = read_cooldown(home)?.is_some_and(|until| Timestamp::now() < until);
         let mut started = false;
         let mut resync = false;
+        step!("task dispatch");
         for candidate in candidates {
             if stop.stopped() || lap_stop_requested() {
                 break;
@@ -4432,10 +4439,9 @@ async fn poll(
             attempted.push(task.id);
             started = true;
         }
-        if stop.stopped() || lap_stop_requested() {
-            return Ok(());
-        }
+        step!("settling dispatch");
         if started || resync {
+            lock(status).lap_step = None;
             continue;
         }
         if owned.is_empty() && opts.once {
@@ -4452,11 +4458,13 @@ async fn poll(
                             | "service:daemon-maintenance"
                     )
             }) {
+                lock(status).lap_step = None;
                 stop.idle(RECHECK_WHILE_BUSY.min(opts.poll)).await;
                 continue;
             }
             break;
         }
+        lock(status).lap_step = None;
         stop.idle(if live.is_empty() {
             opts.poll
         } else {
@@ -4466,6 +4474,7 @@ async fn poll(
     }
     // Dropping a scheduler only drops dispatch bookkeeping. The workers own
     // every queue claim and Runner driver lease through outcome settlement.
+    lock(status).lap_step = None;
     stop.busy.store(0, Ordering::SeqCst);
     Ok(())
 }
@@ -6888,6 +6897,18 @@ mod tests {
         let old_dir = home.path().join("workers/jobs").join(&old.id);
         std::fs::create_dir_all(&old_dir).unwrap();
         std::fs::write(old_dir.join("job.json"), serde_json::to_vec(&old).unwrap()).unwrap();
+        let mut status = Status::new();
+        status.pid = 4242;
+        let step = LapStep {
+            name: "task inquiries".into(),
+            since: Timestamp::now(),
+        };
+        status.lap_step = Some(step.clone());
+        write_status_to(&home.path().join("daemon.json"), &status).unwrap();
+        assert_eq!(
+            read_status(home.path()).unwrap().lap_step,
+            Some(step.clone())
+        );
         let old_lease = crate::worker::try_lease(home.path(), "scheduler")
             .unwrap()
             .unwrap();
@@ -6908,7 +6929,10 @@ mod tests {
         assert!(scheduler_restart_path(home.path()).exists());
         let note = std::fs::read_to_string(home.path().join("upgrade.note.json")).unwrap();
         assert!(
-            note.contains("4242") && note.contains("finishing its lap"),
+            note.contains("4242")
+                && note.contains("finishing its lap")
+                && note.contains("step task inquiries since")
+                && note.contains(&step.since.to_string()),
             "{note}"
         );
         assert_eq!(
@@ -6927,6 +6951,26 @@ mod tests {
                 .is_none()
         );
         assert!(!home.path().join("worker-parks").exists());
+
+        // A replacement's status must not be attributed to the old PID.
+        status.pid = 4243;
+        write_status_to(&home.path().join("daemon.json"), &status).unwrap();
+        assert!(
+            !scheduler_restart_wait(home.path())
+                .unwrap()
+                .contains("task inquiries")
+        );
+        // Legacy status files remain readable and give PID-only diagnostics.
+        let mut legacy = serde_json::to_value(&status).unwrap();
+        legacy["pid"] = 4242.into();
+        legacy.as_object_mut().unwrap().remove("lap_step");
+        std::fs::write(home.path().join("daemon.json"), legacy.to_string()).unwrap();
+        assert!(read_status(home.path()).unwrap().lap_step.is_none());
+        assert!(
+            !scheduler_restart_wait(home.path())
+                .unwrap()
+                .contains("step task inquiries")
+        );
 
         // Releasing only the lease is insufficient: the reservation must retire.
         drop(old_lease);
@@ -7029,6 +7073,42 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn scheduler_poll_stop_clears_lap_and_dispatch_bookkeeping() {
+        let dir = tempfile::tempdir().unwrap();
+        let (opts, queue, _, home, worktrees) = idle_loop(dir.path());
+        let mut snapshot = Status::new();
+        snapshot.lap_step = Some(LapStep {
+            name: "previous step".into(),
+            since: Timestamp::now(),
+        });
+        let status = Arc::new(Mutex::new(snapshot));
+        let stop = Stop::new();
+        stop.busy.store(1, Ordering::SeqCst);
+        crate::worker::request(&home, "scheduler", crate::worker::Control::Stop).unwrap();
+        LAP_HOME
+            .scope(
+                home.clone(),
+                poll(
+                    &opts,
+                    &queue,
+                    &status,
+                    &home,
+                    &worktrees,
+                    &stop,
+                    DispatchLimits {
+                        max_concurrent: 1,
+                        pause_for_interrupts: false,
+                        recovery_cfg: None,
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stop.busy.load(Ordering::SeqCst), 0);
+        assert!(lock(&status).lap_step.is_none());
     }
 
     #[tokio::test(flavor = "current_thread")]
