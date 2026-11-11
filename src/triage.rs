@@ -666,6 +666,7 @@ fn keep_held_note(task: &Task, q: &Question, resolution: &str) -> String {
 /// [`latest_triage_question`] - so this never checks again.
 fn file_question(
     questions: &Questions,
+    ownership: &crate::task_chat::InquiryOwnership,
     task: &Task,
     bucket: Bucket,
     w: &Wording,
@@ -708,7 +709,7 @@ fn file_question(
         choices,
     );
     q.triage_generation = Some(task.resumption.as_ref().map_or(0, |r| r.generation));
-    questions.put_executable(&mut q).ok()?;
+    questions.put_executable_in(&mut q, ownership).ok()?;
     Some(q)
 }
 
@@ -1154,7 +1155,10 @@ fn ask_about_stuck_roots(
             choices,
         );
         question.triage_generation = Some(root.resumption.as_ref().map_or(0, |r| r.generation));
-        if questions.put_executable(&mut question).is_ok() {
+        if questions
+            .put_executable_in(&mut question, &ownership)
+            .is_ok()
+        {
             report.asked.push(root.id.clone());
         }
     }
@@ -1320,6 +1324,7 @@ pub fn run_once(
     };
     ask_about_stuck_roots(queue, questions, config_override, &mut report);
     let recovery = RecoveryIndex::load(questions);
+    let ownership = crate::task_chat::InquiryOwnership::default();
     for listed in queue.list() {
         if listed.status != TaskStatus::Held {
             continue;
@@ -1373,7 +1378,15 @@ pub fn run_once(
                     .as_ref()
                     .is_some_and(|o| o.conductor_rehold.is_some() && !o.forced);
                 if overridden {
-                    if file_question(questions, &task, Bucket::ConductorOverride, w, now).is_some()
+                    if file_question(
+                        questions,
+                        &ownership,
+                        &task,
+                        Bucket::ConductorOverride,
+                        w,
+                        now,
+                    )
+                    .is_some()
                     {
                         report.asked.push(task.id.clone());
                     }
@@ -1383,19 +1396,28 @@ pub fn run_once(
                     if queue.put(&mut task).is_ok() {
                         report.resumed.push(task.id.clone());
                     }
-                } else if file_question(questions, &task, Bucket::MachineUnknown, w, now).is_some()
+                } else if file_question(
+                    questions,
+                    &ownership,
+                    &task,
+                    Bucket::MachineUnknown,
+                    w,
+                    now,
+                )
+                .is_some()
                 {
                     report.asked.push(task.id.clone());
                 }
             }
             None => {
-                if file_question(questions, &task, Bucket::Legacy, w, now).is_some() {
+                if file_question(questions, &ownership, &task, Bucket::Legacy, w, now).is_some() {
                     report.asked.push(task.id.clone());
                 }
             }
             Some(HoldSource::Manual) => {
                 if manual_is_stale(&task, now)
-                    && file_question(questions, &task, Bucket::ManualStale, w, now).is_some()
+                    && file_question(questions, &ownership, &task, Bucket::ManualStale, w, now)
+                        .is_some()
                 {
                     report.asked.push(task.id.clone());
                 }
@@ -1809,6 +1831,26 @@ mod tests {
     }
 
     #[test]
+    fn run_once_filing_many_new_questions_reads_the_queue_a_constant_number_of_times() {
+        let (dir, queue, questions) = store();
+        let size = 200;
+        for i in 0..size {
+            let mut t = task("scan fixture", dir.path().join("repo"));
+            t.id = format!("task-{i:04}");
+            t.hold_machine(Some("gate red".to_owned()));
+            queue.put(&mut t).unwrap();
+        }
+        scan_counts();
+        let report = run_once(&queue, &questions, None, Timestamp::now());
+        let (lists, _, _) = scan_counts();
+        assert_eq!(report.asked.len(), size, "every held task is asked about");
+        assert!(
+            lists <= 12,
+            "queue scans while filing {size} questions: {lists}"
+        );
+    }
+
+    #[test]
     fn base_recovery_stops_suppress_generic_and_dependency_resume_offers() {
         let (dir, queue, questions) = store();
         let mut root = task("base stop", dir.path().to_path_buf());
@@ -1844,6 +1886,7 @@ mod tests {
         // task into a replacement competition after the fix is installed.
         let q = file_question(
             &questions,
+            &crate::task_chat::InquiryOwnership::default(),
             &root,
             Bucket::MachineUnknown,
             &EN,
@@ -2038,6 +2081,7 @@ mod tests {
                 queue.put(&mut t).unwrap();
                 let mut q = file_question(
                     &questions,
+                    &crate::task_chat::InquiryOwnership::default(),
                     &t,
                     Bucket::MachineUnknown,
                     &JA,
@@ -2079,6 +2123,7 @@ mod tests {
         queue.put(&mut t).unwrap();
         let mut q = file_question(
             &questions,
+            &crate::task_chat::InquiryOwnership::default(),
             &t,
             Bucket::MachineUnknown,
             &JA,
@@ -2109,6 +2154,7 @@ mod tests {
         queue.put(&mut after).unwrap();
         let mut late = file_question(
             &questions,
+            &crate::task_chat::InquiryOwnership::default(),
             &after,
             Bucket::MachineUnknown,
             &EN,
