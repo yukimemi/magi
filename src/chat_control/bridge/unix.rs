@@ -1,4 +1,4 @@
-//! A turn-scoped inherited channel, without filesystem or network grants.
+//! Turn-scoped inherited pipes plus authenticated local socket recovery.
 //!
 //! The launcher executes typed [`crate::chat_control::Operation`]s as the talk fixed
 //! at startup. The channel cannot name a different talk or execute a command.
@@ -16,15 +16,18 @@ use super::{MAX_FRAME, Operation, Request, Response};
 pub const CHANNEL_ENV: &str = "MAGI_CHAT_CONTROL_FD";
 const RESPONSE_ENV: &str = "MAGI_CHAT_CONTROL_RESPONSE_FD";
 const LOCK_ENV: &str = "MAGI_CHAT_CONTROL_LOCK_FD";
+mod socket;
+const IDENTITY_ENV: &str = "MAGI_CHAT_CONTROL_IDENTITIES";
 const MAX_STALE_RESPONSES: usize = 64;
 
-/// Only descriptor preparation failures are safe to fall back from: no request
+/// Only transport preparation failures are safe to fall back from: no request
 /// bytes have been sent, so local execution cannot duplicate an operation.
 #[derive(Debug, thiserror::Error)]
-#[error("prepare chat control descriptors")]
+#[error("prepare authenticated chat control transport (no operation sent)")]
 pub(crate) struct Unavailable;
 
 pub(crate) struct Bridge {
+    socket: Option<socket::Socket>,
     requests: std::fs::File,
     responses: std::fs::File,
     lock: std::fs::File,
@@ -48,6 +51,14 @@ impl Bridge {
             .create_new(true)
             .open(&path)?;
         std::fs::remove_file(path)?;
+        let serial = socket::Serial::default();
+        let socket = match socket::Socket::start(home, talk, serial.clone()) {
+            Ok(socket) => Some(socket),
+            Err(error) => {
+                tracing::warn!(%error, "chat control socket unavailable; inherited descriptor transport remains available");
+                None
+            }
+        };
         let home = home.to_owned();
         let talk = talk.to_owned();
         let server = tokio::spawn(async move {
@@ -58,6 +69,7 @@ impl Bridge {
                     let mut body = vec![0; len];
                     incoming.read_exact(&mut body).await?;
                     let Request { id, operation } = serde_json::from_slice(&body)?;
+                    let _guard = serial.lock().await;
                     let result = super::super::execute(
                         &crate::queue::Queue::at(home.join("queue")),
                         &home,
@@ -67,6 +79,7 @@ impl Bridge {
                     )
                     .await
                     .map_err(|e| format!("{e:#}"));
+                    drop(_guard);
                     let response = serde_json::to_vec(&Response { id, result })?;
                     ensure!(response.len() <= MAX_FRAME, "control response too large");
                     outgoing.write_u32(response.len() as u32).await?;
@@ -79,6 +92,7 @@ impl Bridge {
             }
         });
         Ok(Self {
+            socket,
             requests,
             responses,
             lock,
@@ -90,6 +104,18 @@ impl Bridge {
         let requests = self.requests.as_raw_fd();
         let responses = self.responses.as_raw_fd();
         let lock = self.lock.as_raw_fd();
+        if let Some(socket) = &self.socket {
+            socket.attach(command);
+        }
+        let identities: Vec<_> = [requests, responses, lock]
+            .into_iter()
+            .map(identity)
+            .collect::<Result<_>>()
+            .expect("launcher owns control descriptors");
+        command.env(
+            IDENTITY_ENV,
+            serde_json::to_string(&identities).expect("descriptor identities serialize"),
+        );
         command
             .env(CHANNEL_ENV, requests.to_string())
             .env(RESPONSE_ENV, responses.to_string())
@@ -116,16 +142,54 @@ impl Drop for Bridge {
     }
 }
 
-pub(crate) fn clear_environment(command: &mut tokio::process::Command) {
-    command
-        .env_remove(CHANNEL_ENV)
-        .env_remove(RESPONSE_ENV)
-        .env_remove(LOCK_ENV)
-        .env_remove("MAGI_CHAT_CONTROL_PIPE")
-        .env_remove("MAGI_CHAT_CONTROL_CAP");
+/// Drop inherited authority in detached children, as well as removing its env.
+/// Inspect in the parent; the child hook uses only async-signal-safe syscalls.
+pub(super) fn close_inherited(command: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt as _;
+    let Ok(encoded) = std::env::var(IDENTITY_ENV) else {
+        return;
+    };
+    let Ok(identities) = serde_json::from_str::<Vec<[String; 4]>>(&encoded) else {
+        return;
+    };
+    let mut descriptors = Vec::new();
+    for (name, expected) in [CHANNEL_ENV, RESPONSE_ENV, LOCK_ENV]
+        .into_iter()
+        .zip(identities)
+    {
+        let Some(fd) = std::env::var(name)
+            .ok()
+            .and_then(|s| s.parse::<RawFd>().ok())
+            .filter(|fd| *fd > 2)
+        else {
+            continue;
+        };
+        if identity(fd).ok().as_ref() != Some(&expected) {
+            continue;
+        }
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd, &mut stat) } == 0 {
+            descriptors.push((fd, stat.st_dev, stat.st_ino, stat.st_mode));
+        }
+    }
+    unsafe {
+        command.pre_exec(move || {
+            for &(fd, dev, ino, mode) in &descriptors {
+                let mut stat: libc::stat = std::mem::zeroed();
+                if libc::fstat(fd, &mut stat) == 0
+                    && stat.st_dev == dev
+                    && stat.st_ino == ino
+                    && stat.st_mode == mode
+                {
+                    libc::close(fd);
+                }
+            }
+            Ok(())
+        });
+    }
 }
 
-fn duplicate(name: &str) -> Result<RawFd> {
+fn duplicate(name: &str, expected: &[String; 4]) -> Result<RawFd> {
     let fd: RawFd = std::env::var(name)?.parse()?;
     ensure!(fd > 2, "invalid control descriptor");
     // SAFETY: duplicate an existing inherited descriptor; the caller takes
@@ -136,14 +200,45 @@ fn duplicate(name: &str) -> Result<RawFd> {
         "control channel is unavailable: {}",
         std::io::Error::last_os_error()
     );
-    Ok(copy)
+    // Own the duplicate immediately, including on identity failure. Never
+    // read/write a reused fd merely because its number was inherited in env.
+    let file = unsafe { std::fs::File::from_raw_fd(copy) };
+    ensure!(
+        &identity(file.as_raw_fd())? == expected,
+        "control descriptor identity mismatch: {name}"
+    );
+    use std::os::fd::IntoRawFd as _;
+    Ok(file.into_raw_fd())
+}
+
+fn identity(fd: RawFd) -> Result<[String; 4]> {
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    ensure!(
+        unsafe { libc::fstat(fd, &mut stat) } == 0,
+        "control descriptor closed: {}",
+        std::io::Error::last_os_error()
+    );
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    ensure!(flags != -1, "cannot inspect control descriptor");
+    Ok([
+        stat.st_dev.to_string(),
+        stat.st_ino.to_string(),
+        (stat.st_mode & libc::S_IFMT).to_string(),
+        (flags & libc::O_ACCMODE).to_string(),
+    ])
 }
 
 pub fn request(operation: &Operation) -> Result<String> {
     let id = crate::rng::entropy();
     let body = serde_json::to_vec(&serde_json::json!({ "id": id, "operation": operation }))?;
     ensure!(body.len() <= MAX_FRAME, "control request exceeds 1 MiB");
-    let (lock, mut requests, mut responses) = prepare().context(Unavailable)?;
+    let (lock, mut requests, mut responses) = match prepare() {
+        Ok(descriptors) => descriptors,
+        Err(error) => {
+            return socket::request(&body, id)
+                .with_context(|| format!("inherited control descriptors unavailable: {error:#}"));
+        }
+    };
     // POSIX locks belong to each process (unlike flock's inherited open-file
     // description lock). Closing `lock` releases this command's reservation.
     let mut record: libc::flock = unsafe { std::mem::zeroed() };
@@ -174,11 +269,24 @@ pub fn request(operation: &Operation) -> Result<String> {
 }
 
 fn prepare() -> Result<(std::fs::File, std::fs::File, std::fs::File)> {
+    let identities: Vec<[String; 4]> = serde_json::from_str(
+        &std::env::var(IDENTITY_ENV).context("missing launcher descriptor identities")?,
+    )?;
+    ensure!(
+        identities.len() == 3,
+        "invalid launcher descriptor identities"
+    );
+    ensure!(
+        identities[0][2] == libc::S_IFIFO.to_string()
+            && identities[1][2] == libc::S_IFIFO.to_string()
+            && identities[2][2] == libc::S_IFREG.to_string(),
+        "invalid control descriptor types"
+    );
     // SAFETY: duplicate() transfers ownership of fresh descriptors. Each file
     // is immediately owned so later preparation failures close earlier copies.
-    let lock = unsafe { std::fs::File::from_raw_fd(duplicate(LOCK_ENV)?) };
-    let requests = unsafe { std::fs::File::from_raw_fd(duplicate(CHANNEL_ENV)?) };
-    let responses = unsafe { std::fs::File::from_raw_fd(duplicate(RESPONSE_ENV)?) };
+    let lock = unsafe { std::fs::File::from_raw_fd(duplicate(LOCK_ENV, &identities[2])?) };
+    let requests = unsafe { std::fs::File::from_raw_fd(duplicate(CHANNEL_ENV, &identities[0])?) };
+    let responses = unsafe { std::fs::File::from_raw_fd(duplicate(RESPONSE_ENV, &identities[1])?) };
     Ok((lock, requests, responses))
 }
 
@@ -211,6 +319,67 @@ fn receive(responses: &mut impl std::io::Read, id: u64) -> Result<Response> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "subprocess helper for detached control cleanup"]
+    fn detached_control_cleanup_child() {
+        if std::env::var_os("MAGI_TEST_CONTROL_CLEANUP").is_none() {
+            return;
+        }
+        let descriptors: Vec<_> = [CHANNEL_ENV, RESPONSE_ENV, LOCK_ENV]
+            .into_iter()
+            .map(|name| std::env::var(name).unwrap())
+            .collect();
+        let mut command = std::process::Command::new("python3");
+        command
+            .args([
+                "-c",
+                r#"import os, sys
+assert not any(n.startswith('MAGI_CHAT_CONTROL_') for n in os.environ)
+for fd in map(int, sys.argv[1:]):
+    try:
+        os.fstat(fd)
+    except OSError:
+        pass
+    else:
+        raise AssertionError('detached child retained control descriptor')
+"#,
+            ])
+            .args(descriptors);
+        super::super::clear_std_environment(&mut command);
+        assert!(command.status().unwrap().success());
+    }
+
+    #[tokio::test]
+    async fn detached_children_lose_control_environment_and_descriptors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let talks = crate::talk::Talks::at(tmp.path().join("talks"));
+        let mut talk: crate::talk::Talk = serde_json::from_value(serde_json::json!({
+            "schema": 1, "id": "cleanup-chat", "repo": ".", "agent": "mock",
+            "status": "open", "turns": [], "created_at": jiff::Timestamp::now(),
+            "updated_at": jiff::Timestamp::now(),
+            "seat": crate::agent::SeatState::new("talk", "mock", 1)
+        }))
+        .unwrap();
+        talks.put(&mut talk).unwrap();
+        let bridge = Bridge::start(tmp.path(), &talk.id, tmp.path()).unwrap();
+        let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--ignored",
+                "--exact",
+                "chat_control::bridge::unix::tests::detached_control_cleanup_child",
+            ])
+            .env("MAGI_TEST_CONTROL_CLEANUP", "1");
+        bridge.attach(&mut command);
+        let output = command.output().await.unwrap();
+        assert!(
+            output.status.success(),
+            "{} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     fn frame(id: u64, result: std::result::Result<String, String>) -> Vec<u8> {
         let body = serde_json::to_vec(&Response { id, result }).unwrap();

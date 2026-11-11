@@ -151,7 +151,7 @@ impl Bridge {
                                     // Authenticate before parsing or executing an operation.
                                     let mut supplied = [0; 64];
                                     pipe.read_exact(&mut supplied).await?;
-                                    ensure!(supplied.as_slice() == token.as_bytes(), "invalid control capability");
+                                    ensure!(super::constant_eq(&supplied, token.as_bytes()), "invalid control capability");
                                     let len = pipe.read_u32().await? as usize;
                                     ensure!(len <= MAX_FRAME, "control request too large");
                                     let mut body = vec![0; len];
@@ -198,18 +198,6 @@ impl Drop for Bridge {
     fn drop(&mut self) {
         self.active.store(false, Ordering::Release);
         self.server.abort();
-    }
-}
-
-pub(crate) fn clear_environment(command: &mut tokio::process::Command) {
-    for name in [
-        CHANNEL_ENV,
-        CAP_ENV,
-        "MAGI_CHAT_CONTROL_FD",
-        "MAGI_CHAT_CONTROL_RESPONSE_FD",
-        "MAGI_CHAT_CONTROL_LOCK_FD",
-    ] {
-        command.env_remove(name);
     }
 }
 
@@ -304,7 +292,7 @@ mod tests {
         assert!(environment.iter().any(|(name, value)| {
             *name == CAP_ENV && *value == Some(std::ffi::OsStr::new(&bridge.token))
         }));
-        clear_environment(&mut command);
+        super::super::clear_environment(&mut command);
         assert!(
             command
                 .as_std()

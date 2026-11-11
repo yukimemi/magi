@@ -119,7 +119,7 @@ where
     *free -= 1;
     drop(free);
     let mut command = std::process::Command::new(std::env::current_exe().expect("current_exe"));
-    for key in WORKER_ENV {
+    for key in WORKER_ENV.into_iter().chain(cli::CONTROL_ENV) {
         command.env_remove(key);
     }
     let out = command

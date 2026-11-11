@@ -694,24 +694,22 @@ if os.environ['TEST_SANDBOX'] == '0':
         for allowed in ['0', '1']:
             p = subprocess.run([binary, 'task', 'control', 'hold', task, 'local fallback'],
                                capture_output=True, text=True, pass_fds=fds,
-                               env={**os.environ, name:'999999', 'MAGI_ALLOW_WRITE':allowed})
+                               env={**os.environ, name:'999999', 'MAGI_CHAT_CONTROL_SOCKET':'/nonexistent/magi-control', 'MAGI_ALLOW_WRITE':allowed})
             assert (p.returncode == 0) == (allowed == '1'), (p.stdout, p.stderr)
     # The local fallback still authorizes the standing chat it speaks for.
     denied = subprocess.run([binary, 'task', 'control', 'hold', task],
                             capture_output=True, text=True, pass_fds=fds,
                             env={**os.environ, 'MAGI_RUN':'no-such-talk', 'MAGI_CHAT_CONTROL_FD':'999999', 'MAGI_ALLOW_WRITE':'1'})
     assert denied.returncode != 0, denied.stdout
-    # A usable descriptor that disconnects after transmission must never fall
-    # back locally, even when write permission is available.
+    # A reused descriptor must fail validation before any request is sent.
     read, write = os.pipe()
     os.close(write)
     p = subprocess.run([binary, 'task', 'control', 'hold', task, 'must not execute locally'],
                        capture_output=True, text=True, pass_fds=(*fds, read),
-                       env={**os.environ, 'MAGI_CHAT_CONTROL_RESPONSE_FD':str(read), 'MAGI_ALLOW_WRITE':'1'})
+                       env={**os.environ, 'MAGI_CHAT_CONTROL_RESPONSE_FD':str(read), 'MAGI_CHAT_CONTROL_SOCKET':'/nonexistent/magi-control', 'MAGI_ALLOW_WRITE':'0'})
     os.close(read)
-    assert p.returncode != 0 and 'outcome is unknown' in p.stderr, p.stderr
-    # The sent operation is allowed to execute at the launcher; drain its
-    # response and prove subsequent requests still select their own results.
+    assert p.returncode != 0 and 'identity mismatch' in p.stderr, p.stderr
+    # A rejected descriptor does not disturb subsequent valid requests.
     control('control', 'hold', task, 'after disconnect')
     saved = json.loads((pathlib.Path(os.environ['MAGI_HOME'])/'queue'/(task+'.json')).read_text())
     assert saved['hold_reason'] == 'after disconnect', saved
@@ -1687,4 +1685,166 @@ fn reconciliation_cli_rejects_non_chat_seats_and_preserves_direct_route() {
         "retention reconciliation requires Unix leases"
     };
     assert!(error.contains(expected), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn chat_transport_rejects_reused_fds_and_never_replays_after_ack() {
+    common::isolated(
+        "chat_transport_rejects_reused_fds_and_never_replays_after_ack",
+        || async {
+            use std::io::{Read as _, Write as _};
+            let f = Fixture::new();
+            let before = std::fs::read(f.queue().path_of(&f.task.id)).unwrap();
+            let sentinel = f.tmp.path().join("unrelated-file");
+            std::fs::write(&sentinel, "must stay intact").unwrap();
+            let script = f.tmp.path().join("reuse.py");
+            std::fs::write(
+                &script,
+                r#"import os, subprocess, sys
+sys.stdin.read()
+fd = int(os.environ['MAGI_CHAT_CONTROL_FD'])
+os.close(fd)
+file = os.open(os.environ['SENTINEL'], os.O_WRONLY)
+os.dup2(file, fd)
+p = subprocess.run([os.environ['TEST_BINARY'], 'task', 'control', 'hold', os.environ['TEST_TASK']],
+    pass_fds=tuple(int(os.environ[n]) for n in ['MAGI_CHAT_CONTROL_FD', 'MAGI_CHAT_CONTROL_RESPONSE_FD', 'MAGI_CHAT_CONTROL_LOCK_FD']), capture_output=True, text=True,
+    env={**os.environ, 'MAGI_CHAT_CONTROL_SOCKET':'/nonexistent/control'})
+assert p.returncode != 0 and 'identity mismatch' in p.stderr, p.stderr
+print('reused descriptor rejected')
+"#,
+            )
+            .unwrap();
+            magi::run::set_home(f.tmp.path().to_owned());
+            let mut spec = f.run.config.agents[0].clone();
+            spec.command = vec!["python3".into(), script.to_str().unwrap().into()];
+            spec.env
+                .extend(common::magi_cli_env(f.tmp.path(), "TEST_BINARY"));
+            spec.env.insert("TEST_TASK".into(), f.task.id.clone());
+            spec.env
+                .insert("SENTINEL".into(), sentinel.to_str().unwrap().into());
+            let mut seat = magi::agent::SeatState::new("chat", "mock", 1);
+            let artifacts = f.talks.artifacts_of(&f.talk);
+            let output = magi::agent::invoke(
+                &spec,
+                &mut seat,
+                &magi::agent::Invocation {
+                    coordination: None,
+                    fetched_base: None,
+                    cwd: f.tmp.path(),
+                    prompt: "",
+                    timeout: std::time::Duration::from_secs(30),
+                    allow_write: false,
+                    sessions: false,
+                    artifacts: &artifacts,
+                    stem: "reuse",
+                    run: &f.talk,
+                    node: CHAT_NODE,
+                    cache_dir: None,
+                    attachments: &[],
+                    writable: &[],
+                },
+            )
+            .await
+            .unwrap();
+            assert!(output.usable(), "{output:?}");
+            assert_eq!(
+                std::fs::read_to_string(sentinel).unwrap(),
+                "must stay intact"
+            );
+            assert_eq!(
+                std::fs::read(f.queue().path_of(&f.task.id)).unwrap(),
+                before
+            );
+
+            // A server that authenticates, reads the request, then loses its response
+            // is fundamentally different from transport preparation failure. Even a
+            // writable chat must not execute this hold locally or resend it.
+            let endpoint = f.tmp.path().join("lost-response");
+            let listener = std::os::unix::net::UnixListener::bind(&endpoint).unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut cap = [0; 64];
+                stream.read_exact(&mut cap).unwrap();
+                stream.write_all(b"A").unwrap();
+                let mut len = [0; 4];
+                stream.read_exact(&mut len).unwrap();
+                let mut body = vec![0; u32::from_be_bytes(len) as usize];
+                stream.read_exact(&mut body).unwrap();
+            });
+            let output = common::magi_cli(f.tmp.path())
+                .env("MAGI_RUN", &f.talk)
+                .env("MAGI_NODE", CHAT_NODE)
+                .env("MAGI_ALLOW_WRITE", "1")
+                .env("MAGI_CHAT_CONTROL_SOCKET", &endpoint)
+                .env("MAGI_CHAT_CONTROL_CAP", "0".repeat(64))
+                .env_remove("MAGI_CHAT_CONTROL_IDENTITIES")
+                .args(["task", "control", "hold", &f.task.id, "must not replay"])
+                .output()
+                .unwrap();
+            server.join().unwrap();
+            assert!(!output.status.success());
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("outcome is unknown"),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                std::fs::read(f.queue().path_of(&f.task.id)).unwrap(),
+                before
+            );
+
+            // 同一性検証を通ったパイプでも、送信後の応答消失はローカル再実行しない。
+            // Match the fixture cwd as well as its home: interpreter shims must
+            // not discover the checkout's tool configuration with an isolated home.
+            let output = std::process::Command::new("python3")
+                .current_dir(f.tmp.path())
+                .args([
+                    "-c",
+                    r#"import fcntl, json, os, stat, subprocess, tempfile
+request_read, request_write = os.pipe()
+response_read, response_write = os.pipe()
+with tempfile.TemporaryFile() as lock:
+    fds = (request_write, response_read, lock.fileno())
+    def identity(fd):
+        info = os.fstat(fd)
+        return [str(info.st_dev), str(info.st_ino), str(stat.S_IFMT(info.st_mode)),
+                str(fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE)]
+    env = {k: v for k, v in os.environ.items() if not k.startswith('MAGI_CHAT_CONTROL_')}
+    env.update(MAGI_CHAT_CONTROL_FD=str(request_write),
+               MAGI_CHAT_CONTROL_RESPONSE_FD=str(response_read),
+               MAGI_CHAT_CONTROL_LOCK_FD=str(lock.fileno()),
+               MAGI_CHAT_CONTROL_IDENTITIES=json.dumps([identity(fd) for fd in fds]),
+               MAGI_NODE='chat', MAGI_ALLOW_WRITE='1')
+    child = subprocess.Popen([env['TEST_BINARY'], 'task', 'control', 'hold',
+                              env['TEST_TASK'], 'must not replay pipe'],
+                             env=env, pass_fds=fds, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    os.close(request_write)
+    os.close(response_read)
+    with os.fdopen(request_read, 'rb') as requests:
+        length = requests.read(4)
+        assert len(length) == 4, length
+        body = requests.read(int.from_bytes(length, 'big'))
+        assert json.loads(body)['operation']['operation'] == 'Hold', body
+    os.close(response_write)
+    out, err = child.communicate(timeout=30)
+    assert child.returncode != 0 and b'outcome is unknown' in err, (out, err)
+"#,
+                ])
+                .envs(common::magi_cli_env(f.tmp.path(), "TEST_BINARY"))
+                .env("MAGI_RUN", &f.talk)
+                .env("TEST_TASK", &f.task.id)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                std::fs::read(f.queue().path_of(&f.task.id)).unwrap(),
+                before
+            );
+        },
+    );
 }

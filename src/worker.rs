@@ -923,6 +923,7 @@ fn detached_command(home: &Path, job: &Job, generation: &Generation) -> Result<C
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(stderr));
+    crate::chat_control::bridge::clear_std_environment(&mut command);
     let mut paths = vec![
         generation
             .executable
@@ -1479,7 +1480,10 @@ mod tests {
         )
         .unwrap();
         let mut command = detached_command(home.path(), &job, &generation).unwrap();
-        for key in ["MAGI_RUN", "MAGI_NODE", "MAGI_SEAT"] {
+        for key in ["MAGI_RUN", "MAGI_NODE", "MAGI_SEAT"]
+            .into_iter()
+            .chain(crate::chat_control::bridge::ENVIRONMENT.iter().copied())
+        {
             assert!(
                 command
                     .get_envs()

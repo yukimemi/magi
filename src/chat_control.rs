@@ -242,7 +242,11 @@ pub struct Filing {
 pub fn has_channel() -> bool {
     #[cfg(any(unix, windows))]
     {
-        std::env::var_os(bridge::CHANNEL_ENV).is_some()
+        #[cfg(unix)]
+        let socket = std::env::var_os("MAGI_CHAT_CONTROL_SOCKET").is_some();
+        #[cfg(windows)]
+        let socket = false;
+        std::env::var_os(bridge::CHANNEL_ENV).is_some() || socket
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -265,11 +269,11 @@ pub async fn dispatch(
     ) {
         #[cfg(unix)]
         {
-            return bridge::request(&operation).context("this operation requires the authenticated chat control channel; restart this chat turn through the launcher");
+            return bridge::request(&operation).context("this operation requires the authenticated chat control channel; repair the launcher/backend transport; reopening the conversation does not repair descriptor propagation");
         }
         #[cfg(windows)]
         {
-            return bridge::request(&operation).await.context("this operation requires the authenticated chat control channel; restart this chat turn through the launcher");
+            return bridge::request(&operation).await.context("this operation requires the authenticated chat control channel; repair the launcher/backend transport; reopening the conversation does not repair descriptor propagation");
         }
         #[cfg(not(any(unix, windows)))]
         {
@@ -277,7 +281,9 @@ pub async fn dispatch(
         }
     }
     #[cfg(unix)]
-    if std::env::var_os(bridge::CHANNEL_ENV).is_some() {
+    if std::env::var_os(bridge::CHANNEL_ENV).is_some()
+        || std::env::var_os("MAGI_CHAT_CONTROL_SOCKET").is_some()
+    {
         // The launcher sets this flag for writable seats, including effective
         // unsandboxed chat turns. execute() still enforces talk authorization.
         match bridge::request(&operation) {

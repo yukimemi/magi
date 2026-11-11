@@ -206,6 +206,7 @@ pub fn start(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    crate::chat_control::bridge::clear_std_environment(&mut cmd);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -378,6 +379,7 @@ pub fn supervise(home: &Path, id: &str) -> Result<()> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     cmd.quiet();
+    crate::chat_control::bridge::clear_std_environment(&mut cmd);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -597,6 +599,7 @@ pub fn execute(home: &Path, id: &str) -> Result<()> {
                 .current_dir(&job.cwd)
                 .env_remove("MAGI_RUN")
                 .env_remove("MAGI_NODE");
+            crate::chat_control::bridge::clear_std_environment(&mut command);
             command.quiet();
             // Signal only after authorization and command construction. The
             // supervisor starts the command timeout at this execution boundary.

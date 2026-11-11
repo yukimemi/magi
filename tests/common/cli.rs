@@ -4,6 +4,18 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
+// Mirror bridge::ENVIRONMENT: fixture CLIs must never borrow a standing
+// conversation's authority from the process running the test suite.
+pub(super) const CONTROL_ENV: [&str; 7] = [
+    "MAGI_CHAT_CONTROL_FD",
+    "MAGI_CHAT_CONTROL_RESPONSE_FD",
+    "MAGI_CHAT_CONTROL_LOCK_FD",
+    "MAGI_CHAT_CONTROL_IDENTITIES",
+    "MAGI_CHAT_CONTROL_SOCKET",
+    "MAGI_CHAT_CONTROL_PIPE",
+    "MAGI_CHAT_CONTROL_CAP",
+];
+
 pub(super) const SEAT_ENV: [&str; 3] = ["MAGI_RUN", "MAGI_NODE", "MAGI_SEAT"];
 // These resets apply to spawned CLIs. Library-embedding test hosts retain their
 // explicit MAGI_WORKER_EXE when copying child isolation settings back to a host.
@@ -88,7 +100,7 @@ pub fn magi_cli(home: &Path) -> std::process::Command {
         .env("HOME", &host_home)
         .env("USERPROFILE", &host_home)
         .env("MAGI_NO_AUTOUPDATE", "1");
-    for key in SEAT_ENV.into_iter().chain(WORKER_ENV) {
+    for key in SEAT_ENV.into_iter().chain(WORKER_ENV).chain(CONTROL_ENV) {
         command.env_remove(key);
     }
     // A fresh CLI belongs to this fixture, not the web server that launched
