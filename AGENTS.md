@@ -1721,8 +1721,24 @@ remain outside those lanes and global queue-worker park requests.
   restoring a recorded operator send to a manual draft. Preserve attachments,
   reply metadata, later drafts and task posts. A posted task turn is not proof
   that the chat answered an operator send.
+- **Bound scheduler retirement, never kill it.** `daemon::restart_detached`
+  waits up to 30 seconds for the old scheduler's reservation and singleton lease
+  to retire, then hands `scheduler-restart.json` to the successor web. Startup
+  resumes this durable request in the background and retries failures; the marker
+  is removed only after spawn succeeds or an acknowledged replacement is observed.
+  The coordinator lease serializes restart consumers; the scheduler reservation
+  and lease still prevent overlapping dispatch. No task/chat controls are sent.
+  Do not signal or cancel a scheduler in a synchronous reconciliation item:
+  queue, question and talk updates can span multiple writes. Poll and item
+  boundaries observe durable Stop directly, even if a synchronous sweep starves
+  the control watcher. Check only before the next complete item, never between
+  its writes; remaining reconciliation is retried by the next scheduler.
+  Older generations without these checks can finish their lap while the upgraded
+  web is already serving. Health/banner and `upgrade.note.json` report the old
+  scheduler PID, elapsed wait and handover bound; a completed web upgrade can
+  still have a scheduler restart pending. This does not change poll costs.
 - **Release, then spawn.** Remember the installed executable path before update,
-  replace the scheduler, release the listener, then start the successor web.
+  request scheduler replacement, release the listener, then start the successor web.
   Answer 202 before process exit. A live legacy embedded scheduler requires one
   finish/park migration; a stale heartbeat alone does not permit overlap.
 - **Evidence stays local.** Active jobs and logs live in `workers/jobs`, terminal

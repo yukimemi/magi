@@ -1318,6 +1318,14 @@ function renderLoop() {
   state.lastUpgradeStage = upgradeStage;
   setAttr(box, "data-upgrade-failed", upgradeStage === "failed" ? "yes" : null);
 
+  if (upgradeInfo && upgradeInfo.scheduler_restart_pending) {
+    setAttr(box, "data-state", "upgrading");
+    setAttr(box, "data-owned", null);
+    setText(text, "Scheduler restart pending; execution workers continue.");
+    quiet(upgradeInfo.scheduler_restart_pending);
+    return;
+  }
+
   const loop = state.health.loop || state.loop || {};
   const daemon = loop.daemon || state.health.daemon || {};
   clear(text);
