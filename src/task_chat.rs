@@ -811,6 +811,39 @@ fn history_reason(home: &Path, q: &Question) -> Option<(String, HistoryResolutio
     ))
 }
 
+/// Task state read directly, never inferred from absence in `Queue::list()`
+/// (a listing skips unreadable records). `Missing` needs no record with the
+/// exact id and no prefix match from `resolve_id`; a prefix match, an
+/// ambiguous prefix or a damaged record is `Unknown` and keeps the question open.
+enum TaskState {
+    Done,
+    Other,
+    Missing,
+    Unknown,
+}
+
+fn task_state(queue: &Queue, id: &str) -> Result<TaskState> {
+    match std::fs::read(queue.path_of(id)) {
+        Ok(bytes) => match serde_json::from_slice::<Task>(&bytes) {
+            Ok(task) if task.id == id => Ok(if task.status == crate::queue::TaskStatus::Done {
+                TaskState::Done
+            } else {
+                TaskState::Other
+            }),
+            _ => Ok(TaskState::Unknown),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match queue.resolve_id(id) {
+                Err(error) if error.to_string().starts_with("no task matches") => {
+                    Ok(TaskState::Missing)
+                }
+                _ => Ok(TaskState::Unknown),
+            }
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn retire_finished_triage(
     queue: &Queue,
     questions: &Questions,
@@ -855,21 +888,13 @@ fn retire_finished_triage(
         }
         _ => {}
     }
-    let reason = match std::fs::read(queue.path_of(&q.run)) {
-        Ok(bytes) => {
-            let task: Task = serde_json::from_slice(&bytes)?;
-            if task.id != q.run || task.status != crate::queue::TaskStatus::Done {
-                return Ok(q.clone());
-            }
-            format!("task {} is done; nothing left to decide", q.run)
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            format!(
-                "task {} is no longer in the queue; nothing left to decide",
-                q.run
-            )
-        }
-        Err(error) => return Err(error.into()),
+    let reason = match task_state(queue, &q.run)? {
+        TaskState::Done => format!("task {} is done; nothing left to decide", q.run),
+        TaskState::Missing => format!(
+            "task {} is no longer in the queue; nothing left to decide",
+            q.run
+        ),
+        TaskState::Other | TaskState::Unknown => return Ok(q.clone()),
     };
     let source = questions
         .update(&q.id, |source| {
@@ -1880,6 +1905,17 @@ mod tests {
                 .status,
             crate::ask::QuestionStatus::Abandoned
         );
+        // An id that is only a prefix of an existing task is not "missing".
+        assert!(matches!(
+            task_state(&queue, "abc").unwrap(),
+            TaskState::Missing
+        ));
+        std::fs::create_dir_all(home.join("queue")).unwrap();
+        std::fs::write(home.join("queue").join("abcdef.json"), "{}").unwrap();
+        assert!(matches!(
+            task_state(&queue, "abc").unwrap(),
+            TaskState::Unknown
+        ));
         let mut forwarded = Question::new(
             "task".into(),
             "implement".into(),
