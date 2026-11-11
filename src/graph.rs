@@ -1568,7 +1568,13 @@ impl Runner {
     /// the phone - ends here, so this is the one place a run that ended
     /// Blocked / Stalled / Failed, or died with an error, is announced to the
     /// attention-report outbox. Best-effort: see [`crate::notices::raise`].
-    pub async fn execute(&mut self) -> Result<()> {
+    pub fn execute(&mut self) -> impl std::future::Future<Output = Result<()>> + '_ {
+        // Allocate before polling: boxing inside an async wrapper would still
+        // retain its construction frame while the nested graph is polled.
+        Box::pin(self.execute_inner())
+    }
+
+    async fn execute_inner(&mut self) -> Result<()> {
         anyhow::ensure!(
             self.state.startup.as_ref().is_none_or(|s| s.complete),
             "startup incomplete; inspect retained evidence before explicit recovery"
@@ -2396,7 +2402,11 @@ impl Runner {
 
     /// The tail of the graph after a trustworthy tally: fold losers, review,
     /// gate, merge, and persist.
-    async fn finish_after_tally(&mut self) -> Result<()> {
+    fn finish_after_tally(&mut self) -> impl std::future::Future<Output = Result<()>> + '_ {
+        Box::pin(self.finish_after_tally_inner())
+    }
+
+    async fn finish_after_tally_inner(&mut self) -> Result<()> {
         // Before the losers are folded: their branches are what the graft
         // reads from.
         self.graft().await?;
@@ -9486,7 +9496,11 @@ impl Runner {
         decision
     }
 
-    async fn merge(&mut self) -> Result<()> {
+    fn merge(&mut self) -> impl std::future::Future<Output = Result<()>> + '_ {
+        Box::pin(self.merge_inner())
+    }
+
+    async fn merge_inner(&mut self) -> Result<()> {
         if self.resource_halt()? || self.hold_base_sync().await? {
             return Ok(());
         }
@@ -9812,7 +9826,11 @@ impl Runner {
     /// this run's CI wait against a *different* run's land-approval resume
     /// in the same repository, which is exactly the "must not wait on
     /// another task" property the daemon's slot-freeing exists to give.
-    async fn run_land(&mut self) -> Result<()> {
+    fn run_land(&mut self) -> impl std::future::Future<Output = Result<()>> + '_ {
+        Box::pin(self.run_land_inner())
+    }
+
+    async fn run_land_inner(&mut self) -> Result<()> {
         crate::pr_head::ensure_owner(&self.state)?;
         let url = self
             .state
