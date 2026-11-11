@@ -5878,6 +5878,11 @@ function scheduleTalkPosition(initial) {
   const id = state.talkDetail.id;
   const pane = $("main").dataset.split === "1" ? $("view-talk") : null;
   const position = () => pane ? pane.scrollTop : window.scrollY;
+  // Search placement owns layout corrections until user input. Native scroll
+  // anchoring can otherwise move the opener behind the sticky header first.
+  const scrollHost = pane || document.body;
+  const overflowAnchor = scrollHost.style.overflowAnchor;
+  if (target) scrollHost.style.overflowAnchor = "none";
   const current = () => state.route.name === "talk" && !state.route.inquiry && state.route.id === id && state.talkDetail.id === id && talkSearchFocus === (target ? focus : null);
   let frame = 0, timer = 0, observer = null, expected = null, anchorTop = null;
   const events = ["wheel", "touchstart", "pointerdown", "keydown"];
@@ -5886,6 +5891,7 @@ function scheduleTalkPosition(initial) {
     cancelAnimationFrame(frame);
     clearTimeout(timer);
     observer?.disconnect();
+    if (target) scrollHost.style.overflowAnchor = overflowAnchor;
     for (const event of events) window.removeEventListener(event, release, true);
     window.removeEventListener("scroll", onScroll, true);
     openingTalkPosition = false;
@@ -5913,7 +5919,9 @@ function scheduleTalkPosition(initial) {
     const anchorPosition = () => last.getBoundingClientRect().top
       - (header ? Math.ceil(header.getBoundingClientRect().height) + 4 : 0);
     expected = position();
-    anchorTop = anchorPosition();
+    // The sticky header may resize during the initial scroll itself. Search
+    // targets must correct to the requested header gap, not preserve that drift.
+    anchorTop = target ? 0 : anchorPosition();
     observer = new ResizeObserver(() => {
       if (!current() || Math.abs(position() - expected) > 1 || !last.isConnected || (!target && last !== $("talk-turns").lastElementChild)) { stop(); return; }
       if (Math.abs(anchorPosition() - anchorTop) > 1) {
@@ -5923,6 +5931,12 @@ function scheduleTalkPosition(initial) {
       }
     });
     observer.observe($("talk-turns"));
+    if (target) {
+      // Deferred progress/header content can change the transcript's offset
+      // without changing the transcript's own dimensions.
+      for (let sibling = $("talk-turns").previousElementSibling; sibling; sibling = sibling.previousElementSibling)
+        observer.observe(sibling);
+    }
     if (header) observer.observe(header);
     if (!target) timer = setTimeout(stop, 2000);
   });

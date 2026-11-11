@@ -6733,7 +6733,7 @@ async fn chat_search_click_waits_for_early_message_in_long_transcript() {
     let talks = Talks::at(home.join("talks"));
     let mut chat = talk::begin(&talks, &fx.config, fx.repo.clone(), None).unwrap();
     for i in 0..240 {
-        let body = if i == 8 { "Search needle 運用".to_owned() }
+        let body = if i == 0 { "運用について".to_owned() }
             else if i == 18 { "Second needle 別の検索".to_owned() }
             else { format!("Question {i}\n\n{}", "Transcript paragraph.\n\n".repeat(4)) };
         talk::record(&mut chat, &talks, &body, Vec::new()).unwrap();
@@ -6750,6 +6750,8 @@ async fn chat_search_click_waits_for_early_message_in_long_transcript() {
         })()"#).await.unwrap();
         browser.wait_for(&page, "document.querySelector('#talks-list .card[href*=message]') !== null", Duration::from_secs(30)).await.unwrap();
         browser.eval(&page, r#"(() => {
+          if (document.querySelector('#talks-list .snippet-field').textContent !== 'title')
+            throw new Error('expected an opener-derived title snippet');
           const native = window.fetch;
           window.fetch = async (...args) => {
             if (String(args[0]).endsWith('/core')) {
@@ -6765,26 +6767,30 @@ async fn chat_search_click_waits_for_early_message_in_long_transcript() {
         let before = browser.eval(&page, "scrollCalls.length").await.unwrap();
         assert_eq!(before, 0, "must not place at the bottom while core is pending");
         browser.eval(&page, "restoreFetch(); releaseCore()").await.unwrap();
-        browser.wait_for(&page, "document.getElementById('talk-message-8-0') && scrollCalls.length > 0", Duration::from_secs(30)).await.unwrap();
+        browser.wait_for(&page, "document.getElementById('talk-message-0-0') && scrollCalls.length > 0", Duration::from_secs(30)).await.unwrap();
         let result = browser.eval(&page, r#"(async () => {
           const frame = () => new Promise(requestAnimationFrame);
           const visible = () => {
-            const r = document.getElementById('talk-message-8-0').getBoundingClientRect();
+            const r = document.getElementById('talk-message-0-0').getBoundingClientRect();
             const pane = document.getElementById('view-talk');
             return r.top >= document.querySelector('.top').getBoundingClientRect().bottom
               && r.top < (document.getElementById('main').dataset.split === '1' ? pane.getBoundingClientRect().bottom : innerHeight);
           };
           await frame(); await frame();
-          if (!visible()) return 'target hidden after core';
-          const matched = document.getElementById('talk-message-8-0');
+          if (!visible()) return 'target hidden after core: ' + JSON.stringify({rect:document.getElementById('talk-message-0-0').getBoundingClientRect().toJSON(), header:document.querySelector('.top').getBoundingClientRect().toJSON(), y:scrollY, calls:scrollCalls});
+          const matched = document.getElementById('talk-message-0-0');
           if (!matched.classList.contains('reply-highlight')) return 'target not highlighted';
           await new Promise(resolve => setTimeout(resolve, 1900));
           if (matched.classList.contains('reply-highlight')) return 'target highlight did not expire';
+          // Late sections above the opener must not hide the search target.
+          document.getElementById('talk-task-progress').style.minHeight = '240px';
+          await frame(); await frame(); await frame();
+          if (!visible()) return 'header layout shift hid opener';
           const calls = scrollCalls.length;
           for (let i = 0; i < 3; i++) deck.renderTalk();
           deck.state.talkDetail.talk.turns.push({who:'agent', body:'Subsequent reply', at:new Date().toISOString()});
           deck.renderTalk(); await frame(); await frame();
-          if (!visible() || scrollCalls.length !== calls) return 'render overrode target';
+          if (!visible() || scrollCalls.length !== calls) return 'render overrode target: ' + JSON.stringify({rect:document.getElementById('talk-message-0-0').getBoundingClientRect().toJSON(), header:document.querySelector('.top').getBoundingClientRect().toJSON(), calls, scrollCalls});
           // Re-clicking an identical result must explicitly reposition it.
           window.dispatchEvent(new WheelEvent('wheel'));
           const pane = document.getElementById('view-talk');

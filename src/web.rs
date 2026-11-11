@@ -5894,7 +5894,31 @@ fn search_chat(terms: &[String], talk: &Talk) -> Option<SearchHit> {
                 .map(move |(j, body)| (i, j, turn, body))
         })
         .collect();
-    if let Some((i, j, turn, body)) = leaf.checked_sub(2).and_then(|i| messages.get(i)) {
+    let target = leaf
+        .checked_sub(2)
+        .and_then(|i| messages.get(i))
+        .or_else(|| {
+            // An unsaved title is the opener's first nonempty line, so its
+            // snippet still identifies a transcript message. Saved titles do not.
+            if leaf != 1 || talk.title.as_ref().is_some_and(|t| !t.text.is_empty()) {
+                return None;
+            }
+            let (index, opener) = talk
+                .turns
+                .iter()
+                .enumerate()
+                .find(|(_, turn)| turn.who == talk::Who::Operator)?;
+            let line = opener
+                .body
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())?;
+            messages.iter().find(|(i, _, _, body)| {
+                *i == index
+                    && body.lines().map(str::trim).find(|line| !line.is_empty()) == Some(line)
+            })
+        });
+    if let Some((i, j, turn, body)) = target {
         hit.target = Some(ChatSearchTarget {
             turn: *i,
             message: *j,
@@ -19026,6 +19050,41 @@ mod tests {
         // All terms may still match across separate display rows.
         assert!(search_chat(&search_terms("message Search"), &talk).is_some());
         assert!(search_chat(&search_terms("messageSearch"), &talk).is_none());
+    }
+
+    #[test]
+    fn chat_search_targets_opener_derived_titles() {
+        let mut talk: Talk = serde_json::from_value(serde_json::json!({
+            "schema": 1, "id": "20260908-205806-ab12", "repo": ".", "agent": "test",
+            "status": "open", "turns": [
+                {"who":"agent", "body":"Welcome", "at":"2026-09-08T20:58:01Z"},
+                {"who":"operator", "body":"\n 運用について\nDetails", "at":"2026-09-08T20:58:02Z"},
+                {"who":"agent", "body":"Latest reply", "at":"2026-09-08T20:59:02Z"}],
+            "created_at": "2026-09-08T20:58:01Z", "updated_at": "2026-09-08T20:59:02Z",
+            "seat": crate::agent::SeatState::new("talk", "test", 1)
+        }))
+        .unwrap();
+        let terms = search_terms("運用");
+        let hit = search_chat(&terms, &talk).unwrap();
+        assert_eq!(hit.field, "title");
+        assert_eq!(hit.snippet, snippet_of("運用について", &terms));
+        let target = hit.target.unwrap();
+        assert_eq!((target.turn, target.message), (1, 0));
+        assert_eq!(target.text, chat_text_key(&talk.turns[1].body));
+        // A blank first send can put the opener line in a later display row.
+        talk.turns[1].messages = serde_json::from_value(serde_json::json!([
+            {"body":"", "attachments":[], "reply":null},
+            {"body":" 運用について\nDetails", "attachments":[], "reply":null}
+        ]))
+        .unwrap();
+        let target = search_chat(&terms, &talk).unwrap().target.unwrap();
+        assert_eq!((target.turn, target.message), (1, 1));
+        assert_eq!(target.text, chat_text_key(" 運用について\nDetails"));
+        talk.title = Some(talk::ChatTitle {
+            text: "運用について".into(),
+            source: talk::TitleSource::Manual,
+        });
+        assert!(search_chat(&terms, &talk).unwrap().target.is_none());
     }
 
     #[tokio::test]
