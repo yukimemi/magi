@@ -498,28 +498,107 @@ fn latest_triage_question(questions: &Questions, task_id: &str) -> Option<Questi
     latest_question(questions, NODE, task_id)
 }
 
-/// Read-only views must use the same exact supersession evidence as grant
-/// admission and answer recording. Missing task evidence keeps the question
-/// actionable; changed question contents invalidate the exemption.
-fn superseded_recovery_question(questions: &Questions, q: &Question) -> bool {
-    questions
-        .root()
-        .parent()
-        .and_then(|home| Queue::at(home.join("queue")).get(&q.run).ok())
-        .is_some_and(|task| crate::repair_budget::reconcile::superseded_question(&task, q))
+/// Latest recovery questions from one effect-view scan. Task filename ids
+/// participate in prefix resolution even when their records are unreadable.
+pub(crate) struct RecoveryIndex {
+    latest: std::collections::HashMap<(String, String), Question>,
+    open: std::collections::BTreeSet<String>,
 }
 
-/// [`latest_triage_question`] for any of this module's nodes.
+impl RecoveryIndex {
+    pub(crate) fn load(questions: &Questions) -> Self {
+        let queue = Queue::at(
+            questions
+                .root()
+                .parent()
+                .unwrap_or(Path::new(""))
+                .join("queue"),
+        );
+        let tasks = queue.list();
+        let ownership = crate::task_chat::InquiryOwnership::from_tasks(&tasks);
+        Self::from_scan(&queue, &tasks, questions.list_for_effects_in(&ownership))
+    }
+
+    fn from_scan(queue: &Queue, tasks: &[Task], all: Vec<Question>) -> Self {
+        let ids = crate::queue::record_ids(queue.root(), "json").unwrap_or_default();
+        let by_id: std::collections::HashMap<_, _> =
+            tasks.iter().map(|task| (task.id.as_str(), task)).collect();
+        let exact: std::collections::HashSet<_> = ids.iter().map(String::as_str).collect();
+        let mut aliases: std::collections::HashMap<&str, Option<&str>> = Default::default();
+        for id in &ids {
+            for boundary in id
+                .char_indices()
+                .map(|(i, _)| i)
+                .chain(std::iter::once(id.len()))
+            {
+                for alias in [&id[..boundary], &id[boundary..]] {
+                    let entry = aliases.entry(alias).or_insert(Some(id));
+                    if *entry != Some(id.as_str()) {
+                        *entry = None;
+                    }
+                }
+            }
+        }
+        let mut index = Self {
+            latest: Default::default(),
+            open: Default::default(),
+        };
+        for q in all {
+            if q.node != NODE && q.node != DEPS_NODE {
+                continue;
+            }
+            let resolved = if exact.contains(q.run.as_str()) {
+                Some(q.run.as_str())
+            } else {
+                aliases.get(q.run.as_str()).copied().flatten()
+            };
+            if let Some(id) = resolved
+                && by_id.get(id).is_some_and(|task| {
+                    crate::repair_budget::reconcile::superseded_question(task, &q)
+                })
+            {
+                continue;
+            }
+            if q.status.open() {
+                index.open.insert(q.run.clone());
+            }
+            let key = (q.node.clone(), q.run.clone());
+            let entry = index.latest.entry(key).or_insert_with(|| q.clone());
+            if (q.asked_at, &q.id) > (entry.asked_at, &entry.id) {
+                *entry = q;
+            }
+        }
+        index
+    }
+
+    fn latest(&self, node: &str, task_id: &str) -> Option<Question> {
+        self.latest
+            .get(&(node.to_owned(), task_id.to_owned()))
+            .cloned()
+    }
+
+    pub(crate) fn pending(&self, task: &Task) -> Vec<Question> {
+        [NODE, DEPS_NODE]
+            .into_iter()
+            .filter_map(|node| {
+                self.latest(node, &task.id).filter(|q| {
+                    q.status.open()
+                        || awaiting_task_chat(q, task)
+                        || (q.status == QuestionStatus::Answered
+                            && if node == NODE {
+                                !already_applied(task, q)
+                            } else {
+                                !task.triage_applied(&q.id)
+                            })
+                })
+            })
+            .collect()
+    }
+}
+
+/// Single-task compatibility entry point; batch callers retain the index.
 fn latest_question(questions: &Questions, node: &str, task_id: &str) -> Option<Question> {
-    questions
-        .list_for_effects()
-        .into_iter()
-        .filter(|q| {
-            q.node == node && q.run == task_id && !superseded_recovery_question(questions, q)
-        })
-        // `asked_at` first: ids carry only whole seconds plus a random
-        // suffix, so two questions filed in the same second order randomly.
-        .max_by(|a, b| a.asked_at.cmp(&b.asked_at).then_with(|| a.id.cmp(&b.id)))
+    RecoveryIndex::load(questions).latest(node, task_id)
 }
 
 /// What an answered triage question's choice means, independent of which
@@ -864,11 +943,17 @@ fn detach_dependants(queue: &Queue, questions: &Questions, root: &str) {
 /// Apply an answered [`DEPS_NODE`] question. Every step is idempotent, so a
 /// pass that dies half way is finished by the next one. Returns whether the
 /// answer was consumed.
-fn apply_deps_answer(queue: &Queue, questions: &Questions, q: &Question, now: Timestamp) -> bool {
+fn apply_deps_answer(
+    queue: &Queue,
+    questions: &Questions,
+    q: &Question,
+    now: Timestamp,
+    ownership: &crate::task_chat::InquiryOwnership,
+) -> bool {
     let Ok(_claim) = queue.claim(&q.run) else {
         return false;
     };
-    let Ok(current) = questions.get_for_effects(&q.id) else {
+    let Ok(current) = questions.get_for_effects_in(&q.id, ownership) else {
         return false;
     };
     if current.status != QuestionStatus::Answered {
@@ -983,7 +1068,9 @@ fn ask_about_stuck_roots(
     report: &mut Report,
 ) {
     let all = questions.list_for_effects();
-    let inv = crate::blockers::Inventory::load(queue, questions);
+    let tasks = queue.list();
+    let recovery = RecoveryIndex::from_scan(queue, &tasks, all.clone());
+    let inv = crate::blockers::Inventory::load_with_tasks(queue, questions, tasks);
     let mut frozen: std::collections::BTreeMap<String, Vec<String>> = Default::default();
     for (id, roots) in inv.stuck() {
         for root in roots {
@@ -995,6 +1082,7 @@ fn ask_about_stuck_roots(
     // A cycle root freezes the others but may have no dependants of its own
     // listed above when it is alone; a root with nothing to name is not asked.
 
+    let ownership = crate::task_chat::InquiryOwnership::default();
     for mut q in all
         .iter()
         .filter(|q| q.node == DEPS_NODE && q.status.open())
@@ -1002,7 +1090,7 @@ fn ask_about_stuck_roots(
     {
         if !frozen.contains_key(&q.run) {
             q.abandon("nothing waits on this task anymore");
-            let _ = questions.put_executable(&mut q);
+            let _ = questions.put_executable_in(&mut q, &ownership);
         }
     }
 
@@ -1012,7 +1100,11 @@ fn ask_about_stuck_roots(
         };
         // Recheck the chain immediately before asking: an earlier inventory
         // may have seen a held prerequisite that has since started running.
-        let current = crate::blockers::Inventory::load(queue, questions);
+        let seeds: Vec<_> = std::iter::once(root_id)
+            .chain(dependant_ids.iter())
+            .filter_map(|id| queue.get(id).ok())
+            .collect();
+        let current = crate::blockers::Inventory::load_for_tasks(queue, questions, &seeds);
         let Some(root) = current.task(root_id) else {
             continue;
         };
@@ -1030,15 +1122,8 @@ fn ask_about_stuck_roots(
         if repair_receipt_notice(queue, root) {
             continue;
         }
-        let latest = all
-            .iter()
-            .filter(|q| {
-                q.node == DEPS_NODE
-                    && q.run == *root_id
-                    && !crate::repair_budget::reconcile::superseded_question(root, q)
-            })
-            .max_by(|a, b| a.asked_at.cmp(&b.asked_at).then_with(|| a.id.cmp(&b.id)));
-        match latest {
+        let latest = recovery.latest(DEPS_NODE, root_id);
+        match latest.as_ref() {
             Some(q) if q.status.open() || awaiting_task_chat(q, root) => continue,
             Some(q) if q.status == QuestionStatus::Answered && !root.triage_applied(&q.id) => {
                 continue;
@@ -1052,7 +1137,7 @@ fn ask_about_stuck_roots(
             }
             _ => {}
         }
-        if pending_for(questions, root) {
+        if !recovery.pending(root).is_empty() {
             continue;
         }
         let cfg = Config::discover(&repo_for(root), config_override)
@@ -1079,16 +1164,22 @@ fn ask_about_stuck_roots(
 /// Kept separate from diagnosis so queued tasks can recover legacy answers too.
 pub fn apply_answers(queue: &Queue, questions: &Questions) -> Vec<String> {
     let mut applied = Vec::new();
-    for q in questions.list_for_effects() {
+    let ownership = crate::task_chat::InquiryOwnership::default();
+    for q in questions.list_for_effects_in(&ownership) {
         if q.node == DEPS_NODE
             && q.status == QuestionStatus::Answered
-            && apply_deps_answer(queue, questions, &q, Timestamp::now())
+            && apply_deps_answer(queue, questions, &q, Timestamp::now(), &ownership)
         {
             applied.push(q.run.clone());
         }
     }
-    for listed in queue.list() {
-        let Some(q) = latest_triage_question(questions, &listed.id) else {
+    // Dependency answers above may change task and question state.
+    let tasks = queue.list();
+    let ownership = crate::task_chat::InquiryOwnership::from_tasks(&tasks);
+    let recovery =
+        RecoveryIndex::from_scan(queue, &tasks, questions.list_for_effects_in(&ownership));
+    for listed in tasks {
+        let Some(q) = recovery.latest(NODE, &listed.id) else {
             continue;
         };
         if q.status != QuestionStatus::Answered || already_applied(&listed, &q) {
@@ -1102,7 +1193,7 @@ pub fn apply_answers(queue: &Queue, questions: &Questions) -> Vec<String> {
         };
         // Settlement holds this same task claim; discard a reply read before
         // it won the claim rather than executing a settled answer.
-        let Ok(q) = questions.get_for_effects(&q.id) else {
+        let Ok(q) = questions.get_for_effects_in(&q.id, &ownership) else {
             continue;
         };
         if q.status != QuestionStatus::Answered {
@@ -1228,6 +1319,7 @@ pub fn run_once(
         ..Report::default()
     };
     ask_about_stuck_roots(queue, questions, config_override, &mut report);
+    let recovery = RecoveryIndex::load(questions);
     for listed in queue.list() {
         if listed.status != TaskStatus::Held {
             continue;
@@ -1253,7 +1345,7 @@ pub fn run_once(
         // A question about what this task freezes is already the one question
         // it owes the operator; a second, about the hold itself, would ask two
         // things at once.
-        if deps_pending(questions, &task) {
+        if deps_pending_in(&recovery, &task) {
             continue;
         }
 
@@ -1262,7 +1354,7 @@ pub fn run_once(
             .map(|(c, _)| c);
         let w = wording(cfg.as_ref().map_or("en", |c| c.graph.language.as_str()));
 
-        if let Some(q) = latest_triage_question(questions, &task.id) {
+        if let Some(q) = recovery.latest(NODE, &task.id) {
             if q.status.open() || awaiting_task_chat(&q, &task) {
                 // Already asked, still waiting - nothing to do this pass.
                 continue;
@@ -1341,21 +1433,7 @@ pub fn pending_for(questions: &Questions, task: &Task) -> bool {
 /// The exact recovery decisions that prevent triage/conductor progress,
 /// including routed decisions and answers not yet applied to this task.
 pub(crate) fn pending_recovery_questions(questions: &Questions, task: &Task) -> Vec<Question> {
-    [NODE, DEPS_NODE]
-        .into_iter()
-        .filter_map(|node| {
-            latest_question(questions, node, &task.id).filter(|q| {
-                q.status.open()
-                    || awaiting_task_chat(q, task)
-                    || (q.status == QuestionStatus::Answered
-                        && if node == NODE {
-                            !already_applied(task, q)
-                        } else {
-                            !task.triage_applied(&q.id)
-                        })
-            })
-        })
-        .collect()
+    RecoveryIndex::load(questions).pending(task)
 }
 
 fn awaiting_task_chat(q: &Question, task: &Task) -> bool {
@@ -1369,8 +1447,8 @@ fn awaiting_task_chat(q: &Question, task: &Task) -> bool {
 /// Is the latest [`DEPS_NODE`] question about `task` still open, or answered
 /// but not yet applied? Same reasoning as [`pending_for`]: the gap between an
 /// answer and the next [`run_once`] pass must not be walked through.
-fn deps_pending(questions: &Questions, task: &Task) -> bool {
-    match latest_question(questions, DEPS_NODE, &task.id) {
+fn deps_pending_in(recovery: &RecoveryIndex, task: &Task) -> bool {
+    match recovery.latest(DEPS_NODE, &task.id) {
         Some(q) if q.status.open() || awaiting_task_chat(&q, task) => true,
         Some(q) if q.status == QuestionStatus::Answered => !task.triage_applied(&q.id),
         _ => false,
@@ -1382,16 +1460,7 @@ fn deps_pending(questions: &Questions, task: &Task) -> bool {
 /// decision, rather than have it read identically to one nobody has looked
 /// at yet.
 pub fn open_task_ids(questions: &Questions) -> std::collections::BTreeSet<String> {
-    questions
-        .list_for_effects()
-        .into_iter()
-        .filter(|q| {
-            (q.node == NODE || q.node == DEPS_NODE)
-                && q.status.open()
-                && !superseded_recovery_question(questions, q)
-        })
-        .map(|q| q.run)
-        .collect()
+    RecoveryIndex::load(questions).open
 }
 
 #[cfg(test)]
@@ -1410,6 +1479,292 @@ mod tests {
 
     fn task(title: &str, repo: PathBuf) -> Task {
         Task::new(title.to_owned(), format!("do {title}"), repo, Source::Human)
+    }
+
+    #[test]
+    fn recovery_index_preserves_supersession_and_ambiguous_file_references() {
+        let (dir, queue, questions) = store();
+        let mut t = task("supersession", dir.path().join("repo"));
+        t.id = "task-alpha-end".into();
+        queue.put(&mut t).unwrap();
+        let at: Timestamp = "2026-11-01T00:00:00Z".parse().unwrap();
+        let mut all = Vec::new();
+        for (i, run) in ["task-alpha-end", "task-alpha", "end"]
+            .into_iter()
+            .enumerate()
+        {
+            let mut q = Question::new(
+                run.into(),
+                NODE.into(),
+                SEAT.into(),
+                "superseded".into(),
+                String::new(),
+                EN.choices3(),
+            );
+            q.id = format!("superseded-{i}");
+            q.asked_at = at;
+            all.push(q);
+        }
+        let evidence: Vec<_> = all
+            .iter()
+            .map(|q| {
+                (
+                    q.id.clone(),
+                    crate::repair_budget::reconcile::source(q).unwrap(),
+                )
+            })
+            .collect();
+        t.repair_reconciliations.push(
+            serde_json::from_value(serde_json::json!({
+                "request": {
+                    "task": t.id, "run": "run", "head": "head", "expect_pass": 0,
+                    "receipt": "grant", "question": "original", "answer_at": at,
+                    "request": "reconcile", "reason": "fixture"
+                },
+                "grant": {
+                    "request": {
+                        "task": t.id, "run": "run", "kind": "review", "rounds": 1,
+                        "head": "head", "expect_pass": 0, "request": "grant", "reason": "fixture"
+                    },
+                    "at": at, "decision": null, "contract": "fixture"
+                },
+                "source": "fixture", "application": "fixture", "decision": at,
+                "superseded_questions": evidence
+            }))
+            .unwrap(),
+        );
+        queue.put(&mut t).unwrap();
+        let index = RecoveryIndex::from_scan(&queue, &[t.clone()], all.clone());
+        assert!(index.open.is_empty());
+        // Unreadable filenames still make prefixes and suffixes ambiguous.
+        std::fs::write(queue.path_of("task-alphabet-other"), "{").unwrap();
+        std::fs::write(queue.path_of("broken-end"), "{").unwrap();
+        let index = RecoveryIndex::from_scan(&queue, &[t.clone()], all.clone());
+        assert_eq!(index.open, ["end".into(), "task-alpha".into()].into());
+        all[0].detail.push_str("changed evidence");
+        let index = RecoveryIndex::from_scan(&queue, &[t], all);
+        assert!(index.open.contains("task-alpha-end"));
+        assert_eq!(questions.list().len(), 0);
+    }
+
+    #[test]
+    fn ownership_index_requires_positive_foreground_provenance() {
+        let (dir, queue, _) = store();
+        let mut run = crate::run::RunState::new(
+            dir.path().join("repo"),
+            "main".into(),
+            "origin".into(),
+            "fixture".into(),
+            Config::default(),
+        );
+        run.origin = Some(crate::run::Origin::operator());
+        run.save_under(dir.path()).unwrap();
+        let foreground = run.id.clone();
+        run.id = "owned-run".into();
+        run.origin = Some(crate::run::Origin::queue("missing-task"));
+        run.save_under(dir.path()).unwrap();
+        let mut task = task("owner", dir.path().join("repo"));
+        task.runs = vec!["linked-run".into()];
+        queue.put(&mut task).unwrap();
+        let ownership = crate::task_chat::InquiryOwnership::default();
+        for (run, cwd, node, seat, expected) in [
+            (foreground.as_str(), true, "node", "seat", true),
+            (foreground.as_str(), false, "node", "seat", false),
+            ("owned-run", true, "ask", "operator", false),
+            ("linked-run", true, "ask", "operator", false),
+            ("missing-run", true, "node", "seat", false),
+            ("missing-run", false, "ask", "operator", true),
+        ] {
+            let mut q = Question::new(
+                run.into(),
+                node.into(),
+                seat.into(),
+                "provenance".into(),
+                String::new(),
+                Vec::new(),
+            );
+            q.cwd = cwd.then(|| dir.path().join("repo").display().to_string());
+            assert_eq!(standalone_by_scanning(dir.path(), &q), expected);
+            assert_eq!(
+                crate::task_chat::standalone_inquiry_in(dir.path(), &q, &ownership),
+                expected
+            );
+        }
+    }
+
+    // Deliberately retain the pre-index predicate as an independent oracle.
+    fn standalone_by_scanning(home: &Path, q: &Question) -> bool {
+        if q.routed_task.is_some()
+            || (q.node == crate::bump::NOTICE_NODE && q.seat == "release-watch")
+        {
+            return false;
+        }
+        if q.legacy_foreground || q.run.is_empty() {
+            return true;
+        }
+        if Queue::at(home.join("queue"))
+            .list()
+            .iter()
+            .any(|task| task.id == q.run || task.runs.contains(&q.run))
+        {
+            return false;
+        }
+        let run = crate::run::RunState::load_under(&q.run, home).ok();
+        let origin = run.as_ref().and_then(|run| run.origin.as_ref());
+        if origin.is_some_and(|origin| origin.task.is_some()) {
+            return false;
+        }
+        (q.node == "ask" && q.seat == "operator")
+            || (q.cwd.is_some() && origin.is_some_and(|origin| origin.task.is_none()))
+    }
+
+    fn scan_counts() -> (usize, usize, usize) {
+        (
+            crate::queue::LIST_READS.with(|c| c.replace(0)),
+            crate::queue::TASK_READS.with(|c| c.replace(0)),
+            crate::ask::QUESTION_SCANS.with(|c| c.replace(0)),
+        )
+    }
+
+    #[test]
+    fn recovery_scans_are_linear_and_match_legacy_decisions() {
+        let mut previous = None;
+        for size in [150, 300] {
+            let (dir, queue, questions) = store();
+            let at: Timestamp = "2026-11-01T00:00:00Z".parse().unwrap();
+            let mut sources = Vec::new();
+            let mut expected_applied = std::collections::BTreeSet::new();
+            for i in 0..size {
+                let mut t = task("scan fixture", dir.path().join("repo"));
+                t.id = format!("task-{i:04}");
+                t.runs = vec![format!("run-{i:04}")];
+                t.hold_manual(Some("held for scan fixture".into()));
+                queue.put(&mut t).unwrap();
+                let mut q = Question::new(
+                    t.id.clone(),
+                    NODE.into(),
+                    SEAT.into(),
+                    "scan fixture".into(),
+                    String::new(),
+                    EN.choices3(),
+                );
+                q.id = format!("question-{i:04}");
+                q.asked_at = at;
+                match i % 10 {
+                    0 => {
+                        q.answer(Answer::Choice(q.choices[1].clone())).unwrap();
+                        q.accepted_answer_at = q.answered_at;
+                        expected_applied.insert(t.id.clone());
+                    }
+                    1 => q.node = DEPS_NODE.into(),
+                    2 => {
+                        q.answer(Answer::Choice(q.choices[0].clone())).unwrap();
+                    }
+                    3 => {
+                        q.run = format!("missing-{i}");
+                        q.legacy_foreground = true;
+                    }
+                    4 => {
+                        q.run.clear();
+                        q.node = crate::bump::NOTICE_NODE.into();
+                        q.seat = "release-watch".into();
+                    }
+                    5 => {
+                        q.run = format!("missing-{i}");
+                        q.node = "ask".into();
+                        q.seat = "operator".into();
+                    }
+                    6 => q.run = t.runs[0].clone(),
+                    7 => q.run = format!("missing-{i}"),
+                    8 => q.abandon("fixture"),
+                    _ => {}
+                }
+                questions.put(&mut q).unwrap();
+                sources.push(q.id.clone());
+                if i % 10 == 9 {
+                    q.id = format!("question-{i:04}-tie");
+                    questions.put(&mut q).unwrap();
+                    sources.push(q.id.clone());
+                }
+            }
+            let migration = dir.path().join("notifications/task-chat-migration-v1");
+            std::fs::create_dir_all(&migration).unwrap();
+            std::fs::write(
+                migration.join("state.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "schema": 1, "classification_revision": 1, "pending": [], "sources": sources
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+            scan_counts();
+            let all = questions.list_for_effects();
+            let (lists, reads, scans) = scan_counts();
+            assert_eq!((lists, reads, scans), (1, size, 1));
+            let tasks = queue.list();
+            let ownership = crate::task_chat::InquiryOwnership::from_tasks(&tasks);
+            for q in &all {
+                assert_eq!(
+                    crate::task_chat::standalone_inquiry_in(dir.path(), q, &ownership),
+                    standalone_by_scanning(dir.path(), q),
+                    "{}",
+                    q.id,
+                );
+                if q.id.ends_with("0002") {
+                    assert!(q.answer.is_none(), "saved consent remains fenced");
+                }
+            }
+            let recovery = RecoveryIndex::from_scan(&queue, &tasks, all.clone());
+            for task in &tasks {
+                for node in [NODE, DEPS_NODE] {
+                    let expected = all
+                        .iter()
+                        .filter(|q| {
+                            q.node == node
+                                && q.run == task.id
+                                && !queue.get(&q.run).ok().is_some_and(|t| {
+                                    crate::repair_budget::reconcile::superseded_question(&t, q)
+                                })
+                        })
+                        .max_by(|a, b| a.asked_at.cmp(&b.asked_at).then_with(|| a.id.cmp(&b.id)));
+                    assert_eq!(
+                        recovery.latest(node, &task.id).map(|q| q.id),
+                        expected.map(|q| q.id.clone())
+                    );
+                }
+            }
+
+            scan_counts();
+            crate::daemon::apply_task_choice_actions(&queue, &questions, dir.path());
+            assert_eq!(
+                scan_counts(),
+                (1, size, 1),
+                "choice-action rechecks share ownership"
+            );
+
+            scan_counts();
+            let applied: std::collections::BTreeSet<_> =
+                apply_answers(&queue, &questions).into_iter().collect();
+            let counts = scan_counts();
+            assert_eq!(applied, expected_applied);
+            assert!(counts.0 <= 3, "queue scans: {counts:?}");
+            assert!(counts.1 <= 4 * size, "task reads: {counts:?}");
+            assert_eq!(counts.2, 2, "question scans: {counts:?}");
+            if let Some((_, reads, scans)) = previous {
+                assert!(counts.1 <= 2 * reads);
+                assert_eq!(counts.2, scans);
+            }
+            previous = Some(counts);
+
+            let config = gate_disabled_config(dir.path());
+            scan_counts();
+            run_once(&queue, &questions, Some(&config), Timestamp::now());
+            let lap = scan_counts();
+            assert!(lap.0 <= 12, "triage queue scans: {lap:?}");
+            assert!(lap.1 <= 14 * size, "triage task reads: {lap:?}");
+            assert!(lap.2 <= 6, "triage question scans: {lap:?}");
+        }
     }
 
     #[test]

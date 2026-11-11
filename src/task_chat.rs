@@ -222,6 +222,17 @@ pub fn post(
     task_id: &str,
     q: &Question,
 ) -> Result<String> {
+    post_in(queue, talks, home, task_id, q, &InquiryOwnership::default())
+}
+
+fn post_in(
+    queue: &Queue,
+    talks: &Talks,
+    home: &Path,
+    task_id: &str,
+    q: &Question,
+    ownership: &InquiryOwnership,
+) -> Result<String> {
     let task = queue.get(task_id)?;
     let outbox = crate::task_inquiry::Outbox::at(home);
     outbox.enqueue(live_record(home, &task, q))?;
@@ -232,7 +243,7 @@ pub fn post(
         && q.accepted_answer_at.is_some()
         && q.accepted_answer_at == q.answered_at
     {
-        accept_fresh_reply(home, q)?;
+        accept_fresh_reply(home, q, ownership)?;
     }
     outbox.deliver(queue, talks, &q.id)
 }
@@ -270,9 +281,39 @@ pub(crate) fn migration_sources(home: &Path) -> Result<Option<std::collections::
     Ok(state.sources)
 }
 
+/// Ownership evidence scoped to one scan, with no process-wide cache.
+#[derive(Default)]
+pub(crate) struct InquiryOwnership {
+    owned: std::cell::OnceCell<std::collections::HashSet<String>>,
+    origins: std::cell::RefCell<std::collections::HashMap<String, (bool, bool)>>,
+}
+
+impl InquiryOwnership {
+    pub(crate) fn from_tasks(tasks: &[Task]) -> Self {
+        let index = Self::default();
+        let _ = index.owned.set(Self::owned_ids(tasks));
+        index
+    }
+
+    fn owned_ids(tasks: &[Task]) -> std::collections::HashSet<String> {
+        tasks
+            .iter()
+            .flat_map(|task| std::iter::once(task.id.clone()).chain(task.runs.iter().cloned()))
+            .collect()
+    }
+}
+
 /// A foreground ask without run/task attribution retains legacy ownership.
 /// Release-watch inquiries may have an empty run but still belong to a task.
 pub(crate) fn standalone_inquiry(home: &Path, q: &Question) -> bool {
+    standalone_inquiry_in(home, q, &InquiryOwnership::default())
+}
+
+pub(crate) fn standalone_inquiry_in(
+    home: &Path,
+    q: &Question,
+    ownership: &InquiryOwnership,
+) -> bool {
     if q.routed_task.is_some() || (q.node == crate::bump::NOTICE_NODE && q.seat == "release-watch")
     {
         return false;
@@ -282,35 +323,41 @@ pub(crate) fn standalone_inquiry(home: &Path, q: &Question) -> bool {
     }
     // Older foreground asks have no explicit route marker. Recognize only
     // positive legacy provenance, never infer it from a missing task alone.
-    if Queue::at(home.join("queue"))
-        .list()
-        .iter()
-        .any(|task| task.id == q.run || task.runs.contains(&q.run))
+    if ownership
+        .owned
+        .get_or_init(|| InquiryOwnership::owned_ids(&Queue::at(home.join("queue")).list()))
+        .contains(&q.run)
     {
         return false;
     }
-    let run = crate::run::RunState::load_under(&q.run, home).ok();
-    if run
-        .as_ref()
-        .and_then(|run| run.origin.as_ref())
-        .is_some_and(|origin| origin.task.is_some())
-    {
+    let (task_origin, foreground_origin) = *ownership
+        .origins
+        .borrow_mut()
+        .entry(q.run.clone())
+        .or_insert_with(|| {
+            let run = crate::run::RunState::load_under(&q.run, home).ok();
+            let origin = run.as_ref().and_then(|run| run.origin.as_ref());
+            (
+                origin.is_some_and(|origin| origin.task.is_some()),
+                origin.is_some_and(|origin| origin.task.is_none()),
+            )
+        });
+    if task_origin {
         return false;
     }
-    (q.node == "ask" && q.seat == "operator")
-        || (q.cwd.is_some()
-            && run
-                .as_ref()
-                .and_then(|run| run.origin.as_ref())
-                .is_some_and(|origin| origin.task.is_none()))
+    (q.node == "ask" && q.seat == "operator") || (q.cwd.is_some() && foreground_origin)
 }
 
 pub(crate) fn migrated_source(home: &Path, id: &str) -> bool {
+    migrated_source_in(home, id, &InquiryOwnership::default())
+}
+
+pub(crate) fn migrated_source_in(home: &Path, id: &str, ownership: &InquiryOwnership) -> bool {
     // Also repairs the effective scope of older, overbroad journals without
     // decoding the entire history on each scheduler lap.
     if Questions::at(home.join("questions"))
         .read_history(id)
-        .is_ok_and(|q| standalone_inquiry(home, &q))
+        .is_ok_and(|q| standalone_inquiry_in(home, &q, ownership))
     {
         return false;
     }
@@ -326,8 +373,12 @@ pub(crate) fn migrated_source(home: &Path, id: &str) -> bool {
 /// A live answer update is distinct from importing a saved reply. Persist its
 /// exact generation before Questions exposes it to an effect consumer, even
 /// when the first migration sweep has not run yet. Queuing is not resolution.
-pub(crate) fn accept_fresh_reply(home: &Path, q: &Question) -> Result<()> {
-    if standalone_inquiry(home, q) {
+pub(crate) fn accept_fresh_reply(
+    home: &Path,
+    q: &Question,
+    ownership: &InquiryOwnership,
+) -> Result<()> {
+    if standalone_inquiry_in(home, q, ownership) {
         return Ok(());
     }
     let outbox = crate::task_inquiry::Outbox::at(home);
@@ -573,10 +624,11 @@ fn migrate_batch(
         .drain(..migration.pending.len().min(64))
         .collect();
     let tasks = queue.list();
+    let ownership = InquiryOwnership::from_tasks(&tasks);
     for id in batch {
         let result = (|| -> Result<()> {
             let q = questions.read_history(&id)?;
-            if standalone_inquiry(home, &q) {
+            if standalone_inquiry_in(home, &q, &ownership) {
                 if let Some(sources) = &mut migration.sources {
                     sources.remove(&id);
                 }
@@ -625,7 +677,7 @@ fn migrate_batch(
                 "source changed while classifying saved history; retry with its current generation"
             );
             outbox.reclassify_history(record)?;
-            sync_effect_receipt(home, queue, &q);
+            sync_effect_receipt_in(home, queue, &q, &ownership);
             let imported = outbox.get(&q.id)?;
             if imported.archived
                 || imported
@@ -641,12 +693,12 @@ fn migrate_batch(
                 && let Some(task) = task
             {
                 if q.routed_task.as_ref() != Some(&task.id) {
-                    questions.update(&q.id, |source| {
+                    questions.update_in(&q.id, &ownership, |source| {
                         source.routed_task = Some(task.id.clone());
                         Ok(())
                     })?;
                 }
-                post(queue, talks, home, &task.id, &q)?;
+                post_in(queue, talks, home, &task.id, &q, &ownership)?;
             } else if task.is_some() {
                 // Native discussion of unknown effects is supported without
                 // reopening or rerouting the immutable answered source.
@@ -764,6 +816,7 @@ pub fn sweep(queue: &Queue, talks: &Talks, questions: &Questions, home: &Path) {
         all.iter().map(|q| q.id.clone()).collect()
     });
     let outbox = crate::task_inquiry::Outbox::at(home);
+    let ownership = InquiryOwnership::from_tasks(&tasks);
     for q in &all {
         if deferred.contains(&q.id) {
             continue;
@@ -772,7 +825,7 @@ pub fn sweep(queue: &Queue, talks: &Talks, questions: &Questions, home: &Path) {
             // Execution views quarantine imported replies. Receipt projection
             // needs their original payload, without making it executable.
             match questions.read_history(&q.id) {
-                Ok(source) => sync_effect_receipt(home, queue, &source),
+                Ok(source) => sync_effect_receipt_in(home, queue, &source, &ownership),
                 Err(error) => {
                     tracing::warn!("decision {} source history: {error:#}", q.id);
                     let _ = outbox.update_decision(&q.id, |d| {
@@ -786,7 +839,7 @@ pub fn sweep(queue: &Queue, talks: &Talks, questions: &Questions, home: &Path) {
                 && chat_routable(q)
                 && let Some(task) = task_of_with_watches(q, &tasks, &watches)
             {
-                if let Err(error) = post(queue, talks, home, &task, q) {
+                if let Err(error) = post_in(queue, talks, home, &task, q, &ownership) {
                     tracing::warn!("decision {} owner recovery: {error:#}", q.id);
                 }
             }
@@ -795,7 +848,7 @@ pub fn sweep(queue: &Queue, talks: &Talks, questions: &Questions, home: &Path) {
     for q in all.into_iter().filter(|q| {
         q.status.open()
             && chat_routable(q)
-            && !standalone_inquiry(home, q)
+            && !standalone_inquiry_in(home, q, &ownership)
             && !deferred.contains(&q.id)
     }) {
         // The pre-migration scan may have projected a not-yet-imported source
@@ -840,8 +893,8 @@ pub fn sweep(queue: &Queue, talks: &Talks, questions: &Questions, home: &Path) {
             if q.routed_chat.is_some() {
                 return Ok(());
             }
-            let chat = post(queue, talks, home, &task_id, &q)?;
-            questions.update(&q.id, |r| {
+            let chat = post_in(queue, talks, home, &task_id, &q, &ownership)?;
+            questions.update_in(&q.id, &ownership, |r| {
                 r.routed_chat = Some(chat.clone());
                 if awaits_decision(r) {
                     // Its answer is still read by the machinery behind it; the
@@ -867,10 +920,14 @@ pub fn sweep(queue: &Queue, talks: &Talks, questions: &Questions, home: &Path) {
 /// Project only authoritative durable application evidence. Answered, delivered
 /// and read fields are deliberately not treated as effect receipts.
 pub(crate) fn sync_effect_receipt(home: &Path, queue: &Queue, q: &Question) {
+    sync_effect_receipt_in(home, queue, q, &InquiryOwnership::default())
+}
+
+fn sync_effect_receipt_in(home: &Path, queue: &Queue, q: &Question, ownership: &InquiryOwnership) {
     if q.answer.is_some()
         && q.accepted_answer_at.is_some()
         && q.accepted_answer_at == q.answered_at
-        && let Err(error) = accept_fresh_reply(home, q)
+        && let Err(error) = accept_fresh_reply(home, q, ownership)
     {
         tracing::warn!("decision {} acceptance: {error:#}", q.id);
         return;

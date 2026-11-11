@@ -1218,14 +1218,19 @@ pub(crate) fn task_of_question<'a>(tasks: &'a [Task], q: &ask::Question) -> Opti
 /// Legacy conductor prose never becomes a maintenance command by inference.
 /// Replace unsupported open labels under the question lock before dispatch.
 fn repair_choice_offers(questions: &Questions) {
-    for q in questions.list_for_effects().into_iter().filter(|q| {
-        q.status.open()
-            && q.node == crate::conduct::NODE
-            && q.choices
-                .iter()
-                .any(|c| crate::choice_effect::describe(q, c).is_none())
-    }) {
-        let _ = questions.update(&q.id, |current| {
+    let ownership = crate::task_chat::InquiryOwnership::default();
+    for q in questions
+        .list_for_effects_in(&ownership)
+        .into_iter()
+        .filter(|q| {
+            q.status.open()
+                && q.node == crate::conduct::NODE
+                && q.choices
+                    .iter()
+                    .any(|c| crate::choice_effect::describe(q, c).is_none())
+        })
+    {
+        let _ = questions.update_in(&q.id, &ownership, |current| {
             if current.status.open() {
                 crate::choice_effect::executable_conductor(current);
                 if let Some(deputy) = &mut current.deputy {
@@ -1252,12 +1257,13 @@ pub async fn apply_choice_actions(queue: &Queue, questions: &Questions, home: &P
 /// Apply bounded maintenance effects independently of question ownership: a
 /// release watcher need not have a queue task, and a predecessor is another run.
 async fn apply_maintenance_choices(queue: &Queue, questions: &Questions, home: &Path) {
-    for q in questions.list_for_effects() {
+    let ownership = crate::task_chat::InquiryOwnership::default();
+    for q in questions.list_for_effects_in(&ownership) {
         // Read again under the same fence used by explicit settlement.
         let Ok(_execution) = crate::task_inquiry::Outbox::at(home).execution_claim(&q.id) else {
             continue;
         };
-        let Ok(q) = questions.get_for_effects(&q.id) else {
+        let Ok(q) = questions.get_for_effects_in(&q.id, &ownership) else {
             continue;
         };
         let Some(action) = q.chosen_action().filter(|a| a.maintenance()) else {
@@ -1549,12 +1555,13 @@ pub(crate) async fn rerun_checks_once(
 /// ordinary `unfinished_run` logic resumes that same run.
 pub(crate) fn apply_task_choice_actions(queue: &Queue, questions: &Questions, home: &Path) {
     let tasks = queue.list();
-    for q in questions.list_for_effects() {
+    let ownership = crate::task_chat::InquiryOwnership::from_tasks(&tasks);
+    for q in questions.list_for_effects_in(&ownership) {
         // Read again under the same fence used by explicit settlement.
         let Ok(_execution) = crate::task_inquiry::Outbox::at(home).execution_claim(&q.id) else {
             continue;
         };
-        let Ok(q) = questions.get_for_effects(&q.id) else {
+        let Ok(q) = questions.get_for_effects_in(&q.id, &ownership) else {
             continue;
         };
         // Dismissal is committed by the question writer, never a resume.
@@ -1737,6 +1744,7 @@ fn asker_may_still_read(questions: &Questions, q: &ask::Question, home: &Path) -
 /// calling `Questions::open_for` (a full disk scan on its own) once per task.
 fn reconcile_task_questions(queue: &Queue, questions: &Questions) {
     let tasks = queue.list();
+    let ownership = crate::task_chat::InquiryOwnership::from_tasks(&tasks);
     let by_id: std::collections::BTreeMap<&str, &Task> =
         tasks.iter().map(|t| (t.id.as_str(), t)).collect();
     let referenced: Vec<&str> = tasks
@@ -1744,10 +1752,10 @@ fn reconcile_task_questions(queue: &Queue, questions: &Questions) {
         .flat_map(|task| task.blocked_by.iter().map(String::as_str))
         .collect();
 
-    for mut question in questions.list_for_effects() {
+    for mut question in questions.list_for_effects_in(&ownership) {
         if !question.status.open()
             || question.node != crate::conduct::NODE
-            || questions.held_reply(&question.id)
+            || questions.held_reply_in(&question.id, &ownership)
         {
             continue;
         }
@@ -1768,7 +1776,7 @@ fn reconcile_task_questions(queue: &Queue, questions: &Questions) {
             "task {} no longer waits for this answer",
             task.short()
         ));
-        if let Err(e) = questions.put(&mut question) {
+        if let Err(e) = questions.put_in(&mut question, &ownership) {
             tracing::warn!(
                 "could not retire question {} for task {}: {e:#}",
                 question.short(),

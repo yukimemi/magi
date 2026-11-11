@@ -29,6 +29,11 @@
 //!
 //! [`RunStatus::Waiting`]: crate::run::RunStatus::Waiting
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static QUESTION_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -1475,6 +1480,15 @@ impl Questions {
         id: &str,
         f: impl FnOnce(&mut Question) -> Result<T>,
     ) -> Result<(Question, T)> {
+        self.update_in(id, &crate::task_chat::InquiryOwnership::default(), f)
+    }
+
+    pub(crate) fn update_in<T>(
+        &self,
+        id: &str,
+        ownership: &crate::task_chat::InquiryOwnership,
+        f: impl FnOnce(&mut Question) -> Result<T>,
+    ) -> Result<(Question, T)> {
         std::fs::create_dir_all(&self.root)
             .with_context(|| format!("create {}", self.root.display()))?;
         let lock = self.root.join(format!("{id}.lock"));
@@ -1511,7 +1525,8 @@ impl Questions {
         let effective_dismissal = |q: &Question| {
             q.resolution().as_deref() == Some(crate::merge_decision::DISMISS)
                 && !self.root.parent().is_some_and(|home| {
-                    crate::task_chat::saved_reply_requires_confirmation(home, q)
+                    crate::task_chat::migrated_source_in(home, &q.id, ownership)
+                        && crate::task_chat::source_reply_needs_confirmation(home, q)
                 })
         };
         let was_dismissed = effective_dismissal(&q);
@@ -1520,19 +1535,27 @@ impl Questions {
         if q.resolution().is_some() && prior_answer != (q.answered_at, q.resolution()) {
             let home = self.root.parent().context("question store has no home")?;
             q.accepted_answer_at = q.answered_at;
-            crate::task_chat::accept_fresh_reply(home, &q)?;
+            crate::task_chat::accept_fresh_reply(home, &q, ownership)?;
         }
         if !was_dismissed && effective_dismissal(&q) {
             let home = self.root.parent().context("question store has no home")?;
             crate::merge_decision::dismiss(home, &q)?;
         }
-        self.put(&mut q)?;
+        self.put_in(&mut q, ownership)?;
         Ok((q, out))
     }
 
     /// File a component-owned question only when every choice has an effect.
     /// Legacy records remain readable; this is deliberately a creation check.
     pub fn put_executable(&self, q: &mut Question) -> Result<()> {
+        self.put_executable_in(q, &crate::task_chat::InquiryOwnership::default())
+    }
+
+    pub(crate) fn put_executable_in(
+        &self,
+        q: &mut Question,
+        ownership: &crate::task_chat::InquiryOwnership,
+    ) -> Result<()> {
         anyhow::ensure!(
             q.actions.keys().all(|c| q.choices.contains(c)),
             "question action names an unoffered choice"
@@ -1544,16 +1567,24 @@ impl Questions {
                 q.node
             );
         }
-        self.put(q)
+        self.put_in(q, ownership)
     }
 
     /// Write a question, atomically, so a process killed mid-write leaves the
     /// previous state readable rather than a truncated file that would strand
     /// the run waiting on it.
     pub fn put(&self, q: &mut Question) -> Result<()> {
+        self.put_in(q, &crate::task_chat::InquiryOwnership::default())
+    }
+
+    pub(crate) fn put_in(
+        &self,
+        q: &mut Question,
+        ownership: &crate::task_chat::InquiryOwnership,
+    ) -> Result<()> {
         if self.path_of(&q.id).exists()
             && let Ok(saved) = self.read_history(&q.id)
-            && self.held_reply(&q.id)
+            && self.held_reply_in(&q.id, ownership)
             && (saved.status != q.status
                 || saved.answer != q.answer
                 || saved.answered_at != q.answered_at)
@@ -1619,15 +1650,38 @@ impl Questions {
     /// Execution-only projection: saved consent is never a new request.
     /// UI and API readers must use `get` / `list`, which retain saved status.
     pub fn get_for_effects(&self, id: &str) -> Result<Question> {
-        Ok(self.consumption_view(self.get(id)?))
+        self.get_for_effects_in(id, &crate::task_chat::InquiryOwnership::default())
+    }
+
+    pub(crate) fn get_for_effects_in(
+        &self,
+        id: &str,
+        ownership: &crate::task_chat::InquiryOwnership,
+    ) -> Result<Question> {
+        let resolved = self.resolve_id(id)?;
+        let q = self.with_repair_choice_in(read_path(&self.path_of(&resolved))?, ownership);
+        let migrated = self
+            .root
+            .parent()
+            .is_some_and(|home| crate::task_chat::migrated_source_in(home, &q.id, ownership));
+        Ok(self.consumption_view_in(q, migrated, ownership))
     }
 
     /// Whether this source is quarantined saved consent, including history
     /// without a current consumer. It must not expire into a default action.
     pub(crate) fn held_reply(&self, id: &str) -> bool {
+        self.held_reply_in(id, &crate::task_chat::InquiryOwnership::default())
+    }
+
+    pub(crate) fn held_reply_in(
+        &self,
+        id: &str,
+        ownership: &crate::task_chat::InquiryOwnership,
+    ) -> bool {
         self.read_history(id).is_ok_and(|q| {
             self.root.parent().is_some_and(|home| {
-                crate::task_chat::saved_reply_requires_confirmation(home, &q)
+                (crate::task_chat::migrated_source_in(home, &q.id, ownership)
+                    && crate::task_chat::source_reply_needs_confirmation(home, &q))
                     || crate::task_inquiry::Outbox::at(home)
                         .get(id)
                         .is_ok_and(|record| {
@@ -1643,15 +1697,12 @@ impl Questions {
     // Keep the source JSON intact for the passive history decoder. Every
     // operational reader sees an unanswered hold until a fresh owner answer
     // exists; neither delivery nor a saved legacy reply supplies that authority.
-    fn consumption_view(&self, q: Question) -> Question {
-        let migrated = self
-            .root
-            .parent()
-            .is_some_and(|home| crate::task_chat::migrated_source(home, &q.id));
-        self.consumption_view_in(q, migrated)
-    }
-
-    fn consumption_view_in(&self, mut q: Question, migrated: bool) -> Question {
+    fn consumption_view_in(
+        &self,
+        mut q: Question,
+        migrated: bool,
+        ownership: &crate::task_chat::InquiryOwnership,
+    ) -> Question {
         if self.root.parent().is_some_and(|home| {
             crate::task_inquiry::Outbox::at(home)
                 .get(&q.id)
@@ -1672,7 +1723,7 @@ impl Questions {
         }
         if let Some(home) = self.root.parent()
             && migrated
-            && !crate::task_chat::standalone_inquiry(home, &q)
+            && !crate::task_chat::standalone_inquiry_in(home, &q, ownership)
             && crate::task_chat::source_reply_needs_confirmation(home, &q)
         {
             let saved = q.resolution().unwrap_or_default();
@@ -1689,14 +1740,22 @@ impl Questions {
         q
     }
 
-    fn with_repair_choice(&self, mut q: Question) -> Question {
+    fn with_repair_choice(&self, q: Question) -> Question {
+        self.with_repair_choice_in(q, &crate::task_chat::InquiryOwnership::default())
+    }
+
+    fn with_repair_choice_in(
+        &self,
+        mut q: Question,
+        ownership: &crate::task_chat::InquiryOwnership,
+    ) -> Question {
         // Older local release approvals already persisted their displayed head
         // in the watch record. Recover that binding, never today's forge head.
         if q.status.open()
             && q.merge_target.is_none()
             && let Some(home) = self.root.parent()
             && let Some(target) = crate::release_watch::approval_target(home, &q)
-            && let Ok((current, ())) = self.update(&q.id, |current| {
+            && let Ok((current, ())) = self.update_in(&q.id, ownership, |current| {
                 if current.status.open() && current.merge_target.is_none() {
                     current.merge_target = Some(target.clone());
                 }
@@ -1707,13 +1766,13 @@ impl Questions {
         }
         if (q.status.open() || q.resolution().as_deref() == Some(crate::land::REPAIR))
             && q.node == crate::land::APPROVAL_NODE
-            && !self.held_reply(&q.id)
+            && !self.held_reply_in(&q.id, ownership)
             && let Some(home) = self.root.parent()
             && let Ok(state) = crate::run::RunState::load_under(&q.run, home)
         {
             let mut upgraded = q.clone();
             if crate::land::upgrade_repair_choice(&mut upgraded, &state) {
-                match self.update(&q.id, |current| {
+                match self.update_in(&q.id, ownership, |current| {
                     crate::land::upgrade_repair_choice(current, &state);
                     Ok(())
                 }) {
@@ -1742,6 +1801,23 @@ impl Questions {
     }
 
     fn list_view(&self, effects: bool) -> Vec<Question> {
+        self.list_view_in(effects, &crate::task_chat::InquiryOwnership::default())
+    }
+
+    pub(crate) fn list_for_effects_in(
+        &self,
+        ownership: &crate::task_chat::InquiryOwnership,
+    ) -> Vec<Question> {
+        self.list_view_in(true, ownership)
+    }
+
+    fn list_view_in(
+        &self,
+        effects: bool,
+        ownership: &crate::task_chat::InquiryOwnership,
+    ) -> Vec<Question> {
+        #[cfg(test)]
+        QUESTION_SCANS.with(|count| count.set(count.get() + 1));
         // Parse the immutable boundary once per scan, rather than once per file.
         let sources = self.root.parent().map(crate::task_chat::migration_sources);
         let mut all: Vec<Question> = std::fs::read_dir(&self.root)
@@ -1757,9 +1833,9 @@ impl Questions {
                     Some(_) => true,
                     None => false,
                 };
-                let q = self.with_repair_choice(q);
+                let q = self.with_repair_choice_in(q, ownership);
                 if effects {
-                    self.consumption_view_in(q, migrated)
+                    self.consumption_view_in(q, migrated, ownership)
                 } else {
                     q
                 }

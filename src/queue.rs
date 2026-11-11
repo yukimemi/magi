@@ -30,6 +30,11 @@
 //! has burned its attempts becomes [`TaskStatus::Held`] and waits for a human
 //! rather than for another agent.
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static LIST_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
@@ -3294,6 +3299,8 @@ impl Queue {
     /// not take the queue - or the web UI, or an unattended daemon - down
     /// with it.
     pub fn list(&self) -> Vec<Task> {
+        #[cfg(test)]
+        LIST_READS.with(|count| count.set(count.get() + 1));
         let mut tasks: Vec<Task> = std::fs::read_dir(&self.root)
             .into_iter()
             .flatten()
@@ -3549,7 +3556,14 @@ pub(crate) fn first_line(instruction: &str) -> Option<&str> {
     (!line.is_empty()).then_some(line)
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TASK_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn read_path(path: &Path) -> Result<Task> {
+    #[cfg(test)]
+    TASK_READS.with(|count| count.set(count.get() + 1));
     let body = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let task: Task =
         serde_json::from_str(&body).with_context(|| format!("parse {}", path.display()))?;

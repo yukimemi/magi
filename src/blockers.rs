@@ -281,6 +281,7 @@ impl Inventory {
             .flat_map(|task| task.blocked_by.iter().cloned())
             .collect();
         let mut seen = BTreeSet::new();
+        let ownership = crate::task_chat::InquiryOwnership::default();
         while let Some(reference) = pending.pop() {
             let full =
                 if queue.path_of(&reference).is_file() || questions.path_of(&reference).is_file() {
@@ -306,7 +307,7 @@ impl Inventory {
                 inventory.tasks.insert(full.clone(), t);
             }
             if questions.path_of(&full).is_file()
-                && let Ok(q) = questions.get_for_effects(&full)
+                && let Ok(q) = questions.get_for_effects_in(&full, &ownership)
             {
                 inventory.questions.insert(full, DecisionRecord::from(&q));
             }
