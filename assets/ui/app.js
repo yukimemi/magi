@@ -10236,7 +10236,7 @@ function decisionPhase(d) {
     case "resolved":
       return d.legacy_settled
         ? { key: "settled", label: "Resolved: settled by owner", glyph: "\u2713", tone: "answered" }
-        : { key: "done", label: "Resolved: effect confirmed", glyph: "\u2713", tone: "answered" };
+        : { key: "done", label: decisionLabels.resolved, glyph: "\u2713", tone: "answered" };
     default: return { key: "unknown", label: String(d.status), glyph: "?", tone: "waiting" };
   }
 }

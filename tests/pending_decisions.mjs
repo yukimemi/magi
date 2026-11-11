@@ -61,6 +61,7 @@ test('all phases explain progress and preserve unresolved saved replies', () => 
   assert.match(f.decisionGuidance({ status: 'resolved', legacy_settled: true }), /does not confirm/);
   assert.equal(f.decisionPhase({ status: 'retry_needed', retry_safe: true }).label, 'Retry needed');
   assert.equal(f.decisionPhase({ status: 'resolved', legacy_settled: true }).label, 'Resolved: settled by owner');
+  assert.equal(f.decisionPhase({ status: 'resolved' }).label, 'Resolved');
 });
 
 test('owner titles, context and literal outcome evidence remain unchanged', () => {
