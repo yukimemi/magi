@@ -836,6 +836,9 @@ pub fn sweep(queue: &Queue, talks: &Talks, questions: &Questions, home: &Path) {
     let outbox = crate::task_inquiry::Outbox::at(home);
     let ownership = InquiryOwnership::from_tasks(&tasks);
     for q in &all {
+        if crate::daemon::lap_stop_requested() {
+            break;
+        }
         if deferred.contains(&q.id) {
             continue;
         }
@@ -869,6 +872,9 @@ pub fn sweep(queue: &Queue, talks: &Talks, questions: &Questions, home: &Path) {
             && !standalone_inquiry_in(home, q, &ownership)
             && !deferred.contains(&q.id)
     }) {
+        if crate::daemon::lap_stop_requested() {
+            break;
+        }
         // The pre-migration scan may have projected a not-yet-imported source
         // as open. Recheck the native result before scheduling delivery: the
         // batch may just have classified it as passive completed history.

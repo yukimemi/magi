@@ -652,6 +652,9 @@ impl Outbox {
         let deferred = crate::task_chat::migration_pending(home);
         let mut failed = None;
         for record in self.records()? {
+            if crate::daemon::lap_stop_requested() {
+                break;
+            }
             let inquiry = match record {
                 Ok(inquiry) => inquiry,
                 Err(error) => {

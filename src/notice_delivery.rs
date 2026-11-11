@@ -238,6 +238,9 @@ fn acknowledge(store: &Notices, snapshot: &Notice, covered: Option<String>) -> R
 /// Unread legacy records enter this same reconciliation; read history never replays.
 pub fn sweep(queue: &Queue, talks: &Talks, home: &Path, repo: &Path) {
     for n in Notices::at(home.join("notifications")).all() {
+        if crate::daemon::lap_stop_requested() {
+            break;
+        }
         if !n.unread() || n.delivered >= n.generation {
             continue;
         }
