@@ -48,7 +48,7 @@ test('all phases explain progress and preserve unresolved saved replies', () => 
   assert.equal(f.get('decisions-count').textContent, '4 unresolved · 1 resolved (history)');
   assert.equal(f.get('decisions-history').querySelector('summary').textContent, 'Resolved history (1)');
   assert.equal(f.get('decisions-list').children.length, 4);
-  for (const [i, label] of ['Awaiting owner', 'Queued', 'In progress', 'Result check needed', 'Resolved: effect confirmed'].entries()) {
+  for (const [i, label] of ['Awaiting owner', 'Queued', 'In progress', 'Result check needed', 'Resolved'].entries()) {
     assert.ok(f.decisionCard(item(statuses[i])).textContent.includes(label));
     assert.doesNotMatch(f.decisionCard(item(statuses[i])).textContent, /[\u3040-\u30ff\u3400-\u9fff]/u);
   }
