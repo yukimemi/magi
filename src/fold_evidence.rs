@@ -368,6 +368,54 @@ pub(crate) fn sync_directory(_path: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn inspection_creation_retries_collisions_without_adopting_existing_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().canonicalize().unwrap();
+        let directory = parent.join("magi-source-inspection-0000000000000001");
+        let file = parent.join("magi-source-inspection-0000000000000002");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("keep"), b"directory evidence").unwrap();
+        std::fs::write(&file, b"file evidence").unwrap();
+        let mut next = 0;
+        let inspection = Inspection::create_with(&parent, || {
+            next += 1;
+            next
+        })
+        .unwrap();
+        assert_eq!(next, 3);
+        assert_eq!(
+            inspection.0,
+            parent.join("magi-source-inspection-0000000000000003")
+        );
+        assert!(inspection.0.is_dir());
+        let owned = inspection.0.clone();
+        drop(inspection);
+        assert!(!owned.exists());
+        assert_eq!(
+            std::fs::read(directory.join("keep")).unwrap(),
+            b"directory evidence"
+        );
+        assert_eq!(std::fs::read(file).unwrap(), b"file evidence");
+    }
+
+    #[test]
+    fn inspection_creation_propagates_other_filesystem_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("file");
+        std::fs::write(&file, b"keep").unwrap();
+        let mut calls = 0;
+        assert!(
+            Inspection::create_with(&file, || {
+                calls += 1;
+                1
+            })
+            .is_err()
+        );
+        assert_eq!(calls, 1);
+        assert_eq!(std::fs::read(file).unwrap(), b"keep");
+    }
+
     #[tokio::test]
     async fn inspection_initialization_preserves_original_blob_line_endings() {
         let temp = tempfile::tempdir().unwrap();
@@ -1104,12 +1152,22 @@ impl Inspection {
                 "inspection refuses Git environment override: {name}"
             );
         }
-        let path = parent.canonicalize()?.join(format!(
-            "magi-source-inspection-{:016x}",
-            crate::rng::entropy()
-        ));
-        std::fs::create_dir(&path)?;
-        Ok(Self(path))
+        Self::create_with(parent, crate::rng::entropy)
+    }
+
+    fn create_with(parent: &Path, mut next: impl FnMut() -> u64) -> Result<Self> {
+        let parent = parent.canonicalize()?;
+        // Clock-derived entropy can repeat across concurrent inspections. Only
+        // own a directory after exclusive creation; leave collisions untouched.
+        for _ in 0..128 {
+            let path = parent.join(format!("magi-source-inspection-{:016x}", next()));
+            match std::fs::create_dir(&path) {
+                Ok(()) => return Ok(Self(path)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error).context("create source inspection directory"),
+            }
+        }
+        anyhow::bail!("source inspection directory name collision limit exceeded")
     }
 }
 impl Drop for Inspection {
