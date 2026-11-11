@@ -420,6 +420,48 @@ pub(crate) fn state_for_question(home: &Path, question_id: &str) -> Option<Watch
         .find(|s| s.question.as_deref() == Some(question_id))
 }
 
+/// A removed watch is completion evidence only in an existing, fully readable
+/// store and for a structurally identified PR. `Watcher::finish` removes the
+/// state only after observing merged/closed. Prose and absent stores prove nothing.
+pub(crate) fn retired_question(home: &Path, q: &Question) -> Result<bool> {
+    let pr = q
+        .merge_target
+        .as_ref()
+        .map(|target| target.pr.as_str())
+        .or_else(|| {
+            q.actions.values().find_map(|action| match action {
+                crate::ask::ChoiceAction::RerunChecks { pr, .. } => Some(pr.as_str()),
+                _ => None,
+            })
+        });
+    let Some(pr) = pr else { return Ok(false) };
+    let key = pr_key(pr).or_else(|| {
+        let (repo, number) = pr.split_once('#')?;
+        let (owner, name) = repo.split_once('/')?;
+        (!owner.is_empty()
+            && !name.is_empty()
+            && !name.contains('/')
+            && number.parse::<u64>().is_ok())
+        .then(|| pr.to_owned())
+    });
+    let Some(key) = key else { return Ok(false) };
+    let watcher = Watcher::new(Box::new(GhForge), home.to_path_buf());
+    for entry in std::fs::read_dir(watcher.dir())? {
+        let path = entry?.path();
+        if path.extension().is_some_and(|ext| ext == "json") {
+            let state: WatchState = serde_json::from_slice(&std::fs::read(path)?)?;
+            if state.question.as_deref() == Some(q.id.as_str()) {
+                return Ok(false);
+            }
+        }
+    }
+    match std::fs::metadata(watcher.state_path(&key)) {
+        Ok(_) => Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Quiet watcher effects retain receipts even after the PR watch is retired.
 pub(crate) fn quiet_effect_applied(home: &Path, q: &Question) -> Result<bool> {
     if q.node != crate::bump::NOTICE_NODE

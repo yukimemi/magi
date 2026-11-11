@@ -1,5 +1,6 @@
 //! Durable task-decision outbox. Questions remain the transport from restricted
 //! seats; only the daemon writes the task link and the talk's own draft.
+use crate::task_inquiry::HistoryResolution;
 use anyhow::{Context, Result};
 use std::path::Path;
 
@@ -533,6 +534,8 @@ pub(crate) fn migration_pending(home: &Path) -> Result<std::collections::BTreeSe
     Ok(migration.pending.into_iter().collect())
 }
 
+const CLASSIFICATION_REVISION: u32 = 2;
+
 fn migrate_batch(
     queue: &Queue,
     talks: &Talks,
@@ -619,7 +622,7 @@ fn migrate_batch(
         std::fs::rename(temp, &path)?;
         Ok(())
     };
-    let needs_correction = migration.classification_revision < 1;
+    let needs_correction = migration.classification_revision < CLASSIFICATION_REVISION;
     if needs_correction {
         // Revisit exactly the saved boundary, including already imported
         // sources. Never discover a new generation during compatibility repair.
@@ -627,7 +630,7 @@ fn migrate_batch(
             migration.pending.iter().cloned().collect();
         pending.extend(migration.sources.iter().flatten().cloned());
         migration.pending = pending.into_iter().collect();
-        migration.classification_revision = 1;
+        migration.classification_revision = CLASSIFICATION_REVISION;
     }
     // Persist the boundary before delivering anything. Receipt loss can repeat
     // a batch, but the original inquiry/transcript keys make that repeat inert.
@@ -645,7 +648,7 @@ fn migrate_batch(
     let ownership = InquiryOwnership::from_tasks(&tasks);
     for id in batch {
         let result = (|| -> Result<()> {
-            let q = questions.read_history(&id)?;
+            let q = retire_finished_triage(queue, questions, home, &questions.read_history(&id)?)?;
             if standalone_inquiry_in(home, &q, &ownership) {
                 if let Some(sources) = &mut migration.sources {
                     sources.remove(&id);
@@ -660,13 +663,28 @@ fn migrate_batch(
             let outbox = crate::task_inquiry::Outbox::at(home);
             let receipt = effect_receipt(home, queue, &q, task.map(|task| task.id.as_str()));
             let mut record = history_record(&q, task);
-            match receipt {
-                Ok(Some(receipt)) => {
+            let history = history_reason(home, &q);
+            let mut resolution = history
+                .as_ref()
+                .map(|(_, kind)| *kind)
+                .unwrap_or(HistoryResolution::Applied);
+            match (receipt, history) {
+                (Ok(Some(receipt)), _) => {
+                    resolution = HistoryResolution::Applied;
                     let mut decision = crate::task_decision::Decision::awaiting(q.summary.clone());
                     decision.applied(&receipt)?;
                     record.decision = Some(decision);
                 }
-                outcome if pending_intent(home, &q, task, watches) || outcome.is_err() => {
+                (_, Some((reason, retire))) => {
+                    let mut decision = crate::task_decision::Decision::awaiting(q.summary.clone());
+                    if retire == HistoryResolution::Retired {
+                        decision.retire(&reason)?;
+                    } else {
+                        decision.applied(&reason)?;
+                    }
+                    record.decision = Some(decision);
+                }
+                (outcome, None) if pending_intent(home, &q, task, watches) || outcome.is_err() => {
                     if q.status.open()
                         && let Some(task) = task
                     {
@@ -694,7 +712,7 @@ fn migrate_batch(
                     == (q.status, &q.answer, q.answered_at),
                 "source changed while classifying saved history; retry with its current generation"
             );
-            outbox.reclassify_history(record)?;
+            outbox.reclassify_history(record, resolution)?;
             sync_effect_receipt_in(home, queue, &q, &ownership);
             let imported = outbox.get(&q.id)?;
             if imported.archived
@@ -738,6 +756,141 @@ fn migrate_batch(
         }
     }
     save(&migration)
+}
+
+/// Classification uses saved state only: importing never executes a reply.
+/// Retirement remains distinct from positive application evidence.
+fn history_reason(home: &Path, q: &Question) -> Option<(String, HistoryResolution)> {
+    if q.answer.is_none()
+        && q.status == crate::ask::QuestionStatus::Abandoned
+        && (q.routed_chat.is_none() || awaits_decision(q))
+    {
+        return Some(("Source abandoned: silence already settled as a hold; existing task holds and blocks are unchanged".into(), HistoryResolution::Retired));
+    }
+    if q.answer.is_none() {
+        return None;
+    }
+    if q.node == crate::bump::NOTICE_NODE && q.seat == "release-watch" {
+        return crate::release_watch::retired_question(home, q)
+            .ok()
+            .filter(|retired| *retired)
+            .map(|_| {
+                (
+                    "Migration evidence: release PR watch retired after PR completion".into(),
+                    HistoryResolution::Applied,
+                )
+            });
+    }
+    if q.node != crate::land::APPROVAL_NODE && q.merge_target.is_none() {
+        return None;
+    }
+    let run = crate::run::RunState::load_under(&q.run, home).ok()?;
+    if run.status != crate::run::RunStatus::Merged
+        || !run.merge.as_ref().is_some_and(|out| {
+            out.ok
+                && !out.empty
+                && (out.mode == crate::config::MergeMode::Local
+                    || run.pr.as_ref().is_some_and(|pr| pr.state == "merged"))
+        })
+    {
+        return None;
+    }
+    if let Some(target) = &q.merge_target
+        && !run.pr.as_ref().is_some_and(|pr| {
+            pr.url == target.pr && run.pr_merged_head.as_ref() == Some(&target.head)
+        })
+    {
+        return None;
+    }
+    Some((
+        format!(
+            "Migration evidence: run {} durably records a successful merge",
+            q.run
+        ),
+        HistoryResolution::Applied,
+    ))
+}
+
+fn retire_finished_triage(
+    queue: &Queue,
+    questions: &Questions,
+    home: &Path,
+    q: &Question,
+) -> Result<Question> {
+    if !matches!(
+        q.node.as_str(),
+        crate::triage::NODE | crate::triage::DEPS_NODE
+    ) || !q.status.open()
+        || q.answer.is_some()
+    {
+        return Ok(q.clone());
+    }
+    // Only these producers put the exact task ID in run. Missing tasks with
+    // conflicting routing/native ownership may still matter: never guess from
+    // a filtered queue listing, a run association, or an unreadable record.
+    if !q.run_names_task()
+        || matches!(q.run.as_str(), "" | "." | "..")
+        || q.run.contains(['/', '\\'])
+        || q.routed_task.as_ref().is_some_and(|task| task != &q.run)
+    {
+        return Ok(q.clone());
+    }
+    let outbox = crate::task_inquiry::Outbox::at(home);
+    match outbox.get(&q.id) {
+        Ok(record)
+            if (!record.task.is_empty() && record.task != q.run)
+                || record
+                    .decision
+                    .as_ref()
+                    .is_some_and(|d| d.request.is_some()) =>
+        {
+            return Ok(q.clone());
+        }
+        Err(error)
+            if !error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            return Err(error);
+        }
+        _ => {}
+    }
+    let reason = match std::fs::read(queue.path_of(&q.run)) {
+        Ok(bytes) => {
+            let task: Task = serde_json::from_slice(&bytes)?;
+            if task.id != q.run || task.status != crate::queue::TaskStatus::Done {
+                return Ok(q.clone());
+            }
+            format!("task {} is done; nothing left to decide", q.run)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            format!(
+                "task {} is no longer in the queue; nothing left to decide",
+                q.run
+            )
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let source = questions
+        .update(&q.id, |source| {
+            if source.status.open()
+                && source.answer.is_none()
+                && source.run == q.run
+                && source.routed_task == q.routed_task
+            {
+                source.abandon(&reason);
+            }
+            Ok(())
+        })?
+        .0;
+    if source.status == crate::ask::QuestionStatus::Abandoned && source.answer.is_none() {
+        let mut record = history_record(&source, None);
+        let mut decision = crate::task_decision::Decision::awaiting(source.summary.clone());
+        decision.retire(&reason)?;
+        record.decision = Some(decision);
+        outbox.reclassify_history(record, HistoryResolution::Retired)?;
+    }
+    Ok(source)
 }
 
 fn pending_intent(
@@ -813,7 +966,16 @@ fn history_record(q: &Question, task: Option<&Task>) -> crate::task_inquiry::Inq
 /// as the existing land/release consent authority, including their deadlines.
 pub fn sweep(queue: &Queue, talks: &Talks, questions: &Questions, home: &Path) {
     let tasks = queue.list();
-    let all = questions.list();
+    let all: Vec<_> = questions
+        .list()
+        .into_iter()
+        .map(|q| {
+            retire_finished_triage(queue, questions, home, &q).unwrap_or_else(|error| {
+                tracing::warn!("triage {} retirement: {error:#}", q.id);
+                q
+            })
+        })
+        .collect();
     let watches = crate::release_watch::states_for_questions(home, &all);
     let migration_error = home.join("notifications/task-chat-migration-v1/last-error.txt");
     if let Err(error) = migrate_batch(queue, talks, questions, home, &watches) {
@@ -840,6 +1002,15 @@ pub fn sweep(queue: &Queue, talks: &Talks, questions: &Questions, home: &Path) {
             continue;
         }
         if let Ok(record) = outbox.get(&q.id) {
+            // Completed imports and owner settlements retain their original
+            // ownership and prose; recovery must not redeliver them.
+            if record.archived
+                || record.decision.as_ref().is_some_and(|decision| {
+                    decision.status == crate::task_decision::Status::Resolved
+                })
+            {
+                continue;
+            }
             // Execution views quarantine imported replies. Receipt projection
             // needs their original payload, without making it executable.
             match questions.read_history(&q.id) {
@@ -1530,6 +1701,241 @@ mod tests {
     }
 
     #[test]
+    fn migration_revision_retires_proven_and_abandoned_history() {
+        use crate::{
+            ask::Answer,
+            queue::{Source, TaskStatus},
+            run::{MergeOutcome, RunState, RunStatus},
+            task_decision::{Decision, Status},
+            task_inquiry::Outbox,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let queue = Queue::at(home.join("queue"));
+        let questions = Questions::at(home.join("questions"));
+        let talks = Talks::at(home.join("talks"));
+        let outbox = Outbox::at(home);
+        let mut run = RunState::new(
+            home.into(),
+            "main".into(),
+            "base".into(),
+            "work".into(),
+            Config::default(),
+        );
+        run.reserve_under(home).unwrap();
+        run.status = RunStatus::Merged;
+        run.merge = Some(MergeOutcome {
+            mode: crate::config::MergeMode::Local,
+            ok: true,
+            empty: false,
+            detail: String::new(),
+        });
+        run.save_under(home).unwrap();
+        let mut task = Task::new("work".into(), "work".into(), home.into(), Source::Human);
+        task.status = TaskStatus::Done;
+        task.runs.push(run.id.clone());
+        queue.put(&mut task).unwrap();
+        let mut sources = Vec::new();
+        for (node, run_id, answered) in [
+            (crate::land::APPROVAL_NODE, run.id.as_str(), true),
+            (crate::land::APPROVAL_NODE, "unproven", true),
+            (crate::conduct::NODE, task.id.as_str(), false),
+            (crate::triage::NODE, task.id.as_str(), false),
+        ] {
+            let mut q = Question::new(
+                run_id.into(),
+                node.into(),
+                "seat".into(),
+                "Decision".into(),
+                String::new(),
+                vec!["yes".into()],
+            );
+            if answered {
+                q.answer(Answer::Choice("yes".into())).unwrap();
+            } else if node == crate::conduct::NODE {
+                q.abandon("expired; held");
+            }
+            questions.put(&mut q).unwrap();
+            sources.push(q);
+        }
+        // Revision 1 already imported these as unresolved decisions.
+        for q in &sources {
+            let mut record = history_record(q, None);
+            record.archived = false;
+            let mut decision = Decision::awaiting(q.summary.clone());
+            decision
+                .fail("Saved reply has no confirmed effect receipt")
+                .unwrap();
+            record.decision = Some(decision);
+            outbox.enqueue(record).unwrap();
+        }
+        // A settled import must remain byte-for-byte equivalent after repair.
+        let mut settled = sources[0].clone();
+        settled.id = "settled-history".into();
+        questions.put(&mut settled).unwrap();
+        let mut record = history_record(&settled, None);
+        let mut decision = Decision::awaiting(settled.summary.clone());
+        decision.settle("owner settled after inspection").unwrap();
+        record.decision = Some(decision);
+        record.archived = false;
+        outbox.enqueue(record).unwrap();
+        let settled_before = outbox.get(&settled.id).unwrap();
+        sources.push(settled);
+        let dir = home.join("notifications/task-chat-migration-v1");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("state.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema": 1, "classification_revision": 1, "pending": [],
+                "sources": sources.iter().map(|q| &q.id).collect::<Vec<_>>()
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        for _ in 0..2 {
+            sweep(&queue, &talks, &questions, home);
+        }
+        for index in [0, 2, 3] {
+            let record = outbox.get(&sources[index].id).unwrap();
+            assert!(record.archived);
+            let decision = record.decision.unwrap();
+            assert_eq!(decision.status, Status::Resolved);
+            assert!(decision.error.is_none());
+            assert!(!decision.legacy_settled);
+        }
+        assert_eq!(
+            outbox.get(&sources[1].id).unwrap().decision.unwrap().status,
+            Status::RetryNeeded
+        );
+        let triage = questions.read_history(&sources[3].id).unwrap();
+        assert_eq!(triage.status, crate::ask::QuestionStatus::Abandoned);
+        assert!(triage.detail.contains("nothing left to decide"));
+        assert_eq!(outbox.get(&sources[4].id).unwrap(), settled_before);
+        // Done by itself is not proof that an answered merge decision applied.
+        run.merge.as_mut().unwrap().empty = true;
+        run.save_under(home).unwrap();
+        assert!(history_reason(home, &sources[0]).is_none());
+        run.merge.as_mut().unwrap().empty = false;
+        run.merge.as_mut().unwrap().mode = crate::config::MergeMode::Pr;
+        run.pr = Some(crate::run::PrRecord {
+            url: "https://example.test/project/repo/pull/1".into(),
+            number: 1,
+            state: "open".into(),
+            checks: "green".into(),
+            round: 1,
+            rounds: 1,
+            red_at_merge: vec![],
+        });
+        run.save_under(home).unwrap();
+        assert!(
+            history_reason(home, &sources[0]).is_none(),
+            "publication alone is insufficient"
+        );
+        run.pr.as_mut().unwrap().state = "merged".into();
+        run.pr_merged_head = Some("merged-head".into());
+        run.save_under(home).unwrap();
+        let mut bound = sources[0].clone();
+        bound.merge_target = Some(crate::merge_decision::Target {
+            pr: run.pr.as_ref().unwrap().url.clone(),
+            head: "merged-head".into(),
+            language: "en".into(),
+        });
+        assert!(history_reason(home, &bound).is_some());
+        bound.merge_target.as_mut().unwrap().head = "other-head".into();
+        assert!(history_reason(home, &bound).is_none());
+    }
+
+    #[test]
+    fn triage_retirement_preserves_ambiguous_ownership_and_forwarded_discussion() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let queue = Queue::at(home.join("queue"));
+        let questions = Questions::at(home.join("questions"));
+        let mut q = Question::new(
+            "missing-task".into(),
+            crate::triage::NODE.into(),
+            "triage".into(),
+            "Decide".into(),
+            String::new(),
+            vec![],
+        );
+        q.routed_task = Some("another-task".into());
+        questions.put(&mut q).unwrap();
+        assert!(
+            retire_finished_triage(&queue, &questions, home, &q)
+                .unwrap()
+                .status
+                .open()
+        );
+        q = questions
+            .update(&q.id, |q| {
+                q.routed_task = None;
+                Ok(())
+            })
+            .unwrap()
+            .0;
+        assert_eq!(
+            retire_finished_triage(&queue, &questions, home, &q)
+                .unwrap()
+                .status,
+            crate::ask::QuestionStatus::Abandoned
+        );
+        let mut forwarded = Question::new(
+            "task".into(),
+            "implement".into(),
+            "seat".into(),
+            "Discuss".into(),
+            String::new(),
+            vec![],
+        );
+        forwarded.routed_chat = Some("chat".into());
+        forwarded.abandon("forwarded to task chat");
+        assert!(history_reason(home, &forwarded).is_none());
+    }
+
+    #[test]
+    fn release_watch_history_requires_readable_existing_store() {
+        use crate::ask::Answer;
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let mut q = Question::new(
+            "run".into(),
+            crate::bump::NOTICE_NODE.into(),
+            "release-watch".into(),
+            "Release".into(),
+            String::new(),
+            vec!["merge".into()],
+        );
+        q.merge_target = Some(crate::merge_decision::Target {
+            pr: "https://example.test/project/repo/pull/1".into(),
+            head: "head".into(),
+            language: "en".into(),
+        });
+        q.answer(Answer::Choice("merge".into())).unwrap();
+        assert!(history_reason(home, &q).is_none());
+        let dir = home.join("release-watch");
+        std::fs::create_dir(&dir).unwrap();
+        assert!(history_reason(home, &q).is_some());
+        let active = dir.join(format!("{}.json", crate::notices::id_of("project/repo#1")));
+        // Use the same owner/repository key as the watcher, rather than the URL.
+        std::fs::write(&active, b"{}").unwrap();
+        assert!(history_reason(home, &q).is_none());
+        std::fs::remove_file(active).unwrap();
+        std::fs::write(dir.join("broken.json"), "invalid").unwrap();
+        assert!(history_reason(home, &q).is_none());
+        std::fs::write(
+            dir.join("broken.json"),
+            serde_json::to_vec(&crate::release_watch::WatchState {
+                question: Some(q.id.clone()),
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(history_reason(home, &q).is_none());
+    }
+
+    #[test]
     fn history_correction_preserves_accepted_and_completed_decisions() {
         let home = tempfile::tempdir().unwrap();
         let outbox = crate::task_inquiry::Outbox::at(home.path());
@@ -1556,7 +1962,9 @@ mod tests {
                 })
                 .unwrap();
             let before = outbox.get(&q.id).unwrap();
-            outbox.reclassify_history(history_record(&q, None)).unwrap();
+            outbox
+                .reclassify_history(history_record(&q, None), HistoryResolution::Retired)
+                .unwrap();
             assert_eq!(outbox.get(&q.id).unwrap(), before);
         }
     }
