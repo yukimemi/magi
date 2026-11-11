@@ -23,3 +23,26 @@ struct Response {
     id: u64,
     result: std::result::Result<String, String>,
 }
+
+/// Control capabilities belong only to the current foreground chat turn.
+pub(crate) const ENVIRONMENT: &[&str] = &[
+    "MAGI_CHAT_CONTROL_FD",
+    "MAGI_CHAT_CONTROL_RESPONSE_FD",
+    "MAGI_CHAT_CONTROL_LOCK_FD",
+    "MAGI_CHAT_CONTROL_IDENTITIES",
+    "MAGI_CHAT_CONTROL_SOCKET",
+    "MAGI_CHAT_CONTROL_PIPE",
+    "MAGI_CHAT_CONTROL_CAP",
+];
+
+pub(crate) fn clear_environment(command: &mut tokio::process::Command) {
+    clear_std_environment(command.as_std_mut());
+}
+
+pub(crate) fn clear_std_environment(command: &mut std::process::Command) {
+    #[cfg(unix)]
+    unix::close_inherited(command);
+    for name in ENVIRONMENT {
+        command.env_remove(name);
+    }
+}

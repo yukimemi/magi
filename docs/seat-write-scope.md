@@ -170,7 +170,9 @@ grants no extra write access and no repository edit permission. A chat's
 `magi answer --reply` / `--reply-other` and `magi task control ...` go over the
 turn's inherited control bridge instead: the launcher records them outside the
 sandbox, including an obsolete approval's dismissal that saves its run record,
-so they work in a read-only chat without any runs directory grant.
+so they work in a read-only chat without any runs directory grant when a
+supported transport reaches the tool subprocess (see Standing-chat control
+transport below).
 
 Repository readers (including judges, advisors and reviewers) still wait for
 the editor: allowing them through would violate the shared-lock contract.
@@ -555,3 +557,51 @@ Git 書込み拒否はインフラ停止とし、保持中の内容を削除せ�
 現在の index を手作業で基準として書き込んだり、別 driver で元の run を進めたり
 しない。移行不能時は元の所有者が不一致の原因を確認し、保持された内容の修復を
 判断する必要がある。
+
+### Standing-chat control transport
+
+Unix launchers provide two turn-scoped routes to the same typed control
+executor: inherited anonymous pipes and a capability-authenticated Unix socket.
+Clearing `FD_CLOEXEC` on the backend launch only reaches that first process;
+backends may close descriptors when launching shell tools. The former tests
+explicitly supplied Python `pass_fds`, masking that boundary. Ordinary tools
+need no descriptor forwarding configuration when the socket route is permitted.
+
+The socket lives in a fresh private directory with a short pathname, with mode
+0700 on the directory and 0600 on the socket. Both peers check the effective UID;
+a 256-bit OS-random capability authenticates clients before an acknowledgement
+allows any operation to be sent. The launcher fixes the conversation and home
+at invocation time. Environment provenance cannot select another executor.
+Both transports serialize operations through one turn lock, and retain the
+existing authorization, liveness, repository scope, transaction and receipt
+checks. Initial, resumed, fallback and consultation/waiter invocations all pass
+through the same launcher attachment point. Completion or cancellation revokes
+the endpoint; a subsequent turn in the same conversation receives a new one.
+Capabilities are environment-only, never prompts or saved session metadata.
+Detached workers, watchers and worktree setup commands have them removed.
+The environment-name list in `tests/common/cli.rs` mirrors
+`chat_control::bridge::ENVIRONMENT` so fixture CLIs and test re-executions
+never inherit a real conversation's authority; keep both lists aligned.
+
+The inherited route remains necessary where read-only sandbox policy denies
+socket connections. Each descriptor is duplicated and checked against its
+launcher-recorded device, inode, type and access mode before locking or writing,
+so a reused descriptor number cannot silently target a different file. Neither
+transport adds sandbox permissions. If a backend both closes inherited pipes
+and denies the socket, controls fail with an infrastructure error; that backend
+must provide a supported transport under its existing policy.
+
+For a failure, distinguish closed or mismatched descriptors, a missing or
+expired endpoint, an OS permission/sandbox refusal, and authentication rejection.
+Check launcher deployment, backend environment filtering and tool subprocess
+handling; do not print capabilities, copy them into session files, edit stores,
+or widen sandbox grants. Reopening a conversation recreates the same broken
+launch path and is not a repair. Once the launcher/backend is repaired, the next
+ordinary turn of the existing conversation gets a fresh channel. Reassignment
+and base recovery always require authentication. Other operations retain their
+previous authorized local fallback only when transport preparation fails before
+sending an operation and the seat already has local write permission.
+Authentication failure never enables fallback. After transmission starts, a
+lost response means the outcome is unknown: inspect the operation's receipt and
+current state before considering another request; never automatically resend or
+execute locally.

@@ -2713,13 +2713,21 @@ existing transition (`resume::pin_queued`, extracted from the daemon's
   or Unknown driver is refused.
 - **Transport.** 通常のチャットは既存の sandbox・network・cwd を維持し、
   queue / questions / choice-actions / run / transcript への書き込み権限を追加しない。
-  `chat_control::bridge` が Unix の継承済み通信路で型付き操作だけをランチャーへ渡す。
-  ランチャーは起動時の talk を固定し、要求ごとに open と既存遷移の条件を検証する。
-  任意コマンド、パス、別の talk は要求できない。merge 承認は `decide` で回答として
-  記録し、既存の land 処理が保存済み head に対して実行する。
-  同時 CLI は継承した未リンクの lock FD の POSIX process lock で直列化し、
-  request ID で応答を照合する。通信路の準備失敗は警告のみで会話を継続する。
-  完了・中断・fallback は通信路を破棄する。非 Unix には通信路を提供しない。
+  `chat_control::bridge` が型付き操作だけをランチャーへ渡す。Unix は識別情報を
+  検証した継承 FD と capability 認証付き Unix socket、Windows は認証付き named
+  pipe を使う。backend 本体への FD 継承だけでは通常ツール子プロセスへ届かない。
+  sandbox が socket を拒否する場合は検証済み FD が必要で、権限を追加しない。
+  ランチャーは起動時の talk と home を固定し、要求ごとに open と既存遷移の条件を
+  検証する。任意コマンド、パス、別の talk は要求できない。merge 承認は `decide`
+  で回答として記録し、既存の land 処理が保存済み head に対して実行する。
+  FD のフレームは未リンク lock FD の POSIX process lock、両経路の操作全体は
+  同じ launcher lock で直列化し、request ID で応答を照合する。socket は認証 ACK
+  の後だけ操作を送る。送信後の切断は結果不明で、自動再送・ローカル実行をしない。
+  準備失敗は会話を止めないが、再割り当てと base recovery は認証を必須とする。
+  完了・中断・fallback は通信路を破棄し、同じ会話の次ターンで新しい能力を渡す。
+  detached worker / watcher / setup へは環境変数と検証済み FD を継承させない。
+  両経路が使えない場合は launcher/backend の基盤障害として報告する。会話の
+  開き直しは修復策ではない。詳細と復旧手順は `docs/seat-write-scope.md` を参照。
   CLI を席の外から実行する場合も、従来どおり chat / open talk の認可が必要。
 - **Answers.** A chat seat's `magi answer --reply` / `--reply-other`
   (`MAGI_NODE=chat`) is sent as `Operation::Answer` / `Operation::ReplyOther`

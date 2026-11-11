@@ -2552,7 +2552,8 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
     // - `magi answer --reply` / `--reply-other` and `magi task control ...`
     //   always go over the turn's inherited control bridge
     //   (`chat_control::bridge`); the launcher records them outside the
-    //   sandbox, so they work under any sandbox, including an obsolete
+    //   sandbox, using verified inherited descriptors or a capability-authenticated local
+    //   socket (where the sandbox permits it), including an obsolete
     //   approval's dismissal that saves its run record.
     // - `magi task add`, `done` and `priority` also save through the bridge,
     //   including attachments and superseded run records.
@@ -3285,7 +3286,8 @@ pub fn briefing_for(
          did. When the owner clearly asks to move a task to another repository, \
          use reassign instead of generic resume prompts. Reassignment requires \
          the authenticated control bridge; if unavailable, report the channel \
-         error and restart the turn through the launcher, never edit stores. \
+         error as a launcher/backend infrastructure failure, never edit stores. \
+         Reopening the conversation does not repair descriptor propagation. \
          Resolve reported retained PR or execution conflicts first. For retention maintenance, `magi task control \
          reconcile-retention <task> --authority-run <full run id>` saves a \
          reviewable plan and retires nothing; present its complete summary, \

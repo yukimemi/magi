@@ -434,3 +434,141 @@ async fn reassign_keeps_registered_windows_execution_fail_closed() {
     assert_eq!(std::fs::read(old.dir().join("run.json")).unwrap(), old_json);
 }
 }
+
+#[cfg(unix)]
+common::e2e! {
+async fn standing_reassign_survives_normal_tool_subprocesses_and_continued_turns() {
+    let f = fixture(home_lock().await, Judges::Unanimous, false);
+    publish_config(&f.repo, &f.config);
+    let dest = destination(&f);
+    let home = magi::run::home();
+    let queue = Queue::open();
+    let (task, _) = stopped(&f, &queue);
+    let script = f.tmp.path().join("ordinary-tools.py");
+    // Command is a supported seat backend. Its ordinary tool invocation uses
+    // Python's default close_fds, with no pass_fds or shell inheritance shim.
+    std::fs::write(&script, r#"import os, pathlib, subprocess, sys
+sys.stdin.read()
+binary = os.environ['TEST_BINARY']
+task = os.environ['TEST_TASK']
+queue = pathlib.Path(os.environ['MAGI_HOME'])/'queue'/(task+'.json')
+def call(args, env=None):
+    return subprocess.run([binary, 'task', 'control', *args], env=env, capture_output=True, text=True)
+args = ['reassign', task, '--repo', os.environ['TEST_DESTINATION']]
+before = queue.read_bytes()
+for changes, diagnostic in [
+    ({'MAGI_CHAT_CONTROL_CAP':'0'*64}, 'authentication'),
+    ({'MAGI_CHAT_CONTROL_CAP':''}, 'invalid control capability'),
+    ({'MAGI_RUN':'unrelated-conversation'}, 'conversation'),
+    ({'MAGI_CHAT_CONTROL_SOCKET':'/nonexistent/magi-control'}, 'endpoint unavailable'),
+    ({'MAGI_CHAT_CONTROL_SOCKET':'', 'MAGI_CHAT_CONTROL_FD':'999999'}, 'control'),
+]:
+    denied = call(args, {**os.environ, **changes})
+    assert denied.returncode != 0, denied.stdout
+    assert diagnostic in denied.stderr, denied.stderr
+    assert queue.read_bytes() == before
+# Concurrent ordinary tools use independent authenticated connections.
+jobs = [subprocess.Popen([binary, 'task', 'control', 'hold', task, str(i)], stdout=subprocess.PIPE, stderr=subprocess.PIPE) for i in range(3)]
+for job in jobs:
+    out, err = job.communicate()
+    assert job.returncode == 0, (out, err)
+p = call(args)
+assert p.returncode == 0, p.stderr
+# Other commands sharing the transport also survive default fd closure.
+for command in [['hold', task, 'ordinary tool'], ['release', task], ['hold', task, 'end of turn']]:
+    p = call(command)
+    assert p.returncode == 0, p.stderr
+pathlib.Path(os.environ['TEST_ENDPOINT_RECORD']).write_text(os.environ['MAGI_CHAT_CONTROL_SOCKET'])
+print('ordinary tool controls completed')
+"#).unwrap();
+    let mut config = f.config.clone();
+    config.talk.allow_write = false;
+    config.agents[0].kind = magi::config::AgentKind::Command;
+    config.agents[0].command = vec!["python3".into(), script.to_str().unwrap().into()];
+    config.agents[0].env.extend(common::magi_cli_env(&home, "TEST_BINARY"));
+    config.agents[0].env.insert("TEST_TASK".into(), task.id.clone());
+    let endpoint_record = f.tmp.path().join("endpoint-path");
+    config.agents[0].env.insert("TEST_ENDPOINT_RECORD".into(), endpoint_record.to_str().unwrap().into());
+    let talks = magi::talk::Talks::at(home.join("talks"));
+    let mut conversation = magi::talk::begin(&talks, &config, f.repo.clone(), Some(&config.agents[0].id)).unwrap();
+    let lease = talks.claim_turn(&conversation.id).unwrap().unwrap();
+    let mut previous_endpoint = None;
+    for destination in [&dest, &f.repo] {
+        config.agents[0].env.insert("TEST_DESTINATION".into(), destination.to_str().unwrap().into());
+        magi::talk::say(&lease, &mut conversation, &talks, &config, "Move this task to the requested repository", vec![]).await.unwrap_or_else(|error| {
+            let errors: Vec<_> = std::fs::read_dir(talks.artifacts_of(&conversation.id)).unwrap()
+                .filter_map(Result::ok).filter(|entry| entry.path().extension().is_some_and(|ext| ext == "err"))
+                .filter_map(|entry| std::fs::read_to_string(entry.path()).ok()).collect();
+            panic!("ordinary tool turn failed: {error:#}; stderr: {errors:?}");
+        });
+        assert_eq!(queue.get(&task.id).unwrap().repo.canonicalize().unwrap(), destination.canonicalize().unwrap());
+        let endpoint = std::fs::read_to_string(&endpoint_record).unwrap();
+        assert!(!Path::new(&endpoint).exists(), "completed turn must revoke its endpoint");
+        assert_ne!(previous_endpoint.as_ref(), Some(&endpoint));
+        previous_endpoint = Some(endpoint);
+    }
+    assert_eq!(conversation.turns.len(), 4);
+    assert_eq!(queue.get(&task.id).unwrap().chat, task.chat);
+}
+}
+
+/// Opt-in contract test against an installed backend's real shell tool. This
+/// deliberately has no replacement backend executable or descriptor shim.
+#[cfg(unix)]
+#[test]
+#[ignore = "requires the installed authenticated shell-tool backend"]
+fn installed_backend_reassigns_from_initial_and_resumed_chat_tools() {
+    common::isolated(
+        "installed_backend_reassigns_from_initial_and_resumed_chat_tools",
+        || async {
+            let f = fixture(home_lock().await, Judges::Unanimous, false);
+            publish_config(&f.repo, &f.config);
+            let dest = destination(&f);
+            let home = magi::run::home();
+            let queue = Queue::open();
+            let (task, _) = stopped(&f, &queue);
+            let mut config = f.config.clone();
+            config.talk.allow_write = false;
+            config.graph.timeout_talk = 90;
+            config.agents[0].kind = magi::config::AgentKind::Claude;
+            config.agents[0].model = None;
+            config.agents[0].command.clear();
+            config.agents[0].extra_args.clear();
+            config.agents[0]
+                .env
+                .extend(common::magi_cli_env(&home, "TEST_BINARY"));
+            config.agents[0]
+                .env
+                .insert("TEST_TASK".into(), task.id.clone());
+            // Live backends need their normal subscription credentials. The
+            // control CLI still uses the isolated MAGI_HOME/config stores.
+            config.agents[0].env.remove("HOME");
+            config.agents[0].env.remove("USERPROFILE");
+            let talks = magi::talk::Talks::at(home.join("talks"));
+            let mut conversation =
+                magi::talk::begin(&talks, &config, f.repo.clone(), Some(&config.agents[0].id))
+                    .unwrap();
+            let lease = talks.claim_turn(&conversation.id).unwrap().unwrap();
+            for destination in [&dest, &f.repo] {
+                config.agents[0].env.insert(
+                    "TEST_DESTINATION".into(),
+                    destination.to_str().unwrap().into(),
+                );
+                magi::talk::say(&lease, &mut conversation, &talks, &config,
+                "This is an isolated transport regression fixture. I authorize moving only TEST_TASK to TEST_DESTINATION. Use your ordinary shell tool to run exactly: \"$TEST_BINARY\" task control reassign \"$TEST_TASK\" --repo \"$TEST_DESTINATION\". Do not alter files, run other task operations, or manually preserve descriptors. Report the command result.",
+                vec![]).await.unwrap_or_else(|error| {
+                    let errors: Vec<_> = std::fs::read_dir(talks.artifacts_of(&conversation.id)).unwrap()
+                        .filter_map(Result::ok)
+                        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "err"))
+                        .filter_map(|entry| std::fs::read_to_string(entry.path()).ok()).collect();
+                    panic!("installed backend turn failed: {error:#}; stderr: {errors:?}");
+                });
+                assert_eq!(
+                    queue.get(&task.id).unwrap().repo.canonicalize().unwrap(),
+                    destination.canonicalize().unwrap()
+                );
+            }
+            assert_eq!(conversation.turns.len(), 4);
+        },
+    );
+}

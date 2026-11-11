@@ -215,6 +215,7 @@ pub(crate) async fn run_command(
         .stdout(out)
         .stderr(err)
         .kill_on_drop(true);
+    crate::chat_control::bridge::clear_environment(&mut cmd);
     if pre_clean {
         cmd.env("MAGI_PRE_CLEAN_ACTIVE", "1");
         for key in crate::worker::INVOCATION_ENV {

@@ -201,18 +201,6 @@ impl Drop for Bridge {
     }
 }
 
-pub(crate) fn clear_environment(command: &mut tokio::process::Command) {
-    for name in [
-        CHANNEL_ENV,
-        CAP_ENV,
-        "MAGI_CHAT_CONTROL_FD",
-        "MAGI_CHAT_CONTROL_RESPONSE_FD",
-        "MAGI_CHAT_CONTROL_LOCK_FD",
-    ] {
-        command.env_remove(name);
-    }
-}
-
 pub async fn request(operation: &Operation) -> Result<String> {
     let name = std::env::var(CHANNEL_ENV)?;
     ensure!(
@@ -304,7 +292,7 @@ mod tests {
         assert!(environment.iter().any(|(name, value)| {
             *name == CAP_ENV && *value == Some(std::ffi::OsStr::new(&bridge.token))
         }));
-        clear_environment(&mut command);
+        super::super::clear_environment(&mut command);
         assert!(
             command
                 .as_std()
