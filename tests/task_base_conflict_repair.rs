@@ -763,7 +763,7 @@ async fn inspect(request: &Request) -> serde_json::Value {
 
 common::e2e! {
 async fn legacy_diagnostic_only_stop_without_scratch_recovers_once_after_restart() {
-    let (_fx, task, mut runner, mut request) = stopped().await;
+    let (fx, task, mut runner, mut request) = stopped().await;
     legacy_stop(&mut runner, &request.head, false);
     let run_before = std::fs::read(runner.state.dir().join("run.json")).unwrap();
     let task_before = std::fs::read(Queue::open().path_of(&task.id)).unwrap();
@@ -779,8 +779,14 @@ async fn legacy_diagnostic_only_stop_without_scratch_recovers_once_after_restart
     assert!(receipt.legacy.is_some());
     assert_eq!(grant(&request).await, receipt);
     assert_eq!(std::fs::read(runner.state.dir().join("run.json")).unwrap(), run_before, "grant must not fabricate a modern checkpoint");
-    let mut resumed = Runner::resume(&request.run).unwrap();
-    resumed.execute().await.unwrap();
+    let config = fx.tmp.path().join("daemon.toml");
+    std::fs::write(&config, toml::to_string(&fx.config).unwrap()).unwrap();
+    let opts = magi::daemon::Opts {
+        repo: fx.repo.clone(), config: Some(config), once: true,
+        poll: std::time::Duration::from_millis(20), ..Default::default()
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(120), magi::daemon::serve(opts))
+        .await.unwrap().unwrap();
     let after = RunState::load(&request.run).unwrap();
     assert!(after.repair_grants[0].succeeded);
     assert_eq!(after.repair_grants[0].spent, 1);
@@ -793,6 +799,12 @@ async fn legacy_diagnostic_only_stop_without_scratch_recovers_once_after_restart
     assert_eq!(after.gate_head.as_ref(), Some(result));
     assert_eq!(grant(&request).await, receipt);
     assert_eq!(std::fs::read_to_string(after.dir().join("artifacts/base-conflict.log")).unwrap().lines().count(), 1);
+    assert!(after.base_sync_recovery.stops.iter().any(|s| Some(s) == receipt.stop.as_ref()));
+    assert_eq!(Queue::open().get(&task.id).unwrap().runs, vec![request.run.clone()]);
+    let mut again = Runner::resume(&request.run).unwrap();
+    again.execute().await.unwrap();
+    assert_eq!(again.state.repair_grants[0].spent, 1);
+
 }
 }
 
@@ -898,5 +910,36 @@ async fn legacy_scratch_descendant_and_owner_hold_refuse_without_losing_dirty_co
     assert_eq!(std::fs::read(runner.state.dir().join("run.json")).unwrap(), run_before);
     assert_eq!(git_ok(&runner.state.repo, &["show-ref"]).await, refs_before);
     assert_eq!(std::fs::read_to_string(scratch.join("README.md")).unwrap(), "resolved contents retained for inspection\n");
+}
+}
+
+common::e2e! {
+async fn legacy_movement_diagnostics_use_recover_base_without_mutation() {
+    let (_fx, task, mut runner, request) = stopped().await;
+    legacy_stop(&mut runner, &request.head, false);
+    let branch = runner.state.winner().unwrap().branch.clone();
+    for (noun, verb) in [("rebase(s)", "rebasing"), ("synchronization(s)", "synchronizing")] {
+        let sync = runner.state.base_sync.as_mut().unwrap();
+        sync.attempts = 4;
+        let detail = format!("main moved {} commit(s) ahead of {branch} after {} {noun}; {verb} again would only race it", sync.behind, sync.attempts);
+        sync.conflict = Some(detail.clone());
+        runner.state.save().unwrap();
+        let run_path = runner.state.dir().join("run.json");
+        let before = std::fs::read(&run_path).unwrap();
+        let owner_before = std::fs::read(Queue::open().path_of(&task.id)).unwrap();
+        let assessment = magi::repair_budget::legacy::classify(&runner.state, &request.head, request.tip.as_deref().unwrap());
+        assert_eq!(assessment.class, magi::repair_budget::legacy::Class::MovementExhausted);
+        let report = inspect(&request).await;
+        assert_eq!(report["classification"], "movement-exhaustion");
+        assert!(report["next_step"].as_str().unwrap().contains("recover-base"));
+        let refused = grant_output(&request);
+        assert!(!refused.status.success());
+        assert!(String::from_utf8_lossy(&refused.stderr).contains("recover-base"));
+        assert_eq!(std::fs::read(&run_path).unwrap(), before);
+        assert_eq!(std::fs::read(Queue::open().path_of(&task.id)).unwrap(), owner_before);
+        runner.state.base_sync.as_mut().unwrap().conflict = Some(format!("{detail}; unrecognized suffix"));
+        runner.state.save().unwrap();
+        assert_eq!(inspect(&request).await["classification"], "insufficient-evidence", "near matches must not authorize movement recovery");
+    }
 }
 }

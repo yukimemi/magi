@@ -16,11 +16,115 @@ pub struct Evidence {
     pub source: serde_json::Value,
 }
 
+/// Saved evidence classification, independent of filesystem and Git reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Class {
+    /// 整合する構造化停止が保存されている。
+    Recorded,
+    /// 旧形式の診断と修復履歴から停止を導出できる。
+    LegacyTextual,
+    /// 通常のベース移動予算の枯渇。
+    MovementExhausted,
+    /// 停止を安全に証明する証拠が不足している。
+    Insufficient,
+}
+
+/// Read-only assessment used by inspection and grant admission alike.
+pub struct Assessment {
+    /// 保存された証拠の分類。
+    pub class: Class,
+    /// 保存済み、または証拠から導出した停止。
+    pub stop: Option<Stop>,
+    /// 承認対象となる旧形式の証拠。
+    pub legacy: Option<Evidence>,
+    /// 証拠不足や矛盾の具体的な理由。
+    pub missing: Option<String>,
+}
+
+impl Assessment {
+    fn textual(self) -> Result<(Stop, Option<Evidence>)> {
+        match self.class {
+            Class::Recorded | Class::LegacyTextual => {
+                Ok((self.stop.context("missing textual stop")?, self.legacy))
+            }
+            Class::MovementExhausted => anyhow::bail!(
+                "ordinary movement exhaustion; use task control recover-base, not base-conflict repair"
+            ),
+            Class::Insufficient => anyhow::bail!("{}", self.missing.unwrap_or_default()),
+        }
+    }
+
+    /// Stable labels for the operator-facing JSON report.
+    pub fn report(&self) -> serde_json::Value {
+        serde_json::json!({
+            "classification": match self.class {
+                Class::Recorded => "modern-textual-conflict",
+                Class::LegacyTextual => "legacy-textual-conflict",
+                Class::MovementExhausted => "movement-exhaustion",
+                Class::Insufficient => "insufficient-evidence",
+            },
+            "stop": self.stop,
+            "legacy": self.legacy,
+            "missing_evidence": self.missing,
+        })
+    }
+}
+
+/// Match both historical and current movement diagnostics exactly. Leftover
+/// legacy repair records do not turn this diagnostic into a textual conflict.
+pub fn classify(state: &RunState, head: &str, tip: &str) -> Assessment {
+    if let (Some(sync), Some(winner)) = (&state.base_sync, state.winner()) {
+        let exhausted = sync.attempts >= crate::graph::BASE_SYNC_ROUNDS
+            && [("rebase(s)", "rebasing"), ("synchronization(s)", "synchronizing")]
+                .iter().any(|(noun, verb)| sync.conflict.as_deref() == Some(format!(
+                    "{} moved {} commit(s) ahead of {} after {} {}; {} again would only race it",
+                    state.base_branch, sync.behind, winner.branch, crate::graph::BASE_SYNC_ROUNDS, noun, verb
+                ).as_str()));
+        let consistent = state.base_sync_recovery.stop.as_ref().is_none_or(|s| {
+            s.kind == StopKind::Exhausted
+                && s.head == head
+                && s.tip == sync.tip
+                && Some(&s.detail) == sync.conflict.as_ref()
+                && s.attempts == sync.attempts
+        });
+        if exhausted && consistent {
+            return Assessment {
+                class: Class::MovementExhausted,
+                stop: state.base_sync_recovery.stop.clone(),
+                legacy: None,
+                missing: None,
+            };
+        }
+    }
+    match derive_textual(state, head, tip) {
+        Ok((stop, legacy)) => Assessment {
+            class: if legacy.is_some() {
+                Class::LegacyTextual
+            } else {
+                Class::Recorded
+            },
+            stop: Some(stop),
+            legacy,
+            missing: None,
+        },
+        Err(error) => Assessment {
+            class: Class::Insufficient,
+            stop: None,
+            legacy: None,
+            missing: Some(error.to_string()),
+        },
+    }
+}
+
 pub(super) fn textual_stop(
     state: &RunState,
     head: &str,
     tip: &str,
 ) -> Result<(Stop, Option<Evidence>)> {
+    classify(state, head, tip).textual()
+}
+
+fn derive_textual(state: &RunState, head: &str, tip: &str) -> Result<(Stop, Option<Evidence>)> {
     let sync = state
         .base_sync
         .as_ref()
@@ -184,19 +288,12 @@ pub async fn inspect(
     let mut result = serde_json::json!({"task": task.id, "run": state.id, "head": head, "base": tip,
         "scratch_present": home.join("runs").join(&state.id).join("base-sync").exists(),
         "next_step": "Retain all records and commits. Inspect the missing evidence; do not edit JSON, reset budgets or start another run."});
-    let mut classified = state.clone();
-    classified.record_base_sync_stop(&head);
-    if classified
-        .base_sync_recovery
-        .stop
-        .as_ref()
-        .is_some_and(|s| s.kind == StopKind::Exhausted)
-        && !state
-            .rebase_fixes
-            .iter()
-            .any(|r| !r.finished && r.stop.is_none())
-    {
-        result["classification"] = "movement-exhaustion".into();
+    let assessment = classify(&state, &head, &tip);
+    result
+        .as_object_mut()
+        .unwrap()
+        .extend(assessment.report().as_object().unwrap().clone());
+    if assessment.class == Class::MovementExhausted {
         result["next_step"] = format!(
             "Use task control recover-base {} --request <unique-id> --head {head}",
             state.id
@@ -204,21 +301,8 @@ pub async fn inspect(
         .into();
         return Ok(result);
     }
-    match textual_stop(&state, &head, &tip) {
-        Err(error) => {
-            result["classification"] = "insufficient-evidence".into();
-            result["missing_evidence"] = error.to_string().into();
-        }
-        Ok((stop, evidence)) => {
-            result["classification"] = if evidence.is_some() {
-                "legacy-textual-conflict"
-            } else {
-                "modern-textual-conflict"
-            }
-            .into();
-            result["stop"] = serde_json::to_value(&stop)?;
-            result["legacy"] = serde_json::to_value(&evidence)?;
-            let checks = async {
+    if let Ok((stop, evidence)) = assessment.textual() {
+        let checks = async {
                 ensure!(!state.passes.is_empty(), "missing stopped pass checkpoint; inspect retained run provenance before recovery");
                 super::controls(home, &task, &state, super::Kind::BaseConflict)?;
                 super::owner_effects_settled(home, &task, &state)?;
@@ -235,15 +319,14 @@ pub async fn inspect(
                 Ok::<_, anyhow::Error>(())
             }
             .await;
-            if let Err(error) = checks {
-                result["admission_blocker"] = error.to_string().into();
-                result["next_step"] = "Resolve the reported ownership, hold or Git-state blocker through its supported owner control, then inspect again. Inspection grants no authorization.".into();
-            } else {
-                let digest = evidence.as_ref().map_or(String::new(), |e| {
-                    format!(" --evidence-digest {}", e.digest)
-                });
-                result["next_step"] = format!("magi task grant-repair {} --run {} --kind base-conflict --rounds 1 --head {head} --tip {tip} --expect-pass {}{digest} --request <unique-id> --reason <reason> --instruction <approved-resolution>", task.id, state.id, state.passes.last().map_or(0, |p| p.index)).into();
-            }
+        if let Err(error) = checks {
+            result["admission_blocker"] = error.to_string().into();
+            result["next_step"] = "Resolve the reported ownership, hold or Git-state blocker through its supported owner control, then inspect again. Inspection grants no authorization.".into();
+        } else {
+            let digest = evidence.as_ref().map_or(String::new(), |e| {
+                format!(" --evidence-digest {}", e.digest)
+            });
+            result["next_step"] = format!("magi task grant-repair {} --run {} --kind base-conflict --rounds 1 --head {head} --tip {tip} --expect-pass {}{digest} --request <unique-id> --reason <reason> --instruction <approved-resolution>", task.id, state.id, state.passes.last().map_or(0, |p| p.index)).into();
         }
     }
     Ok(result)

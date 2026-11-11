@@ -708,6 +708,18 @@ pub(crate) async fn apply(home: &Path, state: &mut RunState, disk: &RunState) ->
         conflict_target(disk, &receipt.request, receipt.stop.as_ref()).await?;
         let _outputs = output_leases(home, disk)?;
         head_and_public(disk, &receipt.request.head).await?;
+        if receipt.legacy.is_some() && state.base_sync_recovery.stop.is_none() {
+            // Import only after re-deriving the approved evidence under the owner
+            // and execution locks. Grant acceptance itself never edits the run.
+            let stop = receipt
+                .stop
+                .clone()
+                .context("legacy receipt missing stop")?;
+            if !state.base_sync_recovery.stops.contains(&stop) {
+                state.base_sync_recovery.stops.push(stop.clone());
+            }
+            state.base_sync_recovery.stop = Some(stop);
+        }
         state.repair_grants.push(Applied {
             receipt: receipt.clone(),
             spent: 0,
