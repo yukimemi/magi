@@ -787,7 +787,7 @@ fn resolve_blockers(queue: &Queue, questions: &Questions) {
             else {
                 return None;
             };
-            questions.get(&full).ok().filter(|q| {
+            questions.get_for_effects(&full).ok().filter(|q| {
                 q.node == crate::conduct::NODE && q.status == ask::QuestionStatus::Abandoned
             })
         }) {
@@ -811,7 +811,7 @@ fn resolve_blockers(queue: &Queue, questions: &Questions) {
                 continue;
             }
             if let crate::queue::Dependency::Question(full) = resolved
-                && let Ok(q) = questions.get(&full)
+                && let Ok(q) = questions.get_for_effects(&full)
                 && q.status == ask::QuestionStatus::Answered
             {
                 // The action sweep releases conductor blockers atomically
@@ -1218,7 +1218,7 @@ pub(crate) fn task_of_question<'a>(tasks: &'a [Task], q: &ask::Question) -> Opti
 /// Legacy conductor prose never becomes a maintenance command by inference.
 /// Replace unsupported open labels under the question lock before dispatch.
 fn repair_choice_offers(questions: &Questions) {
-    for q in questions.list().into_iter().filter(|q| {
+    for q in questions.list_for_effects().into_iter().filter(|q| {
         q.status.open()
             && q.node == crate::conduct::NODE
             && q.choices
@@ -1252,12 +1252,12 @@ pub async fn apply_choice_actions(queue: &Queue, questions: &Questions, home: &P
 /// Apply bounded maintenance effects independently of question ownership: a
 /// release watcher need not have a queue task, and a predecessor is another run.
 async fn apply_maintenance_choices(queue: &Queue, questions: &Questions, home: &Path) {
-    for q in questions.list() {
+    for q in questions.list_for_effects() {
         // Read again under the same fence used by explicit settlement.
         let Ok(_execution) = crate::task_inquiry::Outbox::at(home).execution_claim(&q.id) else {
             continue;
         };
-        let Ok(q) = questions.get(&q.id) else {
+        let Ok(q) = questions.get_for_effects(&q.id) else {
             continue;
         };
         let Some(action) = q.chosen_action().filter(|a| a.maintenance()) else {
@@ -1549,12 +1549,12 @@ pub(crate) async fn rerun_checks_once(
 /// ordinary `unfinished_run` logic resumes that same run.
 pub(crate) fn apply_task_choice_actions(queue: &Queue, questions: &Questions, home: &Path) {
     let tasks = queue.list();
-    for q in questions.list() {
+    for q in questions.list_for_effects() {
         // Read again under the same fence used by explicit settlement.
         let Ok(_execution) = crate::task_inquiry::Outbox::at(home).execution_claim(&q.id) else {
             continue;
         };
-        let Ok(q) = questions.get(&q.id) else {
+        let Ok(q) = questions.get_for_effects(&q.id) else {
             continue;
         };
         // Dismissal is committed by the question writer, never a resume.
@@ -1744,8 +1744,11 @@ fn reconcile_task_questions(queue: &Queue, questions: &Questions) {
         .flat_map(|task| task.blocked_by.iter().map(String::as_str))
         .collect();
 
-    for mut question in questions.list() {
-        if !question.status.open() || question.node != crate::conduct::NODE {
+    for mut question in questions.list_for_effects() {
+        if !question.status.open()
+            || question.node != crate::conduct::NODE
+            || questions.held_reply(&question.id)
+        {
             continue;
         }
         // Keep questions a task still names, including when the reference
@@ -3118,7 +3121,7 @@ fn land_resume_state(task: &Task) -> LandResume {
     if state.status == RunStatus::Landing
         && state.land_approval.as_ref().is_some_and(|binding| {
             ask::Questions::open()
-                .get(&binding.question)
+                .get_for_effects(&binding.question)
                 .is_ok_and(|q| {
                     q.run == state.id
                         && q.resolution()
@@ -3144,7 +3147,7 @@ fn land_resume_state(task: &Task) -> LandResume {
     };
     let store = ask::Questions::open();
     let waiting = store
-        .list()
+        .list_for_effects()
         .into_iter()
         .filter(|q| &q.run == run_id && q.node == node)
         .max_by(|a, b| a.id.cmp(&b.id));
@@ -3171,7 +3174,7 @@ fn land_resume_state(task: &Task) -> LandResume {
     // told to look at it.
     let timeout = Duration::from_secs(state.config.graph.answer_timeout);
     let elapsed = Timestamp::now().as_second() - q.asked_at.as_second();
-    if elapsed >= 0 && elapsed as u64 >= timeout.as_secs() {
+    if !store.held_reply(&q.id) && elapsed >= 0 && elapsed as u64 >= timeout.as_secs() {
         q.abandon(format!(
             "no answer within {}s of asking",
             timeout.as_secs().max(1)
@@ -3699,7 +3702,7 @@ async fn start_service(
                 && load_conductor(home)?.worth_a_look(queue, &stalled, &finished)
         }
         "maintenance" => Questions::at(home.join("questions"))
-            .list()
+            .list_for_effects()
             .iter()
             .any(|q| {
                 q.chosen_action().is_some_and(|action| action.maintenance())
@@ -4341,12 +4344,14 @@ async fn attempt(
             crate::merge_decision::resumable_hold(state)
                 || state.status == RunStatus::Landing
                     && state.land_approval.as_ref().is_some_and(|binding| {
-                        Questions::open().get(&binding.question).is_ok_and(|q| {
-                            q.run == state.id
-                                && q.resolution()
-                                    .as_deref()
-                                    .is_some_and(crate::merge_decision::stops)
-                        })
+                        Questions::open()
+                            .get_for_effects(&binding.question)
+                            .is_ok_and(|q| {
+                                q.run == state.id
+                                    && q.resolution()
+                                        .as_deref()
+                                        .is_some_and(crate::merge_decision::stops)
+                            })
                     })
         });
     if let Some(owner) = stop_owner {
@@ -4690,12 +4695,14 @@ async fn attempt(
         .resume_override
         .as_ref()
         .filter(|pin| {
-            Questions::open().get(&pin.question_id).is_ok_and(|q| {
-                q.node == land::APPROVAL_NODE
-                    && q.resolution()
-                        .as_deref()
-                        .is_some_and(crate::merge_decision::stops)
-            })
+            Questions::open()
+                .get_for_effects(&pin.question_id)
+                .is_ok_and(|q| {
+                    q.node == land::APPROVAL_NODE
+                        && q.resolution()
+                            .as_deref()
+                            .is_some_and(crate::merge_decision::stops)
+                })
         })
         .and_then(|pin| pin.pinned_run.clone());
     let granted_run = task.repair_grants.last().and_then(|receipt| {

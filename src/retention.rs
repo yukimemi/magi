@@ -1329,7 +1329,7 @@ async fn retire_empty(
     }
     let queue = crate::queue::Queue::at(home.join("queue"));
     let questions = crate::ask::Questions::at(home.join("questions"));
-    let open = questions.list();
+    let open = questions.list_for_effects();
     for listed in queue.list() {
         let Ok(_claim) = queue.claim(&listed.id) else {
             continue;
@@ -1732,7 +1732,7 @@ fn commit_retirement(
     );
     ensure!(
         !crate::ask::Questions::at(home.join("questions"))
-            .list()
+            .list_for_effects()
             .iter()
             .any(|q| q.status.open()
                 && (q.run == state.id

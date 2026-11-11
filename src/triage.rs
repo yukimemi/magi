@@ -512,7 +512,7 @@ fn superseded_recovery_question(questions: &Questions, q: &Question) -> bool {
 /// [`latest_triage_question`] for any of this module's nodes.
 fn latest_question(questions: &Questions, node: &str, task_id: &str) -> Option<Question> {
     questions
-        .list()
+        .list_for_effects()
         .into_iter()
         .filter(|q| {
             q.node == node && q.run == task_id && !superseded_recovery_question(questions, q)
@@ -868,7 +868,7 @@ fn apply_deps_answer(queue: &Queue, questions: &Questions, q: &Question, now: Ti
     let Ok(_claim) = queue.claim(&q.run) else {
         return false;
     };
-    let Ok(current) = questions.get(&q.id) else {
+    let Ok(current) = questions.get_for_effects(&q.id) else {
         return false;
     };
     if current.status != QuestionStatus::Answered {
@@ -982,7 +982,7 @@ fn ask_about_stuck_roots(
     config_override: Option<&Path>,
     report: &mut Report,
 ) {
-    let all = questions.list();
+    let all = questions.list_for_effects();
     let inv = crate::blockers::Inventory::load(queue, questions);
     let mut frozen: std::collections::BTreeMap<String, Vec<String>> = Default::default();
     for (id, roots) in inv.stuck() {
@@ -1079,7 +1079,7 @@ fn ask_about_stuck_roots(
 /// Kept separate from diagnosis so queued tasks can recover legacy answers too.
 pub fn apply_answers(queue: &Queue, questions: &Questions) -> Vec<String> {
     let mut applied = Vec::new();
-    for q in questions.list() {
+    for q in questions.list_for_effects() {
         if q.node == DEPS_NODE
             && q.status == QuestionStatus::Answered
             && apply_deps_answer(queue, questions, &q, Timestamp::now())
@@ -1102,7 +1102,7 @@ pub fn apply_answers(queue: &Queue, questions: &Questions) -> Vec<String> {
         };
         // Settlement holds this same task claim; discard a reply read before
         // it won the claim rather than executing a settled answer.
-        let Ok(q) = questions.get(&q.id) else {
+        let Ok(q) = questions.get_for_effects(&q.id) else {
             continue;
         };
         if q.status != QuestionStatus::Answered {
@@ -1383,7 +1383,7 @@ fn deps_pending(questions: &Questions, task: &Task) -> bool {
 /// at yet.
 pub fn open_task_ids(questions: &Questions) -> std::collections::BTreeSet<String> {
     questions
-        .list()
+        .list_for_effects()
         .into_iter()
         .filter(|q| {
             (q.node == NODE || q.node == DEPS_NODE)

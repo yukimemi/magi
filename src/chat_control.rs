@@ -946,14 +946,19 @@ fn reconcile_task_decision(queue: &Queue, home: &Path, chat: &str, id: &str) -> 
     let outbox = crate::task_inquiry::Outbox::at(home);
     let inquiry = outbox.get(id)?;
     ensure!(
-        inquiry.delivered_to.as_deref() == Some(chat),
+        inquiry.delivered_to.as_deref() == Some(chat)
+            || (inquiry.task.is_empty() && inquiry.delivered_to.is_none()),
         "decision belongs to another chat"
     );
     let decision = inquiry.decision.context("inquiry is informational")?;
-    let request = decision
+    if decision.status == crate::task_decision::Status::Resolved {
+        return Ok(());
+    }
+    if decision
         .request
-        .context("decision has no accepted operation to reconcile")?;
-    if request.starts_with("decision: ") {
+        .as_ref()
+        .is_none_or(|request| request.starts_with("decision: "))
+    {
         let source = crate::ask::Questions::at(home.join("questions")).read_history(id)?;
         crate::task_chat::sync_effect_receipt(home, queue, &source);
         ensure!(
@@ -965,6 +970,9 @@ fn reconcile_task_decision(queue: &Queue, home: &Path, chat: &str, id: &str) -> 
         );
         return Ok(());
     }
+    let request = decision
+        .request
+        .context("decision has no accepted operation to reconcile")?;
     let command: Operation = serde_json::from_str(&request)?;
     if let Operation::Resume { run } = &command {
         reconcile_resume_decision(queue, home, &outbox, id, run)?;
@@ -1725,6 +1733,56 @@ mod tests {
         );
         queue.put(&mut t).unwrap();
         t
+    }
+
+    #[test]
+    fn ownerless_import_reconciliation_requires_effect_evidence_not_saved_consent() {
+        use crate::ask::{Answer, Question, Questions};
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        let queue = Queue::at(home.join("queue"));
+        let talks = Talks::at(home.join("talks"));
+        let questions = Questions::at(home.join("questions"));
+        let mut q = Question::new(
+            String::new(),
+            crate::bump::NOTICE_NODE.into(),
+            "release-watch".into(),
+            "Historical release hold".into(),
+            String::new(),
+            vec!["hold".into()],
+        );
+        q.answer(Answer::Choice("hold".into())).unwrap();
+        q.answer_delivered = true;
+        questions.put(&mut q).unwrap();
+        let source = std::fs::read(questions.path_of(&q.id)).unwrap();
+        crate::task_chat::sweep(&queue, &talks, &questions, home);
+        assert!(reconcile_task_decision(&queue, home, "authorized-chat", &q.id).is_err());
+        let outbox = crate::task_inquiry::Outbox::at(home);
+        assert_eq!(
+            outbox.get(&q.id).unwrap().decision.unwrap().status,
+            crate::task_decision::Status::RetryNeeded
+        );
+        let dir = home.join("release-watch-receipts");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{}.json", q.id)),
+            serde_json::to_vec(&crate::release_watch::WatchState {
+                applied: vec![q.id.clone()],
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        for _ in 0..2 {
+            reconcile_task_decision(&queue, home, "authorized-chat", &q.id).unwrap();
+        }
+        let decision = outbox.get(&q.id).unwrap().decision.unwrap();
+        assert_eq!(decision.status, crate::task_decision::Status::Resolved);
+        assert!(decision.request.is_none());
+        assert!(decision.source_answer_at.is_none());
+        assert_eq!(std::fs::read(questions.path_of(&q.id)).unwrap(), source);
+        assert!(queue.list().is_empty());
+        assert!(talks.list().is_empty());
     }
 
     #[test]

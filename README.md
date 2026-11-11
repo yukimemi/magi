@@ -1732,6 +1732,12 @@ to consumers, avoiding a crash window that could consume an older title or
 answer. Legacy workers cannot resume imported sources. The original source
 files remain available to the passive history decoder.
 
+回答済みの履歴は Questions と API でも保存済みの状態・回答・回答時刻を保ち、
+再回答の操作を表示しない。通常の scheduler が保存済みの移行境界内を一度に
+64 件ずつ補正し、再起動後も続行する。効果不明の回答は新たな OPEN Question
+ではなく inquiry として残す。更新後の収束、証拠だけによる再照合、所有者による
+明示的な精算は [履歴の判断の復旧手順](docs/historical-decisions.md) を参照。
+
 
 判断待ち基盤の追加検証（2026-11-02）:
 `watch_supervisor_loss_is_reported_without_reexecuting_the_command` の既報の失敗は、

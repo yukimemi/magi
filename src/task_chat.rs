@@ -131,17 +131,8 @@ pub(crate) fn destination_in(talks: &Talks, repo: &Path, id: &str) -> Result<tal
     load(id)
 }
 
-/// Reserve the destination under the task lock, then deliver without it.
-/// A stable creation id and persisted link let retries recover interrupted delivery.
-/// Never wait for a talk lock while holding the task write lock.
-pub fn post(
-    queue: &Queue,
-    talks: &Talks,
-    home: &Path,
-    task_id: &str,
-    q: &Question,
-) -> Result<String> {
-    let task = queue.get(task_id)?;
+/// Build task-owned discussion and control guidance for current intent.
+fn live_record(home: &Path, task: &Task, q: &Question) -> crate::task_inquiry::Inquiry {
     let run = if q.run == task.id {
         task.runs.last().map(String::as_str).unwrap_or("none")
     } else {
@@ -201,8 +192,7 @@ pub fn post(
     let text = format!(
         "{body}\nThis automatic report is not an owner instruction. Investigate and report; it authorizes neither repository edits nor new tasks.\n{instructions}{legacy_answer}"
     );
-    let outbox = crate::task_inquiry::Outbox::at(home);
-    outbox.enqueue(crate::task_inquiry::Inquiry {
+    crate::task_inquiry::Inquiry {
         schema: 1,
         id: q.id.clone(),
         task: task.id.clone(),
@@ -213,13 +203,28 @@ pub fn post(
         text,
         display: format!("{body}{legacy_answer}"),
         key: format!("question:{}", q.id),
-        evidence: Some(crate::notice_semantics::question(home, &task, run, q)),
+        evidence: Some(crate::notice_semantics::question(home, task, run, q)),
         created_at: q.asked_at,
         delivered_to: None,
         decision: Some(crate::task_decision::Decision::awaiting(q.summary.clone())),
         delivery_error: None,
         archived: false,
-    })?;
+    }
+}
+
+/// Reserve the destination under the task lock, then deliver without it.
+/// A stable creation id and persisted link let retries recover interrupted delivery.
+/// Never wait for a talk lock while holding the task write lock.
+pub fn post(
+    queue: &Queue,
+    talks: &Talks,
+    home: &Path,
+    task_id: &str,
+    q: &Question,
+) -> Result<String> {
+    let task = queue.get(task_id)?;
+    let outbox = crate::task_inquiry::Outbox::at(home);
+    outbox.enqueue(live_record(home, &task, q))?;
     // Fresh consent can predate task ownership. Once the inquiry has its
     // owner, bind that exact response before chat creation/delivery can fail.
     // Saved replies without the live acceptance generation remain history.
@@ -238,6 +243,9 @@ pub fn post(
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Migration {
     schema: u32,
+    /// Finite, restartable correction of imports made by the reopening view.
+    #[serde(default)]
+    classification_revision: u32,
     pending: Vec<String>,
     /// Immutable boundary, retained after individual imports finish.
     #[serde(default)]
@@ -482,6 +490,7 @@ fn migrate_batch(
     } else {
         Migration {
             schema: 1,
+            classification_revision: 0,
             // list() intentionally skips unreadable records for the old UI.
             // A finite migration boundary must include their filenames too.
             pending: {
@@ -541,9 +550,19 @@ fn migrate_batch(
         std::fs::rename(temp, &path)?;
         Ok(())
     };
+    let needs_correction = migration.classification_revision < 1;
+    if needs_correction {
+        // Revisit exactly the saved boundary, including already imported
+        // sources. Never discover a new generation during compatibility repair.
+        let mut pending: std::collections::BTreeSet<_> =
+            migration.pending.iter().cloned().collect();
+        pending.extend(migration.sources.iter().flatten().cloned());
+        migration.pending = pending.into_iter().collect();
+        migration.classification_revision = 1;
+    }
     // Persist the boundary before delivering anything. Receipt loss can repeat
     // a batch, but the original inquiry/transcript keys make that repeat inert.
-    if !path.exists() || needs_boundary {
+    if !path.exists() || needs_boundary || needs_correction {
         save(&migration)?;
     }
     if migration.pending.is_empty() {
@@ -569,47 +588,58 @@ fn migrate_batch(
             let task = task_of_with_watches(&q, &tasks, watches)
                 .and_then(|id| tasks.iter().find(|task| task.id == id));
             let outbox = crate::task_inquiry::Outbox::at(home);
-            let receipt = match effect_receipt(home, queue, &q, task.map(|task| task.id.as_str())) {
-                Ok(receipt) => receipt,
-                Err(error) => {
-                    if pending_intent(home, &q, task, watches) {
-                        if let Some(task) = task {
-                            if q.routed_task.as_ref() != Some(&task.id) {
-                                questions.update(&q.id, |source| {
-                                    source.routed_task = Some(task.id.clone());
-                                    Ok(())
-                                })?;
-                            }
-                            post(queue, talks, home, &task.id, &q)?;
-                            sync_effect_receipt(home, queue, &q);
-                        } else if !q.run.is_empty() {
-                            let mut record = history_record(&q, None);
-                            record.decision =
-                                Some(crate::task_decision::Decision::awaiting(q.summary.clone()));
-                            record
-                                .decision
-                                .as_mut()
-                                .unwrap()
-                                .fail(&format!("Source receipt needs reconciliation: {error:#}"))?;
-                            record.delivery_error =
-                                Some("Restore the original task ownership before acting, or explicitly settle with task control settle-decision and a reason.".into());
-                            record.archived = false;
-                            outbox.enqueue(record)?;
-                        }
-                    } else {
-                        archive_history(&outbox, &q, task, None)?;
-                    }
-                    return Ok(());
+            let receipt = effect_receipt(home, queue, &q, task.map(|task| task.id.as_str()));
+            let mut record = history_record(&q, task);
+            match receipt {
+                Ok(Some(receipt)) => {
+                    let mut decision = crate::task_decision::Decision::awaiting(q.summary.clone());
+                    decision.applied(&receipt)?;
+                    record.decision = Some(decision);
                 }
-            };
-            let pending = receipt.is_none() && pending_intent(home, &q, task, watches);
-            if !pending {
-                archive_history(&outbox, &q, task, receipt.as_deref())?;
+                outcome if pending_intent(home, &q, task, watches) || outcome.is_err() => {
+                    if q.status.open()
+                        && let Some(task) = task
+                    {
+                        record = live_record(home, task, &q);
+                    }
+                    record.archived = false;
+                    let mut decision = crate::task_decision::Decision::awaiting(q.summary.clone());
+                    if let Err(error) = outcome {
+                        decision
+                            .fail(&format!("Source receipt needs reconciliation: {error:#}"))?;
+                    } else if q.answer.is_some() {
+                        decision.fail("Saved reply has no confirmed effect receipt. Use reconcile-decision to check durable evidence, or settle-decision with an explicit reason. Import authorized no operation.")?;
+                    }
+                    record.decision = Some(decision);
+                    record.text.push_str("\n\nImported history authorizes no operation. Saved replies require evidence reconciliation or explicit owner settlement; never replay them.");
+                    if task.is_none() {
+                        record.delivery_error = Some("Owning task is missing or ambiguous. Restore the original ownership, or use task control settle-decision with this inquiry ID and a reason. Import executed no operation.".into());
+                    }
+                }
+                _ => {}
+            }
+            let current = questions.read_history(&id)?;
+            anyhow::ensure!(
+                (current.status, &current.answer, current.answered_at)
+                    == (q.status, &q.answer, q.answered_at),
+                "source changed while classifying saved history; retry with its current generation"
+            );
+            outbox.reclassify_history(record)?;
+            sync_effect_receipt(home, queue, &q);
+            let imported = outbox.get(&q.id)?;
+            if imported.archived
+                || imported
+                    .decision
+                    .as_ref()
+                    .is_some_and(|d| d.status == crate::task_decision::Status::Resolved)
+            {
                 return Ok(());
             }
-            if let Some(task) = task {
-                // Reserve task routing before delivery: a deputy/waiter must
-                // never be a second audience for the same imported inquiry.
+            // Only genuinely unanswered intent retains legacy task routing.
+            // Saved answers and their source JSON remain immutable history.
+            if q.status.open()
+                && let Some(task) = task
+            {
                 if q.routed_task.as_ref() != Some(&task.id) {
                     questions.update(&q.id, |source| {
                         source.routed_task = Some(task.id.clone());
@@ -617,16 +647,10 @@ fn migrate_batch(
                     })?;
                 }
                 post(queue, talks, home, &task.id, &q)?;
-                sync_effect_receipt(home, queue, &q);
-            } else {
-                // An ownerless saved inquiry (empty run included) keeps its
-                // unresolved intent in the pending list for manual repair.
-                let mut record = history_record(&q, None);
-                record.archived = false;
-                record.decision = Some(crate::task_decision::Decision::awaiting(q.summary.clone()));
-                record.delivery_error = Some("Owning task is missing or ambiguous. Restore the original task/run association, or ask any chat to use task control settle-decision with this inquiry ID and a reason. Migration executed no operation.".into());
-                outbox.enqueue(record)?;
-                sync_effect_receipt(home, queue, &q);
+            } else if task.is_some() {
+                // Native discussion of unknown effects is supported without
+                // reopening or rerouting the immutable answered source.
+                outbox.deliver(queue, talks, &q.id)?;
             }
             Ok(())
         })();
@@ -652,7 +676,7 @@ fn pending_intent(
     task: Option<&Task>,
     watches: &[crate::release_watch::WatchState],
 ) -> bool {
-    if q.status.open() {
+    if q.status.open() || (q.answer.is_some() && awaits_decision(q)) {
         return true;
     }
     if watches
@@ -713,27 +737,6 @@ fn history_record(q: &Question, task: Option<&Task>) -> crate::task_inquiry::Inq
         delivery_error: None,
         archived: true,
     }
-}
-
-fn archive_history(
-    outbox: &crate::task_inquiry::Outbox,
-    q: &Question,
-    task: Option<&Task>,
-    receipt: Option<&str>,
-) -> Result<()> {
-    let mut record = history_record(q, task);
-    if let Some(receipt) = receipt {
-        let mut decision = crate::task_decision::Decision::awaiting(q.summary.clone());
-        decision.applied(receipt)?;
-        record.decision = Some(decision);
-    }
-    outbox.enqueue(record)?;
-    if let Some(receipt) = receipt {
-        outbox.update_decision(&q.id, |d| d.applied(receipt))?;
-    } else if outbox.get(&q.id)?.decision.is_some() {
-        outbox.suspend_delivery(&q.id, "Passive saved inquiry history; no current consumer requests this effect. No automatic redelivery is scheduled. Explicit owner settlement remains available where no action is queued.")?;
-    }
-    Ok(())
 }
 
 /// Queue once before retiring the ordinary question. Merge records stay open
@@ -1228,7 +1231,8 @@ pub(crate) fn effect_receipt(
             )));
         }
     }
-    if let Some(target) = &q.merge_target
+    if q.node == crate::land::APPROVAL_NODE
+        && let Some(target) = &q.merge_target
         && q.resolution().as_deref() == Some(crate::land::APPROVE)
     {
         let run = crate::run::RunState::load_under(&q.run, home)?;
@@ -1288,6 +1292,199 @@ fn task_of_with_watches(
 mod tests {
     use super::*;
     use crate::ask::{Answer, QuestionStatus};
+
+    #[tokio::test]
+    async fn release_2029_stays_answered_across_partial_import_and_restart() {
+        use crate::{task_decision::Status, task_inquiry::Outbox};
+        let home = tempfile::tempdir().unwrap();
+        let home = home.path();
+        let questions = Questions::at(home.join("questions"));
+        let queue = Queue::at(home.join("queue"));
+        let talks = Talks::at(home.join("talks"));
+        let outbox = Outbox::at(home);
+        let mut saved = Vec::new();
+        for index in 0..66 {
+            let mut q = Question::new(
+                String::new(),
+                crate::bump::NOTICE_NODE.into(),
+                "release-watch".into(),
+                "Release approval".into(),
+                "Saved reviewed head".into(),
+                vec!["merge".into(), "hold".into()],
+            );
+            q.id = format!(
+                "20261109-014940-871849981cd969b1-0000000000000000-{}",
+                1964 + index
+            );
+            q.merge_target = Some(crate::merge_decision::Target {
+                pr: "https://example.test/mebae/pull/100".into(),
+                head: "4d5a46f99a678608d2b883498d8bebd9399c0261".into(),
+                language: "en".into(),
+            });
+            q.answer(Answer::Choice(
+                if index == 0 { "hold" } else { "merge" }.into(),
+            ))
+            .unwrap();
+            q.answered_at = Some("2026-11-08T17:03:30.66862Z".parse().unwrap());
+            q.answer_delivered = true;
+            questions.put(&mut q).unwrap();
+            saved.push(q);
+        }
+        // A real effect receipt is different from answer delivery or missing ownership.
+        let receipts = home.join("release-watch-receipts");
+        std::fs::create_dir_all(&receipts).unwrap();
+        let receipt = crate::release_watch::WatchState {
+            applied: vec![saved[0].id.clone()],
+            ..Default::default()
+        };
+        std::fs::write(
+            receipts.join(format!("{}.json", saved[0].id)),
+            serde_json::to_vec(&receipt).unwrap(),
+        )
+        .unwrap();
+        // Simulate a partially completed v1 import, including a mistaken passive
+        // classification that is no longer in pending.
+        outbox.enqueue(history_record(&saved[1], None)).unwrap();
+        let dir = home.join("notifications/task-chat-migration-v1");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("state.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema": 1, "sources": saved.iter().map(|q| &q.id).collect::<Vec<_>>(),
+                "pending": saved[64..].iter().map(|q| &q.id).collect::<Vec<_>>()
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let source = &saved[65];
+        assert!(source.id.ends_with("2029"));
+        let bytes = std::fs::read(questions.path_of(&source.id)).unwrap();
+        let assert_history = || {
+            let read = questions.get(&source.id).unwrap();
+            assert_eq!(read.status, QuestionStatus::Answered);
+            assert_eq!(read.resolution().as_deref(), Some("merge"));
+            assert_eq!(read.answered_at, source.answered_at);
+            assert_eq!(
+                questions.list().iter().filter(|q| q.status.open()).count(),
+                0
+            );
+            assert!(
+                questions
+                    .get_for_effects(&source.id)
+                    .unwrap()
+                    .resolution()
+                    .is_none()
+            );
+            assert!(
+                questions
+                    .update(&source.id, |q| q.answer(Answer::Choice("merge".into())))
+                    .is_err()
+            );
+            let mut operational = questions.get_for_effects(&source.id).unwrap();
+            operational.abandon("old deadline");
+            assert!(
+                questions.put(&mut operational).is_err(),
+                "quarantine must not activate a default on timeout"
+            );
+            assert_eq!(std::fs::read(questions.path_of(&source.id)).unwrap(), bytes);
+        };
+        assert_history();
+        assert_eq!(
+            questions
+                .abandon_for_run("", "retired source owner")
+                .unwrap(),
+            0
+        );
+        assert_history();
+        let mut waiting = source.clone();
+        assert!(matches!(
+            crate::ask::resume_wait(&mut waiting, &questions, std::time::Duration::ZERO)
+                .await
+                .unwrap(),
+            crate::ask::Wait::Pending
+        ));
+        assert_history();
+        sweep(&queue, &talks, &questions, home);
+        assert_history();
+        assert_eq!(migration_pending(home).unwrap().len(), 2);
+        assert!(
+            outbox.get(&source.id).is_err(),
+            "2029 is beyond the first batch"
+        );
+        assert_eq!(
+            outbox.get(&saved[0].id).unwrap().decision.unwrap().status,
+            Status::Resolved
+        );
+        let repaired = outbox.get(&saved[1].id).unwrap();
+        assert!(!repaired.archived);
+        assert_eq!(repaired.decision.unwrap().status, Status::RetryNeeded);
+        // Reopening all stores exercises the persisted correction cursor.
+        for _ in 0..2 {
+            sweep(
+                &Queue::at(home.join("queue")),
+                &Talks::at(home.join("talks")),
+                &Questions::at(home.join("questions")),
+                home,
+            );
+            assert_history();
+        }
+        assert!(migration_pending(home).unwrap().is_empty());
+        let imported = outbox.get(&source.id).unwrap();
+        assert!(!imported.archived);
+        assert!(imported.task.is_empty());
+        assert!(
+            imported
+                .delivery_error
+                .unwrap()
+                .contains("missing or ambiguous")
+        );
+        let decision = imported.decision.unwrap();
+        assert_eq!(decision.status, Status::RetryNeeded);
+        assert!(decision.request.is_none());
+        assert!(decision.source_answer_at.is_none());
+        assert!(queue.list().is_empty());
+        assert!(talks.list().is_empty());
+        let mut later = saved[1].clone();
+        later.id = "outside-boundary".into();
+        questions.put(&mut later).unwrap();
+        sweep(&queue, &talks, &questions, home);
+        assert!(
+            outbox.get(&later.id).is_err(),
+            "correction must not expand its boundary"
+        );
+    }
+
+    #[test]
+    fn history_correction_preserves_accepted_and_completed_decisions() {
+        let home = tempfile::tempdir().unwrap();
+        let outbox = crate::task_inquiry::Outbox::at(home.path());
+        for completed in [false, true] {
+            let q = Question::new(
+                String::new(),
+                crate::bump::NOTICE_NODE.into(),
+                "release-watch".into(),
+                "Saved release".into(),
+                String::new(),
+                vec!["hold".into()],
+            );
+            let mut record = history_record(&q, None);
+            record.archived = false;
+            record.decision = Some(crate::task_decision::Decision::awaiting(q.summary.clone()));
+            outbox.enqueue(record).unwrap();
+            outbox
+                .update_decision(&q.id, |d| {
+                    if completed {
+                        d.applied("explicit durable effect receipt")
+                    } else {
+                        d.accept("decision: hold")
+                    }
+                })
+                .unwrap();
+            let before = outbox.get(&q.id).unwrap();
+            outbox.reclassify_history(history_record(&q, None)).unwrap();
+            assert_eq!(outbox.get(&q.id).unwrap(), before);
+        }
+    }
 
     #[test]
     fn routed_merge_accepts_direct_answers_and_checks_optional_button_binding() {

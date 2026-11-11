@@ -303,7 +303,7 @@ async fn migrating_answered_unapplied_decisions_never_replays_or_approves_them()
     assert!(decision.request.is_none(), "migration never manufactures an owner request");
     assert_eq!(before, std::fs::read(queue.path_of(&task.id)).unwrap());
     assert_eq!(talks.get(&chat.id).unwrap().pending_messages.len(), 1);
-    assert!(questions.get(&old.id).unwrap().answer.is_none(), "operational readers must not consume saved replies");
+    assert!(questions.get_for_effects(&old.id).unwrap().answer.is_none(), "operational readers must not consume saved replies");
     let raw: magi::ask::Question = serde_json::from_slice(&std::fs::read(questions.path_of(&old.id)).unwrap()).unwrap();
     assert!(raw.answer.is_some(), "the passive source history remains intact");
 }
@@ -835,7 +835,7 @@ async fn scheduler_effect_consumers_never_replay_migrated_or_deferred_saved_answ
         magi::daemon::apply_choice_actions(&queue, &questions, &home).await;
         assert_eq!(std::fs::read(queue.path_of(&task.id)).unwrap(), before);
         assert_eq!(outbox.list().unwrap().len(), count);
-        assert!(questions.list().iter().all(|q| q.chosen_action().is_none()));
+        assert!(questions.list_for_effects().iter().all(|q| q.chosen_action().is_none()));
         assert!(outbox.list().unwrap().iter().all(|q| q.decision.as_ref().unwrap().request.is_none()));
     }
     // Even an accepted native command cannot expose the *old* source payload
@@ -891,7 +891,7 @@ async fn imported_effect_receipts_recover_from_delay_and_unreadable_receipts_wit
         let pending = outbox.get(&q.id).unwrap().decision.unwrap();
         assert_eq!(pending.status, Status::RetryNeeded);
         assert!(pending.request.is_none());
-        assert!(questions.get(&q.id).unwrap().resolution().is_none(), "execution view must still quarantine the saved reply");
+        assert!(questions.get_for_effects(&q.id).unwrap().resolution().is_none(), "execution view must still quarantine the saved reply");
         let before_source = std::fs::read(questions.path_of(&q.id)).unwrap();
         // An already-running legacy consumer can commit this receipt later;
         // migration and subsequent reconciliation may only observe it.
@@ -902,7 +902,7 @@ async fn imported_effect_receipts_recover_from_delay_and_unreadable_receipts_wit
             let decision = Outbox::at(&home).get(&q.id).unwrap().decision.unwrap();
             assert_eq!(decision.status, Status::Resolved);
             assert!(decision.request.is_none(), "receipt observation must not manufacture owner authority");
-            assert!(questions.get(&q.id).unwrap().resolution().is_none());
+            assert!(questions.get_for_effects(&q.id).unwrap().resolution().is_none());
             assert_eq!(std::fs::read(questions.path_of(&q.id)).unwrap(), before_source);
             assert_eq!(std::fs::read(queue.path_of(&task.id)).unwrap(), before_task);
             assert!(magi::worker::active(&home).unwrap().is_empty());
@@ -1491,9 +1491,10 @@ async fn accepted_legacy_effects_support_explicit_settlement_without_replay() {
             assert_eq!(decision.status, Status::Resolved); assert!(decision.legacy_settled);
             assert_eq!(decision.request.as_deref(), Some(format!("decision: {choice}").as_str()));
             if choice == "retry" { assert!(decision.history.iter().any(|e| e.status == Status::RetryNeeded)); }
-            assert!(questions.get(&q.id).unwrap().answer.is_none());
-            assert!(!questions.get(&q.id).unwrap().status.open());
-            assert!(!questions.list().into_iter().any(|q| q.answer.is_some()));
+            assert!(questions.get_for_effects(&q.id).unwrap().answer.is_none());
+            assert!(questions.get_for_effects(&q.id).unwrap().status.open(), "settlement must not activate abandoned-question defaults");
+            assert!(!questions.list_for_effects().into_iter().any(|q| q.answer.is_some()));
+            assert!(questions.get(&q.id).unwrap().answer.is_some(), "presentation retains the recorded answer");
             assert_eq!(std::fs::read(questions.path_of(&q.id)).unwrap(), saved);
             assert!(chat_control::decide(&talks, &home, &chat.id, &q.id, choice).is_err());
         }
@@ -1540,7 +1541,7 @@ async fn fresh_cli_answers_survive_migration_before_and_after_first_sweep() {
             assert_eq!(decision.request.as_deref(), Some("decision: hold"), "migrate_first={migrate_first} associate_later={associate_later} delivery_fails={delivery_fails}: {decision:?}; source={reopened:?}");
             assert_eq!(decision.source_answer_at, reopened.answered_at);
             assert_eq!(decision.status, Status::Queued, "acceptance is not an effect receipt");
-            assert!(questions.get(&historical.id).unwrap().answer.is_none());
+            assert!(questions.get_for_effects(&historical.id).unwrap().answer.is_none());
             assert!(Outbox::at(&home).get(&historical.id).unwrap().decision.unwrap().request.is_none());
         }
         if delivery_fails {

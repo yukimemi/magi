@@ -140,7 +140,10 @@ pub fn chat_talk_of(tasks: &[Task], start: &Task) -> Option<String> {
 /// heading. Answered or abandoned questions and ended consultations stop
 /// counting.
 pub fn pending_consults(questions: &Questions, talk_id: &str) -> bool {
-    questions.list().iter().any(|q| active_consult(q, talk_id))
+    questions
+        .list_for_effects()
+        .iter()
+        .any(|q| active_consult(q, talk_id))
 }
 
 /// Consultation activity is separate from the question's waiting state.
