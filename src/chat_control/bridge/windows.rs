@@ -151,7 +151,7 @@ impl Bridge {
                                     // Authenticate before parsing or executing an operation.
                                     let mut supplied = [0; 64];
                                     pipe.read_exact(&mut supplied).await?;
-                                    ensure!(supplied.as_slice() == token.as_bytes(), "invalid control capability");
+                                    ensure!(super::constant_eq(&supplied, token.as_bytes()), "invalid control capability");
                                     let len = pipe.read_u32().await? as usize;
                                     ensure!(len <= MAX_FRAME, "control request too large");
                                     let mut body = vec![0; len];

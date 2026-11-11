@@ -12,6 +12,10 @@ pub(crate) use windows::*;
 
 const MAX_FRAME: usize = 1024 * 1024;
 
+fn constant_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Request {
     id: u64,
@@ -44,5 +48,20 @@ pub(crate) fn clear_std_environment(command: &mut std::process::Command) {
     unix::close_inherited(command);
     for name in ENVIRONMENT {
         command.env_remove(name);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn capability_comparison_checks_every_position_and_length() {
+        let token = [b'a'; 64];
+        assert!(super::constant_eq(&token, &token));
+        assert!(!super::constant_eq(&token, &token[..63]));
+        for index in 0..token.len() {
+            let mut wrong = token;
+            wrong[index] ^= 1;
+            assert!(!super::constant_eq(&token, &wrong));
+        }
     }
 }

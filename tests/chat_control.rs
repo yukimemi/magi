@@ -1793,6 +1793,55 @@ print('reused descriptor rejected')
                 std::fs::read(f.queue().path_of(&f.task.id)).unwrap(),
                 before
             );
+
+            // 同一性検証を通ったパイプでも、送信後の応答消失はローカル再実行しない。
+            let output = std::process::Command::new("python3")
+                .args([
+                    "-c",
+                    r#"import fcntl, json, os, stat, subprocess, tempfile
+request_read, request_write = os.pipe()
+response_read, response_write = os.pipe()
+with tempfile.TemporaryFile() as lock:
+    fds = (request_write, response_read, lock.fileno())
+    def identity(fd):
+        info = os.fstat(fd)
+        return [str(info.st_dev), str(info.st_ino), str(stat.S_IFMT(info.st_mode)),
+                str(fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE)]
+    env = {k: v for k, v in os.environ.items() if not k.startswith('MAGI_CHAT_CONTROL_')}
+    env.update(MAGI_CHAT_CONTROL_FD=str(request_write),
+               MAGI_CHAT_CONTROL_RESPONSE_FD=str(response_read),
+               MAGI_CHAT_CONTROL_LOCK_FD=str(lock.fileno()),
+               MAGI_CHAT_CONTROL_IDENTITIES=json.dumps([identity(fd) for fd in fds]),
+               MAGI_NODE='chat', MAGI_ALLOW_WRITE='1')
+    child = subprocess.Popen([env['TEST_BINARY'], 'task', 'control', 'hold',
+                              env['TEST_TASK'], 'must not replay pipe'],
+                             env=env, pass_fds=fds, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    os.close(request_write)
+    os.close(response_read)
+    with os.fdopen(request_read, 'rb') as requests:
+        length = requests.read(4)
+        assert len(length) == 4, length
+        body = requests.read(int.from_bytes(length, 'big'))
+        assert json.loads(body)['operation']['operation'] == 'Hold', body
+    os.close(response_write)
+    out, err = child.communicate(timeout=30)
+    assert child.returncode != 0 and b'outcome is unknown' in err, (out, err)
+"#,
+                ])
+                .envs(common::magi_cli_env(f.tmp.path(), "TEST_BINARY"))
+                .env("MAGI_RUN", &f.talk)
+                .env("TEST_TASK", &f.task.id)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                std::fs::read(f.queue().path_of(&f.task.id)).unwrap(),
+                before
+            );
         },
     );
 }

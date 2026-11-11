@@ -1,6 +1,7 @@
 //! Capability-authenticated transport for backends that close inherited fds.
 use super::*;
 use std::io::Read as _;
+use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
 use std::sync::{
     Arc,
@@ -26,13 +27,30 @@ fn secret() -> Result<String> {
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
+fn socket_directory(
+    bases: impl IntoIterator<Item = std::path::PathBuf>,
+) -> Result<std::path::PathBuf> {
+    let address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    let mut failure = anyhow::anyhow!("no temporary directory candidates");
+    for base in bases {
+        let directory = base.join(format!("magi-control-{}", &secret()?[..24]));
+        // 終端 NUL を含めて、ホストの sun_path に収まる必要がある。
+        if directory.join("channel").as_os_str().as_bytes().len() >= address.sun_path.len() {
+            failure = anyhow::anyhow!("chat control socket path exceeds sun_path capacity");
+            continue;
+        }
+        match std::fs::DirBuilder::new().mode(0o700).create(&directory) {
+            Ok(()) => return Ok(directory),
+            Err(error) => failure = error.into(),
+        }
+    }
+    Err(failure).context("cannot create a private directory for the chat control socket")
+}
+
 impl Socket {
     pub(super) fn start(home: &Path, talk: &str, serial: Serial) -> Result<Self> {
-        // A short path also works on hosts whose ordinary temp path nearly
-        // fills sockaddr_un. Creation is exclusive and private from the start.
         let token = secret()?;
-        let directory = Path::new("/tmp").join(format!("magi-control-{}", &secret()?[..24]));
-        std::fs::DirBuilder::new().mode(0o700).create(&directory)?;
+        let directory = socket_directory([std::env::temp_dir(), "/tmp".into()])?;
         let listener = match (|| -> Result<_> {
             let listener = tokio::net::UnixListener::bind(directory.join("channel"))?;
             std::fs::set_permissions(
@@ -71,7 +89,7 @@ impl Socket {
                                         ensure!(stream.peer_cred()?.uid() == unsafe { libc::geteuid() }, "control peer UID mismatch");
                                         let mut supplied = [0; 64];
                                         stream.read_exact(&mut supplied).await?;
-                                        ensure!(supplied.as_slice() == token.as_bytes(), "control authentication rejected");
+                                        ensure!(super::super::constant_eq(&supplied, token.as_bytes()), "control authentication rejected");
                                         // No operation has been sent before this ACK.
                                         stream.write_all(b"A").await?;
                                         let len = stream.read_u32().await? as usize;
@@ -181,6 +199,28 @@ impl PeerCredentials for std::os::unix::net::UnixStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn socket_directory_prefers_temp_and_falls_back_for_length_or_creation_failure() {
+        let tmp = tempfile::tempdir_in("/tmp").unwrap();
+        let preferred = socket_directory([tmp.path().to_owned(), "/tmp".into()]).unwrap();
+        assert_eq!(preferred.parent(), Some(tmp.path()));
+        assert_eq!(
+            std::fs::metadata(&preferred).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        std::fs::remove_dir(preferred).unwrap();
+
+        for unusable in [tmp.path().join("x".repeat(108)), tmp.path().join("missing")] {
+            let directory = socket_directory([unusable, tmp.path().to_owned()]).unwrap();
+            assert_eq!(directory.parent(), Some(tmp.path()));
+            let path = directory.join("channel");
+            let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            drop(listener);
+            std::fs::remove_dir_all(directory).unwrap();
+        }
+        assert!(socket_directory([tmp.path().join("missing")]).is_err());
+    }
 
     async fn call(socket: &Socket, token: &str, operation: Operation) -> Result<String> {
         let path = socket.directory.join("channel");
