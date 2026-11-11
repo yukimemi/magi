@@ -3289,39 +3289,14 @@ async fn task_cmd(command: TaskCmd) -> Result<()> {
 /// `Queue::open` reads, which only the first caller in the binary may do (see
 /// `run::set_home`'s doc and `run_rm_cmd_guards_and_removes`, the test that
 /// already claims that spot).
-fn task_cmd_on(command: TaskCmd, q: Queue) -> impl std::future::Future<Output = Result<()>> {
-    // Callers may retain several commands. Allocate their state here so debug
-    // builds do not copy every command frame through the caller and executor.
-    Box::pin(task_cmd_inner(command, q))
-}
-
-async fn task_cmd_inner(command: TaskCmd, q: Queue) -> Result<()> {
+fn task_cmd_on(
+    command: TaskCmd,
+    q: Queue,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send>> {
+    // Select ordinary file writes before constructing the shared dispatcher.
+    // Its debug poll frame reserves locals for every command, including cold
+    // run-recovery paths; boxing that frame alone does not bound its stack use.
     match command {
-        TaskCmd::Reassign { id, repo } => {
-            if std::env::var("MAGI_NODE").as_deref() == Ok("chat") {
-                println!(
-                    "{}",
-                    control_from_chat(magi::chat_control::Operation::Reassign { task: id, repo })
-                        .await?
-                );
-            } else {
-                magi::repair_budget::authorize_terminal()?;
-                let task = magi::task_reassign::reassign(
-                    &q,
-                    &magi::run::home(),
-                    &std::env::current_dir()?,
-                    &id,
-                    &repo,
-                    "terminal",
-                )
-                .await?;
-                println!("{} -> {}", task.short(), task.repo.display());
-                for note in magi::task_reassign::advisory_notes(&task, &magi::run::home()) {
-                    println!("  {note}");
-                }
-            }
-            Ok(())
-        }
         TaskCmd::Add {
             sources,
             instruction,
@@ -3337,7 +3312,7 @@ async fn task_cmd_inner(command: TaskCmd, q: Queue) -> Result<()> {
             force,
             json,
             implementers,
-        } => {
+        } => Box::pin(async move {
             if let Some(why) = mistyped_command(
                 "magi task add",
                 &instruction,
@@ -3442,8 +3417,97 @@ async fn task_cmd_inner(command: TaskCmd, q: Queue) -> Result<()> {
                 );
             }
             Ok(())
-        }
+        }),
+        TaskCmd::Edit {
+            id,
+            instruction,
+            file,
+            title,
+            attach,
+        } => Box::pin(async move {
+            if let Some(why) = mistyped_command(
+                &format!("magi task edit {id}"),
+                &instruction,
+                had_separator(),
+                &subcommand_words(),
+            ) {
+                bail!(why);
+            }
+            let resolved = q.resolve_id(&id)?;
+            let _claim = q
+                .claim(&resolved)
+                .with_context(|| format!("task {resolved} is claimed by a running daemon"))?;
+            let mut t = q.get(&resolved)?;
+            if !attach.is_empty() && instruction.is_empty() && file.is_none() && title.is_none() {
+                if !matches!(t.status, TaskStatus::Queued | TaskStatus::Held) {
+                    bail!(
+                        "task {} is {}; only a queued or held task can be edited",
+                        t.short(),
+                        t.status.as_str()
+                    );
+                }
+                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                q.attach_and_put(&mut t, &absolute_paths(&attach, &cwd))?;
+                println!("edited {} {}", t.short(), t.title);
+                return Ok(());
+            }
+            let text = task_text(&instruction, file.as_deref(), None).await?;
+            if instruction.is_empty() && file.is_none() {
+                // Same stdin gap as `task add`: no positional words means
+                // `task_text` read the new instruction from stdin, and the
+                // guard above never saw it.
+                guard_free_form_text(
+                    &format!("magi task edit {id}"),
+                    &text,
+                    had_separator(),
+                    &subcommand_words(),
+                )?;
+            }
+            let title = title.unwrap_or_else(|| queue::title_from(&text, 72));
+            t.edit(title, text)?;
+            if !attach.is_empty() {
+                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+                q.attach_and_put(&mut t, &absolute_paths(&attach, &cwd))?;
+            } else {
+                q.put(&mut t)?;
+            }
+            println!("edited {} {}", t.short(), t.title);
+            Ok(())
+        }),
+        command => Box::pin(task_cmd_inner(command, q)),
+    }
+}
 
+async fn task_cmd_inner(command: TaskCmd, q: Queue) -> Result<()> {
+    match command {
+        TaskCmd::Add { .. } | TaskCmd::Edit { .. } => {
+            unreachable!("file writes are dispatched before the shared command future")
+        }
+        TaskCmd::Reassign { id, repo } => {
+            if std::env::var("MAGI_NODE").as_deref() == Ok("chat") {
+                println!(
+                    "{}",
+                    control_from_chat(magi::chat_control::Operation::Reassign { task: id, repo })
+                        .await?
+                );
+            } else {
+                magi::repair_budget::authorize_terminal()?;
+                let task = magi::task_reassign::reassign(
+                    &q,
+                    &magi::run::home(),
+                    &std::env::current_dir()?,
+                    &id,
+                    &repo,
+                    "terminal",
+                )
+                .await?;
+                println!("{} -> {}", task.short(), task.repo.display());
+                for note in magi::task_reassign::advisory_notes(&task, &magi::run::home()) {
+                    println!("  {note}");
+                }
+            }
+            Ok(())
+        }
         TaskCmd::Sources { id, sources, clear } => {
             anyhow::ensure!(
                 clear || sources.supplied(),
@@ -3864,63 +3928,6 @@ async fn task_cmd_inner(command: TaskCmd, q: Queue) -> Result<()> {
             } else {
                 println!("{} marked to interrupt - {}", t.short(), t.title);
             }
-            Ok(())
-        }
-
-        TaskCmd::Edit {
-            id,
-            instruction,
-            file,
-            title,
-            attach,
-        } => {
-            if let Some(why) = mistyped_command(
-                &format!("magi task edit {id}"),
-                &instruction,
-                had_separator(),
-                &subcommand_words(),
-            ) {
-                bail!(why);
-            }
-            let resolved = q.resolve_id(&id)?;
-            let _claim = q
-                .claim(&resolved)
-                .with_context(|| format!("task {resolved} is claimed by a running daemon"))?;
-            let mut t = q.get(&resolved)?;
-            if !attach.is_empty() && instruction.is_empty() && file.is_none() && title.is_none() {
-                if !matches!(t.status, TaskStatus::Queued | TaskStatus::Held) {
-                    bail!(
-                        "task {} is {}; only a queued or held task can be edited",
-                        t.short(),
-                        t.status.as_str()
-                    );
-                }
-                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                q.attach_and_put(&mut t, &absolute_paths(&attach, &cwd))?;
-                println!("edited {} {}", t.short(), t.title);
-                return Ok(());
-            }
-            let text = task_text(&instruction, file.as_deref(), None).await?;
-            if instruction.is_empty() && file.is_none() {
-                // Same stdin gap as `task add`: no positional words means
-                // `task_text` read the new instruction from stdin, and the
-                // guard above never saw it.
-                guard_free_form_text(
-                    &format!("magi task edit {id}"),
-                    &text,
-                    had_separator(),
-                    &subcommand_words(),
-                )?;
-            }
-            let title = title.unwrap_or_else(|| queue::title_from(&text, 72));
-            t.edit(title, text)?;
-            if !attach.is_empty() {
-                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-                q.attach_and_put(&mut t, &absolute_paths(&attach, &cwd))?;
-            } else {
-                q.put(&mut t)?;
-            }
-            println!("edited {} {}", t.short(), t.title);
             Ok(())
         }
 
