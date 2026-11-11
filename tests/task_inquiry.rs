@@ -811,6 +811,54 @@ async fn task_claim_contention_is_durably_retryable_and_safe_to_cancel_before_ef
 }
 
 common::e2e! {
+async fn answered_sources_never_read_as_open_cards_before_during_or_after_partial_migration() {
+    use magi::ask::{Answer, ChoiceAction, Question, QuestionStatus, Questions};
+    let fx = common::fixture(common::home_lock().await, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("answered-not-open");
+    let queue = Queue::at(home.join("queue")); let talks = Talks::at(home.join("talks"));
+    let chat = talk::begin(&talks, &fx.config, fx.repo.clone(), Some("alpha")).unwrap();
+    let mut task = Task::new("work".into(), "work".into(), fx.repo.clone(), Source::Human);
+    task.chat = Some(chat.id.clone()); task.runs.push("run-a".into()); queue.put(&mut task).unwrap();
+    let questions = Questions::at(home.join("questions"));
+    let mut ids = Vec::new();
+    for index in 0..65 {
+        let mut q = Question::new("run-a".into(), "implement".into(), "impl-A".into(), format!("Saved hold {index}"), "history".into(), vec!["hold".into()]);
+        q.actions.insert("hold".into(), ChoiceAction::Hold);
+        q.answer(Answer::Choice("hold".into())).unwrap(); questions.put(&mut q).unwrap(); ids.push(q.id);
+    }
+    // An upgraded installation has already snapshotted these saved sources,
+    // while the first bounded batch may still be pending.
+    let migration = home.join("notifications/task-chat-migration-v1");
+    std::fs::create_dir_all(&migration).unwrap();
+    std::fs::write(migration.join("state.json"), serde_json::to_vec(&serde_json::json!({
+        "schema": 1, "sources": ids, "pending": ids
+    })).unwrap()).unwrap();
+    let before = std::fs::read(queue.path_of(&task.id)).unwrap();
+    for count in [0, 64, 65, 65] {
+        // Reopen stores to exercise the persisted partial migration boundary.
+        let questions = Questions::at(home.join("questions"));
+        if count > 0 { magi::task_chat::sweep(&queue, &talks, &questions, &home); }
+        assert_eq!(Outbox::at(&home).list().unwrap().len(), count);
+        for id in &ids {
+            let q = questions.get(id).unwrap();
+            assert_eq!(q.status, QuestionStatus::Answered);
+            assert_eq!(q.resolution().as_deref(), Some("hold"));
+            assert!(q.clone().answer(Answer::Choice("hold".into())).is_err(), "view and answer agree");
+            assert!(questions.update(id, |q| q.answer(Answer::Choice("hold".into()))).is_err(), "persisted answers cannot be replaced");
+        }
+        assert!(questions.list().iter().all(|q| !q.status.open()));
+        assert!(questions.list_for_effects().iter().all(|q| q.chosen_action().is_none()));
+        assert_eq!(std::fs::read(queue.path_of(&task.id)).unwrap(), before);
+        magi::daemon::apply_choice_actions(&queue, &questions, &home).await;
+        assert_eq!(std::fs::read(queue.path_of(&task.id)).unwrap(), before);
+    }
+    let raw: Question = serde_json::from_slice(&std::fs::read(questions.path_of(&ids[0])).unwrap()).unwrap();
+    assert_eq!(raw.status, QuestionStatus::Answered);
+    assert_eq!(raw.resolution().as_deref(), Some("hold"), "the source history stays intact");
+}
+}
+
+common::e2e! {
 async fn scheduler_effect_consumers_never_replay_migrated_or_deferred_saved_answers() {
     use magi::{ask::{Question, Questions, Answer, ChoiceAction}, task_decision::Status};
     let fx = common::fixture(common::home_lock().await, common::Judges::Unanimous, false);
