@@ -5,6 +5,7 @@ use std::path::Path;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
+pub mod legacy;
 pub mod reconcile;
 
 pub use crate::base_sync_recovery::{Stop, StopKind, ensure_generic_release};
@@ -65,6 +66,10 @@ pub struct Request {
     #[arg(long)]
     #[serde(default)]
     pub replace_request: Option<String>,
+    /// Evidence digest from inspect-base-stop, required for legacy textual stops.
+    #[arg(long)]
+    #[serde(default)]
+    pub evidence_digest: Option<String>,
 }
 
 /// Accepted grant and the control state against which it was authorized.
@@ -81,6 +86,9 @@ pub struct Receipt {
     /// Immutable textual stop; no synchronization budget is renewed.
     #[serde(default)]
     pub stop: Option<crate::base_sync_recovery::Stop>,
+    /// Diagnostic-only provenance; never a fabricated sequencer checkpoint.
+    #[serde(default)]
+    pub legacy: Option<legacy::Evidence>,
 }
 
 /// Durable execution checkpoint; consumed attempts never reset historical counters.
@@ -322,8 +330,9 @@ async fn public_lease(state: &RunState) -> Result<()> {
 }
 
 fn evidence(state: &RunState, request: &Request) -> Result<()> {
+    let pass = state.passes.last().context("repair grant refused: missing stopped pass checkpoint; inspect retained run provenance before recovery")?;
     ensure!(
-        state.passes.last().map(|p| p.index) == Some(request.expect_pass),
+        pass.index == request.expect_pass,
         "repair grant refused: stopped pass changed"
     );
     ensure!(
@@ -346,19 +355,19 @@ fn evidence(state: &RunState, request: &Request) -> Result<()> {
                     .is_some_and(|s| !s.trim().is_empty() && s.len() <= 16384),
                 "base-conflict repair requires --instruction with the narrow owner-approved repair (1..=16384 bytes)"
             );
-            let stop = state
-                .base_sync_recovery
-                .stop
-                .as_ref()
-                .context("no recorded textual stop")?;
+            let (_, legacy) = legacy::textual_stop(
+                state,
+                &request.head,
+                request
+                    .tip
+                    .as_deref()
+                    .context("base-conflict repair requires --tip")?,
+            )?;
             ensure!(
-                stop.kind == crate::base_sync_recovery::StopKind::Conflict
-                    && stop.head == request.head
-                    && request.tip.is_some()
-                    && state.base_sync.as_ref().is_some_and(
-                        |s| s.tip == stop.tip && s.conflict.as_ref() == Some(&stop.detail)
-                    ),
-                "base-conflict repair refused: textual stop, head or --tip changed"
+                legacy.as_ref().map(|e| e.digest.as_str()) == request.evidence_digest.as_deref(),
+                "base-conflict repair refused: missing or stale --evidence-digest; run task inspect-base-stop {} --run {} and authorize the inspected evidence",
+                request.task,
+                request.run
             );
         }
         Kind::Gate => {
@@ -461,7 +470,7 @@ pub async fn grant(queue: &Queue, home: &Path, mut request: Request) -> Result<R
         "repair grant refused: driver is live or unknown"
     );
     let _execution = crate::driver::maintenance(home, &state.id)?;
-    let _outputs = output_leases(&state)?;
+    let _outputs = output_leases(home, &state)?;
     ensure!(
         state.status.resumable(),
         "repair grant refused: run is final"
@@ -492,7 +501,18 @@ pub async fn grant(queue: &Queue, home: &Path, mut request: Request) -> Result<R
         );
         ensure!(
             old.request.head == request.head
-                && old.stop == state.base_sync_recovery.stop
+                && old.stop.as_ref()
+                    == Some(
+                        &legacy::textual_stop(
+                            &state,
+                            &request.head,
+                            request
+                                .tip
+                                .as_deref()
+                                .context("replacement requires --tip")?
+                        )?
+                        .0
+                    )
                 && old.request.tip != request.tip,
             "replacement refused: retained stop/head changed or the approved tip has not moved"
         );
@@ -526,10 +546,19 @@ pub async fn grant(queue: &Queue, home: &Path, mut request: Request) -> Result<R
         );
     }
     let task_contract = contract(&task, request.kind)?;
+    let (stop, legacy) = if request.kind == Kind::BaseConflict {
+        let (stop, legacy) = legacy::textual_stop(
+            &state,
+            &request.head,
+            request.tip.as_deref().context("missing --tip")?,
+        )?;
+        (Some(stop), legacy)
+    } else {
+        (None, None)
+    };
     let receipt = Receipt {
-        stop: (request.kind == Kind::BaseConflict)
-            .then(|| state.base_sync_recovery.stop.clone())
-            .flatten(),
+        stop,
+        legacy,
         request,
         at: jiff::Timestamp::now(),
         decision: task.operator_decided_at,
@@ -551,13 +580,19 @@ pub async fn grant(queue: &Queue, home: &Path, mut request: Request) -> Result<R
     Ok(receipt)
 }
 
-fn output_leases(state: &RunState) -> Result<Vec<crate::retention::OutputLease>> {
+fn output_leases(home: &Path, state: &RunState) -> Result<Vec<crate::retention::OutputLease>> {
     let mut paths: std::collections::BTreeSet<_> = state
         .candidates
         .iter()
         .filter(|c| c.worktree.exists())
         .map(|c| c.worktree.clone())
         .collect();
+    // Legacy rebase scratch lives beside the run record, outside seat roots.
+    // Its descendants still share this repository even when a new scratch is used.
+    let legacy_scratch = home.join("runs").join(&state.id).join("base-sync");
+    if legacy_scratch.join(".git").is_file() {
+        paths.insert(legacy_scratch);
+    }
     // Reviewers and other retained seats are reset on reuse too. A stopped
     // driver does not imply their tool descendants have released the tree.
     match std::fs::read_dir(state.worktree_root()) {
@@ -625,7 +660,7 @@ pub(crate) async fn apply(home: &Path, state: &mut RunState, disk: &RunState) ->
                 && contract(&task, active.receipt.request.kind)? == active.receipt.contract,
             "repair grant held: task contract or owner decision changed after acceptance"
         );
-        let _outputs = output_leases(disk)?;
+        let _outputs = output_leases(home, disk)?;
         if matches!(active.phase, Phase::Pending | Phase::Fixing) {
             conflict_target(disk, &active.receipt.request, active.receipt.stop.as_ref()).await?;
         }
@@ -655,8 +690,23 @@ pub(crate) async fn apply(home: &Path, state: &mut RunState, disk: &RunState) ->
             "repair grant held: owner decision changed after acceptance"
         );
         evidence(disk, &receipt.request)?;
+        if receipt.request.kind == Kind::BaseConflict {
+            ensure!(
+                legacy::textual_stop(
+                    disk,
+                    &receipt.request.head,
+                    receipt
+                        .request
+                        .tip
+                        .as_deref()
+                        .context("missing repair tip")?
+                )?
+                .1 == receipt.legacy,
+                "legacy repair evidence changed after authorization"
+            );
+        }
         conflict_target(disk, &receipt.request, receipt.stop.as_ref()).await?;
-        let _outputs = output_leases(disk)?;
+        let _outputs = output_leases(home, disk)?;
         head_and_public(disk, &receipt.request.head).await?;
         state.repair_grants.push(Applied {
             receipt: receipt.clone(),
@@ -731,9 +781,18 @@ async fn conflict_target(
     if request.kind != Kind::BaseConflict {
         return Ok(());
     }
+    let (derived, legacy) = legacy::textual_stop(
+        state,
+        &request.head,
+        request.tip.as_deref().context("missing repair tip")?,
+    )?;
+    ensure!(
+        legacy.as_ref().map(|e| e.digest.as_str()) == request.evidence_digest.as_deref(),
+        "base-conflict repair held: legacy evidence digest changed; inspect-base-stop before authorizing"
+    );
     if let Some(stop) = stop {
         ensure!(
-            state.base_sync_recovery.stop.as_ref() == Some(stop),
+            &derived == stop,
             "base-conflict repair held: stopped synchronization changed"
         );
     }
@@ -757,8 +816,15 @@ async fn conflict_target(
                 "base-conflict repair refused: recorded base tip moved to {live}; inspect this target and explicitly request --tip {live}. An already queued approval additionally requires --replace-request <old-request-id>"
             );
         }
+        let evidence_flag = if request.evidence_digest.is_some() {
+            " --evidence-digest <fresh-inspected-digest>"
+        } else {
+            ""
+        };
         anyhow::bail!(
-            "base-conflict repair held: recorded base tip moved to {live}. Inspect the new target, then explicitly replace the unimported approval with `magi task grant-repair {} --run {} --kind base-conflict --rounds 1 --head {} --tip {live} --expect-pass {} --replace-request {} --request <new-id> --reason <reason> --instruction <approved-resolution>`. No edit or synchronization budget was granted",
+            "base-conflict repair held: recorded base tip moved to {live}. Run `magi task inspect-base-stop {} --run {}` to inspect the new target, then explicitly replace the unimported approval with `magi task grant-repair {} --run {} --kind base-conflict --rounds 1 --head {} --tip {live} --expect-pass {}{evidence_flag} --replace-request {} --request <new-id> --reason <reason> --instruction <approved-resolution>`. No edit or synchronization budget was granted",
+            request.task,
+            request.run,
             request.task,
             request.run,
             request.head,
@@ -766,11 +832,7 @@ async fn conflict_target(
             request.request
         );
     }
-    let stopped = state
-        .base_sync_recovery
-        .stop
-        .as_ref()
-        .context("base-conflict repair requires the retained textual stop")?;
+    let (stopped, _) = legacy::textual_stop(state, &request.head, &live)?;
     ensure!(
         git::is_ancestor(&state.repo, &stopped.tip, &live).await,
         "base-conflict repair refused: current base {live} does not descend from recorded stop tip {}; reconcile the rewritten base explicitly before granting repair",
