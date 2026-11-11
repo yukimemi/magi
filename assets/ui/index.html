@@ -53,7 +53,7 @@
     <a class="rail-link" href="#/queue" data-nav="queue">Queue</a>
     <a class="rail-link" href="#/stats" data-nav="stats">Stats</a>
     <a class="rail-link" href="#/settings" data-nav="settings">Settings</a>
-    <a class="rail-link" href="#/decisions" data-nav="decisions">判断待ち<span class="badge" id="decision-badge-rail" hidden></span></a>
+    <a class="rail-link" href="#/decisions" data-nav="decisions">Pending decisions<span class="badge" id="decision-badge-rail" hidden></span></a>
     <a class="rail-link btn btn-gold" href="#/chat" data-nav="talks">Chat<span class="badge" id="talk-badge-rail" hidden></span></a>
   </nav>
 
@@ -515,15 +515,15 @@
 
   <section class="view" id="view-decisions" aria-labelledby="decisions-h" hidden>
     <div class="view-head">
-      <h1 id="decisions-h">判断待ち</h1>
-      <p class="view-sub" id="decisions-count" role="status">読み込み中…</p>
+      <h1 id="decisions-h">Pending decisions</h1>
+      <p class="view-sub" id="decisions-count" role="status">Loading…</p>
     </div>
-    <p class="panel-note">相談・判断はタスクのチャットへ。配送・既読・返信だけでは解決済みになりません。</p>
+    <p class="panel-note">An item is complete only after a confirmed effect receipt or explicit settlement with a reason. Delivery, reading and saved replies alone do not resolve it. Discuss decisions in the owning task chat.</p>
     <div id="decisions-error" role="alert" hidden></div>
-    <p><a class="text-link" href="#/questions">従来の問い合わせ・保存履歴<span class="badge" id="ask-badge-rail" hidden></span></a></p>
+    <p><a class="text-link" href="#/questions">Legacy questions and saved replies<span class="badge" id="ask-badge-rail" hidden></span></a></p>
     <ol class="asks" id="decisions-list"></ol>
-    <p class="empty" id="decisions-empty" hidden>未解決の判断はありません。</p>
-    <details id="decisions-history"><summary>解決済みの履歴</summary><ol class="asks" id="decisions-resolved"></ol></details>
+    <p class="empty" id="decisions-empty" hidden>No unresolved decisions.</p>
+    <details id="decisions-history"><summary>Resolved history</summary><ol class="asks" id="decisions-resolved"></ol></details>
   </section>
 
   <!-- QUESTIONS --------------------------------------------------------- -->
@@ -741,7 +741,7 @@
       </svg>
       <span class="badge" id="decision-badge-dock" hidden></span>
     </span>
-    <span>判断待ち</span>
+    <span>Pending decisions</span>
   </a>
   <a class="dock-item dock-chat" href="#/chat" data-nav="talks">
     <span class="dock-glyph" aria-hidden="true">

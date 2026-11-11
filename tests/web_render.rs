@@ -5056,6 +5056,9 @@ async fn pending_chat_links_survive_closed_chats_and_explicit_settlement() {
         )
         .unwrap();
     outbox.deliver(&queue, &talks, &inquiry.id).unwrap();
+    outbox.update_decision(&inquiry.id, |decision| {
+        decision.fail("Saved reply has no confirmed effect receipt. Inspect the outcome before explicit settlement.")
+    }).unwrap();
     for index in 0..20 {
         talk::record(&mut chat, &talks, &format!("Later message {index}"), vec![]).unwrap();
     }
@@ -5083,13 +5086,55 @@ async fn pending_chat_links_survive_closed_chats_and_explicit_settlement() {
           if (!links.every(link => link.getBoundingClientRect().height >= 44)) throw new Error('small tap target');
           const inquiry = links.find(link => link.hash.includes('/inquiry/'));
           if (!inquiry || !links.some(link => link.hash.startsWith('#/tasks/'))) throw new Error('missing ownership links');
-          inquiry.click(); return true;
+          const count = document.querySelector('#decisions-count').innerText;
+          if (count !== '1 unresolved · 0 resolved (history)') throw new Error('ambiguous counts');
+          if (document.title !== 'Pending decisions — magi') throw new Error('document title');
+          const chrome = ['#decisions-h', '#decisions-count', '.rail-link[data-nav="decisions"]', '.dock-item[data-nav="decisions"]'];
+          for (const selector of chrome) {
+            if (/[\u3040-\u30ff\u3400-\u9fff]/u.test(document.querySelector(selector).textContent)) throw new Error('translated product chrome');
+          }
+          if (getComputedStyle(card.querySelector('h2')).textTransform !== 'none') throw new Error('owner heading uppercased');
+          for (const details of card.querySelectorAll('details')) details.open = true;
+          for (const control of document.querySelectorAll('#view-decisions a, #view-decisions button, #view-decisions summary')) {
+            if (!control.getClientRects().length) continue;
+            const r = control.getBoundingClientRect();
+            if (r.height < 44 || r.width < 44) throw new Error('small decision control');
+            if (r.left < 0 || r.right > innerWidth + 1) throw new Error('decision control overflow');
+          }
+          if (document.documentElement.scrollWidth > innerWidth) throw new Error('page overflow');
+          inquiry.focus();
+          if (!inquiry.matches(':focus-visible') || getComputedStyle(inquiry).outlineStyle === 'none') throw new Error('missing keyboard focus');
+          if (!card.innerText.includes('outcome unconfirmed')) throw new Error('saved reply looks complete');
+          return true;
         })()"##).await.unwrap();
         assert_eq!(result, true);
+        if let Ok(dir) = std::env::var("MAGI_DECISIONS_EVIDENCE") {
+            std::fs::create_dir_all(&dir).unwrap();
+            let shot = browser
+                .call(
+                    Some(&page.session),
+                    "Page.captureScreenshot",
+                    serde_json::json!({"format": "png", "captureBeyondViewport": true}),
+                )
+                .await
+                .unwrap();
+            std::fs::write(
+                std::path::Path::new(&dir).join(format!("pending-decisions-{width}.png.base64")),
+                shot["data"].as_str().unwrap(),
+            )
+            .unwrap();
+        }
+        browser
+            .eval(
+                &page,
+                "document.querySelector('#decisions-list a[href*=\"/inquiry/\"]').click()",
+            )
+            .await
+            .unwrap();
         browser.wait_for(&page, "document.querySelector('#talk-inquiry')?.hidden === false && document.querySelector('#talk-inquiry').innerText.includes('元の問い合わせの詳細')", Duration::from_secs(30)).await.unwrap();
         assert_eq!(
             outbox.get(&inquiry.id).unwrap().decision.unwrap().status,
-            magi::task_decision::Status::AwaitingOwner
+            magi::task_decision::Status::RetryNeeded
         );
         assert!(
             !talks.get(&chat.id).unwrap().status.open(),
@@ -5112,8 +5157,28 @@ async fn pending_chat_links_survive_closed_chats_and_explicit_settlement() {
         .unwrap();
     // Navigation can return before the new document has mounted these elements.
     browser.wait_for(&page, "document.querySelector('#decisions-history')?.hidden === false && document.querySelectorAll('#decisions-list .decision-card').length === 0 && document.querySelectorAll('#decisions-resolved .decision-card').length === 1", Duration::from_secs(30)).await.unwrap();
+    assert_eq!(
+        browser
+            .eval(
+                &page,
+                "document.querySelector('#decisions-count').textContent"
+            )
+            .await
+            .unwrap(),
+        "0 unresolved · 1 resolved (history)"
+    );
+    assert_eq!(
+        browser
+            .eval(
+                &page,
+                "document.querySelector('#decisions-history summary').textContent"
+            )
+            .await
+            .unwrap(),
+        "Resolved history (1)"
+    );
     browser.eval(&page, "document.querySelector('#decisions-history summary').click(); document.querySelector('#decisions-resolved a[href*=\"/inquiry/\"]').click()").await.unwrap();
-    browser.wait_for(&page, "document.querySelector('#talk-inquiry')?.hidden === false && document.querySelector('#talk-inquiry').innerText.includes('解決済み')", Duration::from_secs(30)).await.unwrap();
+    browser.wait_for(&page, "document.querySelector('#talk-inquiry')?.hidden === false && document.querySelector('#talk-inquiry').innerText.includes('Resolved')", Duration::from_secs(30)).await.unwrap();
     assert!(!talks.get(&chat.id).unwrap().status.open());
     browser.close_page(&page).await;
 }
@@ -7334,12 +7399,7 @@ async fn phone_pending_decisions_link_to_exact_inquiry_without_settling_it() {
     assert_eq!(measure["fits"], true, "{measure}");
     assert_eq!(measure["touch"], true, "{measure}");
     assert_eq!(measure["dock"], true, "{measure}");
-    assert!(
-        measure["text"]
-            .as_str()
-            .unwrap()
-            .contains("所有者の入力待ち")
-    );
+    assert!(measure["text"].as_str().unwrap().contains("Awaiting owner"));
     assert!(measure["links"].as_array().unwrap().iter().any(|link| {
         link.as_str()
             .unwrap()

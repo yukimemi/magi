@@ -5375,7 +5375,7 @@ function updateAskCard(row, question, { compact = false } = {}) {
     : row.dataset.raced === "1"
       ? "This was answered elsewhere while you had it open. The recorded answer is above."
       : "");
-  if (question.history_only) r.note.append(" ", el("a", { href: "#/decisions", text: "判断待ち一覧へ" }));
+  if (question.history_only) r.note.append(" ", el("a", { class: "text-link", href: "#/decisions", text: "Back to pending decisions" }));
   show(r.note, r.note.textContent !== "");
 }
 
@@ -5555,7 +5555,7 @@ function renderTitle() {
       : state.route.name === "settings"
       ? "Settings \u2014 magi"
       : state.route.name === "decisions"
-      ? "判断待ち \u2014 magi"
+      ? "Pending decisions \u2014 magi"
       : state.route.name === "questions"
         ? "Questions \u2014 magi"
         : state.route.name === "talks"
@@ -10220,45 +10220,111 @@ function loadQuestions() {
 /* ---- durable pending decisions ------------------------------------------ */
 const decisionState = { items: [], unreadable: 0, migrationErrors: [], loaded: false, loading: false, error: null, focus: null };
 const decisionLabels = {
-  awaiting_owner: "所有者の入力待ち", queued: "受付・実行待ち", in_progress: "実行中",
-  retry_needed: "失敗・結果の確認が必要", resolved: "解決済み",
+  awaiting_owner: "Awaiting owner", queued: "Queued", in_progress: "In progress",
+  retry_needed: "Needs retry or result check", resolved: "Resolved",
 };
+function decisionGuidance(d) {
+  switch (d.status) {
+    case "awaiting_owner": return "Open the owning chat to discuss or request an operation. A reply alone is not a confirmed outcome.";
+    case "queued": return "The request is recorded and waiting for a confirmed effect. It may already have been delivered; do not submit it again.";
+    case "in_progress": return "The consumer has started the operation. Wait for its result and confirmed receipt.";
+    case "resolved": return d.legacy_settled
+      ? "Explicitly settled by the owner. Settlement records that no work remains; it does not confirm that the operation was applied. See the recorded reason below."
+      : "Completed by a confirmed effect receipt or explicit settlement. Check the recorded outcome in history; a resolved item does not always mean an operation was applied.";
+    case "retry_needed":
+      if (d.retry_safe && d.request) return "No effect began on the last attempt. Resolve the reported cause, then ask the owning chat to retry the same recorded request, or explicitly settle with a reason if no work remains.";
+      return "The outcome is not confirmed. Ask the owning chat to reconcile-decision using this inquiry ID: it checks durable evidence without replaying the operation. If the owner confirms no work remains, request settle-decision with an explicit reason, where supported. An uncertain effect must be reconciled before retrying.";
+    default: return "Inspect the recorded history in the owning chat before taking action.";
+  }
+}
 function decisionChatLink(item) {
   return item.chat ? `#/chat/${encodeURIComponent(item.chat)}/inquiry/${encodeURIComponent(item.id)}` : null;
 }
-function decisionCard(item) {
+function decisionCard(item, tag = "li") {
   const d = item.decision;
-  const card = el("li", { class: "decision-card panel", "data-decision-id": item.id },
+  const tone = { awaiting_owner: "waiting", queued: "prep", in_progress: "prep", retry_needed: "blocked", resolved: "answered" }[d.status];
+  const card = el(tag, { class: "decision-card panel", "data-decision-id": item.id },
+    el("span", { class: "chip decision-status", "data-status": tone, text: decisionLabels[d.status] || d.status }),
     el("h2", { text: d.reason }),
-    el("p", { class: "decision-status", text: decisionLabels[d.status] || d.status }),
-    el("div", { class: "decision-links" },
-      ...(item.task ? [el("a", { href: `#/tasks/${encodeURIComponent(item.task)}`, text: "タスク" })]
-        : [el("span", { text: "所有タスクの確認が必要" })]),
-      ...(item.run ? [el("a", { href: `#/runs/${encodeURIComponent(item.run)}`, text: "Run" })] : []),
-      ...(item.chat ? [el("a", { href: decisionChatLink(item), text: "チャットの問い合わせへ" })]
-        : [el("span", { text: "チャットへの配送待ち" })])));
-  if (!item.task && !item.chat) card.append(el("p", { text: `問い合わせ ${item.id}：元のタスクを復元するか、既存のチャットで理由を伝えて明示的な解決を依頼できます（settle-decision）。` }));
-  if (d.error || item.delivery_error) card.append(el("p", { class: "decision-error", text: d.error || item.delivery_error }));
-  if (d.history.length) card.append(el("details", {}, el("summary", { text: "状態の履歴" }),
-    el("ol", {}, d.history.map(event => el("li", { text: `${decisionLabels[event.status] || event.status}: ${event.evidence}` })))));
+    el("p", { class: "decision-meta", text: `Inquiry ${item.id}${item.task ? ` · Task ${item.task}` : " · Owning task unavailable"}` }),
+    el("p", { class: "decision-guidance", text: decisionGuidance(d) }));
+  if (d.status === "retry_needed" && !d.request) card.append(el("p", { class: "decision-status", text: "No operation request recorded · outcome unconfirmed. Saved replies do not prove completion." }));
+  card.append(el("div", { class: "decision-links" },
+    ...(item.chat ? [el("a", { class: "btn btn-quiet", href: decisionChatLink(item), text: "Open inquiry in chat" })] : []),
+    ...(item.task ? [el("a", { class: "btn btn-quiet", href: `#/tasks/${encodeURIComponent(item.task)}`, text: "View task" })] : []),
+    ...(item.run ? [el("a", { class: "btn btn-quiet", href: `#/runs/${encodeURIComponent(item.run)}`, text: "View run" })] : [])));
+  if (!item.chat) card.append(el("p", { text: "No owning chat is available. Restore verified original ownership, or ask an existing authorized chat to reconcile this inquiry ID. Do not guess a delivery destination. Explicit settlement requires the owner's confirmation that no work remains and a reason." }));
+  if (d.error) card.append(el("p", { class: "decision-error", text: d.error }));
+  if (item.delivery_error) card.append(el("p", { class: "decision-error", text: `Delivery issue (separate from outcome): ${item.delivery_error}` }));
+  if (d.request) card.append(el("details", { "data-section": "request" }, el("summary", { text: "Recorded request (not proof of completion)" }), el("pre", { text: d.request })));
+  if (item.display) card.append(el("details", { "data-section": "context", open: tag !== "li" }, el("summary", { text: "Inquiry context" }),
+    renderNoticeDisplay({ facts: item.display })));
+  if (d.history.length) {
+    const latest = d.history[d.history.length - 1];
+    card.append(el("p", { class: "decision-meta" }, "Last recorded update: ", el("time", { datetime: latest.at, text: latest.at })));
+    card.append(el("details", { "data-section": "history" }, el("summary", { text: `Outcome and status history (${d.history.length})` }),
+      el("ol", {}, d.history.map(event => el("li", {},
+        el("strong", { text: decisionLabels[event.status] || event.status }), " · ",
+        el("time", { datetime: event.at, text: event.at }), el("p", { class: "decision-evidence", text: event.evidence }))))));
+  } else card.append(el("p", { class: "decision-meta", text: "No outcome history recorded." }));
   return card;
+}
+// Reuse unchanged cards so refreshes retain focus and expanded evidence.
+function renderDecisionList(list, items) {
+  const old = new Map([...list.children].map(card => [card.dataset.decisionId, card]));
+  const focused = document.activeElement;
+  let replacementFocus = null;
+  const cards = items.map(item => {
+    const prior = old.get(item.id);
+    const signature = JSON.stringify(item);
+    if (prior && prior.decisionSignature === signature) return prior;
+    const card = decisionCard(item);
+    card.decisionSignature = signature;
+    if (prior) {
+      for (const details of prior.querySelectorAll("details[data-section]")) {
+        const next = card.querySelector(`details[data-section="${details.dataset.section}"]`);
+        if (next) next.open = details.open;
+      }
+      if (prior.contains(focused)) {
+        const candidates = [...card.querySelectorAll("a, summary")];
+        replacementFocus = candidates.find(node => focused.tagName === "A"
+          ? node.getAttribute("href") === focused.getAttribute("href")
+          : node.parentElement.dataset.section === focused.parentElement.dataset.section);
+      }
+    }
+    return card;
+  });
+  if (cards.length !== list.children.length || cards.some((card, i) => card !== list.children[i])) {
+    const retainFocus = list.contains(focused);
+    list.replaceChildren(...cards);
+    if (replacementFocus) replacementFocus.focus({ preventScroll: true });
+    else if (retainFocus && focused.isConnected) focused.focus({ preventScroll: true });
+  }
 }
 function renderDecisions() {
   const active = decisionState.items.filter(item => item.decision.status !== "resolved");
   const resolved = decisionState.items.filter(item => item.decision.status === "resolved");
+  const counts = `${active.length} unresolved · ${resolved.length} resolved (history)`;
+  const incomplete = decisionState.unreadable || decisionState.migrationErrors.length;
   for (const id of ["decision-badge-rail", "decision-badge-dock"]) {
     const badge = $(id);
     setText(badge, String(active.length)); show(badge, active.length > 0);
+    badge.setAttribute("aria-label", `${active.length} unresolved${decisionState.error ? " (last loaded; refresh failed)" : incomplete ? " (partial list)" : ""}`);
   }
-  setText($("decisions-count"), decisionState.error ? "一覧を更新できませんでした" : decisionState.loaded ? `${active.length} 件の判断待ち` : "読み込み中…");
+  setText($("decisions-count"), decisionState.error
+    ? decisionState.loaded ? `Refresh failed · last loaded: ${counts}` : "Unable to load decisions"
+    : decisionState.loaded ? `${counts}${incomplete ? " · partial list" : ""}` : "Loading…");
   const problems = decisionState.migrationErrors.map(issue => `${issue.id}: ${issue.reason}`);
-  if (decisionState.unreadable) problems.unshift(`${decisionState.unreadable} 件の記録を読み込めません。表示中の件数には含まれていません。`);
-  const warning = decisionState.error || problems.join("\n") || null;
+  if (decisionState.unreadable) problems.unshift(`${decisionState.unreadable} records could not be read and are excluded from these counts.`);
+  if (decisionState.migrationErrors.length) problems.unshift("Some historical records could not be imported. Counts cover only loaded inquiries.");
+  if (decisionState.error) problems.unshift(`Could not refresh decisions. ${decisionState.loaded ? "Showing the last loaded list; counts may be out of date. " : ""}${decisionState.error}`);
+  const warning = problems.join("\n");
   show($("decisions-error"), Boolean(warning));
   if (warning) $("decisions-error").replaceChildren(
-    el("p", { text: warning }), el("button", { type: "button", text: "再読み込み", onclick: () => loadDecisions() }));
-  $("decisions-list").replaceChildren(...active.map(decisionCard));
-  $("decisions-resolved").replaceChildren(...resolved.map(decisionCard));
+    el("p", { class: "decision-error", text: warning }), el("button", { class: "btn btn-quiet", type: "button", text: "Retry loading", onclick: () => loadDecisions() }));
+  renderDecisionList($("decisions-list"), active);
+  renderDecisionList($("decisions-resolved"), resolved);
+  setText($("decisions-history").querySelector("summary"), `Resolved history (${resolved.length})`);
   show($("decisions-empty"), decisionState.loaded && !active.length && !warning);
   show($("decisions-history"), resolved.length > 0);
 }
@@ -10281,22 +10347,20 @@ async function loadInquiry(chat, id) {
   const box = $("talk-inquiry");
   show(box, Boolean(id));
   if (!id) { box.replaceChildren(); return; }
-  box.replaceChildren(el("p", { text: "問い合わせを読み込み中…" }));
+  box.replaceChildren(el("p", { text: "Loading inquiry…" }));
   try {
     const item = await getJson(`${API.decisions}/${encodeURIComponent(id)}`);
     if (decisionState.focus !== key) return;
-    if (item.chat !== chat) throw new Error("この問い合わせは別のチャットに属しています");
-    box.replaceChildren(el("h2", { text: item.decision.reason }),
-      el("p", { text: decisionLabels[item.decision.status] || item.decision.status }),
-      renderNoticeDisplay({ facts: item.display, task: item.task, run: item.run }),
-      el("a", { href: "#/decisions", text: "判断待ち一覧へ" }));
+    if (item.chat !== chat) throw new Error("This inquiry belongs to another chat.");
+    box.replaceChildren(decisionCard(item, "article"),
+      el("a", { class: "btn btn-quiet", href: "#/decisions", text: "Back to pending decisions" }));
     requestAnimationFrame(() => {
       if (decisionState.focus === key) { box.scrollIntoView({ block: "start" }); box.focus({ preventScroll: true }); }
     });
   } catch (error) {
     if (decisionState.focus !== key) return;
     box.replaceChildren(el("p", { role: "alert", text: error.message }),
-      el("button", { type: "button", text: "再読み込み", onclick: () => loadInquiry(chat, id) }));
+      el("button", { type: "button", class: "btn btn-quiet", text: "Retry loading", onclick: () => loadInquiry(chat, id) }));
   }
 }
 

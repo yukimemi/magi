@@ -3080,10 +3080,33 @@ button[aria-busy="true"] {
 .progress-implementers:empty { display: none; }
 
 /* Pending decisions remain reachable on phones without transcript scrolling. */
-.decision-card h2 { overflow-wrap: anywhere; font-size: 1.05rem; }
-.decision-card { min-width: 0; overflow-wrap: anywhere; }
-.decision-links { display: flex; flex-wrap: wrap; gap: .5rem 1rem; }
-.decision-links a { display: inline-flex; align-items: center; min-height: 44px; }
+#view-decisions .view-head { flex-wrap: wrap; }
+.decision-card { min-width: 0; overflow-wrap: anywhere; display: grid; gap: var(--s3); }
+.decision-card h2 {
+  font-family: var(--sans); font-size: 1.1rem; line-height: 1.45;
+  text-transform: none; letter-spacing: normal; color: var(--ink);
+  border: 0; padding: 0; background: none; overflow-wrap: anywhere;
+}
+.decision-links { display: flex; flex-wrap: wrap; gap: var(--s2); }
+.decision-links a { min-height: 44px; white-space: normal; text-align: center; line-height: 1.4; }
 .decision-status { font-weight: 600; }
-.decision-error { white-space: pre-wrap; overflow-wrap: anywhere; }
-.decision-inquiry { scroll-margin-top: 5rem; white-space: normal; }
+.decision-card .chip { justify-self: start; white-space: normal; text-transform: none; letter-spacing: normal; }
+.decision-meta { color: var(--ink-3); font-size: var(--t2); }
+.decision-guidance { line-height: 1.6; }
+.decision-error, .decision-evidence { white-space: pre-wrap; overflow-wrap: anywhere; }
+.decision-card pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: var(--t2); }
+.decision-card details { min-width: 0; }
+.decision-card summary, #decisions-history > summary {
+  display: list-item; min-height: 44px; padding: var(--s3) 0;
+  cursor: pointer; color: var(--ink-2); text-decoration: underline; text-underline-offset: .2em;
+}
+.decision-card details li { margin: var(--s3) 0; padding-left: var(--s3); border-left: 2px solid var(--edge); }
+.decision-inquiry { scroll-margin-top: 5rem; white-space: normal; min-width: 0; }
+.decision-inquiry > .btn { margin-top: var(--s3); }
+#view-decisions > p .text-link { display: inline-flex; align-items: center; min-height: 44px; }
+#view-decisions :is(a, button, summary):focus-visible,
+.decision-inquiry :is(a, button, summary):focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+@media (max-width: 480px) {
+  .decision-links > .btn { flex: 1 1 100%; }
+  .dock-item[data-nav="decisions"] > span:last-child { white-space: normal; text-align: center; line-height: 1.2; overflow: visible; }
+}
