@@ -284,7 +284,9 @@ pub(crate) fn migration_sources(home: &Path) -> Result<Option<std::collections::
 /// Ownership evidence scoped to one scan, with no process-wide cache.
 #[derive(Default)]
 pub(crate) struct InquiryOwnership {
-    owned: std::cell::OnceCell<std::collections::HashSet<String>>,
+    /// Task id / run id -> the distinct tasks naming it, built from one queue
+    /// read.
+    owned: std::cell::OnceCell<std::collections::HashMap<String, Vec<String>>>,
     origins: std::cell::RefCell<std::collections::HashMap<String, (bool, bool)>>,
 }
 
@@ -295,11 +297,31 @@ impl InquiryOwnership {
         index
     }
 
-    fn owned_ids(tasks: &[Task]) -> std::collections::HashSet<String> {
-        tasks
-            .iter()
-            .flat_map(|task| std::iter::once(task.id.clone()).chain(task.runs.iter().cloned()))
-            .collect()
+    fn owned_ids(tasks: &[Task]) -> std::collections::HashMap<String, Vec<String>> {
+        let mut map: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for task in tasks {
+            let mut seen = std::collections::HashSet::new();
+            for key in std::iter::once(&task.id).chain(task.runs.iter()) {
+                if seen.insert(key.as_str()) {
+                    map.entry(key.clone()).or_default().push(task.id.clone());
+                }
+            }
+        }
+        map
+    }
+
+    fn index(&self, home: &Path) -> &std::collections::HashMap<String, Vec<String>> {
+        self.owned
+            .get_or_init(|| Self::owned_ids(&Queue::at(home.join("queue")).list()))
+    }
+
+    /// Same decision as [`task_of`], answered from the shared index.
+    pub(crate) fn task_of(&self, home: &Path, q: &Question) -> Option<String> {
+        match self.index(home).get(&q.run)?.as_slice() {
+            [only] => Some(only.clone()),
+            _ => None,
+        }
     }
 }
 
@@ -323,11 +345,7 @@ pub(crate) fn standalone_inquiry_in(
     }
     // Older foreground asks have no explicit route marker. Recognize only
     // positive legacy provenance, never infer it from a missing task alone.
-    if ownership
-        .owned
-        .get_or_init(|| InquiryOwnership::owned_ids(&Queue::at(home.join("queue")).list()))
-        .contains(&q.run)
-    {
+    if ownership.index(home).contains_key(&q.run) {
         return false;
     }
     let (task_origin, foreground_origin) = *ownership

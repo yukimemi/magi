@@ -1601,9 +1601,9 @@ impl Questions {
             && q.routed_task.is_none()
             && let Some(home) = self.root.parent()
         {
-            let tasks = crate::queue::Queue::at(home.join("queue")).list();
-            q.routed_task =
-                crate::task_chat::task_of(q, &tasks).filter(|_| crate::task_chat::chat_routable(q));
+            q.routed_task = ownership
+                .task_of(home, q)
+                .filter(|_| crate::task_chat::chat_routable(q));
         }
         std::fs::create_dir_all(&self.root)
             .with_context(|| format!("create {}", self.root.display()))?;

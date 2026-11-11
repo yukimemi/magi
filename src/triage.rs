@@ -1627,6 +1627,47 @@ mod tests {
     }
 
     #[test]
+    fn creating_and_updating_questions_share_one_queue_read() {
+        let (dir, queue, questions) = store();
+        let size = 200;
+        let mut ids = Vec::new();
+        for i in 0..size {
+            let mut t = task("scan fixture", dir.path().join("repo"));
+            t.id = format!("task-{i:04}");
+            t.runs = vec![format!("run-{i:04}")];
+            t.hold_manual(Some("held for scan fixture".into()));
+            queue.put(&mut t).unwrap();
+            ids.push(t.id);
+        }
+        let ownership = crate::task_chat::InquiryOwnership::default();
+        scan_counts();
+        let mut created = Vec::new();
+        for id in &ids {
+            let mut q = Question::new(
+                id.clone(),
+                NODE.into(),
+                SEAT.into(),
+                "scan fixture".into(),
+                String::new(),
+                EN.choices3(),
+            );
+            questions.put_executable_in(&mut q, &ownership).unwrap();
+            assert_eq!(q.routed_task.as_deref(), Some(id.as_str()));
+            created.push(q.id);
+        }
+        for id in &created {
+            questions
+                .update_in(id, &ownership, |q| {
+                    q.answer_delivered = true;
+                    Ok(())
+                })
+                .unwrap();
+        }
+        let (lists, _, _) = scan_counts();
+        assert_eq!(lists, 1, "one queue read for {size} creations and updates");
+    }
+
+    #[test]
     fn recovery_scans_are_linear_and_match_legacy_decisions() {
         let mut previous = None;
         for size in [150, 300] {

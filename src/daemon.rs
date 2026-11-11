@@ -1710,7 +1710,7 @@ pub(crate) fn apply_task_choice_actions(queue: &Queue, questions: &Questions, ho
         }
         // Delivery is only a note of who has read the answer; the task's own
         // mark above is the authority. Best effort.
-        let _ = questions.update(&q.id, |r| {
+        let _ = questions.update_in(&q.id, &ownership, |r| {
             r.answer_delivered = true;
             Ok(())
         });
