@@ -5901,7 +5901,11 @@ function scheduleTalkPosition(initial) {
     if (!current()) { stop(); return; }
     openingTalkPosition = false;
     scrollToLastTurn("talk-turns", { smooth: !initial && !target, target });
-    if (target) focus.placed = true;
+    if (target) {
+      focus.placed = true;
+      target.classList.add("reply-highlight");
+      setTimeout(() => target.classList.remove("reply-highlight"), 1800);
+    }
     if (!initial) { stop(); return; }
     const last = target || $("talk-turns").lastElementChild;
     if (!last) { stop(); return; }

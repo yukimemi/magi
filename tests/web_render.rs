@@ -6776,6 +6776,10 @@ async fn chat_search_click_waits_for_early_message_in_long_transcript() {
           };
           await frame(); await frame();
           if (!visible()) return 'target hidden after core';
+          const matched = document.getElementById('talk-message-8-0');
+          if (!matched.classList.contains('reply-highlight')) return 'target not highlighted';
+          await new Promise(resolve => setTimeout(resolve, 1900));
+          if (matched.classList.contains('reply-highlight')) return 'target highlight did not expire';
           const calls = scrollCalls.length;
           for (let i = 0; i < 3; i++) deck.renderTalk();
           deck.state.talkDetail.talk.turns.push({who:'agent', body:'Subsequent reply', at:new Date().toISOString()});
@@ -6802,6 +6806,22 @@ async fn chat_search_click_waits_for_early_message_in_long_transcript() {
           const second = document.getElementById('talk-message-18-0').getBoundingClientRect();
           if (second.top < document.querySelector('.top').getBoundingClientRect().bottom || second.top >= innerHeight)
             return 'same conversation target change did not reposition';
+          // A normal link to this same conversation restores tail placement.
+          const plain = document.createElement('a');
+          plain.href = '#/chat/' + deck.state.talkDetail.id;
+          document.body.append(plain); plain.click(); plain.remove();
+          for (let i = 0; i < 120 && location.hash.includes('/message/'); i++) await frame();
+          await frame(); await frame();
+          if (location.hash.includes('/message/')) return 'plain link did not navigate';
+          const tailAfterPlain = document.getElementById('talk-turns').lastElementChild.getBoundingClientRect();
+          const bottom = document.getElementById('main').dataset.split === '1'
+            ? pane.getBoundingClientRect().bottom : innerHeight;
+          if (tailAfterPlain.top < document.querySelector('.top').getBoundingClientRect().bottom || tailAfterPlain.top >= bottom)
+            return 'plain link did not restore tail';
+          if (visible()) return 'plain link retained search target';
+          card.click();
+          for (let i = 0; i < 120 && !location.hash.includes('/message/'); i++) await frame();
+          await frame(); await frame();
           // A transcript edit can shift array positions. Re-identify only an
           // unambiguous message with the original timestamp and text evidence.
           const chat = deck.state.talkDetail.talk;
