@@ -1795,7 +1795,10 @@ print('reused descriptor rejected')
             );
 
             // 同一性検証を通ったパイプでも、送信後の応答消失はローカル再実行しない。
+            // Match the fixture cwd as well as its home: interpreter shims must
+            // not discover the checkout's tool configuration with an isolated home.
             let output = std::process::Command::new("python3")
+                .current_dir(f.tmp.path())
                 .args([
                     "-c",
                     r#"import fcntl, json, os, stat, subprocess, tempfile
