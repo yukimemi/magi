@@ -6756,8 +6756,16 @@ async fn chat_search_click_waits_for_early_message_in_long_transcript() {
           if (document.querySelector('#talks-list .snippet-field').textContent !== 'title')
             throw new Error('expected an opener-derived title snippet');
           const native = window.fetch;
+          const held = new Set();
           window.fetch = async (...args) => {
-            if (String(args[0]).endsWith('/core')) {
+            const section = ['core', 'sections'].find(key => String(args[0]).endsWith('/' + key));
+            if (section && !held.has(section)) {
+              held.add(section);
+              if (section === 'sections') {
+                window.sectionsHeld = true;
+                await new Promise(resolve => window.releaseSections = resolve);
+                return native(...args);
+              }
               window.coreHeld = true;
               await new Promise(resolve => window.releaseCore = resolve);
             }
@@ -6769,22 +6777,46 @@ async fn chat_search_click_waits_for_early_message_in_long_transcript() {
         browser.wait_for(&page, "window.coreHeld === true", Duration::from_secs(10)).await.unwrap();
         let before = browser.eval(&page, "scrollCalls.length").await.unwrap();
         assert_eq!(before, 0, "must not place at the bottom while core is pending");
-        browser.eval(&page, "restoreFetch(); releaseCore()").await.unwrap();
+        browser.eval(&page, "releaseCore()").await.unwrap();
         browser.wait_for(&page, "document.getElementById('talk-message-0-0') && scrollCalls.length > 0", Duration::from_secs(30)).await.unwrap();
         let result = browser.eval(&page, r#"(async () => {
-          const frame = () => new Promise(requestAnimationFrame);
+          // Like afterTalkPaint: measure after paint, rather than inside rAF.
+          const frame = () => new Promise(resolve => requestAnimationFrame(() => setTimeout(resolve, 0)));
           const visible = () => {
             const r = document.getElementById('talk-message-0-0').getBoundingClientRect();
             const pane = document.getElementById('view-talk');
             return r.top >= document.querySelector('.top').getBoundingClientRect().bottom
               && r.top < (document.getElementById('main').dataset.split === '1' ? pane.getBoundingClientRect().bottom : innerHeight);
           };
-          await frame(); await frame();
-          if (!visible()) return 'target hidden after core: ' + JSON.stringify({rect:document.getElementById('talk-message-0-0').getBoundingClientRect().toJSON(), header:document.querySelector('.top').getBoundingClientRect().toJSON(), y:scrollY, calls:scrollCalls});
-          const matched = document.getElementById('talk-message-0-0');
-          if (!matched.classList.contains('reply-highlight')) return 'target not highlighted';
-          await new Promise(resolve => setTimeout(resolve, 1900));
-          if (matched.classList.contains('reply-highlight')) return 'target highlight did not expire';
+          const describe = () => JSON.stringify({rect:document.getElementById('talk-message-0-0').getBoundingClientRect().toJSON(), header:document.querySelector('.top').getBoundingClientRect().toJSON(), y:scrollY, calls:scrollCalls});
+          await frame();
+          if (!visible()) return 'target hidden after core: ' + describe();
+          if (!document.getElementById('talk-message-0-0').classList.contains('reply-highlight')) return 'target not highlighted';
+          const shift = document.createElement('div');
+          shift.style.height = '23px';
+          document.getElementById('talk-turns').before(shift);
+          // An existing sibling resizes while the newly inserted one is present.
+          const progress = document.getElementById('talk-task-progress');
+          progress.style.minHeight = `${progress.getBoundingClientRect().height + 1}px`;
+          await frame();
+          if (!visible()) return 'insert hid target: ' + describe();
+          shift.remove();
+          await frame();
+          if (!visible()) return 'remove hid target: ' + describe();
+          window.searchPlacement = {visible, describe};
+          return 'ok';
+        })()"#).await.unwrap();
+        assert_eq!(result, "ok", "@{width}: {result}");
+        browser.wait_for(&page, "window.sectionsHeld === true", Duration::from_secs(10)).await.unwrap();
+        browser.eval(&page, "restoreFetch(); releaseSections()").await.unwrap();
+        browser.wait_for(&page, "deck.state.talkDetail.sections && !document.getElementById('talk-task-progress').hasAttribute('aria-busy')", Duration::from_secs(30)).await.unwrap();
+        browser.wait_for(&page, "!document.getElementById('talk-message-0-0').classList.contains('reply-highlight')", Duration::from_secs(10)).await.unwrap();
+        let result = browser.eval(&page, r#"(async () => {
+          // Cross the same paint boundary as afterTalkPaint before measuring.
+          const frame = () => new Promise(resolve => requestAnimationFrame(() => setTimeout(resolve, 0)));
+          const {visible, describe} = window.searchPlacement;
+          await frame();
+          if (!visible()) return 'target hidden after sections: ' + describe();
           // Late sections above the opener must not hide the search target.
           document.getElementById('talk-task-progress').style.minHeight = '240px';
           await frame(); await frame(); await frame();

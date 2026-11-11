@@ -5887,13 +5887,14 @@ function scheduleTalkPosition(initial) {
   const overflowAnchor = scrollHost.style.overflowAnchor;
   if (target) scrollHost.style.overflowAnchor = "none";
   const current = () => state.route.name === "talk" && !state.route.inquiry && state.route.id === id && state.talkDetail.id === id && talkSearchFocus === (target ? focus : null);
-  let frame = 0, timer = 0, observer = null, expected = null, anchorTop = null;
+  let frame = 0, timer = 0, observer = null, mutations = null, expected = null, anchorTop = null;
   const events = ["wheel", "touchstart", "pointerdown", "keydown"];
   const release = () => { if (focus) focus.released = true; stop(); };
   const stop = () => {
     cancelAnimationFrame(frame);
     clearTimeout(timer);
     observer?.disconnect();
+    mutations?.disconnect();
     if (target) scrollHost.style.overflowAnchor = overflowAnchor;
     for (const event of events) window.removeEventListener(event, release, true);
     window.removeEventListener("scroll", onScroll, true);
@@ -5901,7 +5902,9 @@ function scheduleTalkPosition(initial) {
     if (cancelTalkPosition === stop) cancelTalkPosition = () => {};
   };
   const onScroll = () => {
-    if (expected !== null && Math.abs(position() - expected) > 1) release();
+    // Layout and browser scroll anchoring can also change the scroll offset.
+    // Search placement yields to the input listeners above, not those shifts.
+    if (!target && expected !== null && Math.abs(position() - expected) > 1) release();
   };
   cancelTalkPosition = stop;
   for (const event of events) window.addEventListener(event, release, { capture: true, passive: true });
@@ -5919,26 +5922,37 @@ function scheduleTalkPosition(initial) {
     const last = target || $("talk-turns").lastElementChild;
     if (!last) { stop(); return; }
     const header = document.querySelector(".top");
+    // Split panes already start below the header and disable scroll margins in
+    // CSS. Match scrollIntoView's pane edge rather than adding the header twice.
     const anchorPosition = () => last.getBoundingClientRect().top
-      - (header ? Math.ceil(header.getBoundingClientRect().height) + 4 : 0);
+      - (pane ? pane.getBoundingClientRect().top
+        : header ? Math.ceil(header.getBoundingClientRect().height) + 4 : 0);
     expected = position();
     // The sticky header may resize during the initial scroll itself. Search
     // targets must correct to the requested header gap, not preserve that drift.
     anchorTop = target ? 0 : anchorPosition();
-    observer = new ResizeObserver(() => {
-      if (!current() || Math.abs(position() - expected) > 1 || !last.isConnected || (!target && last !== $("talk-turns").lastElementChild)) { stop(); return; }
+    const correct = () => {
+      if (!current() || (!target && Math.abs(position() - expected) > 1) || !last.isConnected || (!target && last !== $("talk-turns").lastElementChild)) { stop(); return; }
       if (Math.abs(anchorPosition() - anchorTop) > 1) {
         scrollToLastTurn("talk-turns", { target });
         expected = position();
-        anchorTop = anchorPosition();
+        if (!target) anchorTop = anchorPosition();
       }
-    });
+    };
+    observer = new ResizeObserver(correct);
     observer.observe($("talk-turns"));
     if (target) {
-      // Deferred progress/header content can change the transcript's offset
-      // without changing the transcript's own dimensions.
-      for (let sibling = $("talk-turns").previousElementSibling; sibling; sibling = sibling.previousElementSibling)
-        observer.observe(sibling);
+      // Sections can insert siblings after placement. In split view the parent
+      // has a fixed height, so watch its child list as well as element sizes.
+      const turns = $("talk-turns");
+      const observeSiblings = () => {
+        for (let sibling = turns.previousElementSibling; sibling; sibling = sibling.previousElementSibling)
+          observer.observe(sibling);
+      };
+      observeSiblings();
+      observer.observe(turns.parentElement);
+      mutations = new MutationObserver(() => { observeSiblings(); correct(); });
+      mutations.observe(turns.parentElement, { childList: true });
     }
     if (header) observer.observe(header);
     if (!target) timer = setTimeout(stop, 2000);
