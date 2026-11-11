@@ -5822,10 +5822,10 @@ let nextLocalAttachmentId = 1;
    set via JS on the target element, using getBoundingClientRect for a
    reliable measurement regardless of safe-area insets or zoom level.
    `containerId` is always "talk-turns", the standing chat's transcript. */
-function scrollToLastTurn(containerId, { smooth = false } = {}) {
+function scrollToLastTurn(containerId, { smooth = false, target = null } = {}) {
   const turns = $(containerId);
   if (!turns.children.length) return;
-  const last = turns.lastElementChild;
+  const last = target || turns.lastElementChild;
   const header = document.querySelector(".top");
   const gap = header ? Math.ceil(header.getBoundingClientRect().height) + 4 : 0;
   last.style.scrollMarginTop = `${gap}px`;
@@ -5841,38 +5841,69 @@ function scrollToLastTurn(containerId, { smooth = false } = {}) {
    (for example an image loading), yielding as soon as the operator intervenes. */
 let cancelTalkPosition = () => {};
 let openingTalkPosition = false;
+// Retain the target after placement so refreshes cannot turn it into a tail
+// follow. Only user input, sending, or navigation releases that reading position.
+let talkSearchFocus = null;
+function chatTextKey(body) {
+  let hash = 2166136261, length = 0;
+  for (const c of body) { hash = Math.imul(hash ^ c.codePointAt(0), 16777619); length++; }
+  return `${(hash >>> 0).toString(16).padStart(8, "0")}:${length}`;
+}
+function resolveTalkSearchTarget(focus) {
+  const matches = [];
+  talkTurns(state.talkDetail.talk).forEach((turn, i) => {
+    const messages = turn.messages?.length ? turn.messages : [turn];
+    messages.forEach((message, j) => {
+      if (turn.at === focus.target.at && chatTextKey(message.body || "") === focus.target.text)
+        matches.push({ turn: i, message: j });
+    });
+  });
+  const exact = matches.find(m => m.turn === focus.target.turn && m.message === focus.target.message);
+  const match = exact || (matches.length === 1 ? matches[0] : null);
+  return match ? document.getElementById(`talk-message-${match.turn}-${match.message}`) : null;
+}
 function scheduleTalkPosition(initial) {
   if (state.route.inquiry) return;
   if (!initial && openingTalkPosition) return;
   cancelTalkPosition();
+  const focus = talkSearchFocus;
+  if (focus?.released) return;
+  const target = focus ? resolveTalkSearchTarget(focus) : null;
+  if (focus && !target) {
+    if (!state.talkDetail.coreLoaded) return;
+    talkSearchFocus = null;
+    talkError("The matching message is no longer available. Showing the latest messages.");
+  }
   openingTalkPosition = initial;
   const id = state.talkDetail.id;
   const pane = $("main").dataset.split === "1" ? $("view-talk") : null;
   const position = () => pane ? pane.scrollTop : window.scrollY;
-  const current = () => state.route.name === "talk" && !state.route.inquiry && state.route.id === id && state.talkDetail.id === id;
+  const current = () => state.route.name === "talk" && !state.route.inquiry && state.route.id === id && state.talkDetail.id === id && talkSearchFocus === (target ? focus : null);
   let frame = 0, timer = 0, observer = null, expected = null, anchorTop = null;
   const events = ["wheel", "touchstart", "pointerdown", "keydown"];
+  const release = () => { if (focus) focus.released = true; stop(); };
   const stop = () => {
     cancelAnimationFrame(frame);
     clearTimeout(timer);
     observer?.disconnect();
-    for (const event of events) window.removeEventListener(event, stop, true);
+    for (const event of events) window.removeEventListener(event, release, true);
     window.removeEventListener("scroll", onScroll, true);
     openingTalkPosition = false;
     if (cancelTalkPosition === stop) cancelTalkPosition = () => {};
   };
   const onScroll = () => {
-    if (expected !== null && Math.abs(position() - expected) > 1) stop();
+    if (expected !== null && Math.abs(position() - expected) > 1) release();
   };
   cancelTalkPosition = stop;
-  for (const event of events) window.addEventListener(event, stop, { capture: true, passive: true });
+  for (const event of events) window.addEventListener(event, release, { capture: true, passive: true });
   window.addEventListener("scroll", onScroll, true);
   frame = requestAnimationFrame(() => {
     if (!current()) { stop(); return; }
     openingTalkPosition = false;
-    scrollToLastTurn("talk-turns", { smooth: !initial });
+    scrollToLastTurn("talk-turns", { smooth: !initial && !target, target });
+    if (target) focus.placed = true;
     if (!initial) { stop(); return; }
-    const last = $("talk-turns").lastElementChild;
+    const last = target || $("talk-turns").lastElementChild;
     if (!last) { stop(); return; }
     const header = document.querySelector(".top");
     const anchorPosition = () => last.getBoundingClientRect().top
@@ -5880,16 +5911,16 @@ function scheduleTalkPosition(initial) {
     expected = position();
     anchorTop = anchorPosition();
     observer = new ResizeObserver(() => {
-      if (!current() || Math.abs(position() - expected) > 1 || last !== $("talk-turns").lastElementChild) { stop(); return; }
+      if (!current() || Math.abs(position() - expected) > 1 || !last.isConnected || (!target && last !== $("talk-turns").lastElementChild)) { stop(); return; }
       if (Math.abs(anchorPosition() - anchorTop) > 1) {
-        scrollToLastTurn("talk-turns");
+        scrollToLastTurn("talk-turns", { target });
         expected = position();
         anchorTop = anchorPosition();
       }
     });
     observer.observe($("talk-turns"));
     if (header) observer.observe(header);
-    timer = setTimeout(stop, 2000);
+    if (!target) timer = setTimeout(stop, 2000);
   });
 }
 
@@ -6058,7 +6089,19 @@ function updateTalkCard(row, talk) {
   const turns = talkTurns(talk);
   const tone = toneOf(status, TALK_STATUS);
 
-  r.card.setAttribute("href", `#/chat/${talk.id}`);
+  const hit = searchHit("chats", talk.id);
+  const target = hit?.target;
+  const suffix = target ? `/message/${target.turn}/${target.message}?${new URLSearchParams({ at: target.at, text: target.text })}` : "";
+  r.card.setAttribute("href", `#/chat/${talk.id}${suffix}`);
+  r.card.onclick = event => {
+    if (event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    if (target && location.hash === r.card.getAttribute("href")) {
+      event.preventDefault();
+      cancelTalkPosition();
+      talkSearchFocus = { target, placed: false, released: false };
+      renderTalk();
+    }
+  };
   setAttr(r.card, "data-talk-id", talk.id);
   setAttr(r.card, "data-tone", tone);
   setAttr(row, "data-tone", tone);
@@ -6637,7 +6680,11 @@ function renderTalk() {
   const lastIsPending = wait && wait.pending
     && turns.length > 0 && turns[turns.length - 1].who === "operator"
     && turns[turns.length - 1].body === wait.pending.body;
-  if (state.openingTalk) {
+  if (talkSearchFocus?.released && followingTail) talkSearchFocus = null;
+  if (talkSearchFocus) {
+    state.openingTalk = false;
+    if (!talkSearchFocus.placed && !talkSearchFocus.released && state.talkDetail.coreLoaded) scheduleTalkPosition(true);
+  } else if (state.openingTalk) {
     state.openingTalk = false;
     if (turnCount > 0) scheduleTalkPosition(true);
   } else if (followingTail && turnCount > state.prevTalkTurnCount && !lastIsPending) {
@@ -7253,6 +7300,8 @@ async function sendTalkTurn(event) {
   }
 
   talkError("");
+  cancelTalkPosition();
+  talkSearchFocus = null;
   const submissionReply = state.talkReply;
   state.talkReply = null;
   const submissionAttachments = takeTalkAttachments(id);
@@ -10793,7 +10842,13 @@ function parseRoute() {
   if (parts[0] === "questions") return { name: "questions", id: parts[1] ? decodeURIComponent(parts[1]) : null };
   if (parts[0] === "decisions") return { name: "decisions", id: null };
   if (parts[0] === "notifications") return { name: "notifications", id: null };
-  if (parts[0] === "chat" && parts[1]) return { name: "talk", id: decodeURIComponent(parts[1]), inquiry: parts[2] === "inquiry" && parts[3] ? decodeURIComponent(parts[3]) : null };
+  if (parts[0] === "chat" && parts[1]) {
+    const params = new URLSearchParams((parts[4] || "").split("?")[1] || "");
+    const turn = Number(parts[3]), message = Number((parts[4] || "").split("?")[0]);
+    const target = parts[2] === "message" && Number.isSafeInteger(turn) && turn >= 0 && Number.isSafeInteger(message) && message >= 0 && params.has("at") && params.has("text")
+      ? { turn, message, at: params.get("at"), text: params.get("text") } : null;
+    return { name: "talk", id: decodeURIComponent(parts[1]), target, inquiry: parts[2] === "inquiry" && parts[3] ? decodeURIComponent(parts[3]) : null };
+  }
   if (parts[0] === "chat") return { name: "talks", id: null };
   if (parts[0] === "runs" && parts[1]) {
     const tab = RUN_TABS.includes(parts[2]) ? parts[2] : "overview";
@@ -10961,6 +11016,12 @@ function applyRoute() {
   if (changed) {
     cancelDetailSections();
     cancelTalkPosition();
+  }
+  const targetChanged = JSON.stringify(route.target || null) !== JSON.stringify(state.route.target || null);
+  if (changed || targetChanged) {
+    cancelTalkPosition();
+    talkSearchFocus = route.target ? { target: route.target, placed: false, released: false } : null;
+    if (route.name === "talk") state.openingTalk = true;
   }
   state.route = route;
 
