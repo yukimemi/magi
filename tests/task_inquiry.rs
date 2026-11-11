@@ -378,7 +378,7 @@ async fn orphaned_migration_stays_visible_and_recovers_original_ownership_once()
     let talks = Talks::at(home.join("talks"));
     let questions = Questions::at(home.join("questions"));
     let mut old = Question::new("run-a".into(), "implement".into(), "impl-A".into(), "Retain unresolved intent".into(), "Original task ownership needs recovery".into(), vec![]);
-    old.abandon("deadline elapsed; no owner reply was recorded");
+    // Open, not abandoned: an abandoned source is history and never pending.
     questions.put(&mut old).unwrap();
     magi::task_chat::sweep(&queue, &talks, &questions, &home);
     let outbox = Outbox::at(&home);
