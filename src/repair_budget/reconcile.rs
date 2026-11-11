@@ -182,7 +182,14 @@ pub(super) fn decision_matches(home: &Path, task: &Task, grant: &super::Receipt)
 
 /// Supported owner operation. A crash before the single task write changes
 /// nothing; a retry after it returns the same receipt without queuing again.
-pub async fn apply(queue: &Queue, home: &Path, mut request: Request) -> Result<Receipt> {
+pub async fn apply(queue: &Queue, home: &Path, request: Request) -> Result<Receipt> {
+    // Defer construction of the proof frame until this operation is polled.
+    // Call-site boxing alone still builds its argument on the caller's stack,
+    // including the dispatcher for unrelated queue commands on Windows.
+    Box::pin(apply_inner(queue, home, request)).await
+}
+
+async fn apply_inner(queue: &Queue, home: &Path, mut request: Request) -> Result<Receipt> {
     ensure!(
         !request.reason.trim().is_empty() && request.reason.len() <= 4096,
         "reason must contain 1..=4096 bytes"

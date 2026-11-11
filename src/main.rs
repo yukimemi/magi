@@ -7848,6 +7848,26 @@ command = ['sh', '-c', 'cat >/dev/null; printf "%s" "{\"duplicate\":true,\"reaso
         );
         let bytes = std::mem::size_of_val(&reassignment);
         assert!(bytes < 1024, "reassignment entry occupies {bytes} bytes");
+        let repair_reconciliation = magi::repair_budget::reconcile::apply(
+            &queue,
+            Path::new("unused-home"),
+            magi::repair_budget::reconcile::Request {
+                task: "task".into(),
+                run: "run".into(),
+                head: "head".into(),
+                expect_pass: 0,
+                receipt: "receipt".into(),
+                question: "question".into(),
+                answer_at: jiff::Timestamp::now(),
+                request: "request".into(),
+                reason: "reason".into(),
+            },
+        );
+        let bytes = std::mem::size_of_val(&repair_reconciliation);
+        assert!(
+            bytes < 1024,
+            "repair reconciliation entry occupies {bytes} bytes"
+        );
     }
 
     #[tokio::test]
