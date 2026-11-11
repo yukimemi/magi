@@ -767,9 +767,7 @@ fn history_reason(home: &Path, q: &Question) -> Option<(String, HistoryResolutio
     if q.answer.is_none() && q.status == crate::ask::QuestionStatus::Abandoned {
         return Some(("Source abandoned: silence already settled as a hold; existing task holds and blocks are unchanged".into(), HistoryResolution::Retired));
     }
-    if q.answer.is_none() {
-        return None;
-    }
+    q.answer.as_ref()?;
     if q.node == crate::bump::NOTICE_NODE && q.seat == "release-watch" {
         return crate::release_watch::retired_question(home, q)
             .ok()
