@@ -3555,7 +3555,7 @@ of transport acknowledgement. `task_decision::Decision` tracks awaiting owner,
 queued, in progress, retry needed and resolved, with append-only outcome history.
 Never resolve it from delivery, read receipts, opening/closing a conversation,
 ordinary replies, elapsed time or restart. Information-only inquiries have no
-`decision` and never enter the list. The phone dock's `判断待ち` route is
+`decision` and never enter the list. The phone dock's `Pending decisions` route is
 `#/decisions`, and exact inquiry links are
 `#/chat/<chat>/inquiry/<inquiry>`; the inquiry snapshot survives transcript burial.
 
