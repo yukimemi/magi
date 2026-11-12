@@ -1738,10 +1738,14 @@ remain outside those lanes and global queue-worker park requests.
   Older executable generations without these checks cannot guarantee bounded
   successful replacement: their retirement timeout is reported as failure and
   requires retry after they stop. No safe forced-retirement protocol for those
-  generations is implemented. Health/banner and `upgrade.note.json` report the
-  old scheduler PID, current `Status::lap_step` name/start time (when the status
-  PID matches), elapsed wait and retirement bound. Stop exits the poll loop through
-  its bookkeeping cleanup. This does not change poll costs.
+  generations is implemented. A retained intent must not hide Update retry,
+  Start or explicit worker Park controls. Start retries the saved restart options
+  under the coordinator lease and clears the intent only on confirmed success.
+  Health/banner and `upgrade.note.json` distinguish an observed old reservation
+  (PID and matching `Status::lap_step`) from replacement startup, missing
+  ownership evidence and pending bookkeeping; a marker is not process liveness.
+  Diagnostics include elapsed wait and retirement bound. Stop exits the poll
+  loop through its bookkeeping cleanup. This does not change poll costs.
 - **Release, then spawn.** Remember the installed executable path before update,
   request scheduler replacement, release the listener, then start the successor web.
   Answer 202 before process exit. A live legacy embedded scheduler requires one

@@ -1169,9 +1169,12 @@ function renderLoop() {
   const why = $("loop-why");
   const button = $("loop-toggle");
   const controls = $("loop-controls");
+  const restartNote = state.health?.upgrade?.scheduler_restart_pending || null;
+  const withRestartNote = note => restartNote && !String(note || "").includes(restartNote)
+    ? [restartNote, note].filter(Boolean).join(" ") : note;
   const quiet = (note) => {
-    setText(why, note);
-    show(why, Boolean(note));
+    setText(why, withRestartNote(note));
+    show(why, Boolean(restartNote || note));
     show(button, false);
     button.dataset.armed = "";
     button.onclick = null;
@@ -1227,7 +1230,7 @@ function renderLoop() {
      redraw while that tap is pending keeps showing the question, so the
      label never reads "Stop the loop" while the next tap already commits. */
   const control = (kind, label, note, question = null) => {
-    setText(why, note);
+    setText(why, withRestartNote(note));
     show(why, true);
     setAttr(button, "data-kind", kind);
     if (question && button.dataset.armed === "yes") {
@@ -1304,6 +1307,10 @@ function renderLoop() {
       ? `Asked for ${upgradeInfo.to || "an update"} more than an hour ago and has not come back. Check on it by hand.`
       : [upgradeInfo.waiting_on || upgradeStageDetail(upgradeStage),
          upgradeStage === "restarting" ? upgradeInfo.detail : null].filter(Boolean).join(" "));
+    if (taskJobs.length > 0) {
+      parkControl("Park active task workers",
+        "Explicitly stops task workers at their next node boundary. Updating does not require this.");
+    }
     state.lastUpgradeStage = upgradeStage;
     return;
   }
@@ -1318,14 +1325,8 @@ function renderLoop() {
   state.lastUpgradeStage = upgradeStage;
   setAttr(box, "data-upgrade-failed", upgradeStage === "failed" ? "yes" : null);
 
-  if (upgradeInfo && upgradeInfo.scheduler_restart_pending) {
-    setAttr(box, "data-state", "upgrading");
-    setAttr(box, "data-owned", null);
-    setText(text, "Scheduler restart pending; execution workers continue.");
-    quiet(upgradeInfo.scheduler_restart_pending);
-    return;
-  }
-
+  /* A retained restart intent is diagnostic, not a live handover. In
+     particular, timeout recovery must retain Update, Start and explicit Park. */
   const loop = state.health.loop || state.loop || {};
   const daemon = loop.daemon || state.health.daemon || {};
   clear(text);

@@ -20,7 +20,7 @@ function harness(saved = null) {
     show: (node, visible) => { node.hidden = !visible; },
     setText: (node, text) => { node.textContent = text; },
     setAttr: (node, name, value) => { node[name] = value; }, clear() {}, el() {},
-    announce() {}, ok() {}, runnableTasks: () => 0, startCost: () => '',
+    announce() {}, ok() {}, setLoop() {}, runnableTasks: () => 0, startCost: () => '',
     plural: (n, word) => `${n} ${word}`, STOP_ASK_MS: 1000,
     UPGRADE_BUSY_STAGES: new Set(['downloading', 'replaced', 'parking', 'restarting']),
   };
@@ -155,4 +155,59 @@ test('standalone workers are not included in queue-wide park controls', () => {
   h.health.jobs = [{kind: 'task', queue_owned: true, version: '0.1.0'}];
   h.renderLoop();
   assert.equal(h.$('loop-park').hidden, false, 'queue-owned work remains controllable after the scheduler stops');
+});
+
+
+test('retained restart intent preserves Park, Start and confirmed upgrade retry after timeout', async () => {
+  const h = harness();
+  h.health.update = {available: false};
+  h.health.jobs = [{kind: 'task', queue_owned: true, version: '0.1.0'}];
+  h.health.loop = {running: true, stopping: true};
+  h.health.upgrade = {
+    stage: 'failed', to: 'v0.2.0', started_at: 'timeout',
+    detail: 'Scheduler retirement timed out',
+    scheduler_restart_pending: 'old scheduler pid 4242 is finishing its lap',
+  };
+  const controls = [];
+  h.context.setLoop = (...args) => controls.push(args);
+  h.renderLoop();
+  assert.equal(h.$('loop-upgrade').hidden, false, 'failure offers update retry without a cached release');
+  assert.equal(h.$('loop-park').hidden, false, 'workers remain controllable during retirement');
+  assert.match(h.$('loop-why').textContent, /4242/);
+  h.$('loop-park').onclick();
+  assert.deepEqual(controls.pop(), [false, true], 'Park remains explicit');
+
+  // The marker outlives retirement and the one-shot background recovery.
+  h.health.loop = {running: false};
+  h.health.upgrade.scheduler_restart_pending = 'replacement startup pending';
+  h.renderLoop();
+  assert.equal(h.$('loop-toggle').hidden, false, 'retired scheduler can be started');
+  assert.equal(h.$('loop-toggle')['data-kind'], 'start');
+  assert.equal(h.$('loop-park').hidden, false);
+  assert.equal(h.$('loop-upgrade').hidden, false);
+  assert.match(h.$('loop-why').textContent, /replacement startup pending/);
+  h.$('loop-toggle').onclick();
+  assert.deepEqual(controls.pop(), [true]);
+  let requests = 0;
+  h.context.fetch = async () => {
+    requests++;
+    return new Response(JSON.stringify({to: 'v0.2.0'}), {status: 202});
+  };
+  await h.attempt();
+  assert.equal(requests, 1, 'confirmed retry reaches the upgrade endpoint');
+});
+
+test('active handover keeps explicit Park available without sending controls on render', () => {
+  const h = harness();
+  h.health.jobs = [{kind: 'task', queue_owned: true, version: '0.1.0'}];
+  h.health.upgrade = {stage: 'restarting', waiting_on: 'old scheduler pid 4242 is finishing its lap',
+    scheduler_restart_pending: 'old scheduler pid 4242 is finishing its lap'};
+  let controls = 0;
+  h.context.setLoop = () => controls++;
+  h.renderLoop();
+  assert.equal(h.$('loop-park').hidden, false);
+  assert.equal(controls, 0);
+  assert.equal(h.$('loop-why').textContent.match(/4242/g).length, 1);
+  h.$('loop-park').onclick();
+  assert.equal(controls, 1);
 });
