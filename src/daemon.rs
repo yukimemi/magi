@@ -2707,19 +2707,34 @@ pub fn scheduler_restart_wait(home: &Path) -> Option<String> {
     let pending: SchedulerRestart =
         serde_json::from_slice(&std::fs::read(scheduler_restart_path(home)).ok()?).ok()?;
     let elapsed = (Timestamp::now().as_second() - pending.since.as_second()).max(0);
-    // daemon.json may already describe the replacement. Never attribute its
-    // sub-step to the retiring process (or guess when its PID is unknown).
-    let step = read_status(home)
-        .filter(|status| pending.pid.is_some() && status.pid == pending.pid)
-        .and_then(|status| status.lap_step)
-        .map_or_else(String::new, |step| {
-            format!("; step {} since {}", step.name, step.since)
-        });
+    let pid = pending
+        .pid
+        .map_or_else(|| "unknown".into(), |pid| pid.to_string());
+    // Observe without reconciling the worker store: banners must not mutate
+    // reservations. A retained intent alone says nothing about the old PID.
+    let state = match crate::worker::observe_active(home) {
+        Err(_) => "scheduler ownership unavailable; retry after checking worker storage".into(),
+        Ok(jobs) => match jobs.iter().find(|job| job.kind == "scheduler") {
+            Some(job) if Some(&job.id) == pending.job_id.as_ref() => {
+                let step = read_status(home)
+                    .filter(|status| pending.pid.is_some() && status.pid == pending.pid)
+                    .and_then(|status| status.lap_step)
+                    .map_or_else(String::new, |step| {
+                        format!("; step {} since {}", step.name, step.since)
+                    });
+                format!("old scheduler pid {pid} is finishing its lap{step}")
+            }
+            Some(job) if job.status == crate::worker::Status::Running => {
+                "replacement scheduler acknowledged; restart bookkeeping pending".into()
+            }
+            Some(_) => "waiting for replacement scheduler startup acknowledgement".into(),
+            None => format!(
+                "old scheduler pid {pid} has no active reservation; waiting for retirement lease or replacement startup; retry Update & restart or Start after retirement"
+            ),
+        },
+    };
     Some(format!(
-        "scheduler restart pending: old scheduler pid {} is finishing its lap{step} (waited {elapsed}s; retirement attempt waits at most {}s)",
-        pending
-            .pid
-            .map_or_else(|| "unknown".into(), |pid| pid.to_string()),
+        "scheduler restart pending: {state} (waited {elapsed}s; retirement attempt waits at most {}s)",
         SCHEDULER_RESTART_WAIT.as_secs(),
     ))
 }
@@ -2734,6 +2749,16 @@ pub async fn restart_detached(home: &Path) -> Result<()> {
         spawn_detached(home, &opts).await.map(|_| ())
     })
     .await
+}
+
+/// An explicit Start also retries a retained upgrade restart. Preserve its
+/// options and coordinator fencing, and remove the intent only after success.
+pub(crate) async fn retry_scheduler_restart(home: &Path) -> Result<bool> {
+    if !scheduler_restart_path(home).try_exists()? {
+        return Ok(false);
+    }
+    restart_detached(home).await?;
+    Ok(true)
 }
 
 async fn restart_detached_with<F, Fut>(home: &Path, bound: Duration, spawn: F) -> Result<()>
@@ -6995,6 +7020,9 @@ mod tests {
         );
         assert_eq!(calls.get(), 0);
         std::fs::remove_dir_all(old_dir).unwrap();
+        let waiting = scheduler_restart_wait(home.path()).unwrap();
+        assert!(waiting.contains("replacement startup"), "{waiting}");
+        assert!(!waiting.contains("finishing its lap"), "{waiting}");
         // A failed spawn retains the intent for an explicit retry.
         assert!(
             complete_scheduler_restart(home.path(), Duration::ZERO, |_| {

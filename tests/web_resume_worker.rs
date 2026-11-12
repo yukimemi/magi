@@ -362,5 +362,33 @@ async fn replacement_web_controls_a_foreign_upgraded_scheduler() {
     wait_for(|| magi::worker::active(&home).is_ok_and(|jobs| {
         jobs.iter().all(|job| job.kind != "scheduler")
     }), "phone stop to finish the detached scheduler").await;
+    // Model a restart whose bounded recovery already timed out. The old
+    // scheduler is now gone, but no background consumer remains for its intent.
+    let marker = home.join("scheduler-restart.json");
+    std::fs::write(&marker, serde_json::to_vec(&json!({
+        "opts": scheduler.payload,
+        "job_id": scheduler.id,
+        "pid": scheduler.pid,
+        "since": jiff::Timestamp::now(),
+    })).unwrap()).unwrap();
+    let mut progress = magi::updater::Progress::new("old".into(), "new".into());
+    progress.fail("scheduler retirement timed out");
+    magi::updater::write_progress(&home, &progress).unwrap();
+    let (status, health) = request(address, "GET", "/api/health", None).await;
+    assert_eq!(status, 200, "{health}");
+    assert_eq!(health["upgrade"]["stage"], "failed");
+    assert!(health["upgrade"]["scheduler_restart_pending"].as_str().unwrap()
+        .contains("replacement startup"));
+
+    let (status, body) = request(address, "POST", "/api/loop", Some(json!({"running": true}))).await;
+    assert_eq!(status, 200, "explicit Start must finish the retained restart: {body}");
+    assert!(!marker.exists(), "confirmed Start clears the retained intent");
+    let replacements: Vec<_> = magi::worker::active(&home).unwrap().into_iter()
+        .filter(|job| job.kind == "scheduler").collect();
+    assert_eq!(replacements.len(), 1, "Start must not duplicate dispatchers");
+    assert_ne!(replacements[0].id, scheduler.id);
+    let (status, health) = request(address, "GET", "/api/health", None).await;
+    assert_eq!(status, 200, "{health}");
+    assert!(health["upgrade"]["scheduler_restart_pending"].is_null());
 }
 }

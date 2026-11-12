@@ -1148,9 +1148,14 @@ impl Ui {
             worktrees_root: Some(self.worktrees_root.clone()),
             ..daemon::Opts::default()
         };
-        daemon::spawn_detached(&self.home, &opts)
+        if !daemon::retry_scheduler_restart(&self.home)
             .await
-            .map_err(ApiError::from)?;
+            .map_err(ApiError::from)?
+        {
+            daemon::spawn_detached(&self.home, &opts)
+                .await
+                .map_err(ApiError::from)?;
+        }
         let mut state = self.lock_loop();
         state.last_error = None;
         state.rev += 1;
@@ -24131,7 +24136,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_web_upgrade_still_reports_pending_scheduler_retirement() {
+    fn completed_web_upgrade_reports_pending_replacement_after_retirement() {
         let home = TempDir::new().unwrap();
         let ui = idle_ui(&home);
         let mut progress = updater::Progress::new("old".into(), "new".into());
@@ -24149,7 +24154,8 @@ mod tests {
         .unwrap();
         let view = upgrade_progress_view(&ui, progress);
         let pending = view.scheduler_restart_pending.unwrap();
-        assert!(pending.contains("4242") && pending.contains("finishing its lap"));
+        assert!(pending.contains("4242") && pending.contains("replacement startup"));
+        assert!(!pending.contains("finishing its lap"));
         assert_eq!(view.waiting_on.as_deref(), Some(pending.as_str()));
         assert!(view.stuck_for_secs.is_none());
     }
