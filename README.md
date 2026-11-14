@@ -88,6 +88,9 @@ specific one:
 | language_judge (PR title / body English check) | ×1 per check, only when set | `language_judge` *(optional; unset spawns nothing and the built-in heuristics decide, as they do after a failed, timed-out or unparsable call)* | `[graph] github_text_guard` | yes |
 | tally / fold / gate / merge | n/a — no agent seat | — | `[verify] gate`, `[graph] land`, `land_approval` | n/a |
 
+`fold_losers` は読み取り専用席の破棄イベントを各撤去の直後に保存します。
+後続席の撤去が失敗しても、既に破棄したパスの記録は残ります。
+
 **Role lists are also an ordered backup list.** An array-valued `implementers`,
 `judges` or `reviewers` may be longer than its `[graph]` seat count. With
 `[graph] implementers = 1` and `implementers = ["a", "b", "c"]`, only the first

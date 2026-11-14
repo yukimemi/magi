@@ -5331,6 +5331,7 @@ impl Runner {
             let wt = root.join(format!("judge-{j}"));
             if wt.exists() {
                 remove_read_seat_worktree(&mut self.state, &wt).await?;
+                self.state.save()?;
             }
         }
         // The design-deliberation stage is finished by the time a tally
@@ -5340,6 +5341,7 @@ impl Runner {
                 let wt = root.join(format!("advisor-{k}"));
                 if wt.exists() {
                     remove_read_seat_worktree(&mut self.state, &wt).await?;
+                    self.state.save()?;
                 }
             }
         }
@@ -15935,6 +15937,35 @@ mod tests {
         });
         runner.state.save().unwrap();
         (tmp, runner)
+    }
+
+    #[tokio::test]
+    async fn fold_losers_persists_discard_before_later_teardown_failure() {
+        let (_tmp, mut runner) = preservation_resume_fixture().await;
+        runner.state.candidates[0].folded = true;
+        runner.state.config.graph.advise = true;
+        runner.state.config.graph.advisors = 2;
+        let repo = runner.state.repo.clone();
+        let root = runner.state.worktree_root();
+        let discarded = root.join("advisor-1");
+        git::worktree_add_detached(&repo, &discarded, "main")
+            .await
+            .unwrap();
+        std::fs::write(discarded.join("design_proposal.json"), "{}").unwrap();
+        let protected = root.join("advisor-2");
+        git::worktree_add_branch(&repo, &protected, "attached-advisor", "main")
+            .await
+            .unwrap();
+        std::fs::write(protected.join("keep"), "uncommitted").unwrap();
+        runner.state.save().unwrap();
+
+        assert!(runner.fold_losers().await.is_err());
+        assert!(!discarded.exists());
+        assert!(protected.join("keep").exists());
+        let saved = RunState::load(&runner.state.id).unwrap();
+        assert!(saved.events.iter().any(|event| {
+            event.message.contains("advisor-1") && event.message.contains("design_proposal.json")
+        }));
     }
 
     #[tokio::test]
