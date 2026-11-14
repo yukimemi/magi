@@ -811,7 +811,7 @@ fn profile_output_dirs(profile: &Path, require_proof: bool) -> Result<Vec<PathBu
                 // Reclamation only: a non-hash or incomplete unit is not a
                 // rustc unit, so it is retained while complete ones still
                 // count. The missing-tag proof demands every unit be valid.
-                let complete = meta.is_dir()
+                let structured = meta.is_dir()
                     && unit
                         .file_name()
                         .and_then(|n| n.to_str())
@@ -820,7 +820,13 @@ fn profile_output_dirs(profile: &Path, require_proof: bool) -> Result<Vec<PathBu
                     && ["fingerprint", "out"].iter().all(|name| {
                         let path = unit.join(name);
                         plain_dir(&path) && path.canonicalize().is_ok_and(|p| p == path)
-                    })
+                    });
+                // A completed build-script run unit has no invoked.timestamp;
+                // it is a known structure but its output never gets authority.
+                if structured && v2_run_script_unit(&unit) {
+                    continue;
+                }
+                let complete = structured
                     && plain_file(
                         &unit.join("fingerprint/invoked.timestamp"),
                         "Cargo unit fingerprint",
@@ -845,6 +851,30 @@ fn profile_output_dirs(profile: &Path, require_proof: bool) -> Result<Vec<PathBu
         ensure!(!require_proof, "missing Cargo profile proof");
     }
     Ok(dirs)
+}
+
+// A build-script run unit: fingerprint holds exactly a plain
+// `run-build-script-*` file with its json sibling, and no timestamp.
+fn v2_run_script_unit(unit: &Path) -> bool {
+    let fp = unit.join("fingerprint");
+    if std::fs::symlink_metadata(fp.join("invoked.timestamp")).is_ok() {
+        return false;
+    }
+    let Ok(entries) = std::fs::read_dir(&fp) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        if name.starts_with("run-build-script-")
+            && path.extension().is_none()
+            && plain_file(&path, "Cargo run fingerprint").is_ok()
+            && plain_file(&path.with_extension("json"), "Cargo run fingerprint json").is_ok()
+        {
+            return true;
+        }
+    }
+    false
 }
 
 // A unit directory may also contain arbitrary build-script products. Only
@@ -2812,6 +2842,35 @@ mod tests {
         assert!(!artifact.exists());
         // Unlinking proven names must never remove the retained reference's bytes.
         assert_eq!(std::fs::metadata(retained).unwrap().len(), 200);
+    }
+
+    #[tokio::test]
+    async fn missing_tag_v2_accepts_completed_build_script_run_units() {
+        let f = Fx::new().await;
+        let state = f.run("bc02", true).await;
+        let wt = &state.candidates[0].worktree;
+        let artifact = v2_target(wt);
+        let run = wt.join("target/debug/build/fixture/2222222222222222");
+        std::fs::create_dir_all(run.join("out")).unwrap();
+        std::fs::create_dir(run.join("fingerprint")).unwrap();
+        for name in [
+            "run-build-script-build-script-build",
+            "run-build-script-build-script-build.json",
+        ] {
+            std::fs::write(run.join("fingerprint").join(name), "fixture").unwrap();
+        }
+        // Build-script output carries no deletion authority.
+        let decoy = run.join("out/libdecoy-2222222222222222.rlib");
+        std::fs::copy(&artifact, &decoy).unwrap();
+        std::fs::write(
+            run.join("out/decoy-2222222222222222.d"),
+            format!("{}: source\n", decoy.display()),
+        )
+        .unwrap();
+        let report = sweep(&f.home, &Fx::disk(), Fx::now()).await;
+        assert!(report.freed_bytes > 0, "{report:?}");
+        assert!(!artifact.exists());
+        assert!(decoy.is_file());
     }
 
     #[tokio::test]
