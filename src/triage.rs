@@ -2093,6 +2093,15 @@ mod tests {
                             .update_decision(&q.id, |d| d.accept("owner requested hold"))
                             .unwrap();
                     } else {
+                        // Whether the sweep could route to a chat depends on the
+                        // installed agents; record the delivery explicitly so the
+                        // missing record means "delivered but lost", not "undelivered".
+                        questions
+                            .update(&q.id, |q| {
+                                q.routed_chat = Some("delivered-chat".into());
+                                Ok(())
+                            })
+                            .unwrap();
                         std::fs::remove_file(
                             dir.path()
                                 .join("notifications/task-inquiries")
