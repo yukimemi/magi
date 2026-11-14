@@ -687,6 +687,9 @@ fi
 # own seat and touching note.txt, so a synthesis that names a seat outright
 # has real, seat-specific wording to quote back.
 if has "You are advisor"; then
+  if [ "$MOCK_ADVISOR_DIRTY_SEAT" = "$seat" ]; then
+    printf '{"stray":true}\n' > design_proposal.json
+  fi
   if [ -n "$MOCK_ADVISOR_FAIL_SEAT" ] && { case ",$MOCK_ADVISOR_FAIL_SEAT," in *",$seat,"*) true ;; *) false ;; esac; }; then
     echo 'not a proposal at all'
     exit 1

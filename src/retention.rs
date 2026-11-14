@@ -488,6 +488,17 @@ fn plain_dir(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
 }
 
+pub(crate) fn read_seat(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|s| s.to_str())
+        .is_some_and(|name| {
+            ["review-", "judge-", "advisor-"].iter().any(|prefix| {
+                name.strip_prefix(prefix)
+                    .is_some_and(|n| n.parse::<usize>().is_ok_and(|n| n > 0))
+            })
+        })
+}
+
 /// Old run records outlive their checkout and output directories. Only an
 /// absent path means nothing to reclaim; inaccessible paths remain errors.
 fn run_paths_missing(state: &RunState) -> Result<bool> {

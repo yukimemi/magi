@@ -1,5 +1,22 @@
 # Inactive checkout evidence
 
+## Completed read-only seats
+
+Normal graph teardown (including preparation rollback and explicit folding)
+discards uncommitted and untracked changes in owned detached `advisor-N`,
+`judge-N` and `review-N` worktrees. Their outputs are replies and saved run
+artifacts, not checkout files. The seat must be registered in the run's root,
+belong to the expected Git common directory, and not be a candidate.
+Discarded status entries are recorded in bounded `fold` events. Actual Git
+removal failures still stop teardown.
+
+Editing seats, attached branches and unknown trees retain clean-only removal:
+their uncommitted work is never silently discarded. Existing execution,
+coordination and output-lease protections remain in effect. The independent
+inactive-copy eviction policy below remains conservative about dirty files.
+
+## Inactive-copy eviction
+
 Normal retained-output housekeeping also archives and evicts a small set of
 inactive, non-resumable source copies when `disk.auto_fold` and a positive
 `disk.worktree_reclaim_bytes` are enabled. This is independent of confirmed-merge
