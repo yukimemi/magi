@@ -760,6 +760,16 @@ chatter agent selection, default persona and Solo. Runs without a task get a
 persistent run conversation; global reports go to the home's **operations chat**
 (`notice-operations`), using the first daemon repository context.
 
+Recognized disk-capacity machine holds are automatically monitored, including
+while other tasks run. Capacity and output reservations are rechecked at most
+once per minute per task; pressure and failed measurements spend no attempts or
+agent budget and create no triage questions. After admission succeeds, the same
+task queues again with its retained run and approval evidence preserved.
+Untouched automatic disk triage questions from older versions are superseded
+without an owner answer. Manual holds, owner replies or discussion, unrelated
+approvals and ambiguous old records still require explicit resolution; the task
+chat explains these exceptions while eligible tasks continue recovering.
+
 The notification store is a durable outbox. The daemon coalesces queued reports
 per chat, checks whether the cause cleared, and suppresses reports already
 covered by a related question or posted completion report. Read/dismissed legacy

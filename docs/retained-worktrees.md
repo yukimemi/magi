@@ -498,7 +498,19 @@ Triage rechecks a recorded disk-admission machine hold with the reservation
 validator over repository/worktree and saved/current cache locations. It drops
 the probe reservation immediately and requeues only when admission succeeds;
 cancelled operations, missing run evidence and incremental provenance failures
-remain held.
+remain held. The existing daemon maintenance path also checks these waits while
+other tasks run. A persisted per-task cadence limits probes to once per minute;
+continued pressure or a failed measurement creates no questions and spends no
+attempts. Automatic recovery preserves attempts and pins the retained execution,
+so an unavailable or incompatible run cannot become a new competition.
+
+An untouched automatic triage question from the same hold and decision generation
+may be abandoned through the question lifecycle; a routed inquiry is settled as a
+system supersession under its execution claim, without inventing an owner answer.
+Question abandonment precedes the compare-and-save queue transition: interruption
+leaves a held task for the next pass. Owner requests, discussion, manual holds and
+other approval gates remain protected and produce a stable exception notice after
+capacity recovers. Unknown legacy reasons are never inferred from keywords.
 
 In `retention.json`, `measured_bytes` is logical inventory and `freed_bytes` is
 logical bytes unlinked. Neither means physical disk space recovered.

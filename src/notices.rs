@@ -797,6 +797,11 @@ pub fn task_held(task: &crate::queue::Task) -> Option<Notice> {
     if task.status != TaskStatus::Held || task.hold_source != Some(HoldSource::Machine) {
         return None;
     }
+    if task.machine_hold_cause == Some(crate::queue::MachineHoldCause::DiskCapacity) {
+        return Some(Notice::warn(&format!("task:{}", task.id),
+            format!("Task {} is waiting for disk capacity and will resume automatically after admission succeeds.", task.short()))
+            .link(Link::Task { id: task.id.clone() }).about([task.id.clone()]).cause("disk-capacity"));
+    }
     let why = clean_text(task.hold_reason.as_deref())
         .or_else(|| clean_text(task.last_error.as_deref()))
         .unwrap_or("no reason recorded");

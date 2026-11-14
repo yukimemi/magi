@@ -2096,6 +2096,15 @@ with its own multi-GB `target/`. Two failures came out of that, both silent:
   Run `4043`'s implementer said the disk had 8.9 MB free; the run was recorded
   as "blocked with one finding open". `daemon::disk_gate` holds a task before
   minting a run instead, which spends no attempt and leaves it in the list.
+  Typed disk-capacity holds are resource waits: triage and the existing daemon
+  maintenance service probe admission at most once per minute per task, including
+  while other work runs. Pressure and measurement failure remain held without
+  questions. Recovery preserves attempts, approvals and retained execution identity;
+  it never authorizes a replacement competition. Legacy migration requires the
+  exact localized gate format and machine provenance. Only untouched automatic
+  disk triage questions may be superseded; owner replies, discussion and unrelated
+  approval gates still need owner resolution. Queue transitions compare the complete
+  held snapshot under the task write lock, so a concurrent owner hold wins.
 
 Housekeeping is best-effort by construction: one run's fold failure is a
 `tracing::warn` and the pass continues (`clean::fold_due`). A `?` there stopped

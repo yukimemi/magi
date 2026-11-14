@@ -82,15 +82,44 @@ pub fn unmeasured_in(
 /// Is `reason` one of this module's disk-gate reasons, in either language?
 /// What triage reads back to decide a hold is disk pressure.
 pub fn is_gate_reason(reason: &str) -> bool {
-    [
-        SHORT_EN,
-        SHORT_JA,
-        UNMEASURED_EN,
-        UNMEASURED_JA,
-        RUNNING_PRESSURE,
-    ]
-    .iter()
-    .any(|p| reason.starts_with(p))
+    fn numbers(text: &str, middle: &str, suffix: &str) -> bool {
+        text.strip_suffix(suffix)
+            .and_then(|s| s.split_once(middle))
+            .is_some_and(|(a, b)| {
+                !a.is_empty()
+                    && !b.is_empty()
+                    && a.bytes().all(|c| c.is_ascii_digit())
+                    && b.bytes().all(|c| c.is_ascii_digit())
+                    && matches!((a.parse::<u64>(), b.parse::<u64>()), (Ok(free), Ok(required)) if free < required)
+            })
+    }
+    reason
+        .strip_prefix(&format!("{SHORT_EN} "))
+        .is_some_and(|s| numbers(s, " bytes free, ", " required by `[disk] min_free_bytes`"))
+        || reason
+            .strip_prefix(&format!("{SHORT_JA} 空き "))
+            .is_some_and(|s| numbers(s, " バイト、`[disk] min_free_bytes` の要求は ", " バイト"))
+        || [
+            (
+                UNMEASURED_EN,
+                "); the disk gate refuses to let a run start blind",
+            ),
+            (
+                UNMEASURED_JA,
+                "); ディスクゲートは測定できないまま run を開始させません",
+            ),
+        ]
+        .iter()
+        .any(|(prefix, suffix)| {
+            reason
+                .strip_prefix(prefix)
+                .and_then(|s| s.strip_suffix(suffix))
+                .is_some_and(|s| {
+                    s.split_once(" (").is_some_and(|(path, error)| {
+                        !path.is_empty() && !error.is_empty() && !s.contains('\n')
+                    })
+                })
+        })
 }
 
 /// Is `size` past `limit`? One comparison, shared by the janitor and the
@@ -512,6 +541,23 @@ mod tests {
         assert!(m_ja.contains("測定できませんでした") && is_gate_reason(&m_ja));
         assert!(is_gate_reason(&unmeasured_in(p, &"boom", "en")));
         assert!(!is_gate_reason("something else"));
+    }
+
+    #[test]
+    fn disk_wait_legacy_reasons_require_the_complete_gate_format() {
+        let observed = "run を開始するための空き容量が不足しています: 空き 1477050368 バイト、`[disk] min_free_bytes` の要求は 3221225472 バイト";
+        assert!(is_gate_reason(observed));
+        assert!(is_gate_reason(
+            &gate_in(1477050368, 3221225472, "en").unwrap()
+        ));
+        for ambiguous in [
+            format!("{observed}\nowner: hold"),
+            format!("{SHORT_EN} inspect manually"),
+            format!("{RUNNING_PRESSURE}unknown"),
+            format!("{UNMEASURED_EN}/tmp (error)"),
+        ] {
+            assert!(!is_gate_reason(&ambiguous), "{ambiguous}");
+        }
     }
 
     use super::*;

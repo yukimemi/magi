@@ -2653,6 +2653,9 @@ function updateTaskCard(row, task) {
     ? `${meta.note} Waiting on: ${waitingOn}`
     : meta.note || (waitingOn ? `Waiting on: ${waitingOn}` : "");
   if (status === "parked" && task.park_reason) noteText = `${meta.note} ${task.park_reason}`;
+  if (status === "held" && task.machine_hold_cause === "disk_capacity") {
+    noteText = `Disk wait (automatically monitored). Capacity and output reservations are rechecked before resuming. ${waitingOn || ""}`;
+  }
 
   /* `status_str` alone decides whether the dependency breakdown gets added -
      never the mere presence of `blocked_by`/`block_reason`. Both fields can

@@ -14,9 +14,10 @@
 //! [`run_once`] is that walk. For every `held` task it finds:
 //!
 //! - [`HoldSource::Machine`]: if [`machine_cause_resolved`] can tell the
-//!   cause is gone, the task goes straight back to `queued` - the same effect
-//!   as `magi task release`, just automatic. When it cannot tell, a
-//!   [`Question`] is filed once and the task stays held until answered.
+//!   disk cause is gone, the same task returns to `queued`, preserving attempts
+//!   and retained execution evidence. Known disk waits remain monitored without
+//!   questions while pressure or measurement failure persists. Unknown causes
+//!   get one [`Question`] and remain held until answered.
 //! - `None` (a legacy record, or a hold nobody explained): always a question,
 //!   exactly once - the whole point being that "protected forever" must not
 //!   mean "never shown to anyone" either.
@@ -67,7 +68,8 @@
 //! # Idempotency
 //!
 //! [`run_once`] runs on every daemon idle tick (see `crate::daemon::poll`)
-//! and on every `magi task triage`, so an answered question must be applied to
+//! and on every `magi task triage`; the existing maintenance service also checks
+//! disk waits while other tasks run, at most once per minute per task. Thus an answered question must be applied to
 //! a task **at most once**, and a *fresh* question for the same task (once it
 //! is held again, or goes stale) must still be possible. The record is
 //! [`Task::triage_applied`], the question ids already applied. It cannot live
@@ -379,20 +381,69 @@ fn repo_for(task: &Task) -> PathBuf {
     }
 }
 
-/// Recognise a `HoldSource::Machine` hold caused by the free-space gate
-/// (`crate::disk::gate`'s message, or `daemon::disk_gate`'s "could not
-/// measure" fallback) from `hold_reason` text alone.
-///
-/// There is no field recording *why* a machine hold happened - `hold_machine`
-/// takes only a reason string - so this is the one signal available, and disk
-/// pressure is the one cause this module can safely re-measure without
-/// touching git, a run, or an agent CLI. Keep the two prefixes here in sync
-/// with `crate::disk::gate`'s formatted string and `daemon::disk_gate`'s own
-/// message if either changes; nothing else ties them together.
+/// Only exact legacy admission messages may migrate without structured evidence.
 fn is_disk_hold(task: &Task) -> bool {
-    task.hold_reason
-        .as_deref()
-        .is_some_and(crate::disk::is_gate_reason)
+    task.machine_hold_cause == Some(crate::queue::MachineHoldCause::DiskCapacity)
+        || (task.schema < 22
+            && task
+                .hold_reason
+                .as_deref()
+                .is_some_and(crate::disk::is_gate_reason))
+}
+
+pub(crate) fn disk_wait_eligible(task: &Task) -> bool {
+    disk_wait_known(task, &crate::run::home())
+}
+
+/// Run evidence is mandatory for resource-block and emergency-writer holds.
+fn disk_wait_known(task: &Task, home: &Path) -> bool {
+    if task.status != TaskStatus::Held
+        || task.hold_source != Some(HoldSource::Machine)
+        || task
+            .resume_override
+            .as_ref()
+            .is_some_and(|o| o.conductor_rehold.is_some())
+    {
+        return false;
+    }
+    if task.machine_hold_cause == Some(crate::queue::MachineHoldCause::DiskCapacity) {
+        return true;
+    }
+    // Legacy prose is not authority to reinterpret an explicit recovery pin.
+    if task.resume_override.is_some() {
+        return false;
+    }
+    if is_disk_hold(task) {
+        return true;
+    }
+    if task.schema >= 22 {
+        return false;
+    }
+    if !task.hold_reason.as_deref().is_some_and(|r| {
+        r.starts_with(crate::disk::RUNNING_PRESSURE) || r.starts_with(crate::cache::RESOURCE_HOLD)
+    }) {
+        return false;
+    }
+    let Some(id) = task.execution_runs().last() else {
+        return false;
+    };
+    let Ok(state) = crate::run::RunState::load_under(id, home) else {
+        return false;
+    };
+    state.id == *id
+        && state.resource_block.as_ref().is_some_and(|b| {
+            let expected = match b.kind.as_str() {
+                "disk pressure" => format!("{}{}", crate::disk::RUNNING_PRESSURE, b.detail),
+                "disk admission" => format!(
+                    "{}{}; no attempt was spent; resume to retry the affected operation",
+                    crate::cache::RESOURCE_HOLD,
+                    b.description()
+                ),
+                _ => return false,
+            };
+            matches!(b.cause, crate::run::ResourceBlockCause::Other)
+                && task.hold_reason.as_deref() == Some(expected.as_str())
+        })
 }
 
 /// Has a `HoldSource::Machine` hold's cause resolved? `Some(true)` means yes -
@@ -404,8 +455,8 @@ fn machine_cause_resolved(task: &Task, cfg: &Config) -> Option<bool> {
 }
 
 fn machine_cause_resolved_under(task: &Task, cfg: &Config, home: &Path) -> Option<bool> {
-    machine_cause_resolved_with_admission(task, cfg, home, |paths| {
-        crate::retention::OutputLease::admit(home, paths, cfg.disk.min_free_bytes).is_ok()
+    machine_cause_resolved_with_admission(task, cfg, home, |paths, floor| {
+        crate::retention::OutputLease::admit(home, paths, floor).is_ok()
     })
 }
 
@@ -413,8 +464,38 @@ fn machine_cause_resolved_with_admission(
     task: &Task,
     cfg: &Config,
     home: &Path,
-    admission_available: impl Fn(&[PathBuf]) -> bool,
+    admission_available: impl Fn(&[PathBuf], u64) -> bool,
 ) -> Option<bool> {
+    if disk_wait_known(task, home) {
+        if crate::daemon::disk_gate(&repo_for(task), cfg).is_some() {
+            return Some(false);
+        }
+        let mut floor = cfg.disk.min_free_bytes;
+        let mut paths = vec![repo_for(task)];
+        paths.extend(cfg.cache_dir());
+        paths.push(
+            cfg.graph
+                .worktree_root
+                .clone()
+                .unwrap_or_else(crate::run::default_worktree_root),
+        );
+        if let Some(id) = task.execution_runs().last() {
+            let Ok(state) = crate::run::RunState::load_under(id, home) else {
+                return Some(false);
+            };
+            if state.id != *id || !state.status.resumable() {
+                return Some(false);
+            }
+            if crate::daemon::disk_gate(&state.repo, &state.config).is_some() {
+                return Some(false);
+            }
+            floor = floor.max(state.config.disk.min_free_bytes);
+            paths.extend([state.repo.clone(), state.worktree_root()]);
+            paths.extend(state.candidates.iter().map(|c| c.worktree.clone()));
+            paths.extend(state.config.cache_dir());
+        }
+        return Some(admission_available(&paths, floor));
+    }
     if task
         .hold_reason
         .as_deref()
@@ -426,18 +507,6 @@ fn machine_cause_resolved_with_admission(
         let block = state.resource_block.as_ref()?;
         if state.id != *id {
             return None;
-        }
-        if block.kind == "disk admission"
-            && matches!(block.cause, crate::run::ResourceBlockCause::Other)
-        {
-            // Reuse the actual atomic admission validator, not just df: other
-            // writers may still own headroom on either output volume. Include
-            // saved and current cache locations conservatively across resumes.
-            let mut paths = vec![repo_for(task), state.repo.clone(), state.worktree_root()];
-            paths.extend(state.candidates.iter().map(|c| c.worktree.clone()));
-            paths.extend(state.config.cache_dir());
-            paths.extend(cfg.cache_dir());
-            return Some(admission_available(&paths));
         }
         // A free cache lease resolves contention, not malformed manifests,
         // failed writes, cancellation, or unknown infrastructure failures.
@@ -451,16 +520,7 @@ fn machine_cause_resolved_with_admission(
                 .is_none_or(|dir| !crate::cache::in_use(home, &dir)),
         );
     }
-    if !is_disk_hold(task) {
-        return None;
-    }
-    let min = cfg.disk.min_free_bytes;
-    if min == 0 {
-        // The operator turned the gate off since this hold was placed - its
-        // one possible cause is gone by construction, no measurement needed.
-        return Some(true);
-    }
-    Some(crate::daemon::disk_gate(&repo_for(task), cfg).is_none())
+    None
 }
 
 /// Is a `HoldSource::Manual` hold old enough to earn a "still wanted?"
@@ -738,6 +798,9 @@ pub(crate) fn deputy_brief(q: &Question, queue: &Queue) -> String {
         ),
         None => format!("Task {} no longer exists (its record is gone).", q.run),
     };
+    if task.as_ref().is_some_and(disk_wait_eligible) {
+        s.push_str("\n\nDisk capacity waits are monitored automatically. No owner answer is needed for an untouched automatic disk triage question. Explicit holds, discussion and other approvals still require owner resolution.");
+    }
     s.push_str("\n\nWhat each option does, by position:");
     let n = q.choices.len();
     for (i, c) in q.choices.iter().enumerate() {
@@ -1293,6 +1356,209 @@ pub fn apply_answers(queue: &Queue, questions: &Questions) -> Vec<String> {
     }
     applied
 }
+const DISK_SUPERSEDED: &str =
+    "Automatic disk wait superseded unanswered triage; no owner answer or approval was created";
+
+fn untouched_disk_question(q: &Question, task: &Task) -> bool {
+    q.status.open()
+        && q.node == NODE
+        && q.seat == SEAT
+        && q.run == task.id
+        && q.routed_task.as_deref().is_none_or(|id| id == task.id)
+        && q.triage_generation == Some(task.resumption.as_ref().map_or(0, |r| r.generation))
+        && task.held_at.is_some_and(|at| q.asked_at >= at)
+        && task.operator_decided_at.is_none_or(|at| at <= q.asked_at)
+        && q.answer.is_none()
+        && q.answered_at.is_none()
+        && q.accepted_answer_at.is_none()
+        && q.thread.is_empty()
+        && q.actions.is_empty()
+        && q.merge_target.is_none()
+        && [&EN, &JA].iter().any(|w| {
+            q.summary == w.summary_machine_unknown(task)
+                && q.choices == w.choices3()
+                && q.detail == w.detail(task, w.why_machine())
+        })
+}
+
+/// Refresh old persisted wording without raising, relighting or delivering a notice.
+fn refresh_disk_notices(home: &Path, task: &Task) {
+    let notices = crate::notices::Notices::at(home.join("notifications"));
+    let Some(task_notice) = crate::notices::task_held(task) else {
+        return;
+    };
+    for (key, message) in [
+        (task_notice.key, task_notice.message),
+        (
+            format!("disk:{}", repo_for(task).display()),
+            format!(
+                "Task {} is waiting for disk space. It will resume automatically when disk and output admission checks succeed.",
+                task.id
+            ),
+        ),
+    ] {
+        let id = crate::notices::id_of(&key);
+        if notices
+            .get(&id)
+            .is_ok_and(|n| n.key == key && n.message != message)
+        {
+            let _ = notices.update(&id, |n| {
+                if n.key == key {
+                    n.message = message;
+                }
+            });
+        }
+    }
+}
+
+/// All source changes use the question lock; native decisions additionally use
+/// their execution claim. Abandonment precedes requeue, so interrupted writes
+/// leave a held task that the next pass can safely finish, never fake consent.
+fn resume_disk_task(
+    queue: &Queue,
+    questions: &Questions,
+    task: &mut Task,
+    ownership: &crate::task_chat::InquiryOwnership,
+) -> anyhow::Result<()> {
+    let expected = task.clone();
+    let home = questions
+        .root()
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("missing question home"))?;
+    let _lease = if let Some(id) = task.execution_runs().last() {
+        anyhow::ensure!(
+            task.resume_override
+                .as_ref()
+                .and_then(|o| o.pinned_run.as_ref())
+                .is_none_or(|pin| pin == id),
+            "selected recovery run differs from disk wait evidence"
+        );
+        let state = crate::run::RunState::load_under(id, home)?;
+        anyhow::ensure!(
+            state.id == *id && state.status.resumable() && !task.fresh_start,
+            "retained execution cannot resume"
+        );
+        anyhow::ensure!(
+            state.liveness_under(
+                home,
+                crate::daemon::is_working_on(home, id, Timestamp::now())
+            ) == crate::run::Liveness::Dead,
+            "retained execution is not proven idle"
+        );
+        Some(crate::driver::maintenance(home, id)?)
+    } else {
+        None
+    };
+    let outbox = crate::task_inquiry::Outbox::at(home);
+    let all = questions.list_for_effects_in(ownership);
+    let pending: Vec<_> = all
+        .iter()
+        .filter(|q| {
+            // Legacy task/run aliases are blockers, never supersession proof.
+            (!q.run.is_empty()
+                && std::iter::once(task.id.as_str())
+                    .chain(task.execution_runs().iter().map(String::as_str))
+                    .any(|id| id == q.run || id.starts_with(&q.run) || id.ends_with(&q.run)))
+                && (q.status.open()
+                    || ((q.node == NODE || q.node == DEPS_NODE)
+                        && (awaiting_task_chat(q, task)
+                            || (q.status == QuestionStatus::Answered
+                                && !already_applied(task, q)))))
+        })
+        .collect();
+    // Multiple questions or any different approval requires owner resolution.
+    anyhow::ensure!(pending.len() <= 1, "multiple decisions remain");
+    let candidate = pending.first().copied();
+    if let Some(q) = candidate {
+        anyhow::ensure!(untouched_disk_question(q, task), "owner decision remains");
+    }
+    for inquiry in outbox.pending()? {
+        if inquiry.task == task.id && inquiry.decision.is_some() {
+            anyhow::ensure!(
+                candidate.is_some_and(|q| q.id == inquiry.id),
+                "unrelated decision remains"
+            );
+        }
+    }
+    if let Some(q) = candidate {
+        let _execution = outbox.execution_claim(&q.id)?;
+        questions.update_in(&q.id, ownership, |current| {
+            anyhow::ensure!(untouched_disk_question(current, task), "question changed");
+            let inquiry = match outbox.get(&q.id) {
+                Ok(inquiry) => inquiry,
+                Err(error)
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
+                {
+                    anyhow::ensure!(
+                        current.routed_chat.is_none(),
+                        "delivered inquiry is missing; owner reconciliation required"
+                    );
+                    // Persist a no-effect native receipt even if delivery has
+                    // not run yet. A concurrent producer replay preserves it.
+                    outbox.enqueue(crate::task_chat::live_record(home, task, current))?
+                }
+                Err(error) => return Err(error),
+            };
+            anyhow::ensure!(
+                inquiry.task == task.id
+                    && inquiry.repo == task.repo
+                    && inquiry.source == format!("{}:{}:{}", NODE, SEAT, task.id)
+                    && current
+                        .routed_chat
+                        .as_ref()
+                        .is_none_or(|chat| inquiry.delivered_to.as_ref() == Some(chat)),
+                "inquiry binding changed"
+            );
+            outbox.update_decision(&q.id, |d| {
+                if d.status == crate::task_decision::Status::Resolved {
+                    anyhow::ensure!(
+                        d.request.is_none()
+                            && d.history
+                                .last()
+                                .is_some_and(|e| e.evidence == DISK_SUPERSEDED),
+                        "decision already settled by owner"
+                    );
+                    return Ok(false);
+                }
+                anyhow::ensure!(
+                    d.status == crate::task_decision::Status::AwaitingOwner
+                        && d.request.is_none()
+                        && d.source_answer_at.is_none(),
+                    "owner request remains"
+                );
+                d.settle(DISK_SUPERSEDED)
+            })?;
+            current.abandon(DISK_SUPERSEDED);
+            Ok(())
+        })?;
+    }
+    if let Some(q) = candidate {
+        task.mark_triage_applied(&q.id);
+    }
+    task.resume_disk_wait();
+    queue.commit_disk_wait(task, &expected)?;
+    let notices = crate::notices::Notices::at(home.join("notifications"));
+    let keys = [
+        format!("disk-recovered:{}", task.id),
+        format!("disk:{}", repo_for(task).display()),
+        format!("task:{}", task.id),
+    ];
+    let repo_waiting = queue
+        .list()
+        .iter()
+        .any(|other| other.repo == task.repo && disk_wait_eligible(other));
+    for notice in notices.list() {
+        if notice.key == keys[0]
+            || notice.key == keys[2]
+            || (!repo_waiting && notice.key == keys[1])
+        {
+            let _ = notices.dismiss(&notice.id);
+        }
+    }
+    Ok(())
+}
 
 /// Run one deterministic triage pass over every `held` task in `queue`. No
 /// model call anywhere in this function - see this module's own doc for what
@@ -1311,18 +1577,67 @@ pub fn apply_answers(queue: &Queue, questions: &Questions) -> Vec<String> {
 /// Also runs [`quarantine_orphaned_blocked`], so a `blocked` task whose
 /// dependency no longer exists is caught and turned into a fresh `held`
 /// question in this same pass, not left for a later call to notice.
+/// Reconcile held tasks and requeue proven resource recoveries without owner consent.
 pub fn run_once(
     queue: &Queue,
     questions: &Questions,
     config_override: Option<&Path>,
     now: Timestamp,
 ) -> Report {
+    run_once_inner(queue, questions, config_override, now, false)
+}
+
+/// Existing maintenance service calls this even while other repositories run.
+pub(crate) fn monitor_disk_waits(
+    queue: &Queue,
+    questions: &Questions,
+    config: Option<&Path>,
+    now: Timestamp,
+) -> Report {
+    run_once_inner(queue, questions, config, now, true)
+}
+
+fn run_once_inner(
+    queue: &Queue,
+    questions: &Questions,
+    config_override: Option<&Path>,
+    now: Timestamp,
+    disk_only: bool,
+) -> Report {
+    run_once_with_probe(
+        queue,
+        questions,
+        config_override,
+        now,
+        disk_only,
+        machine_cause_resolved,
+    )
+}
+
+fn run_once_with_probe(
+    queue: &Queue,
+    questions: &Questions,
+    config_override: Option<&Path>,
+    now: Timestamp,
+    disk_only: bool,
+    resolved: impl Fn(&Task, &Config) -> Option<bool>,
+) -> Report {
     let mut report = Report {
-        answered: apply_answers(queue, questions),
-        quarantined: quarantine_orphaned_blocked(queue, questions),
+        answered: if disk_only {
+            Vec::new()
+        } else {
+            apply_answers(queue, questions)
+        },
+        quarantined: if disk_only {
+            Vec::new()
+        } else {
+            quarantine_orphaned_blocked(queue, questions)
+        },
         ..Report::default()
     };
-    ask_about_stuck_roots(queue, questions, config_override, &mut report);
+    if !disk_only {
+        ask_about_stuck_roots(queue, questions, config_override, &mut report);
+    }
     let recovery = RecoveryIndex::load(questions);
     let ownership = crate::task_chat::InquiryOwnership::default();
     for listed in queue.list() {
@@ -1354,10 +1669,52 @@ pub fn run_once(
             continue;
         }
 
-        let cfg = Config::discover(&repo_for(&task), config_override)
+        let explicit = match &task.overrides {
+            Some(o) if !o.inherit_daemon_options => o.config.as_deref(),
+            _ => config_override,
+        };
+        let cfg = Config::discover(&repo_for(&task), explicit)
             .ok()
             .map(|(c, _)| c);
         let w = wording(cfg.as_ref().map_or("en", |c| c.graph.language.as_str()));
+
+        if disk_wait_known(&task, questions.root().parent().unwrap_or(Path::new(""))) {
+            if task
+                .disk_checked_at
+                .is_some_and(|at| now.as_second() - at.as_second() < 60)
+            {
+                continue;
+            }
+            let expected = task.clone();
+            task.disk_checked_at = Some(now);
+            task.machine_hold_cause = Some(crate::queue::MachineHoldCause::DiskCapacity);
+            if queue.commit_disk_wait(&mut task, &expected).is_err() {
+                continue;
+            }
+            refresh_disk_notices(questions.root().parent().unwrap_or(Path::new("")), &task);
+            // Even missing configuration/evidence stays a monitored wait. Never
+            // turn measurement failure or continued pressure into an owner poll.
+            if cfg.as_ref().and_then(|c| resolved(&task, c)) == Some(true) {
+                if let Err(error) = resume_disk_task(queue, questions, &mut task, &ownership) {
+                    crate::notices::raise_in(
+                        questions.root().parent().unwrap_or(Path::new("")),
+                        crate::notices::Notice::warn(
+                            &format!("disk-recovered:{}", task.id),
+                            format!(
+                                "Task {}: disk capacity recovered; automatic recovery is still blocked ({error}). Existing owner decisions and unrelated approvals require explicit resolution. Disk monitoring continues.",
+                                task.id
+                            ),
+                        ).link(crate::notices::Link::Task { id: task.id.clone() }).about([task.id.clone()]),
+                    );
+                } else {
+                    report.resumed.push(task.id.clone());
+                }
+            }
+            continue;
+        }
+        if disk_only {
+            continue;
+        }
 
         if let Some(q) = recovery.latest(NODE, &task.id) {
             if q.status.open() || awaiting_task_chat(&q, &task) {
@@ -1390,8 +1747,7 @@ pub fn run_once(
                     {
                         report.asked.push(task.id.clone());
                     }
-                } else if cfg.as_ref().and_then(|c| machine_cause_resolved(&task, c)) == Some(true)
-                {
+                } else if cfg.as_ref().and_then(|c| resolved(&task, c)) == Some(true) {
                     task.release();
                     if queue.put(&mut task).is_ok() {
                         report.resumed.push(task.id.clone());
@@ -1501,6 +1857,435 @@ mod tests {
 
     fn task(title: &str, repo: PathBuf) -> Task {
         Task::new(title.to_owned(), format!("do {title}"), repo, Source::Human)
+    }
+
+    fn disk_task(repo: PathBuf) -> Task {
+        let mut t = task("capacity", repo);
+        t.hold_machine(crate::disk::gate_in(1_477_050_368, 3_221_225_472, "ja"));
+        t.machine_hold_cause = Some(crate::queue::MachineHoldCause::DiskCapacity);
+        t.attempts = 3;
+        t
+    }
+
+    #[test]
+    fn disk_wait_repeated_pressure_measurement_failure_and_recovery_cost_nothing() {
+        let (dir, queue, questions) = store();
+        let cfg = gate_disabled_config(dir.path());
+        let mut t = disk_task(dir.path().to_owned());
+        queue.put(&mut t).unwrap();
+        let notices = crate::notices::Notices::at(dir.path().join("notifications"));
+        let before = serde_json::to_value(notices.list()).unwrap();
+        let start = Timestamp::now();
+        let probes = std::cell::Cell::new(0);
+        for seconds in [0, 1, 10, 60, 61, 120] {
+            let report = run_once_with_probe(
+                &queue,
+                &questions,
+                Some(&cfg),
+                start + SignedDuration::from_secs(seconds),
+                true,
+                |_, _| {
+                    probes.set(probes.get() + 1);
+                    Some(false) // includes a failed measurement: never permission
+                },
+            );
+            assert!(report.is_empty());
+            assert_eq!(queue.get(&t.id).unwrap().attempts, 3);
+        }
+        assert_eq!(
+            probes.get(),
+            3,
+            "resource probes are bounded to one per minute"
+        );
+        assert!(questions.list().is_empty());
+        assert_eq!(serde_json::to_value(notices.list()).unwrap(), before);
+        let recovered = run_once_with_probe(
+            &queue,
+            &questions,
+            Some(&cfg),
+            start + SignedDuration::from_secs(180),
+            true,
+            |_, _| Some(true),
+        );
+        assert_eq!(recovered.resumed, [t.id.clone()]);
+        let saved = queue.get(&t.id).unwrap();
+        assert_eq!(saved.status, TaskStatus::Queued);
+        assert_eq!(saved.attempts, 3);
+        let again = run_once_with_probe(
+            &queue,
+            &questions,
+            Some(&cfg),
+            start + SignedDuration::from_secs(240),
+            true,
+            |_, _| panic!("queued tasks are not relaunched"),
+        );
+        assert!(again.is_empty());
+    }
+
+    #[test]
+    fn disk_wait_supersedes_only_untouched_automatic_questions_in_both_stores() {
+        for routed in [false, true] {
+            let (dir, queue, questions) = store();
+            let cfg = gate_disabled_config(dir.path());
+            let mut t = disk_task(dir.path().to_owned());
+            queue.put(&mut t).unwrap();
+            let q = file_question(
+                &questions,
+                &crate::task_chat::InquiryOwnership::default(),
+                &t,
+                Bucket::MachineUnknown,
+                &JA,
+                Timestamp::now(),
+            )
+            .unwrap();
+            if routed {
+                crate::task_chat::sweep(
+                    &queue,
+                    &crate::talk::Talks::at(dir.path().join("talks")),
+                    &questions,
+                    dir.path(),
+                );
+                assert!(
+                    crate::task_inquiry::Outbox::at(dir.path())
+                        .get(&q.id)
+                        .is_ok()
+                );
+            }
+            let start = Timestamp::now();
+            for seconds in [0, 60, 120] {
+                assert!(
+                    run_once_with_probe(
+                        &queue,
+                        &questions,
+                        Some(&cfg),
+                        start + SignedDuration::from_secs(seconds),
+                        true,
+                        |_, _| Some(false)
+                    )
+                    .is_empty()
+                );
+                assert!(questions.read_history(&q.id).unwrap().status.open());
+                assert_eq!(questions.list().len(), 1);
+            }
+            let report = monitor_disk_waits(
+                &queue,
+                &questions,
+                Some(&cfg),
+                start + SignedDuration::from_secs(180),
+            );
+            assert_eq!(report.resumed, [t.id.clone()], "routed={routed}");
+            let source = questions.read_history(&q.id).unwrap();
+            assert_eq!(source.status, QuestionStatus::Abandoned);
+            assert!(source.answer.is_none());
+            assert!(source.answered_at.is_none());
+            assert!(!pending_for(&questions, &queue.get(&t.id).unwrap()));
+            if routed {
+                let d = crate::task_inquiry::Outbox::at(dir.path())
+                    .get(&q.id)
+                    .unwrap()
+                    .decision
+                    .unwrap();
+                assert_eq!(d.status, crate::task_decision::Status::Resolved);
+                assert!(
+                    d.request.is_none(),
+                    "system supersession fabricates no owner request"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn disk_wait_respects_owner_hold_discussion_and_unrelated_approvals() {
+        for kind in [
+            "manual",
+            "answered",
+            "discussion",
+            "unrelated",
+            "override",
+            "native-hold",
+            "missing-native",
+        ] {
+            let (dir, queue, questions) = store();
+            let cfg = gate_disabled_config(dir.path());
+            let mut t = disk_task(dir.path().to_owned());
+            queue.put(&mut t).unwrap();
+            let q = file_question(
+                &questions,
+                &crate::task_chat::InquiryOwnership::default(),
+                &t,
+                Bucket::MachineUnknown,
+                &EN,
+                Timestamp::now(),
+            )
+            .unwrap();
+            match kind {
+                "manual" => {
+                    t.hold_manual(Some("owner hold".into()));
+                    queue.put(&mut t).unwrap();
+                }
+                "answered" => {
+                    questions
+                        .update(&q.id, |q| q.answer(Answer::Choice(q.choices[1].clone())))
+                        .unwrap();
+                }
+                "discussion" => {
+                    questions
+                        .update(&q.id, |q| q.say("please wait".to_owned()))
+                        .unwrap();
+                }
+                "unrelated" => {
+                    questions
+                        .update(&q.id, |q| {
+                            q.node = "land".into();
+                            Ok(())
+                        })
+                        .unwrap();
+                }
+                "override" => {
+                    t.resume_override = Some(OperatorResume {
+                        question_id: "owner".into(),
+                        at: Timestamp::now(),
+                        conductor_rehold: Some("pending conductor decision".into()),
+                        forced: true,
+                        pinned_run: None,
+                    });
+                    queue.put(&mut t).unwrap();
+                }
+                "native-hold" | "missing-native" => {
+                    crate::task_chat::sweep(
+                        &queue,
+                        &crate::talk::Talks::at(dir.path().join("talks")),
+                        &questions,
+                        dir.path(),
+                    );
+                    if kind == "native-hold" {
+                        crate::task_inquiry::Outbox::at(dir.path())
+                            .update_decision(&q.id, |d| d.accept("owner requested hold"))
+                            .unwrap();
+                    } else {
+                        std::fs::remove_file(
+                            dir.path()
+                                .join("notifications/task-inquiries")
+                                .join(format!("{}.json", q.id)),
+                        )
+                        .unwrap();
+                    }
+                }
+                _ => unreachable!(),
+            }
+            let report = run_once(&queue, &questions, Some(&cfg), Timestamp::now());
+            assert!(report.resumed.is_empty(), "{kind}");
+            assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Held, "{kind}");
+            assert!(
+                questions.read_history(&q.id).unwrap().status != QuestionStatus::Abandoned,
+                "{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn disk_wait_reuses_retained_execution_and_preserves_attempt_and_approval_evidence() {
+        let (dir, queue, questions) = store();
+        let cfg = gate_disabled_config(dir.path());
+        let mut run = crate::run::RunState::new(
+            dir.path().to_owned(),
+            "main".into(),
+            "base".into(),
+            "capacity".into(),
+            Config::default(),
+        );
+        run.status = crate::run::RunStatus::Blocked;
+        run.driver_exited = true;
+        run.save_under(dir.path()).unwrap();
+        let mut t = disk_task(dir.path().to_owned());
+        t.runs.push(run.id.clone());
+        t.resume_override = Some(OperatorResume {
+            question_id: "approved-recovery".into(),
+            at: Timestamp::now(),
+            conductor_rehold: None,
+            forced: true,
+            pinned_run: Some(run.id.clone()),
+        });
+        queue.put(&mut t).unwrap();
+        let before = std::fs::read(dir.path().join("runs").join(&run.id).join("run.json")).unwrap();
+        let report = run_once_with_probe(
+            &queue,
+            &questions,
+            Some(&cfg),
+            Timestamp::now(),
+            true,
+            |_, _| Some(true),
+        );
+        assert_eq!(report.resumed, [t.id.clone()]);
+        let resumed = queue.get(&t.id).unwrap();
+        assert_eq!(resumed.runs, t.runs);
+        assert_eq!(resumed.disk_resume_run.as_deref(), Some(run.id.as_str()));
+        assert_eq!(resumed.attempts, t.attempts);
+        assert_eq!(resumed.resumption, t.resumption);
+        assert_eq!(
+            serde_json::to_value(&resumed.resume_override).unwrap(),
+            serde_json::to_value(&t.resume_override).unwrap()
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("runs").join(&run.id).join("run.json")).unwrap(),
+            before
+        );
+        assert!(
+            run_once_with_probe(
+                &queue,
+                &questions,
+                Some(&cfg),
+                Timestamp::now(),
+                true,
+                |_, _| panic!("no duplicate launch")
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn disk_wait_interrupted_question_supersession_is_idempotent() {
+        for abandoned in [false, true] {
+            let (dir, queue, questions) = store();
+            let cfg = gate_disabled_config(dir.path());
+            let mut t = disk_task(dir.path().to_owned());
+            queue.put(&mut t).unwrap();
+            let q = file_question(
+                &questions,
+                &crate::task_chat::InquiryOwnership::default(),
+                &t,
+                Bucket::MachineUnknown,
+                &EN,
+                Timestamp::now(),
+            )
+            .unwrap();
+            let outbox = crate::task_inquiry::Outbox::at(dir.path());
+            outbox
+                .enqueue(crate::task_chat::live_record(dir.path(), &t, &q))
+                .unwrap();
+            outbox
+                .update_decision(&q.id, |d| d.settle(DISK_SUPERSEDED))
+                .unwrap();
+            if abandoned {
+                questions
+                    .update(&q.id, |q| {
+                        q.abandon(DISK_SUPERSEDED);
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            let report = monitor_disk_waits(&queue, &questions, Some(&cfg), Timestamp::now());
+            assert_eq!(report.resumed, [t.id.clone()]);
+            assert_eq!(queue.get(&t.id).unwrap().attempts, 3);
+            assert!(questions.read_history(&q.id).unwrap().answer.is_none());
+            assert_eq!(
+                outbox.get(&q.id).unwrap().decision.unwrap().history.len(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn disk_wait_legacy_migration_requires_machine_provenance_and_exact_localized_format() {
+        let (dir, queue, _) = store();
+        for (language, source, suffix, expected) in [
+            ("en", Some(HoldSource::Machine), "", true),
+            ("ja", Some(HoldSource::Machine), "", true),
+            ("ja", Some(HoldSource::Manual), "", false),
+            ("ja", None, "", false),
+            ("ja", Some(HoldSource::Machine), " owner hold", false),
+        ] {
+            let mut t = task("legacy", dir.path().to_owned());
+            t.hold_machine(Some(format!(
+                "{}{suffix}",
+                crate::disk::gate_in(1477050368, 3221225472, language).unwrap()
+            )));
+            t.schema = 21;
+            t.hold_source = source;
+            queue.put(&mut t).unwrap();
+            let loaded = queue.get(&t.id).unwrap();
+            assert_eq!(loaded.machine_hold_cause.is_some(), expected);
+            assert_eq!(disk_wait_eligible(&loaded), expected);
+        }
+    }
+
+    #[test]
+    fn disk_wait_refreshes_stale_notice_wording_without_redelivery() {
+        let (dir, queue, questions) = store();
+        let cfg = gate_disabled_config(dir.path());
+        let mut t = disk_task(dir.path().to_owned());
+        queue.put(&mut t).unwrap();
+        let notices = crate::notices::Notices::at(dir.path().join("notifications"));
+        let key = format!("disk:{}", t.repo.display());
+        let n = notices
+            .raise(crate::notices::Notice::warn(
+                &key,
+                "Free some, then release it from the queue.",
+            ))
+            .unwrap();
+        notices.mark_read(&n.id).unwrap();
+        let before = notices.get(&n.id).unwrap();
+        let report = run_once_with_probe(
+            &queue,
+            &questions,
+            Some(&cfg),
+            Timestamp::now(),
+            true,
+            |_, _| Some(false),
+        );
+        assert!(report.is_empty());
+        let after = notices.get(&n.id).unwrap();
+        assert!(after.message.contains("automatically"));
+        assert_eq!(before.generation, after.generation);
+        assert_eq!(before.count, after.count);
+        assert_eq!(before.read_at, after.read_at);
+    }
+
+    #[test]
+    fn disk_wait_owner_discard_is_applied_without_automatic_resumption() {
+        let (dir, queue, questions) = store();
+        let cfg = gate_disabled_config(dir.path());
+        let mut t = disk_task(dir.path().to_owned());
+        queue.put(&mut t).unwrap();
+        let q = file_question(
+            &questions,
+            &crate::task_chat::InquiryOwnership::default(),
+            &t,
+            Bucket::MachineUnknown,
+            &EN,
+            Timestamp::now(),
+        )
+        .unwrap();
+        questions
+            .update(&q.id, |q| q.answer(Answer::Choice(q.choices[2].clone())))
+            .unwrap();
+        let report = run_once(&queue, &questions, Some(&cfg), Timestamp::now());
+        assert!(report.resumed.is_empty());
+        assert!(queue.get(&t.id).is_err());
+        assert!(questions.read_history(&q.id).unwrap().answer.is_some());
+    }
+
+    #[test]
+    fn disk_wait_commit_cannot_overwrite_a_concurrent_owner_hold() {
+        let (dir, queue, questions) = store();
+        let mut stale = disk_task(dir.path().to_owned());
+        queue.put(&mut stale).unwrap();
+        let mut current = queue.get(&stale.id).unwrap();
+        current.hold_manual(Some("wait for owner".into()));
+        queue.put(&mut current).unwrap();
+        assert!(
+            resume_disk_task(
+                &queue,
+                &questions,
+                &mut stale,
+                &crate::task_chat::InquiryOwnership::default()
+            )
+            .is_err()
+        );
+        assert_eq!(
+            queue.get(&current.id).unwrap().hold_source,
+            Some(HoldSource::Manual)
+        );
     }
 
     #[test]
@@ -1976,6 +2761,11 @@ mod tests {
             "verify".into(),
             cfg.clone(),
         );
+        let saved_cache = home.join("saved-cache");
+        state.config.verify.gate = vec![format!(
+            "CARGO_TARGET_DIR='{}' cargo build",
+            saved_cache.display()
+        )];
         state.resource_block = Some(ResourceBlock {
             node: "gate".into(),
             kind: "disk admission".into(),
@@ -1986,21 +2776,39 @@ mod tests {
         state.save_under(&home).unwrap();
         let mut task = task("verify", home.clone());
         task.runs = vec![state.id.clone()];
-        task.hold_machine(Some("[resource] gate: disk admission: blocked".into()));
+        task.hold_machine(Some(format!(
+            "{}{}; no attempt was spent; resume to retry the affected operation",
+            crate::cache::RESOURCE_HOLD,
+            state.resource_block.as_ref().unwrap().description()
+        )));
+        task.schema = 21; // exact resource-block evidence migrates an older hold
         let gib = 1024 * 1024 * 1024;
         let free = std::cell::Cell::new(100 + gib - 1);
         let check = || {
-            machine_cause_resolved_with_admission(&task, &cfg, &home, |paths| {
+            machine_cause_resolved_with_admission(&task, &cfg, &home, |paths, floor| {
                 assert!(
                     paths.contains(&cache),
                     "the cache volume must also be checked"
                 );
+                assert!(
+                    paths.contains(&saved_cache),
+                    "saved and current cache locations both matter"
+                );
                 assert!(paths.contains(&state.worktree_root()));
-                OutputLease::admit_with(&home, paths, cfg.disk.min_free_bytes, |_| Ok(free.get()))
-                    .is_ok()
+                OutputLease::admit_with(&home, paths, floor, |_| Ok(free.get())).is_ok()
             })
         };
         assert_eq!(check(), Some(false), "the unchanged floor still applies");
+        assert_eq!(
+            machine_cause_resolved_with_admission(&task, &cfg, &home, |paths, floor| {
+                OutputLease::admit_with(&home, paths, floor, |_| {
+                    Err(anyhow::anyhow!("measurement unavailable"))
+                })
+                .is_ok()
+            }),
+            Some(false),
+            "failed output-volume measurements must remain closed"
+        );
         free.set(100 + gib);
         let writer = OutputLease::admit_with(
             &home,
@@ -2039,7 +2847,7 @@ mod tests {
         state.resource_block.as_mut().unwrap().cause = ResourceBlockCause::Cancelled { park: None };
         state.save_under(&home).unwrap();
         assert_eq!(
-            machine_cause_resolved_with_admission(&task, &cfg, &home, |_| panic!(
+            machine_cause_resolved_with_admission(&task, &cfg, &home, |_, _| panic!(
                 "a cancelled operation must remain held"
             )),
             None
@@ -2048,14 +2856,14 @@ mod tests {
         state.resource_block.as_mut().unwrap().cause = ResourceBlockCause::Other;
         state.save_under(&home).unwrap();
         assert_eq!(
-            machine_cause_resolved_with_admission(&task, &cfg, &home, |_| panic!(
+            machine_cause_resolved_with_admission(&task, &cfg, &home, |_, _| panic!(
                 "unproven incremental caches must remain held"
             )),
             None
         );
         task.runs.push("unreadable-run".into());
         assert_eq!(
-            machine_cause_resolved_with_admission(&task, &cfg, &home, |_| panic!(
+            machine_cause_resolved_with_admission(&task, &cfg, &home, |_, _| panic!(
                 "missing evidence must not release a hold"
             )),
             None
@@ -2183,6 +2991,7 @@ mod tests {
              `[disk] min_free_bytes`"
                 .to_owned(),
         ));
+        t.schema = 21; // persisted admission hold from before typed causes
         q.put(&mut t).unwrap();
 
         let report = run_once(&q, &questions, Some(&config), Timestamp::now());
