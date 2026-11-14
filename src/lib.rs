@@ -47,6 +47,7 @@ pub mod direct;
 pub mod disk;
 mod driver;
 pub mod dupes;
+mod external_merge_attention;
 pub mod fixer;
 mod fold_evidence;
 pub mod followup;
