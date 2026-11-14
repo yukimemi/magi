@@ -785,39 +785,60 @@ fn profile_output_dirs(profile: &Path, require_proof: bool) -> Result<Vec<PathBu
         let mut units = 0;
         for package in std::fs::read_dir(profile.join("build"))? {
             let package = package?.path();
+            let meta = std::fs::symlink_metadata(&package)?;
             ensure!(
-                plain_dir(&package) && package.canonicalize()? == package,
+                !meta.file_type().is_symlink(),
+                "Cargo v2 package is a symlink: {}",
+                package.display()
+            );
+            if !meta.is_dir() {
+                ensure!(!require_proof, "Cargo v2 package is not a directory");
+                continue;
+            }
+            ensure!(
+                package.canonicalize()? == package,
                 "Cargo v2 package is not a plain directory"
             );
             let mut package_units = 0;
             for unit in std::fs::read_dir(&package)? {
                 let unit = unit?.path();
+                let meta = std::fs::symlink_metadata(&unit)?;
                 ensure!(
-                    unit.file_name()
+                    !meta.file_type().is_symlink(),
+                    "Cargo v2 unit is a symlink: {}",
+                    unit.display()
+                );
+                // Reclamation only: a non-hash or incomplete unit is not a
+                // rustc unit, so it is retained while complete ones still
+                // count. The missing-tag proof demands every unit be valid.
+                let complete = meta.is_dir()
+                    && unit
+                        .file_name()
                         .and_then(|n| n.to_str())
                         .is_some_and(unit_hash)
-                        && plain_dir(&unit)
-                        && unit.canonicalize()? == unit,
-                    "invalid Cargo v2 unit"
-                );
-                for name in ["fingerprint", "out"] {
-                    let path = unit.join(name);
-                    ensure!(
-                        plain_dir(&path) && path.canonicalize()? == path,
-                        "incomplete Cargo v2 unit: {}",
-                        path.display()
-                    );
+                    && unit.canonicalize()? == unit
+                    && ["fingerprint", "out"].iter().all(|name| {
+                        let path = unit.join(name);
+                        plain_dir(&path) && path.canonicalize().is_ok_and(|p| p == path)
+                    })
+                    && plain_file(
+                        &unit.join("fingerprint/invoked.timestamp"),
+                        "Cargo unit fingerprint",
+                    )
+                    .is_ok();
+                if !complete {
+                    ensure!(!require_proof, "invalid or incomplete Cargo v2 unit");
+                    continue;
                 }
-                plain_file(
-                    &unit.join("fingerprint/invoked.timestamp"),
-                    "Cargo unit fingerprint",
-                )?;
                 dirs.push(unit.join("out"));
                 units += 1;
                 package_units += 1;
                 ensure!(units <= 4096, "Cargo unit inventory too large");
             }
-            ensure!(package_units > 0, "empty Cargo v2 package");
+            ensure!(
+                package_units > 0 || !require_proof,
+                "empty Cargo v2 package"
+            );
         }
         ensure!(units > 0 || !require_proof, "missing Cargo v2 units");
     } else {
@@ -2173,42 +2194,67 @@ mod tests {
         let target = wt.join("target");
         assert!(!declared_outputs(&target).unwrap().is_empty());
         let generated_dirs = profile_output_dirs(&target.join("debug"), true).unwrap();
+        // The directory Cargo itself wrote its dep-info into (v1 `deps`, v2 unit
+        // `out`): the links below go there, so the real layout is exercised.
+        let mut output_dir = None;
         for dir in &generated_dirs {
             for entry in std::fs::read_dir(dir).unwrap() {
                 let path = entry.unwrap().path();
                 if path.extension().is_some_and(|x| x == "d") {
                     std::fs::remove_file(path).unwrap();
+                    if dir != &generated_dirs[0] {
+                        output_dir = Some(dir.clone());
+                    }
                 }
             }
         }
-        // Cargo also leaves hard-linked object outputs in deps. Remove those
-        // fixture outputs so the only external links are the ones below.
-        for dir in generated_dirs.iter().skip(1) {
-            for entry in std::fs::read_dir(dir).unwrap() {
-                let path = entry.unwrap().path();
-                if path.is_file() {
-                    std::fs::remove_file(path).unwrap();
-                }
+        let output_dir = output_dir.expect("Cargo generated no recognised output directory");
+        // Cargo also leaves hard-linked object outputs beside the dep-info.
+        // Remove those fixture outputs so the only external links are the
+        // ones below.
+        for entry in std::fs::read_dir(&output_dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_file() {
+                std::fs::remove_file(path).unwrap();
             }
         }
-        // The links below deliberately use a synthetic v1 deps directory.
-        // Remove the v2 unit tree after its generated outputs were inspected.
-        if !target.join("debug/deps").exists() {
-            std::fs::remove_dir_all(target.join("debug/build")).unwrap();
-            std::fs::create_dir(target.join("debug/deps")).unwrap();
-            std::fs::create_dir(target.join("debug/.fingerprint")).unwrap();
-        }
+        // v2 outputs need a dep-info stem matching a compiler fingerprint of
+        // their unit; v1 has no such rule.
+        let stem = if output_dir.file_name().is_some_and(|n| n == "out") {
+            let unit = output_dir.parent().unwrap();
+            let hash = unit.file_name().unwrap().to_string_lossy().into_owned();
+            let name = std::fs::read_dir(unit.join("fingerprint"))
+                .unwrap()
+                .filter_map(|e| e.unwrap().file_name().into_string().ok())
+                .find_map(|n| {
+                    n.strip_prefix("lib-")
+                        .filter(|n| !n.contains('.'))
+                        .map(str::to_owned)
+                })
+                .expect("Cargo unit has a lib fingerprint");
+            format!("{}-{hash}", name.replace('-', "_"))
+        } else {
+            "link".to_owned()
+        };
+        // One dep-info file may declare several outputs; the names differ only
+        // by the optional `lib` prefix the artifact check accepts.
+        let mut declared = Vec::new();
         for (index, object) in objects.iter().enumerate() {
             assert_eq!(std::fs::metadata(object).unwrap().nlink(), 1);
-            let dep = target.join(format!("debug/deps/link{index}"));
+            let dep = output_dir.join(if index == 0 {
+                stem.clone()
+            } else {
+                format!("lib{stem}")
+            });
             std::fs::hard_link(object, &dep).unwrap();
-            std::fs::write(
-                dep.with_extension("d"),
-                format!("{}: src/lib.rs\n", dep.display()),
-            )
-            .unwrap();
+            declared.push(dep.display().to_string());
             outputs.push(dep);
         }
+        std::fs::write(
+            output_dir.join(format!("{stem}.d")),
+            format!("{}: src/lib.rs\n", declared.join(" ")),
+        )
+        .unwrap();
         let retained = wt.join("retained-input");
         std::fs::hard_link(&objects[1], &retained).unwrap();
         let sentinel = std::fs::read(&retained).unwrap();
