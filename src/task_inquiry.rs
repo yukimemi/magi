@@ -59,6 +59,13 @@ pub struct Inquiry {
     pub archived: bool,
 }
 
+/// Why a passive compatibility import no longer needs a decision.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HistoryResolution {
+    Applied,
+    Retired,
+}
+
 /// File-backed outbox under the existing notifications write grant.
 #[derive(Debug, Clone)]
 pub struct Outbox {
@@ -360,7 +367,11 @@ impl Outbox {
 
     /// Correct only passive compatibility imports, under delivery and execution
     /// fences. Accepted requests, explicit outcomes and delivered prose survive.
-    pub(crate) fn reclassify_history(&self, incoming: Inquiry) -> Result<()> {
+    pub(crate) fn reclassify_history(
+        &self,
+        incoming: Inquiry,
+        resolution: HistoryResolution,
+    ) -> Result<()> {
         let _execution = self.execution_claim(&incoming.id)?;
         let _lock = self.lock(&incoming.id)?;
         let mut saved = match self.get(&incoming.id) {
@@ -406,7 +417,11 @@ impl Outbox {
                         .history
                         .last()
                         .context("completed history has no receipt")?;
-                    saved.applied(&evidence.evidence)?;
+                    if resolution == HistoryResolution::Retired {
+                        saved.retire(&evidence.evidence)?;
+                    } else {
+                        saved.applied(&evidence.evidence)?;
+                    }
                 } else if let Some(error) = next.error {
                     saved.fail(&error)?;
                 }

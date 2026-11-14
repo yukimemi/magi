@@ -171,6 +171,22 @@ impl Decision {
         Ok(self.event(Status::Resolved, receipt))
     }
 
+    /// Retire passive history without claiming an owner settlement or effect.
+    pub(crate) fn retire(&mut self, reason: &str) -> Result<bool> {
+        ensure!(self.request.is_none(), "accepted effects cannot be retired");
+        ensure!(!reason.trim().is_empty(), "retirement reason is empty");
+        if self.status == Status::Resolved {
+            return Ok(false);
+        }
+        ensure!(
+            matches!(self.status, Status::AwaitingOwner | Status::RetryNeeded),
+            "active effects cannot be retired"
+        );
+        self.error = None;
+        self.retry_safe = false;
+        Ok(self.event(Status::Resolved, reason))
+    }
+
     /// Owner settlement is distinct from an application receipt. Legacy
     /// consumers cannot always prove their external outcome; the owner may
     /// explicitly confirm that no effect remains after inspecting it.
