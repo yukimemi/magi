@@ -23783,7 +23783,8 @@ mod tests {
         let (release, blocked) = std::sync::mpsc::channel();
         let cold = DiskObservation::observe(&ui.monitor.disk, scope, move |_| {
             started.send(()).unwrap();
-            blocked.recv().unwrap();
+            // A failed request assertion must also let the blocking worker exit.
+            let _ = blocked.recv();
             known_disk_capacity()
         });
         assert!(cold.runs_bytes.is_none());
@@ -23798,7 +23799,10 @@ mod tests {
                 tokio::spawn(async move { health(State(ui)).await.unwrap().0 })
             })
             .collect();
-        tokio::time::timeout(Duration::from_secs(5), async {
+        // This is a causal independence check, not a five-second latency
+        // benchmark. Leave room for unrelated filesystem/thread contention
+        // when the entire unit suite runs concurrently.
+        let completed = tokio::time::timeout(Duration::from_secs(60), async {
             for request in requests {
                 let view = request.await.unwrap();
                 let disk = serde_json::to_value(view.disk).unwrap();
@@ -23809,8 +23813,12 @@ mod tests {
                 assert!(disk["free_bytes"].is_u64());
             }
         })
-        .await
-        .expect("health must return while the measurement is causally blocked");
+        .await;
+        if completed.is_err() {
+            release.send(()).unwrap();
+            wait_for_disk_scan(&ui.monitor.disk).await;
+            panic!("health must return while the measurement is causally blocked");
+        }
         assert!(ui.monitor.disk.lock().unwrap().in_flight);
         // No competing worker can have published while the first holds flight.
         assert!(

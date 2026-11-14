@@ -16339,6 +16339,9 @@ mod tests {
             .await
             .unwrap();
         std::fs::write(judge.join("uncommitted"), "retain").unwrap();
+        git::git(&repo, &["worktree", "lock", &git::path_arg(&judge)])
+            .await
+            .unwrap();
         runner.roles.judges = vec![spec("judge")];
         assert!(runner.fold_losers().await.is_err());
         runner.state = RunState::load(&runner.state.id).unwrap();
@@ -16348,7 +16351,9 @@ mod tests {
         );
         assert!(!git::branch_exists(&repo, "candidate-A").await.unwrap());
         assert!(judge.join("uncommitted").exists());
-        std::fs::remove_file(judge.join("uncommitted")).unwrap();
+        git::git(&repo, &["worktree", "unlock", &git::path_arg(&judge)])
+            .await
+            .unwrap();
         runner.fold_losers().await.unwrap();
         assert!(!judge.exists());
         runner.fold_losers().await.unwrap();
