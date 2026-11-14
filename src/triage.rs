@@ -1183,6 +1183,11 @@ fn ask_about_stuck_roots(
         if crate::base_sync_recovery::held_task(queue, root) {
             continue;
         }
+        // A monitored disk wait recovers by itself; dependants simply keep
+        // waiting, and no owner question may freeze its automatic recovery.
+        if disk_wait_known(root, questions.root().parent().unwrap_or(Path::new(""))) {
+            continue;
+        }
         let dependants: Vec<&Task> = dependant_ids
             .iter()
             .filter_map(|d| current.task(d))

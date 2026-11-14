@@ -1393,6 +1393,9 @@ impl Task {
         self.interrupt = false;
         // The answer has been honoured: the task got its turn.
         self.resume_override = None;
+        // The automatic disk recovery pin is consumed by this start; a later
+        // failure and requeue must retry normally.
+        self.disk_resume_run = None;
     }
 
     /// Attribute a failed reservation once without spending an execution attempt.
@@ -4237,6 +4240,14 @@ mod tests {
         let listed = crate::notices::Notices::at(dir.path().join("notifications")).list();
         assert_eq!(listed.len(), 1);
         assert!(listed[0].message.contains("out of attempts"));
+    }
+
+    #[test]
+    fn start_consumes_the_disk_resume_pin() {
+        let mut t = task("pin");
+        t.disk_resume_run = Some("run-1".into());
+        t.start("run-1".into());
+        assert!(t.disk_resume_run.is_none());
     }
 
     fn task(title: &str) -> Task {

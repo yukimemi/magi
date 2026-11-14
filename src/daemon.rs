@@ -4787,6 +4787,16 @@ async fn attempt(
         record(queue, task);
         return Vec::new();
     }
+    // Automatic disk recovery resumes its retained run or stops: a changed
+    // seat count or review branch must not turn it into a new competition.
+    // No attempt is spent here.
+    if let Some(run) = &task.disk_resume_run
+        && starter != Starter::Resume(run.clone())
+    {
+        task.hold_manual(Some("Automatic disk recovery cannot resume the retained execution safely: the task's current settings would start a different run. Inspect its state and recovery approvals; no replacement competition was started.".into()));
+        record(queue, task);
+        return Vec::new();
+    }
     if task.replacement.is_some()
         && previous.as_ref().is_some_and(|run| run.replaces.is_some())
         && starter != Starter::Resume(previous.as_ref().unwrap().id.clone())
