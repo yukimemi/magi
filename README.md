@@ -844,6 +844,13 @@ rebases the winner onto the base *as the remote has it* and force-pushes with
 a lease. A rebase that does not apply is a decision rather than a chore: it
 stops and hands over what git said.
 
+Scratch checkout preparation failures stop resumably as infrastructure errors,
+with Git's command, exit status and diagnostic preserved. They do not spend a
+base-sync or landing-sync attempt or start a conflict-fixer round. Preparation
+uses conventional Windows path arguments even when the state directory is
+canonicalized; the winner branch may remain checked out in its owned worktree.
+An existing interrupted rebase and its saved reservation are reused on resume.
+
 A pull request opened a second ago has no checks yet, and "not yet" is
 indistinguishable from "this repository has no CI". So magi waits three minutes
 for the checks to appear before believing there are none. Whatever it then

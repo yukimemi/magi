@@ -3997,7 +3997,10 @@ async fn rebase_landing_worktree(
     let winner = state.winner().cloned().context("landing has no winner")?;
     let scratch = state.dir().join("rebase");
     let target = match state.land_sync_target.clone() {
-        Some(target) => target,
+        Some(target) => {
+            crate::rebase::prepare(state, &scratch, &winner.branch).await?;
+            target
+        }
         // Older records lack the target checkpoint, but Git retains the
         // exact target of an interrupted operation. It is a continuation too.
         None if git::rebase_in_progress(&scratch).await => {
@@ -4009,6 +4012,7 @@ async fn rebase_landing_worktree(
                 "landing base synchronization budget exhausted"
             );
             let target = git::rev_parse(&state.repo, onto).await?;
+            crate::rebase::prepare(state, &scratch, &winner.branch).await?;
             state.land_sync_attempts += 1;
             state.land_sync_target = Some(target.clone());
             target
@@ -4021,7 +4025,7 @@ async fn rebase_landing_worktree(
     // A continuation owns the attempt already charged above, including a
     // crash before the scratch rebase started. Finish its pinned base first;
     // a newer base must use another attempt on the next observation.
-    let result = crate::rebase::rebase_with_fixer(state, &scratch, &winner.branch, &target).await?;
+    let result = crate::rebase::rebase_prepared(state, &scratch, &winner.branch, &target).await?;
     state.land_sync_target = None;
     state.save()?;
     if result == crate::rebase::Rebased::Applied {
@@ -7378,6 +7382,50 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         git::git(&state.repo, &["checkout", "winner"])
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn rebase_preparation_failure_preserves_landing_budget_and_resumes() {
+        let (_tmp, mut state, head) = landing_git_fixture().await;
+        advance_landing_base(&state).await;
+        let scratch = state.dir().join("rebase");
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::fs::write(scratch.join("obstruction"), "keep").unwrap();
+        let attempts = state.land_sync_attempts;
+        let error = rebase_landing_worktree(&mut state, "origin/main")
+            .await
+            .unwrap_err();
+        assert!(error.is::<crate::repo_lock::ResourceBlocked>(), "{error:#}");
+        assert_eq!(state.land_sync_attempts, attempts);
+        assert!(state.land_sync_target.is_none());
+        assert!(state.rebase_fixes.is_empty());
+        assert!(
+            state
+                .base_sync
+                .as_ref()
+                .is_none_or(|sync| sync.conflict.is_none())
+        );
+        assert!(
+            state
+                .resource_block
+                .as_ref()
+                .unwrap()
+                .detail
+                .contains("worktree add")
+        );
+        assert_eq!(git::rev_parse(&state.repo, "winner").await.unwrap(), head);
+        std::fs::remove_dir_all(&scratch).unwrap();
+        state.resource_block = None;
+        assert_eq!(
+            rebase_landing_worktree(&mut state, "origin/main")
+                .await
+                .unwrap(),
+            crate::rebase::Rebased::Applied
+        );
+        assert_eq!(state.land_sync_attempts, attempts + 1);
+        assert!(git::is_ancestor(&state.repo, "origin/main", "winner").await);
+        assert!(git::is_clean(&state.repo).await.unwrap());
+        assert!(state.rebase_fixes.is_empty());
     }
 
     async fn foreign_landing_fixture() -> (tempfile::TempDir, RunState, String, std::path::PathBuf)

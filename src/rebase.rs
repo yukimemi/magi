@@ -68,13 +68,32 @@ pub async fn rebase_with_fixer(
     branch: &str,
     onto: &str,
 ) -> Result<Rebased> {
+    prepare(state, scratch, branch).await?;
+    rebase_prepared(state, scratch, branch, onto).await
+}
+
+/// Prepare before reserving a synchronization attempt. Failures are infrastructure,
+/// not content conflicts, and must not create a fixer round.
+pub(crate) async fn prepare(state: &mut RunState, scratch: &Path, branch: &str) -> Result<()> {
+    git::rebase_prepare(&state.repo, scratch, branch)
+        .await
+        .map_err(|error| block(state, "worktree preparation", format!("{error:#}")))
+}
+
+/// Run an already prepared checkout after the caller saves its budget reservation.
+pub(crate) async fn rebase_prepared(
+    state: &mut RunState,
+    scratch: &Path,
+    branch: &str,
+    onto: &str,
+) -> Result<Rebased> {
     let repo = state.repo.clone();
     let cap = state.config.graph.review_rounds;
     let orig = git::rev_parse(&repo, &format!("refs/heads/{branch}")).await?;
 
     let mut said = String::new();
     if !git::rebase_in_progress(scratch).await {
-        match git::rebase_start(&repo, scratch, branch, onto).await? {
+        match git::rebase_execute(&repo, scratch, onto).await? {
             git::RebaseStart::Applied => return Ok(Rebased::Applied),
             git::RebaseStart::Failed(why) => return Ok(Rebased::Stopped(why)),
             git::RebaseStart::Conflicted(why) => said = why,
@@ -1459,6 +1478,84 @@ mod tests {
         sh(d, &["add", "-A"]);
         sh(d, &["commit", "-q", "-m", msg]);
         git::git(d, &["rev-parse", "HEAD"]).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn rebase_preparation_reports_git_rejection_before_using_scratch() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path();
+        sh(d, &["init", "-q", "-b", "main"]);
+        let scratch = d.join("scratch");
+        let error = git::rebase_start(d, &scratch, "missing-branch", "main")
+            .await
+            .unwrap_err();
+        assert!(error.is::<git::RebasePreparationError>());
+        let why = error.to_string();
+        assert!(why.contains("worktree add --force"), "{why}");
+        assert!(why.contains("missing-branch"), "{why}");
+        assert!(why.contains("fatal:"), "{why}");
+        assert!(why.contains("exit Some("), "{why}");
+        assert!(!why.contains("rev-parse"), "{why}");
+        assert!(!scratch.exists());
+    }
+
+    #[tokio::test]
+    async fn rebase_canonical_scratch_with_checked_out_winner() {
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path().canonicalize().unwrap();
+        sh(&d, &["init", "-q", "-b", "main"]);
+        sh(&d, &["config", "user.name", "t"]);
+        sh(&d, &["config", "user.email", "t@example.com"]);
+        std::fs::write(d.join("base"), "base\n").unwrap();
+        let base = commit(&d, "base").await;
+        sh(&d, &["checkout", "-qb", "winner"]);
+        std::fs::write(d.join("change"), "change\n").unwrap();
+        commit(&d, "winner").await;
+        sh(&d, &["checkout", "main"]);
+        std::fs::write(d.join("advance"), "advance\n").unwrap();
+        let onto = commit(&d, "advance").await;
+        let winner = d.join("winner-tree");
+        git::git(&d, &["worktree", "add", &git::path_arg(&winner), "winner"])
+            .await
+            .unwrap();
+        let scratch = d.join("scratch");
+        #[cfg(windows)]
+        {
+            let out = git::git_raw(
+                &d,
+                &[
+                    "worktree",
+                    "add",
+                    "--force",
+                    &scratch.to_string_lossy(),
+                    "winner",
+                ],
+            )
+            .await
+            .unwrap();
+            assert!(!out.ok(), "{out:?}");
+            assert!(!scratch.exists());
+            eprintln!("verbatim worktree add rejection: {}", out.stderr);
+        }
+        assert_eq!(
+            git::rebase_start(&d, &scratch, "winner", &onto)
+                .await
+                .unwrap(),
+            git::RebaseStart::Applied
+        );
+        git::sync_to_head(&winner).await.unwrap();
+        assert!(git::is_ancestor(&d, &onto, "winner").await);
+        assert!(git::is_ancestor(&d, &base, "winner").await);
+        assert_eq!(
+            std::fs::read_to_string(winner.join("change")).unwrap(),
+            "change\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(winner.join("advance")).unwrap(),
+            "advance\n"
+        );
+        assert!(git::is_clean(&winner).await.unwrap());
+        assert!(!scratch.exists());
     }
 
     #[tokio::test]

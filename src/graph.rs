@@ -5943,11 +5943,18 @@ impl Runner {
                 already_in: None,
             });
         }
+        let scratch = self.state.dir().join("base-sync");
+        if let Err(error) = crate::rebase::prepare(&mut self.state, &scratch, &winner.branch).await
+        {
+            if error.is::<crate::repo_lock::ResourceBlocked>() {
+                return Ok(());
+            }
+            return Err(error);
+        }
         self.state.reserve_base_operation(&head, &tip);
         self.state.save()?;
-        let scratch = self.state.dir().join("base-sync");
         let rebased =
-            match crate::rebase::rebase_with_fixer(&mut self.state, &scratch, &winner.branch, &tip)
+            match crate::rebase::rebase_prepared(&mut self.state, &scratch, &winner.branch, &tip)
                 .await
             {
                 Ok(crate::rebase::Rebased::Applied) => Ok(None),
@@ -16801,7 +16808,6 @@ mod tests {
         assert_eq!(task.attempts, 0);
     }
 
-    #[cfg(unix)]
     async fn exhausted_base_fixture() -> (tempfile::TempDir, Runner, String, String) {
         ask_test_home();
         let tmp = tempfile::tempdir().unwrap();
@@ -16897,6 +16903,38 @@ mod tests {
         runner.sync_to_base().await.unwrap();
         assert_eq!(runner.state.status, RunStatus::Blocked);
         (tmp, runner, head, task.id)
+    }
+
+    #[tokio::test]
+    async fn rebase_preparation_failure_preserves_base_sync_budget_and_resumes() {
+        let (_tmp, mut runner, head, _task) = exhausted_base_fixture().await;
+        runner.state.status = RunStatus::Voting;
+        runner.state.base_sync = None;
+        runner.state.base_sync_recovery = Default::default();
+        let scratch = runner.state.dir().join("base-sync");
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::fs::write(scratch.join("obstruction"), "keep").unwrap();
+        runner.sync_to_base().await.unwrap();
+        assert!(runner.state.resource_block.is_some());
+        assert!(!runner.state.base_sync_blocked());
+        assert_eq!(runner.state.base_sync.as_ref().unwrap().attempts, 0);
+        assert_eq!(runner.state.base_episode_used(), 0);
+        assert!(runner.state.base_sync_recovery.operations.is_empty());
+        assert!(runner.state.rebase_fixes.is_empty());
+        assert_eq!(
+            git::rev_parse(&runner.state.repo, "HEAD").await.unwrap(),
+            head
+        );
+        std::fs::remove_dir_all(&scratch).unwrap();
+        runner.state.resource_block = None;
+        runner.sync_to_base().await.unwrap();
+        assert!(!runner.state.base_sync_blocked());
+        assert_eq!(runner.state.base_sync.as_ref().unwrap().attempts, 1);
+        assert_eq!(runner.state.base_episode_used(), 1);
+        assert!(runner.state.base_sync_recovery.operations[0].finished);
+        assert!(runner.state.rebase_fixes.is_empty());
+        assert!(git::is_ancestor(&runner.state.repo, "origin/main", "HEAD").await);
+        assert!(git::is_clean(&runner.state.repo).await.unwrap());
     }
 
     #[cfg(unix)]
