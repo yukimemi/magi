@@ -1148,9 +1148,14 @@ impl Ui {
             worktrees_root: Some(self.worktrees_root.clone()),
             ..daemon::Opts::default()
         };
-        daemon::spawn_detached(&self.home, &opts)
+        if !daemon::retry_scheduler_restart(&self.home)
             .await
-            .map_err(ApiError::from)?;
+            .map_err(ApiError::from)?
+        {
+            daemon::spawn_detached(&self.home, &opts)
+                .await
+                .map_err(ApiError::from)?;
+        }
         let mut state = self.lock_loop();
         state.last_error = None;
         state.rev += 1;
@@ -1980,6 +1985,7 @@ pub async fn serve(opts: Opts) -> Result<()> {
     // died mid-handover. Before the router starts answering, so the very
     // first `/api/health` a phone gets from this process already reflects it.
     updater::reconcile_after_restart(&home);
+    daemon::resume_scheduler_restart(home.clone());
     updater::log_step(
         &home,
         &format!(
@@ -2598,6 +2604,8 @@ struct UpgradeProgressView {
     /// What [`updater::Stage::Parking`] is waiting on, in words: the run and
     /// the step it is finishing before the address is handed over.
     waiting_on: Option<String>,
+    /// Retirement can continue after web handover has completed.
+    scheduler_restart_pending: Option<String>,
     started_at: Timestamp,
     updated_at: Timestamp,
     detail: Option<String>,
@@ -2787,12 +2795,15 @@ fn upgrade_progress_view(ui: &Ui, progress: updater::Progress) -> UpgradeProgres
             ))
         }
     };
-    let detail = progress
-        .detail
-        .clone()
-        .or_else(|| updater::read_note(&ui.home, &progress));
+    let detail = updater::read_note(&ui.home, &progress).or_else(|| progress.detail.clone());
     let stalled = updater::stall(&progress, lease.as_ref(), now);
-    let waiting_on = waiting_on.or_else(|| stalled.as_ref().map(|s| s.waiting_on.clone()));
+    let scheduler_restart_pending = daemon::scheduler_restart_wait(&ui.home);
+    let waiting_on = if progress.stage == updater::Stage::Restarting || progress.stage.terminal() {
+        scheduler_restart_pending.clone().or(waiting_on)
+    } else {
+        waiting_on
+    }
+    .or_else(|| stalled.as_ref().map(|s| s.waiting_on.clone()));
     UpgradeProgressView {
         trigger: progress.trigger,
         stuck_for_secs: stalled.as_ref().map(|s| s.age_secs),
@@ -2802,6 +2813,7 @@ fn upgrade_progress_view(ui: &Ui, progress: updater::Progress) -> UpgradeProgres
         from: progress.from,
         to: progress.to,
         waiting_on,
+        scheduler_restart_pending,
         started_at: progress.started_at,
         updated_at: progress.updated_at,
         detail,
@@ -24121,6 +24133,31 @@ mod tests {
             .as_str()
             .expect("waiting_on");
         assert!(waiting_on.contains("cd51"), "{waiting_on}");
+    }
+
+    #[test]
+    fn completed_web_upgrade_reports_pending_replacement_after_retirement() {
+        let home = TempDir::new().unwrap();
+        let ui = idle_ui(&home);
+        let mut progress = updater::Progress::new("old".into(), "new".into());
+        progress.advance(updater::Stage::Done);
+        let marker = serde_json::json!({
+            "opts": daemon::Opts::default(),
+            "job_id": "old-job",
+            "pid": 4242,
+            "since": Timestamp::now(),
+        });
+        std::fs::write(
+            home.path().join("scheduler-restart.json"),
+            serde_json::to_vec(&marker).unwrap(),
+        )
+        .unwrap();
+        let view = upgrade_progress_view(&ui, progress);
+        let pending = view.scheduler_restart_pending.unwrap();
+        assert!(pending.contains("4242") && pending.contains("replacement startup"));
+        assert!(!pending.contains("finishing its lap"));
+        assert_eq!(view.waiting_on.as_deref(), Some(pending.as_str()));
+        assert!(view.stuck_for_secs.is_none());
     }
 
     fn idle_ui(home: &TempDir) -> Ui {

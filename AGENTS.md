@@ -1721,8 +1721,33 @@ remain outside those lanes and global queue-worker park requests.
   restoring a recorded operator send to a manual draft. Preserve attachments,
   reply metadata, later drafts and task posts. A posted task turn is not proof
   that the chat answered an operator send.
+- **Bound scheduler retirement, never kill it.** `daemon::restart_detached`
+  waits up to 30 seconds for the old scheduler's reservation and singleton lease
+  to retire. A timeout returns an error; web handover restores the UI but records
+  a failed upgrade, never successful scheduler replacement. The durable intent
+  `scheduler-restart.json` remains available for an explicit retry. Startup
+  attempts crash recovery once with the same bound, never an indefinite sequence
+  of zero-duration checks. The coordinator lease serializes restart consumers;
+  the scheduler reservation and lease prevent overlapping dispatch. No task/chat
+  controls are sent.
+  Do not signal or cancel a scheduler in a synchronous reconciliation item:
+  queue, question and talk updates can span multiple writes. Poll and item
+  boundaries observe durable Stop directly, even if a synchronous sweep starves
+  the control watcher. Check only before the next complete item, never between
+  its writes; remaining reconciliation is retried by the next scheduler.
+  Older executable generations without these checks cannot guarantee bounded
+  successful replacement: their retirement timeout is reported as failure and
+  requires retry after they stop. No safe forced-retirement protocol for those
+  generations is implemented. A retained intent must not hide Update retry,
+  Start or explicit worker Park controls. Start retries the saved restart options
+  under the coordinator lease and clears the intent only on confirmed success.
+  Health/banner and `upgrade.note.json` distinguish an observed old reservation
+  (PID and matching `Status::lap_step`) from replacement startup, missing
+  ownership evidence and pending bookkeeping; a marker is not process liveness.
+  Diagnostics include elapsed wait and retirement bound. Stop exits the poll
+  loop through its bookkeeping cleanup. This does not change poll costs.
 - **Release, then spawn.** Remember the installed executable path before update,
-  replace the scheduler, release the listener, then start the successor web.
+  request scheduler replacement, release the listener, then start the successor web.
   Answer 202 before process exit. A live legacy embedded scheduler requires one
   finish/park migration; a stale heartbeat alone does not permit overlap.
 - **Evidence stays local.** Active jobs and logs live in `workers/jobs`, terminal

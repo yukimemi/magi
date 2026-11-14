@@ -732,7 +732,7 @@ fn waiting_on(progress: &Progress, lease: Option<&HandoverLease>) -> String {
                 None => format!("{talks}the loop to stop (no run was recorded as in flight)"),
             }
         }
-        Stage::Restarting => "spawn_successor returning and this process exiting".to_owned(),
+        Stage::Restarting => "scheduler retirement or web listener handover".to_owned(),
         Stage::Downloading => "the release download and binary replacement".to_owned(),
         Stage::Done | Stage::Failed => String::new(),
     }
@@ -853,7 +853,7 @@ impl Watchdog {
     }
 }
 
-/// The watchdog's latest message, kept apart from `upgrade.json` so a
+/// The latest handover diagnostic, kept apart from `upgrade.json` so a
 /// diagnostic write can never race a stage transition.
 #[derive(Debug, Serialize, Deserialize)]
 struct Note {
@@ -873,13 +873,26 @@ fn write_note(home: &Path, progress: &Progress, message: &str) {
         message: message.to_owned(),
     };
     let path = note_path(home);
-    let tmp = path.with_extension("json.tmp");
+    // The handover waiter and watchdog may publish concurrently.
+    let nonce = crate::rng::SplitMix64::new(crate::rng::entropy()).uuid_v4();
+    let tmp = path.with_extension(format!("{nonce}.tmp"));
     let written = serde_json::to_string(&note)
         .map_err(std::io::Error::other)
         .and_then(|body| std::fs::write(&tmp, body))
         .and_then(|()| std::fs::rename(&tmp, &path));
     if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
         tracing::warn!("could not write {}: {e}", path.display());
+    }
+}
+
+/// Update only stage-scoped diagnostics; never rewrite upgrade progress.
+pub(crate) fn write_scheduler_wait_note(home: &Path) {
+    if let Some(progress) = read_progress(home)
+        && progress.stage == Stage::Restarting
+        && let Some(waiting) = crate::daemon::scheduler_restart_wait(home)
+    {
+        write_note(home, &progress, &waiting);
     }
 }
 
@@ -887,6 +900,11 @@ fn write_note(home: &Path, progress: &Progress, message: &str) {
 /// a note from another stage or another upgrade is ignored.
 #[must_use]
 pub fn read_note(home: &Path, progress: &Progress) -> Option<String> {
+    if progress.stage == Stage::Restarting
+        && let Some(waiting) = crate::daemon::scheduler_restart_wait(home)
+    {
+        return Some(waiting);
+    }
     let body = std::fs::read_to_string(note_path(home)).ok()?;
     let note: Note = serde_json::from_str(&body).ok()?;
     (note.stage == progress.stage && note.stage_since == progress.updated_at)
@@ -906,6 +924,12 @@ pub fn spawn_watchdog(home: PathBuf) {
                 let Some(progress) = read_progress(&home) else {
                     continue;
                 };
+                if progress.stage == Stage::Restarting
+                    && let Some(waiting) = crate::daemon::scheduler_restart_wait(&home)
+                {
+                    write_note(&home, &progress, &waiting);
+                    continue;
+                }
                 let lease = read_lease(&home);
                 let Some(beat) = dog.tick(&progress, lease.as_ref(), Timestamp::now()) else {
                     continue;
@@ -917,8 +941,8 @@ pub fn spawn_watchdog(home: PathBuf) {
                 }
                 // Never rewrites upgrade.json: a read-modify-write here could
                 // overwrite a stage the handover or the successor saved in
-                // between. The note goes to its own file, which only this
-                // thread writes, and is matched to the record when read.
+                // between. Diagnostics go to their own file and are matched
+                // to the record when read.
                 write_note(&home, &progress, &beat.message);
             }
         });

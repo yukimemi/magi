@@ -1170,6 +1170,9 @@ pub fn apply_answers(queue: &Queue, questions: &Questions) -> Vec<String> {
     let mut applied = Vec::new();
     let ownership = crate::task_chat::InquiryOwnership::default();
     for q in questions.list_for_effects_in(&ownership) {
+        if crate::daemon::lap_stop_requested() {
+            break;
+        }
         if q.node == DEPS_NODE
             && q.status == QuestionStatus::Answered
             && apply_deps_answer(queue, questions, &q, Timestamp::now(), &ownership)
@@ -1183,6 +1186,9 @@ pub fn apply_answers(queue: &Queue, questions: &Questions) -> Vec<String> {
     let recovery =
         RecoveryIndex::from_scan(queue, &tasks, questions.list_for_effects_in(&ownership));
     for listed in tasks {
+        if crate::daemon::lap_stop_requested() {
+            break;
+        }
         let Some(q) = recovery.latest(NODE, &listed.id) else {
             continue;
         };

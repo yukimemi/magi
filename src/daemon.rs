@@ -139,6 +139,18 @@ pub struct Status {
     /// Independent-worker control protocol supported by this scheduler.
     #[serde(default)]
     pub worker_protocol: Option<u32>,
+    /// The current poll sub-step and its start time, for restart diagnostics.
+    #[serde(default)]
+    pub lap_step: Option<LapStep>,
+}
+
+/// A named sub-step of one scheduler poll lap.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LapStep {
+    /// Name of the sub-step currently running.
+    pub name: String,
+    /// When this sub-step began.
+    pub since: Timestamp,
 }
 
 impl Status {
@@ -157,6 +169,7 @@ impl Status {
             polls: 0,
             question_recovery: None,
             worker_protocol: Some(1),
+            lap_step: None,
         }
     }
 }
@@ -409,6 +422,9 @@ pub struct Reading {
     pub question_recovery: Option<crate::question_delivery::Recovery>,
     /// Independent-worker control protocol, absent on legacy embedded loops.
     pub worker_protocol: Option<u32>,
+    /// The current poll sub-step and its start time, for restart diagnostics.
+    #[serde(default)]
+    pub lap_step: Option<LapStep>,
 }
 
 /// Accept the old single-`Current`-or-absent shape as well as the current
@@ -648,6 +664,7 @@ where
         .into_iter()
         .flatten()
         .flatten()
+        .take_while(|_| !lap_stop_requested())
         .map(|e| e.path())
         .filter(|p| p.extension().is_some_and(|x| x == "lock"))
         .filter(|p| {
@@ -739,6 +756,9 @@ fn finished_tasks(queue: &Queue) -> Vec<Task> {
 /// never "assume the missing dependency was satisfied and unblock anyway".
 fn resolve_blockers(queue: &Queue, questions: &Questions) {
     for listed in queue.list() {
+        if crate::daemon::lap_stop_requested() {
+            break;
+        }
         if listed.status != TaskStatus::Blocked || listed.blocked_by.is_empty() {
             continue;
         }
@@ -1230,6 +1250,9 @@ fn repair_choice_offers(questions: &Questions) {
                     .any(|c| crate::choice_effect::describe(q, c).is_none())
         })
     {
+        if lap_stop_requested() {
+            break;
+        }
         let _ = questions.update_in(&q.id, &ownership, |current| {
             if current.status.open() {
                 crate::choice_effect::executable_conductor(current);
@@ -1557,6 +1580,9 @@ pub(crate) fn apply_task_choice_actions(queue: &Queue, questions: &Questions, ho
     let tasks = queue.list();
     let ownership = crate::task_chat::InquiryOwnership::from_tasks(&tasks);
     for q in questions.list_for_effects_in(&ownership) {
+        if lap_stop_requested() {
+            break;
+        }
         // Read again under the same fence used by explicit settlement.
         let Ok(_execution) = crate::task_inquiry::Outbox::at(home).execution_claim(&q.id) else {
             continue;
@@ -1753,6 +1779,9 @@ fn reconcile_task_questions(queue: &Queue, questions: &Questions) {
         .collect();
 
     for mut question in questions.list_for_effects_in(&ownership) {
+        if crate::daemon::lap_stop_requested() {
+            break;
+        }
         if !question.status.open()
             || question.node != crate::conduct::NODE
             || questions.held_reply_in(&question.id, &ownership)
@@ -2389,6 +2418,9 @@ fn reclaim_orphaned_running(
 ) -> Vec<String> {
     let mut reclaimed = Vec::new();
     for listed in queue.list() {
+        if crate::daemon::lap_stop_requested() {
+            break;
+        }
         if listed.status != TaskStatus::Running || live_workers.contains(&listed.id) {
             continue;
         }
@@ -2498,6 +2530,9 @@ where
         .flatten()
         .flatten()
     {
+        if lap_stop_requested() {
+            break;
+        }
         let id = entry.file_name().to_string_lossy().into_owned();
         if !crate::run::is_run_id(&id) {
             continue;
@@ -2652,29 +2687,234 @@ pub fn request_control(home: &Path, control: crate::worker::Control) -> Result<(
     crate::worker::request(home, "scheduler", control)
 }
 
-/// Replace the scheduler, leaving all active task and conversation jobs alone.
-pub async fn restart_detached(home: &Path) -> Result<()> {
-    let active = crate::worker::active(home)?;
-    let prior = active.into_iter().find(|job| job.kind == "scheduler");
-    if prior.is_none() && !managed(home) {
-        return Ok(());
-    }
-    let opts: Opts = match prior {
-        Some(job) => serde_json::from_value(job.payload)?,
-        None => serde_json::from_slice(&std::fs::read(home.join("scheduler-options.json"))?)?,
+/// Maximum time spent waiting for scheduler retirement before reporting failure.
+const SCHEDULER_RESTART_WAIT: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SchedulerRestart {
+    opts: Opts,
+    job_id: Option<String>,
+    pid: Option<u32>,
+    since: Timestamp,
+}
+
+fn scheduler_restart_path(home: &Path) -> PathBuf {
+    home.join("scheduler-restart.json")
+}
+
+/// Public diagnostics only; never expose the saved scheduler options.
+pub fn scheduler_restart_wait(home: &Path) -> Option<String> {
+    let pending: SchedulerRestart =
+        serde_json::from_slice(&std::fs::read(scheduler_restart_path(home)).ok()?).ok()?;
+    let elapsed = (Timestamp::now().as_second() - pending.since.as_second()).max(0);
+    let pid = pending
+        .pid
+        .map_or_else(|| "unknown".into(), |pid| pid.to_string());
+    // Observe without reconciling the worker store: banners must not mutate
+    // reservations. A retained intent alone says nothing about the old PID.
+    let state = match crate::worker::observe_active(home) {
+        Err(_) => "scheduler ownership unavailable; retry after checking worker storage".into(),
+        Ok(jobs) => match jobs.iter().find(|job| job.kind == "scheduler") {
+            Some(job) if Some(&job.id) == pending.job_id.as_ref() => {
+                let step = read_status(home)
+                    .filter(|status| pending.pid.is_some() && status.pid == pending.pid)
+                    .and_then(|status| status.lap_step)
+                    .map_or_else(String::new, |step| {
+                        format!("; step {} since {}", step.name, step.since)
+                    });
+                format!("old scheduler pid {pid} is finishing its lap{step}")
+            }
+            Some(job) if job.status == crate::worker::Status::Running => {
+                "replacement scheduler acknowledged; restart bookkeeping pending".into()
+            }
+            Some(_) => "waiting for replacement scheduler startup acknowledgement".into(),
+            None => format!(
+                "old scheduler pid {pid} has no active reservation; waiting for retirement lease or replacement startup; retry Update & restart or Start after retirement"
+            ),
+        },
     };
-    request_control(home, crate::worker::Control::Stop)?;
-    loop {
-        let reserved = crate::worker::active(home)?
-            .iter()
-            .any(|job| job.kind == "scheduler");
-        if !reserved && crate::worker::try_lease(home, "scheduler")?.is_some() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+    Some(format!(
+        "scheduler restart pending: {state} (waited {elapsed}s; retirement attempt waits at most {}s)",
+        SCHEDULER_RESTART_WAIT.as_secs(),
+    ))
+}
+
+/// Replace dispatch only. Reaching the retirement bound is a restart failure,
+/// never evidence that replacement succeeded. Retain the intent for a later retry.
+/// Never kill the scheduler: an item may update queue, question and talk state
+/// across several writes. It retires at an item boundary; its singleton lease
+/// and reservation prevent overlap until then. No execution controls are sent.
+pub async fn restart_detached(home: &Path) -> Result<()> {
+    restart_detached_with(home, SCHEDULER_RESTART_WAIT, |opts| async move {
+        spawn_detached(home, &opts).await.map(|_| ())
+    })
+    .await
+}
+
+/// An explicit Start also retries a retained upgrade restart. Preserve its
+/// options and coordinator fencing, and remove the intent only after success.
+pub(crate) async fn retry_scheduler_restart(home: &Path) -> Result<bool> {
+    if !scheduler_restart_path(home).try_exists()? {
+        return Ok(false);
     }
-    spawn_detached(home, &opts).await?;
+    restart_detached(home).await?;
+    Ok(true)
+}
+
+async fn restart_detached_with<F, Fut>(home: &Path, bound: Duration, spawn: F) -> Result<()>
+where
+    F: FnMut(Opts) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let _coordinator = crate::worker::try_lease(home, "scheduler-restart")?
+        .context("another scheduler restart is in progress")?;
+    if !scheduler_restart_path(home).exists() {
+        let prior = crate::worker::active(home)?
+            .into_iter()
+            .find(|job| job.kind == "scheduler");
+        if prior.is_none() && !managed(home) {
+            return Ok(());
+        }
+        let opts = match &prior {
+            Some(job) => serde_json::from_value(job.payload.clone())?,
+            None => serde_json::from_slice(&std::fs::read(home.join("scheduler-options.json"))?)?,
+        };
+        let request = SchedulerRestart {
+            opts,
+            job_id: prior.as_ref().map(|job| job.id.clone()),
+            pid: prior
+                .as_ref()
+                .and_then(|job| job.pid)
+                .or_else(|| read_status(home).and_then(|s| s.pid)),
+            since: Timestamp::now(),
+        };
+        let path = scheduler_restart_path(home);
+        let temporary = path.with_extension("json.tmp");
+        std::fs::write(&temporary, serde_json::to_vec(&request)?)?;
+        std::fs::rename(temporary, path)?;
+    }
+    finish_scheduler_restart(home, bound, spawn).await
+}
+
+async fn finish_scheduler_restart<F, Fut>(home: &Path, bound: Duration, spawn: F) -> Result<()>
+where
+    F: FnMut(Opts) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    if !complete_scheduler_restart(home, bound, spawn).await? {
+        bail!(
+            "scheduler retirement timed out after {}s: {}; replacement not confirmed; retry after the old scheduler stops",
+            bound.as_secs_f64(),
+            scheduler_restart_wait(home).unwrap_or_else(|| "old scheduler has not retired".into()),
+        );
+    }
     Ok(())
+}
+
+// Caller holds the restart coordinator lease, including through spawn and
+// marker removal. A crash after spawn is recognized by the acknowledged replacement.
+async fn complete_scheduler_restart<F, Fut>(
+    home: &Path,
+    bound: Duration,
+    mut spawn: F,
+) -> Result<bool>
+where
+    F: FnMut(Opts) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let request: SchedulerRestart =
+        serde_json::from_slice(&std::fs::read(scheduler_restart_path(home))?)?;
+    let deadline = tokio::time::Instant::now() + bound;
+    let mut last_note = None;
+    loop {
+        if last_note.is_none_or(|at: tokio::time::Instant| at.elapsed() >= Duration::from_secs(1)) {
+            crate::updater::write_scheduler_wait_note(home);
+            last_note = Some(tokio::time::Instant::now());
+        }
+        let scheduler = crate::worker::active(home)?
+            .into_iter()
+            .find(|job| job.kind == "scheduler");
+        let replacement = scheduler
+            .as_ref()
+            .is_some_and(|job| Some(&job.id) != request.job_id.as_ref())
+            && crate::worker::control(home, "scheduler")?.is_none();
+        if replacement
+            && scheduler
+                .as_ref()
+                .is_some_and(|job| job.status == crate::worker::Status::Running)
+        {
+            std::fs::remove_file(scheduler_restart_path(home))?;
+            return Ok(true);
+        }
+        if scheduler.is_none() && crate::worker::try_lease(home, "scheduler")?.is_some() {
+            spawn(request.opts.clone()).await?;
+            std::fs::remove_file(scheduler_restart_path(home))?;
+            return Ok(true);
+        }
+        // Reissue after a crash between publishing the intent and sending Stop.
+        // An unacknowledged replacement must keep the intent alive, but must
+        // not receive the old generation's Stop while it is starting.
+        if !replacement
+            && crate::worker::control(home, "scheduler")? != Some(crate::worker::Control::Stop)
+        {
+            request_control(home, crate::worker::Control::Stop)?;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        tokio::time::sleep_until(
+            deadline.min(tokio::time::Instant::now() + Duration::from_millis(100)),
+        )
+        .await;
+    }
+}
+
+/// Recover a crashed predecessor's intent with one bounded attempt. A timeout
+/// remains a failure requiring an explicit retry, rather than silently moving
+/// an unbounded retirement wait into the successor web.
+pub fn resume_scheduler_restart(home: PathBuf) {
+    tokio::spawn(async move {
+        if !scheduler_restart_path(&home).exists() {
+            return;
+        }
+        let result = async {
+            let Some(_coordinator) = crate::worker::try_lease(&home, "scheduler-restart")? else {
+                // A live predecessor still owns recovery; do not fail its upgrade.
+                return Ok(());
+            };
+            if !scheduler_restart_path(&home).exists() {
+                return Ok(());
+            }
+            finish_scheduler_restart(&home, SCHEDULER_RESTART_WAIT, |opts| {
+                let home = &home;
+                async move { spawn_detached(home, &opts).await.map(|_| ()) }
+            })
+            .await
+        }
+        .await;
+        if let Err(error) = result {
+            let detail = format!("scheduler restart recovery failed: {error:#}");
+            tracing::warn!("{detail}");
+            let _ = crate::updater::fail_progress(&home, &detail);
+        }
+    });
+}
+
+tokio::task_local! {
+    static LAP_HOME: PathBuf;
+}
+
+/// Safe only between complete reconciliation items, never between their writes.
+/// The next scheduler retries the remaining idempotent reconciliation work.
+/// Read the durable control directly: synchronous sweeps can starve the async
+/// control watcher. Outside a scheduler poll, CLI/web reconciliations run fully.
+pub(crate) fn lap_stop_requested() -> bool {
+    LAP_HOME
+        .try_with(|home| {
+            crate::worker::control(home, "scheduler").ok().flatten()
+                == Some(crate::worker::Control::Stop)
+        })
+        .unwrap_or(false)
 }
 
 /// Hidden worker dispatch entry. The worker infrastructure owns its job lease.
@@ -3009,11 +3249,11 @@ async fn drive(
     );
 
     let outcome = tokio::select! {
-        outcome = poll(opts, queue, &status, home, worktrees_root, stop, DispatchLimits {
+        outcome = LAP_HOME.scope(home.to_path_buf(), poll(opts, queue, &status, home, worktrees_root, stop, DispatchLimits {
             max_concurrent: concurrency,
             pause_for_interrupts: daemon_cfg.pause_for_interrupts,
             recovery_cfg,
-        }) => outcome,
+        })) => outcome,
         () = async {
             while !stop.stopped() {
                 tokio::time::sleep(Duration::from_millis(25)).await;
@@ -3976,7 +4216,22 @@ async fn poll(
         Err(error) => return Err(error.into()),
     };
     let mut previous = std::collections::BTreeSet::<String>::new();
-    while !stop.stopped() {
+    // Stop only at complete-item boundaries. Breaking out of the lap also
+    // runs the dispatch-bookkeeping cleanup below; execution workers own
+    // their claims and are never cancelled here.
+    'laps: while !stop.stopped() {
+        macro_rules! step {
+            ($name:expr) => {
+                if stop.stopped() || lap_stop_requested() {
+                    break 'laps;
+                }
+                lock(status).lap_step = Some(LapStep {
+                    name: $name.to_owned(),
+                    since: Timestamp::now(),
+                });
+            };
+        }
+        step!("worker inventory");
         let jobs: Vec<_> = crate::worker::active(home)?
             .into_iter()
             .filter(|job| job.kind == "task")
@@ -4024,41 +4279,57 @@ async fn poll(
         let sem = Arc::new(tokio::sync::Semaphore::new(ordinary));
         let urgent_sem = Arc::new(tokio::sync::Semaphore::new(urgent));
         let mut permits = Vec::new();
+        step!("stale claims");
         sweep_stale_claims(queue, STALE_CLAIM);
+        step!("orphaned runs");
         reclaim_orphaned_running(queue, opts.max_attempts, &live);
+        step!("abandoned runs");
         reclaim_abandoned_runs(home, Timestamp::now());
         let questions = Questions::at(home.join("questions"));
 
         // Deterministic: no model, run before the conductor sees anything so
         // its input reflects the queue's current, already-resolved state.
+        step!("task chat");
         crate::task_chat::sweep(
             queue,
             &crate::talk::Talks::at(home.join("talks")),
             &questions,
             home,
         );
+        step!("task inquiries");
         if let Err(error) = crate::task_inquiry::Outbox::at(home)
             .sweep(queue, &crate::talk::Talks::at(home.join("talks")))
         {
             tracing::warn!("task inquiry delivery remains pending: {error:#}");
         }
+        step!("question offers");
         repair_choice_offers(&questions);
+        step!("blockers");
         resolve_blockers(queue, &questions);
+        step!("choice actions");
         apply_task_choice_actions(queue, &questions, home);
+        step!("triage answers");
         triage::apply_answers(queue, &questions);
+        step!("task questions");
         reconcile_task_questions(queue, &questions);
         let talks = crate::talk::Talks::at(home.join("talks"));
+        step!("chat notices");
         crate::chat_notify::sweep(queue, &talks, home);
+        step!("attention notices");
         crate::notice_delivery::sweep(queue, &talks, home, &opts.repo);
+        step!("chat watches");
         crate::chat_watch::sweep(home, &talks);
+        step!("decision receipts");
         if let Err(error) = crate::chat_control::reconcile_decisions(queue, home) {
             tracing::warn!("decision receipt reconciliation remains pending: {error:#}");
         }
+        step!("chat turns");
         let mut turns = tokio::task::JoinSet::new();
         crate::chat_notify::start_turns(&talks, stop.parking(), &mut turns);
         // start_turns dispatches detached turns; no paid work lives in this set.
         while turns.join_next().await.is_some() {}
 
+        step!("consultation services");
         crate::consult::start_services(
             home,
             &opts.repo,
@@ -4077,9 +4348,13 @@ async fn poll(
             // Once an idle --once drain starts settling services, subsequent
             // scans only consume their effects. An expired cadence receipt
             // must not start another service and keep the drain alive.
+            if stop.stopped() || lap_stop_requested() {
+                break 'laps;
+            }
             if settling_once_services {
                 break;
             }
+            step!(operation);
             start_service(
                 home,
                 opts,
@@ -4091,20 +4366,24 @@ async fn poll(
             )
             .await?;
         }
+        step!("worker inventory");
         let latest = crate::worker::active(home)?;
         if latest.iter().any(|job| job.key == "service:daemon-cache")
             || latest
                 .iter()
                 .any(|job| job.kind == "task" && !jobs.iter().any(|known| known.id == job.id))
         {
+            lock(status).lap_step = None;
             stop.idle(RECHECK_WHILE_BUSY.min(opts.poll)).await;
             continue;
         }
+        step!("runnable tasks");
         let candidates: Vec<Task> = runnable(queue)
             .into_iter()
             .filter(|task| !live.contains(&task.id))
             .filter(|task| !opts.once || !attempted.contains(&task.id))
             .collect();
+        step!("interrupts");
         let in_flight: Vec<_> = owned.iter().cloned().collect();
         let prior_interrupt = std::mem::discriminant(&interrupt);
         interrupt = advance_interrupt_tick(
@@ -4148,8 +4427,9 @@ async fn poll(
         let cooling = read_cooldown(home)?.is_some_and(|until| Timestamp::now() < until);
         let mut started = false;
         let mut resync = false;
+        step!("task dispatch");
         for candidate in candidates {
-            if stop.stopped() {
+            if stop.stopped() || lap_stop_requested() {
                 break;
             }
             let Some(DispatchClaim {
@@ -4196,7 +4476,9 @@ async fn poll(
             attempted.push(task.id);
             started = true;
         }
+        step!("settling dispatch");
         if started || resync {
+            lock(status).lap_step = None;
             continue;
         }
         if owned.is_empty() && opts.once {
@@ -4213,11 +4495,13 @@ async fn poll(
                             | "service:daemon-maintenance"
                     )
             }) {
+                lock(status).lap_step = None;
                 stop.idle(RECHECK_WHILE_BUSY.min(opts.poll)).await;
                 continue;
             }
             break;
         }
+        lock(status).lap_step = None;
         stop.idle(if live.is_empty() {
             opts.poll
         } else {
@@ -4227,6 +4511,7 @@ async fn poll(
     }
     // Dropping a scheduler only drops dispatch bookkeeping. The workers own
     // every queue claim and Runner driver lease through outcome settlement.
+    lock(status).lap_step = None;
     stop.busy.store(0, Ordering::SeqCst);
     Ok(())
 }
@@ -6610,6 +6895,402 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("job.json"), serde_json::to_vec(&job).unwrap()).unwrap();
         job
+    }
+
+    #[tokio::test]
+    async fn scheduler_restart_reports_timeout_without_touching_execution_workers() {
+        let home = tempfile::tempdir().unwrap();
+        let request = TaskWorker {
+            opts: Opts::default(),
+            queue: home.path().join("queue"),
+            task: "still-executing".into(),
+            lane: PermitKind::Ordinary,
+            standalone: false,
+        };
+        let task = starting_task_reservation(home.path(), &request);
+        let task_path = home
+            .path()
+            .join("workers/jobs")
+            .join(&task.id)
+            .join("job.json");
+        let task_before = std::fs::read(&task_path).unwrap();
+        let execution_lease = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(task_path.with_file_name("live.lock"))
+            .unwrap();
+        crate::pr_head::try_lock_file(&execution_lease).unwrap();
+        let task_lease = crate::worker::try_lease(home.path(), &task.key)
+            .unwrap()
+            .unwrap();
+        let mut old = task.clone();
+        old.id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".into();
+        old.kind = "scheduler".into();
+        old.key = "scheduler".into();
+        old.pid = Some(4242);
+        old.payload = serde_json::to_value(Opts::default()).unwrap();
+        let old_dir = home.path().join("workers/jobs").join(&old.id);
+        std::fs::create_dir_all(&old_dir).unwrap();
+        std::fs::write(old_dir.join("job.json"), serde_json::to_vec(&old).unwrap()).unwrap();
+        let mut status = Status::new();
+        status.pid = 4242;
+        let step = LapStep {
+            name: "task inquiries".into(),
+            since: Timestamp::now(),
+        };
+        status.lap_step = Some(step.clone());
+        write_status_to(&home.path().join("daemon.json"), &status).unwrap();
+        assert_eq!(
+            read_status(home.path()).unwrap().lap_step,
+            Some(step.clone())
+        );
+        let old_lease = crate::worker::try_lease(home.path(), "scheduler")
+            .unwrap()
+            .unwrap();
+        let mut progress = crate::updater::Progress::new("old".into(), "new".into());
+        progress.advance(crate::updater::Stage::Restarting);
+        crate::updater::write_progress_logged(home.path(), &progress);
+        let calls = std::cell::Cell::new(0);
+        let spawn = |_: Opts| {
+            calls.set(calls.get() + 1);
+            std::future::ready(Ok(()))
+        };
+        let started = std::time::Instant::now();
+        let error = restart_detached_with(home.path(), Duration::from_millis(20), spawn)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("scheduler retirement timed out"));
+        assert!(error.to_string().contains("4242"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(calls.get(), 0);
+        assert!(scheduler_restart_path(home.path()).exists());
+        let note = std::fs::read_to_string(home.path().join("upgrade.note.json")).unwrap();
+        assert!(
+            note.contains("4242")
+                && note.contains("finishing its lap")
+                && note.contains("step task inquiries since")
+                && note.contains(&step.since.to_string()),
+            "{note}"
+        );
+        assert_eq!(
+            crate::worker::control(home.path(), "scheduler").unwrap(),
+            Some(crate::worker::Control::Stop)
+        );
+        assert_eq!(std::fs::read(&task_path).unwrap(), task_before);
+        assert!(
+            crate::worker::control(home.path(), &task.key)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            crate::worker::try_lease(home.path(), &task.key)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!home.path().join("worker-parks").exists());
+
+        // A replacement's status must not be attributed to the old PID.
+        status.pid = 4243;
+        write_status_to(&home.path().join("daemon.json"), &status).unwrap();
+        assert!(
+            !scheduler_restart_wait(home.path())
+                .unwrap()
+                .contains("task inquiries")
+        );
+        // Legacy status files remain readable and give PID-only diagnostics.
+        let mut legacy = serde_json::to_value(&status).unwrap();
+        legacy["pid"] = 4242.into();
+        legacy.as_object_mut().unwrap().remove("lap_step");
+        std::fs::write(home.path().join("daemon.json"), legacy.to_string()).unwrap();
+        assert!(read_status(home.path()).unwrap().lap_step.is_none());
+        assert!(
+            !scheduler_restart_wait(home.path())
+                .unwrap()
+                .contains("step task inquiries")
+        );
+
+        // Releasing only the lease is insufficient: the reservation must retire.
+        drop(old_lease);
+        assert!(
+            !complete_scheduler_restart(home.path(), Duration::ZERO, spawn)
+                .await
+                .unwrap()
+        );
+        assert_eq!(calls.get(), 0);
+        std::fs::remove_dir_all(old_dir).unwrap();
+        let waiting = scheduler_restart_wait(home.path()).unwrap();
+        assert!(waiting.contains("replacement startup"), "{waiting}");
+        assert!(!waiting.contains("finishing its lap"), "{waiting}");
+        // A failed spawn retains the intent for an explicit retry.
+        assert!(
+            complete_scheduler_restart(home.path(), Duration::ZERO, |_| {
+                std::future::ready(Err(anyhow::anyhow!("injected startup failure")))
+            })
+            .await
+            .is_err()
+        );
+        assert!(scheduler_restart_path(home.path()).exists());
+        assert!(
+            complete_scheduler_restart(home.path(), Duration::ZERO, spawn)
+                .await
+                .unwrap()
+        );
+        assert_eq!(calls.get(), 1);
+        assert!(!scheduler_restart_path(home.path()).exists());
+        assert_eq!(std::fs::read(&task_path).unwrap(), task_before);
+        assert!(
+            crate::worker::control(home.path(), &task.key)
+                .unwrap()
+                .is_none()
+        );
+        drop(task_lease);
+        drop(execution_lease);
+    }
+
+    #[tokio::test]
+    async fn scheduler_restart_completes_during_a_long_lap_without_touching_workers() {
+        let home = tempfile::tempdir().unwrap();
+        let request = TaskWorker {
+            opts: Opts::default(),
+            queue: home.path().join("queue"),
+            task: "still-executing".into(),
+            lane: PermitKind::Ordinary,
+            standalone: false,
+        };
+        let task = starting_task_reservation(home.path(), &request);
+        let task_path = home
+            .path()
+            .join("workers/jobs")
+            .join(&task.id)
+            .join("job.json");
+        let before = std::fs::read(&task_path).unwrap();
+        let execution = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(task_path.with_file_name("live.lock"))
+            .unwrap();
+        crate::pr_head::try_lock_file(&execution).unwrap();
+        let _task_lease = crate::worker::try_lease(home.path(), &task.key)
+            .unwrap()
+            .unwrap();
+        let mut scheduler = task.clone();
+        scheduler.id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".into();
+        scheduler.kind = "scheduler".into();
+        scheduler.key = "scheduler".into();
+        scheduler.payload = serde_json::to_value(Opts::default()).unwrap();
+        let scheduler_dir = home.path().join("workers/jobs").join(&scheduler.id);
+        std::fs::create_dir_all(&scheduler_dir).unwrap();
+        std::fs::write(
+            scheduler_dir.join("job.json"),
+            serde_json::to_vec(&scheduler).unwrap(),
+        )
+        .unwrap();
+        let scheduler_lease = crate::worker::try_lease(home.path(), "scheduler")
+            .unwrap()
+            .unwrap();
+        let calls = std::cell::Cell::new(0);
+        let started = std::time::Instant::now();
+        let lap = LAP_HOME.scope(home.path().to_path_buf(), async {
+            // Inject a five-second lap. Stop may only take effect after both
+            // writes of an item; the rest of the lap must never be awaited.
+            let mut completed = 0;
+            for item in 0..1000 {
+                if lap_stop_requested() {
+                    break;
+                }
+                std::fs::write(home.path().join("first-record"), item.to_string()).unwrap();
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                std::fs::write(home.path().join("second-record"), item.to_string()).unwrap();
+                completed += 1;
+            }
+            assert!((1..1000).contains(&completed));
+            assert_eq!(
+                std::fs::read(home.path().join("first-record")).unwrap(),
+                std::fs::read(home.path().join("second-record")).unwrap()
+            );
+            std::fs::remove_dir_all(scheduler_dir).unwrap();
+            drop(scheduler_lease);
+        });
+        let restart = async {
+            // Begin the restart while the first item's writes are in flight.
+            tokio::task::yield_now().await;
+            restart_detached_with(home.path(), Duration::from_secs(1), |_| {
+                calls.set(calls.get() + 1);
+                std::future::ready(Ok(()))
+            })
+            .await
+            .unwrap();
+        };
+        tokio::join!(lap, restart);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(calls.get(), 1);
+        assert!(!scheduler_restart_path(home.path()).exists());
+        assert_eq!(std::fs::read(&task_path).unwrap(), before);
+        assert!(
+            crate::worker::control(home.path(), &task.key)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            crate::worker::try_lease(home.path(), &task.key)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!home.path().join("worker-parks").exists());
+    }
+
+    #[tokio::test]
+    async fn scheduler_restart_recognizes_a_replacement_after_a_crash() {
+        let home = tempfile::tempdir().unwrap();
+        let request = TaskWorker {
+            opts: Opts::default(),
+            queue: home.path().join("queue"),
+            task: "unused".into(),
+            lane: PermitKind::Ordinary,
+            standalone: false,
+        };
+        let mut replacement = starting_task_reservation(home.path(), &request);
+        replacement.kind = "scheduler".into();
+        replacement.key = "scheduler".into();
+        let path = home
+            .path()
+            .join("workers/jobs")
+            .join(&replacement.id)
+            .join("job.json");
+        std::fs::write(&path, serde_json::to_vec(&replacement).unwrap()).unwrap();
+        let pending = SchedulerRestart {
+            opts: Opts::default(),
+            job_id: Some("previous-job".into()),
+            pid: Some(4242),
+            since: Timestamp::now(),
+        };
+        std::fs::write(
+            scheduler_restart_path(home.path()),
+            serde_json::to_vec(&pending).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            !complete_scheduler_restart(home.path(), Duration::ZERO, |_| async {
+                panic!("unacknowledged startup must remain reserved")
+            })
+            .await
+            .unwrap()
+        );
+        assert!(scheduler_restart_path(home.path()).exists());
+        assert!(
+            crate::worker::control(home.path(), "scheduler")
+                .unwrap()
+                .is_none()
+        );
+        replacement.status = crate::worker::Status::Running;
+        let execution_lease = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path.with_file_name("live.lock"))
+            .unwrap();
+        crate::pr_head::try_lock_file(&execution_lease).unwrap();
+        std::fs::write(&path, serde_json::to_vec(&replacement).unwrap()).unwrap();
+        assert!(
+            complete_scheduler_restart(home.path(), Duration::ZERO, |_| async {
+                panic!("replacement already reserved: must not spawn again")
+            })
+            .await
+            .unwrap()
+        );
+        assert!(!scheduler_restart_path(home.path()).exists());
+        assert!(
+            crate::worker::control(home.path(), "scheduler")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduler_poll_stop_clears_lap_and_dispatch_bookkeeping() {
+        let dir = tempfile::tempdir().unwrap();
+        let (opts, queue, _, home, worktrees) = idle_loop(dir.path());
+        let mut snapshot = Status::new();
+        snapshot.lap_step = Some(LapStep {
+            name: "previous step".into(),
+            since: Timestamp::now(),
+        });
+        let status = Arc::new(Mutex::new(snapshot));
+        let stop = Stop::new();
+        stop.busy.store(1, Ordering::SeqCst);
+        crate::worker::request(&home, "scheduler", crate::worker::Control::Stop).unwrap();
+        LAP_HOME
+            .scope(
+                home.clone(),
+                poll(
+                    &opts,
+                    &queue,
+                    &status,
+                    &home,
+                    &worktrees,
+                    &stop,
+                    DispatchLimits {
+                        max_concurrent: 1,
+                        pause_for_interrupts: false,
+                        recovery_cfg: None,
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stop.busy.load(Ordering::SeqCst), 0);
+        assert!(lock(&status).lap_step.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn scheduler_long_synchronous_lap_observes_stop_between_complete_items() {
+        let home = tempfile::tempdir().unwrap();
+        let (started, receive_started) = std::sync::mpsc::channel();
+        let (stopped, receive_stopped) = std::sync::mpsc::channel();
+        let control_home = home.path().to_path_buf();
+        let control = std::thread::spawn(move || {
+            receive_started.recv().unwrap();
+            crate::worker::request(&control_home, "scheduler", crate::worker::Control::Stop)
+                .unwrap();
+            stopped.send(()).unwrap();
+        });
+        let mut completed = 0;
+        LAP_HOME
+            .scope(home.path().to_path_buf(), async {
+                // Inject an otherwise long synchronous lap on a single-thread runtime:
+                // an async control watcher cannot run until this sweep returns.
+                for item in 0..1000 {
+                    if lap_stop_requested() {
+                        break;
+                    }
+                    std::fs::write(home.path().join("first-record"), item.to_string()).unwrap();
+                    if item == 0 {
+                        started.send(()).unwrap();
+                        receive_stopped
+                            .recv_timeout(Duration::from_secs(2))
+                            .unwrap();
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                    std::fs::write(home.path().join("second-record"), item.to_string()).unwrap();
+                    completed += 1;
+                }
+            })
+            .await;
+        control.join().unwrap();
+        assert_eq!(completed, 1);
+        assert_eq!(
+            std::fs::read(home.path().join("first-record")).unwrap(),
+            std::fs::read(home.path().join("second-record")).unwrap()
+        );
+        assert!(
+            !lap_stop_requested(),
+            "CLI/web calls outside the poll scope still reconcile fully"
+        );
     }
 
     #[test]

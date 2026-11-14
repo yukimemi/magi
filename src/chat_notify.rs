@@ -610,6 +610,9 @@ fn deliver(
 pub fn sweep(queue: &Queue, talks: &Talks, home: &Path) -> Vec<String> {
     let mut posted = Vec::new();
     for task in queue.list() {
+        if crate::daemon::lap_stop_requested() {
+            break;
+        }
         if task.chat_notice_due().is_none() {
             continue;
         }
