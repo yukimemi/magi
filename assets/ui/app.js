@@ -1307,7 +1307,7 @@ function renderLoop() {
       ? `Asked for ${upgradeInfo.to || "an update"} more than an hour ago and has not come back. Check on it by hand.`
       : [upgradeInfo.waiting_on || upgradeStageDetail(upgradeStage),
          upgradeStage === "restarting" ? upgradeInfo.detail : null].filter(Boolean).join(" "));
-    if (taskJobs.length > 0) {
+    if (upgradeStage === "restarting" && taskJobs.length > 0) {
       parkControl("Park active task workers",
         "Explicitly stops task workers at their next node boundary. Updating does not require this.");
     }

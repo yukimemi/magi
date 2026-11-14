@@ -200,6 +200,11 @@ test('retained restart intent preserves Park, Start and confirmed upgrade retry 
 test('active handover keeps explicit Park available without sending controls on render', () => {
   const h = harness();
   h.health.jobs = [{kind: 'task', queue_owned: true, version: '0.1.0'}];
+  for (const stage of ['downloading', 'replaced', 'parking']) {
+    h.health.upgrade = {stage};
+    h.renderLoop();
+    assert.equal(h.$('loop-park').hidden, true, `${stage} keeps upgrade controls hidden`);
+  }
   h.health.upgrade = {stage: 'restarting', waiting_on: 'old scheduler pid 4242 is finishing its lap',
     scheduler_restart_pending: 'old scheduler pid 4242 is finishing its lap'};
   let controls = 0;
