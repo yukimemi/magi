@@ -1678,7 +1678,12 @@ fn run_once_with_probe(
         // A question about what this task freezes is already the one question
         // it owes the operator; a second, about the hold itself, would ask two
         // things at once.
-        if deps_pending_in(&recovery, &task) {
+        // A monitored disk wait is exempt: a deps question opened before this
+        // wait was recognised must not stop its recheck. The recovery path
+        // itself refuses to resume past a question that needs the owner.
+        if !disk_wait_known(&task, questions.root().parent().unwrap_or(Path::new("")))
+            && deps_pending_in(&recovery, &task)
+        {
             continue;
         }
 
