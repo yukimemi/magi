@@ -3490,6 +3490,8 @@ retention of oversized outputs; this can increase deletion volume and duration.
 That exception is consumed at deletion start even on partial failure, and stops
 further deletions in that pass. Successful removals are counted even on failure.
 Other targets must fit the remaining budget; safety refusals consume no exception.
+Cargo v1 `deps` and v2 unit `out` share the same dep-info/signature proof;
+unit fingerprints restrict v2 authority, and mixed or incomplete layouts retain outputs.
 See `docs/retained-worktrees.md` for the complete retention policy.
 
 ### Managed incremental caches

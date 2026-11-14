@@ -600,13 +600,7 @@ async fn validate_cargo_target(worktree: &Path, allow_missing_tag: bool) -> Resu
             if !dir.exists() {
                 continue;
             }
-            for subdir in [dir.clone(), dir.join("deps"), dir.join(".fingerprint")] {
-                ensure!(
-                    plain_dir(&subdir) && subdir.canonicalize()? == subdir,
-                    "missing-tag profile proof: {} is not a plain directory",
-                    subdir.display()
-                );
-            }
+            profile_output_dirs(&dir, true)?;
             plain_file(&dir.join(".cargo-lock"), "missing-tag Cargo lock")?;
             profiles += 1;
         }
@@ -734,13 +728,151 @@ pub(crate) fn artifact_signature(path: &Path) -> Result<bool> {
         .any(|magic| header.starts_with(magic)))
 }
 
+/// Enumerate only known Cargo output locations. A v2 unit's `out` is not
+/// wholesale compiler authority: callers must still prove each file by dep-info
+/// and signature. In particular, build-script output is never traversed.
+fn profile_output_dirs(profile: &Path, require_proof: bool) -> Result<Vec<PathBuf>> {
+    let mut present = std::collections::BTreeSet::new();
+    for path in [
+        profile.to_owned(),
+        profile.join("deps"),
+        profile.join(".fingerprint"),
+        profile.join("build"),
+    ] {
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => {
+                ensure!(
+                    plain_dir(&path) && path.canonicalize()? == path,
+                    "Cargo profile proof: {} is not a plain directory",
+                    path.display()
+                );
+                present.insert(path);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    if !present.contains(profile) {
+        return Ok(Vec::new());
+    }
+    let deps = present.contains(&profile.join("deps"));
+    let fingerprint = present.contains(&profile.join(".fingerprint"));
+    let mut dirs = vec![profile.to_owned()];
+    if deps || fingerprint {
+        ensure!(
+            !require_proof || (deps && fingerprint),
+            "incomplete Cargo v1 profile proof"
+        );
+        if deps {
+            dirs.push(profile.join("deps"));
+        }
+        // v1 build-script directories have flat <package>-<hash> names;
+        // a nested v2 package directory must not silently mix layouts.
+        if present.contains(&profile.join("build")) {
+            for entry in std::fs::read_dir(profile.join("build"))? {
+                let path = entry?.path();
+                if plain_dir(&path) {
+                    for entry in std::fs::read_dir(&path)? {
+                        ensure!(
+                            !entry?.file_name().to_str().is_some_and(unit_hash),
+                            "mixed Cargo profile layouts"
+                        );
+                    }
+                }
+            }
+        }
+    } else if present.contains(&profile.join("build")) {
+        let mut units = 0;
+        for package in std::fs::read_dir(profile.join("build"))? {
+            let package = package?.path();
+            ensure!(
+                plain_dir(&package) && package.canonicalize()? == package,
+                "Cargo v2 package is not a plain directory"
+            );
+            let mut package_units = 0;
+            for unit in std::fs::read_dir(&package)? {
+                let unit = unit?.path();
+                ensure!(
+                    unit.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(unit_hash)
+                        && plain_dir(&unit)
+                        && unit.canonicalize()? == unit,
+                    "invalid Cargo v2 unit"
+                );
+                for name in ["fingerprint", "out"] {
+                    let path = unit.join(name);
+                    ensure!(
+                        plain_dir(&path) && path.canonicalize()? == path,
+                        "incomplete Cargo v2 unit: {}",
+                        path.display()
+                    );
+                }
+                plain_file(
+                    &unit.join("fingerprint/invoked.timestamp"),
+                    "Cargo unit fingerprint",
+                )?;
+                dirs.push(unit.join("out"));
+                units += 1;
+                package_units += 1;
+                ensure!(units <= 4096, "Cargo unit inventory too large");
+            }
+            ensure!(package_units > 0, "empty Cargo v2 package");
+        }
+        ensure!(units > 0 || !require_proof, "missing Cargo v2 units");
+    } else {
+        ensure!(!require_proof, "missing Cargo profile proof");
+    }
+    Ok(dirs)
+}
+
+// A unit directory may also contain arbitrary build-script products. Only
+// lib/bin rustc fingerprints matching this dep-info stem confer output authority.
+fn v2_compiler_dep_info(dir: &Path, dep_info: &Path) -> Result<bool> {
+    let unit = dir.parent().context("Cargo unit parent")?;
+    let hash = unit.file_name().unwrap_or_default().to_string_lossy();
+    let stem = dep_info.file_stem().unwrap_or_default().to_string_lossy();
+    for entry in std::fs::read_dir(unit.join("fingerprint"))? {
+        let path = entry?.path();
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        // Cargo hashes library filenames but v2 binaries use the crate name
+        // directly; the containing unit directory supplies their disambiguation.
+        let library = name
+            .strip_prefix("lib-")
+            .is_some_and(|name| stem == format!("{}-{hash}", name.replace('-', "_")));
+        let binary = name
+            .strip_prefix("bin-")
+            .is_some_and(|name| stem == name.replace('-', "_"));
+        if library || binary {
+            plain_file(&path, "Cargo compiler fingerprint")?;
+            plain_file(
+                &path.with_extension("json"),
+                "Cargo compiler fingerprint json",
+            )?;
+            plain_file(
+                &path.with_file_name(format!(
+                    "dep-{}",
+                    path.file_name().unwrap().to_string_lossy()
+                )),
+                "Cargo compiler fingerprint dep-info",
+            )?;
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn unit_hash(name: &str) -> bool {
+    name.len() == 16 && name.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 /// Legacy tags identify a cache, not ownership of every file inside it.
 /// Only direct rustc outputs named by dep-info may be reclaimed. Build-script
 /// output, incremental caches, unknown files and the manifests themselves stay.
 fn declared_outputs(target: &Path) -> Result<Vec<PathBuf>> {
     let mut outputs = std::collections::BTreeSet::new();
     for profile in ["debug", "release"] {
-        for dir in [target.join(profile), target.join(profile).join("deps")] {
+        for dir in profile_output_dirs(&target.join(profile), false)? {
             if !plain_dir(&dir) || dir.canonicalize()? != dir {
                 continue;
             }
@@ -750,6 +882,11 @@ fn declared_outputs(target: &Path) -> Result<Vec<PathBuf>> {
                     || !std::fs::symlink_metadata(&path)?.is_file()
                     || std::fs::metadata(&path)?.len() > 1024 * 1024
                     || path.canonicalize()? != path
+                {
+                    continue;
+                }
+                if dir.file_name().is_some_and(|name| name == "out")
+                    && !v2_compiler_dep_info(&dir, &path)?
                 {
                     continue;
                 }
@@ -1936,7 +2073,8 @@ mod tests {
         let wt = &state.candidates[0].worktree;
         let generation = crate::incremental::tests::generate(wt);
         // Remove dep-info authority: incremental proof must be independent.
-        for dir in [wt.join("target/debug"), wt.join("target/debug/deps")] {
+        assert!(!declared_outputs(&wt.join("target")).unwrap().is_empty());
+        for dir in profile_output_dirs(&wt.join("target/debug"), true).unwrap() {
             for entry in std::fs::read_dir(dir).unwrap() {
                 let path = entry.unwrap().path();
                 if path.extension().is_some_and(|x| x == "d") {
@@ -2033,7 +2171,9 @@ mod tests {
         let mut outputs = candidates.files.clone();
         drop(candidates);
         let target = wt.join("target");
-        for dir in [target.join("debug"), target.join("debug/deps")] {
+        assert!(!declared_outputs(&target).unwrap().is_empty());
+        let generated_dirs = profile_output_dirs(&target.join("debug"), true).unwrap();
+        for dir in &generated_dirs {
             for entry in std::fs::read_dir(dir).unwrap() {
                 let path = entry.unwrap().path();
                 if path.extension().is_some_and(|x| x == "d") {
@@ -2043,11 +2183,20 @@ mod tests {
         }
         // Cargo also leaves hard-linked object outputs in deps. Remove those
         // fixture outputs so the only external links are the ones below.
-        for entry in std::fs::read_dir(target.join("debug/deps")).unwrap() {
-            let path = entry.unwrap().path();
-            if path.is_file() {
-                std::fs::remove_file(path).unwrap();
+        for dir in generated_dirs.iter().skip(1) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_file() {
+                    std::fs::remove_file(path).unwrap();
+                }
             }
+        }
+        // The links below deliberately use a synthetic v1 deps directory.
+        // Remove the v2 unit tree after its generated outputs were inspected.
+        if !target.join("debug/deps").exists() {
+            std::fs::remove_dir_all(target.join("debug/build")).unwrap();
+            std::fs::create_dir(target.join("debug/deps")).unwrap();
+            std::fs::create_dir(target.join("debug/.fingerprint")).unwrap();
         }
         for (index, object) in objects.iter().enumerate() {
             assert_eq!(std::fs::metadata(object).unwrap().nlink(), 1);
@@ -2383,6 +2532,11 @@ mod tests {
             .env("RUSTUP_TOOLCHAIN", "stable")
             .env("CARGO_HOME", f._temp.path().join("cargo-home"))
             .env("CARGO_INCREMENTAL", "0")
+            .arg("--config")
+            .arg(format!(
+                "build.build-dir={}",
+                serde_json::to_string(&wt.join("target")).unwrap()
+            ))
             .args([
                 "build",
                 "--offline",
@@ -2448,7 +2602,14 @@ mod tests {
         ] {
             preserved.insert(path.clone(), std::fs::read(path).unwrap());
         }
+        let supported_dirs = profile_output_dirs(&target.join("release"), true).unwrap();
         let proven = declared_outputs(&target).unwrap();
+        assert!(
+            proven
+                .iter()
+                .any(|path| path.parent() != Some(target.join("release").as_path())),
+            "both uplifted and unit/deps binary references must be proven: {proven:?}"
+        );
 
         let out = sweep(&f.home, &Fx::disk(), Fx::now()).await;
         assert!(out.freed_bytes > 0, "{out:?}");
@@ -2492,10 +2653,7 @@ mod tests {
         assert_eq!(deleted, proven);
         for path in deleted {
             assert!(!path.exists());
-            assert!(
-                [target.join("release"), target.join("release/deps")]
-                    .contains(&path.parent().unwrap().to_owned())
-            );
+            assert!(supported_dirs.contains(&path.parent().unwrap().to_owned()));
         }
         assert!(!residue_proof(&f.home, &state.id, wt).unwrap().exists());
     }
@@ -2509,6 +2667,160 @@ mod tests {
         }
         std::fs::write(target.join(".rustc_info.json"),
             r#"{"rustc_fingerprint":123,"outputs":{"1":{"success":true,"stdout":"rustc fixture","stderr":""}},"successes":{}}"#).unwrap();
+    }
+
+    // Synthetic v2 coverage runs even on toolchains that still produce v1.
+    fn v2_target(wt: &Path) -> PathBuf {
+        missing_tag_target(wt);
+        let target = wt.join("target");
+        std::fs::remove_dir(target.join("debug/deps")).unwrap();
+        std::fs::remove_dir(target.join("debug/.fingerprint")).unwrap();
+        let unit = target.join("debug/build/fixture/0123456789abcdef");
+        let out = unit.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::create_dir(unit.join("fingerprint")).unwrap();
+        for name in [
+            "lib-fixture",
+            "lib-fixture.json",
+            "dep-lib-fixture",
+            "invoked.timestamp",
+        ] {
+            std::fs::write(unit.join("fingerprint").join(name), "fixture").unwrap();
+        }
+        let artifact = out.join("libfixture-0123456789abcdef.rlib");
+        std::fs::copy(target.join("debug/output"), &artifact).unwrap();
+        std::fs::write(
+            out.join("fixture-0123456789abcdef.d"),
+            format!("{}: source\n", artifact.display()),
+        )
+        .unwrap();
+        artifact
+    }
+
+    #[tokio::test]
+    async fn missing_tag_v2_proves_only_compiler_units_and_preserves_retained_links() {
+        let f = Fx::new().await;
+        let state = f.run("bc01", true).await;
+        let wt = &state.candidates[0].worktree;
+        let artifact = v2_target(wt);
+        let unknown = artifact.parent().unwrap().join("operator-note");
+        std::fs::write(&unknown, "retain").unwrap();
+        // A valid binary and dep-info in arbitrary build-script output are not authority.
+        let script_unit = wt.join("target/debug/build/fixture/fedcba9876543210");
+        let script = script_unit.join("out");
+        std::fs::create_dir_all(&script).unwrap();
+        std::fs::create_dir(script_unit.join("fingerprint")).unwrap();
+        std::fs::write(script_unit.join("fingerprint/invoked.timestamp"), "fixture").unwrap();
+        let decoy = script.join("libfixture-fedcba9876543210.rlib");
+        std::fs::copy(&artifact, &decoy).unwrap();
+        std::fs::write(
+            script.join("fixture-fedcba9876543210.d"),
+            format!("{}: source\n", decoy.display()),
+        )
+        .unwrap();
+        // Cargo uplifts the same inode from the unit into the profile root.
+        let uplift = wt.join("target/debug/libfixture.rlib");
+        std::fs::hard_link(&artifact, &uplift).unwrap();
+        std::fs::write(
+            wt.join("target/debug/fixture.d"),
+            format!("{}: source\n", uplift.display()),
+        )
+        .unwrap();
+        let bin_unit = wt.join("target/debug/build/fixture/1111111111111111");
+        std::fs::create_dir_all(bin_unit.join("out")).unwrap();
+        std::fs::create_dir(bin_unit.join("fingerprint")).unwrap();
+        for name in [
+            "bin-fixture",
+            "bin-fixture.json",
+            "dep-bin-fixture",
+            "invoked.timestamp",
+        ] {
+            std::fs::write(bin_unit.join("fingerprint").join(name), "fixture").unwrap();
+        }
+        let bin = bin_unit.join("out/fixture");
+        std::fs::hard_link(wt.join("target/debug/output"), &bin).unwrap();
+        std::fs::write(
+            bin.with_extension("d"),
+            format!("{}: source\n", bin.display()),
+        )
+        .unwrap();
+        let retained = wt.join("retained-link");
+        std::fs::hard_link(&artifact, &retained).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        let expected_allocation = std::fs::metadata(wt.join("target/debug/output"))
+            .unwrap()
+            .blocks()
+            * 512;
+        let sentinel = std::fs::read(&retained).unwrap();
+        let first = sweep(&f.home, &Fx::disk(), Fx::now()).await;
+        assert_eq!(first.freed_bytes, 800, "{first:?}");
+        assert!(!bin.exists());
+        assert_eq!(
+            first.estimated_released_allocated_bytes,
+            Some(expected_allocation)
+        );
+        assert_eq!(std::fs::read(&retained).unwrap(), sentinel);
+        assert!(retained.is_file());
+        assert!(unknown.is_file());
+        assert!(decoy.is_file());
+        assert!(!artifact.exists());
+        // Unlinking proven names must never remove the retained reference's bytes.
+        assert_eq!(std::fs::metadata(retained).unwrap().len(), 200);
+    }
+
+    #[tokio::test]
+    async fn missing_tag_v2_rejects_incomplete_mixed_and_symlinked_layouts() {
+        for invalid in [
+            "build",
+            "deps",
+            ".fingerprint",
+            "out",
+            "fingerprint",
+            "hash",
+            "mixed",
+            "unit-fingerprint",
+            "compiler-fingerprint",
+            "absent-out",
+        ] {
+            let f = Fx::new().await;
+            let state = f.run("bc02", true).await;
+            let wt = &state.candidates[0].worktree;
+            let artifact = v2_target(wt);
+            let unit = artifact.parent().unwrap().parent().unwrap();
+            let profile = wt.join("target/debug");
+            match invalid {
+                "mixed" => {
+                    std::fs::create_dir(profile.join("deps")).unwrap();
+                    std::fs::create_dir(profile.join(".fingerprint")).unwrap();
+                }
+                "hash" => {
+                    std::fs::rename(unit, unit.with_file_name("unknown")).unwrap();
+                }
+                "unit-fingerprint" => {
+                    std::fs::remove_file(unit.join("fingerprint/invoked.timestamp")).unwrap();
+                }
+                "compiler-fingerprint" => {
+                    std::fs::remove_file(unit.join("fingerprint/lib-fixture.json")).unwrap();
+                }
+                "absent-out" => {
+                    std::fs::remove_dir_all(unit.join("out")).unwrap();
+                }
+                name => {
+                    let path = if matches!(name, "out" | "fingerprint") {
+                        unit.join(name)
+                    } else {
+                        profile.join(name)
+                    };
+                    if path.exists() {
+                        std::fs::remove_dir_all(&path).unwrap();
+                    }
+                    std::os::unix::fs::symlink(&f.repo, &path).unwrap();
+                }
+            }
+            let report = sweep(&f.home, &Fx::disk(), Fx::now()).await;
+            assert_eq!(report.freed_bytes, 0, "{invalid}: {report:?}");
+            assert!(!report.retained.is_empty(), "{invalid}: {report:?}");
+        }
     }
 
     #[tokio::test]

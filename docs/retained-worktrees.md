@@ -43,8 +43,11 @@ be ignored, contain no tracked files, carry Cargo's standard
 and have plain canonical directories for any existing `debug` and `release`
 profiles. Artifact-only eviction has one alternative for **NotFound on the tag
 path only**: a plain rustc identity with a numeric fingerprint, a cached successful
-rustc version response and a successes map, plus existing plain profile, `deps`,
-`.fingerprint` directories and `.cargo-lock` files. The nonempty dep-info and
+rustc version response and a successes map, plus plain profile directories and
+`.cargo-lock` files. The profile must prove one known layout: v1 has both `deps`
+and `.fingerprint`; v2 has `build/<package>/<16-hex-unit>/fingerprint` and `out`
+with a plain fingerprint timestamp. Mixed, incomplete and symlinked layouts fail
+closed. The nonempty dep-info and
 individual artifact signature/path/name proof remain mandatory. Malformed tags,
 symlinks (including dangling tags), other I/O errors and incomplete layouts retain
 outputs. Cleanup never creates or repairs a tag. The ledger distinguishes
@@ -55,7 +58,11 @@ verification still require the valid tag. Unrelated root entries, including logs
 and never expand the artifact search. These checks do not authorize recursive
 deletion. Cleanup removes only regular artifact files declared as outputs in
 rustc dep-info (`.d`) records in
-`debug`, `release` or their `deps` directories, with matching artifact names and
+`debug`, `release`, their v1 `deps` directories, or v2 unit `out` directories.
+V2 dep-info must match the plain lib/bin fingerprint, JSON and fingerprint
+dep-info files: libraries use `<crate>-<unit-hash>` stems, binaries use `<crate>`
+stems within their hashed unit directory. Arbitrary build-script output is not traversed.
+Every output still requires matching artifact names and
 recognized binary/library extensions and compiler-artifact signatures. Text that
 replaced a stale output remains. Dependency inputs never authorize deletion.
 Canonical paths and plain-file checks exclude symlinks and traversal. Unknown
@@ -508,3 +515,64 @@ activity; it is not attributed to cleanup. Capacity warnings remain visible
 when either pressure or excess inventory persists, including after partial
 progress. Inspect retained reasons instead of assuming the old cache can be
 removed automatically.
+
+### Cargo layout regression evidence
+
+The first matching failure in the inspected CI history is
+[run 43358670512](https://github.com/yukimemi/magi/actions/runs/43358670512)
+(kata-apply, commit `f4f5f6af2d`, November 13): Ubuntu/macOS unit tests and
+coverage fail the same three retention tests. Renovate jiff
+[run 43358811490](https://github.com/yukimemi/magi/actions/runs/43358811490)
+repeats that signature. The preceding successful main
+[run 43230630543](https://github.com/yukimemi/magi/actions/runs/43230630543)
+(commit `daa11fe54b`) used rustc 1.99.1; failing jobs install rustc 1.100.0.
+The kata-apply commit changes only two maintenance workflows and `.kata/applied.toml`;
+its retention code, fixture code and CI workflow are unchanged from that passing base.
+Earlier November 11 main failures inspected here are browser-test failures;
+Renovate sysinfo run 43322668125 fails to compile against changed sysinfo APIs.
+They are separate failures, not evidence that retention already failed then.
+
+A dependency-free crate built offline with the fixtures' cleared environment,
+explicit target directory, isolated Cargo home, one job and custom incremental
+RUSTFLAGS produces these measured layouts:
+
+```text
+Cargo 1.99.1 (5f94df478), rustc 1.99.1 (58cf8f9c3)
+  target/debug/{deps,.fingerprint}/
+  target/debug/deps/<crate>-<hash>.d
+Cargo 1.100.0 (3acc79c0c), rustc 1.100.0 (0ef1bc386)
+  target/debug/build/<package>/<hash>/fingerprint/
+  target/debug/build/<package>/<hash>/out/<crate>-<hash>.d
+```
+
+Cargo's JSON compiler-artifact messages point to the corresponding rmeta in
+`deps` or unit `out`; uplifted rlibs remain directly under `debug`.
+A release binary instead has `build/<package>/<hash>/out/<crate>{,.d}` without
+a filename hash, plus the uplifted `release/<binary>{,.d}`. Both references must
+be proven to release their shared inode. The v2 build
+has no `debug/deps` or `debug/.fingerprint`. This explains both fixture NotFound
+panics and the missing-tag profile rejection; it reproduces without CI,
+coverage instrumentation, inherited Cargo configuration or concurrent builds.
+Holding rustc fixed at 1.99.1 and changing only Cargo reproduces the same
+transition: Cargo 1.99.1 creates `deps`, Cargo 1.100.0 creates one v2 unit and
+no `deps`; both offline builds succeed. This isolates Cargo's layout change
+from rustc changes. Precreating the target for managed incremental output also
+leaves it without `CACHEDIR.TAG` under both versions, so the stricter missing-tag
+proof applies.
+Cargo documents the [1.100 layout change](https://doc.rust-lang.org/cargo/reference/build-cache.html).
+
+Clearing the environment and setting `CARGO_HOME` does not disable Cargo's
+ancestor `.cargo/config.toml` discovery from its working directory. Real-build
+fixtures explicitly set both target and build directories; an ancestor-config
+regression verifies that intermediate artifacts cannot escape into an operator's
+configured build directory. This configuration issue is independently guarded;
+it is not required to reproduce the CI failure.
+
+Focused verification on Cargo/rustc 1.100.0 passed all nine incremental,
+missing-tag and ancestor-config regressions with `cargo llvm-cov --lib --locked
+--no-clean --no-rustc-wrapper --lcov` (using the shared target directory), and
+produced a nonempty LCOV report. The same nine tests also passed with their
+nested Cargo commands routed through `rustup run 1.99.1 cargo`. Existing tagged
+real-Cargo reclamation, target identity/profile validation, owner/driver locks
+and last-hardlink allocation tests passed too. Full verification and review
+belong to the parent run.

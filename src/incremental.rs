@@ -939,7 +939,7 @@ pub(crate) mod tests {
     use super::*;
 
     // A real, dependency-free Cargo crate keeps this regression below a few MiB.
-    // No production paths or inherited Cargo configuration participate.
+    // No production paths participate; output directories override ancestor config.
     fn cargo_generation() -> (tempfile::TempDir, PathBuf, Generation) {
         let temp = tempfile::tempdir().unwrap();
         let worktree = temp.path().canonicalize().unwrap();
@@ -984,6 +984,13 @@ pub(crate) mod tests {
                 "RUSTFLAGS",
                 format!("-C incremental={}", generation.path.display()),
             )
+            // CARGO_HOME isolation does not disable ancestor .cargo/config.toml.
+            // Keep intermediates local even if a parent config separates build-dir.
+            .arg("--config")
+            .arg(format!(
+                "build.build-dir={}",
+                serde_json::to_string(&worktree.join("target")).unwrap()
+            ))
             .args(["build", "--offline", "--jobs", "1", "--target-dir"])
             .arg(worktree.join("target"))
             .output()
@@ -996,6 +1003,39 @@ pub(crate) mod tests {
         assert!(crate::disk::dir_size(&generation.path) > 0);
         generation.seal(worktree).unwrap();
         generation
+    }
+
+    #[test]
+    fn generation_overrides_ancestor_cargo_output_configuration() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        fs::create_dir(root.join(".cargo")).unwrap();
+        fs::write(
+            root.join(".cargo/config.toml"),
+            "[build]\ntarget-dir='operator-target'\nbuild-dir='operator-build'\n",
+        )
+        .unwrap();
+        let worktree = root.join("worktree");
+        fs::create_dir(&worktree).unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .arg("init")
+                .arg(&worktree)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        let generation = generate(&worktree);
+        assert!(
+            worktree
+                .join("target/debug/libcache_fixture.rlib")
+                .is_file()
+        );
+        assert!(!root.join("operator-target").exists());
+        assert!(!root.join("operator-build").exists());
+        drop(generation);
+        assert!(!candidates(&worktree).unwrap().files.is_empty());
     }
 
     #[test]
