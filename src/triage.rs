@@ -357,6 +357,12 @@ pub struct Report {
     /// [`quarantine_orphaned_blocked`]. Distinct from `asked`: the question
     /// about it, if any, is filed in the same pass and only counted there.
     pub quarantined: Vec<String>,
+    /// A disk-wait task whose untouched, automatically filed triage question
+    /// was superseded as part of its automatic resume. No owner answer exists.
+    pub superseded: Vec<String>,
+    /// A recovered disk-wait task that still needs an explicit owner decision
+    /// (an owner-touched or unrelated question/approval); monitoring continues.
+    pub needs_owner: Vec<String>,
 }
 
 impl Report {
@@ -367,6 +373,8 @@ impl Report {
             && self.asked.is_empty()
             && self.answered.is_empty()
             && self.quarantined.is_empty()
+            && self.superseded.is_empty()
+            && self.needs_owner.is_empty()
     }
 }
 
@@ -383,7 +391,7 @@ fn repo_for(task: &Task) -> PathBuf {
 
 /// Only exact legacy admission messages may migrate without structured evidence.
 fn is_disk_hold(task: &Task) -> bool {
-    task.machine_hold_cause == Some(crate::queue::MachineHoldCause::DiskCapacity)
+    task.has_disk_capacity_cause()
         || (task.schema < 22
             && task
                 .hold_reason
@@ -406,7 +414,7 @@ fn disk_wait_known(task: &Task, home: &Path) -> bool {
     {
         return false;
     }
-    if task.machine_hold_cause == Some(crate::queue::MachineHoldCause::DiskCapacity) {
+    if task.has_disk_capacity_cause() {
         return true;
     }
     // Legacy prose is not authority to reinterpret an explicit recovery pin.
@@ -1419,7 +1427,7 @@ fn resume_disk_task(
     questions: &Questions,
     task: &mut Task,
     ownership: &crate::task_chat::InquiryOwnership,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let expected = task.clone();
     let home = questions
         .root()
@@ -1557,7 +1565,7 @@ fn resume_disk_task(
             let _ = notices.dismiss(&notice.id);
         }
     }
-    Ok(())
+    Ok(candidate.is_some())
 }
 
 /// Run one deterministic triage pass over every `held` task in `queue`. No
@@ -1687,7 +1695,10 @@ fn run_once_with_probe(
             }
             let expected = task.clone();
             task.disk_checked_at = Some(now);
-            task.machine_hold_cause = Some(crate::queue::MachineHoldCause::DiskCapacity);
+            if !task.has_disk_capacity_cause() {
+                // Legacy exact-format migration only; never re-bind a stale cause.
+                task.mark_disk_capacity();
+            }
             if queue.commit_disk_wait(&mut task, &expected).is_err() {
                 continue;
             }
@@ -1695,8 +1706,18 @@ fn run_once_with_probe(
             // Even missing configuration/evidence stays a monitored wait. Never
             // turn measurement failure or continued pressure into an owner poll.
             if cfg.as_ref().and_then(|c| resolved(&task, c)) == Some(true) {
-                if let Err(error) = resume_disk_task(queue, questions, &mut task, &ownership) {
-                    crate::notices::raise_in(
+                match resume_disk_task(queue, questions, &mut task, &ownership) {
+                    Ok(superseded) => {
+                        if superseded {
+                            report.superseded.push(task.id.clone());
+                        }
+                        report.resumed.push(task.id.clone());
+                    }
+                    Err(error) => {
+                        if !report.needs_owner.contains(&task.id) {
+                            report.needs_owner.push(task.id.clone());
+                        }
+                        crate::notices::raise_in(
                         questions.root().parent().unwrap_or(Path::new("")),
                         crate::notices::Notice::warn(
                             &format!("disk-recovered:{}", task.id),
@@ -1706,8 +1727,7 @@ fn run_once_with_probe(
                             ),
                         ).link(crate::notices::Link::Task { id: task.id.clone() }).about([task.id.clone()]),
                     );
-                } else {
-                    report.resumed.push(task.id.clone());
+                    }
                 }
             }
             continue;
@@ -1862,7 +1882,7 @@ mod tests {
     fn disk_task(repo: PathBuf) -> Task {
         let mut t = task("capacity", repo);
         t.hold_machine(crate::disk::gate_in(1_477_050_368, 3_221_225_472, "ja"));
-        t.machine_hold_cause = Some(crate::queue::MachineHoldCause::DiskCapacity);
+        t.mark_disk_capacity();
         t.attempts = 3;
         t
     }

@@ -157,11 +157,19 @@ pub(crate) fn dispatch_order(a: &Task, b: &Task) -> std::cmp::Ordering {
 }
 
 /// Resource waits eligible for automatic admission checks, never owner approval.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+///
+/// Bound to the `hold_reason` it was recorded with: [`Task::has_disk_capacity_cause`]
+/// honours it only while the task still carries that exact reason, so a later
+/// hold that rewrites the reason invalidates it even if a transition forgets to
+/// clear the cause.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MachineHoldCause {
     /// The disk floor or an output reservation prevented execution.
-    DiskCapacity,
+    DiskCapacity {
+        /// The exact `hold_reason` the hold was placed with.
+        reason: String,
+    },
 }
 
 /// Who placed the current hold.
@@ -1719,6 +1727,21 @@ impl Task {
         self.blocked_from = None;
     }
 
+    /// Record the disk-capacity cause bound to the current `hold_reason`.
+    pub(crate) fn mark_disk_capacity(&mut self) {
+        self.machine_hold_cause = Some(MachineHoldCause::DiskCapacity {
+            reason: self.hold_reason.clone().unwrap_or_default(),
+        });
+    }
+
+    /// Does the structured disk-capacity cause still match the current hold?
+    pub fn has_disk_capacity_cause(&self) -> bool {
+        matches!(
+            (&self.machine_hold_cause, self.hold_reason.as_deref()),
+            (Some(MachineHoldCause::DiskCapacity { reason }), Some(now)) if reason == now
+        )
+    }
+
     /// Admission waits preserve all execution and approval evidence on recovery.
     pub(crate) fn resume_disk_wait(&mut self) {
         let retained = self.execution_runs().last().cloned();
@@ -2830,7 +2853,7 @@ impl Queue {
                     task.resume_override = stored.resume_override.clone();
                     task.status = stored.status;
                     task.hold_source = stored.hold_source;
-                    task.machine_hold_cause = stored.machine_hold_cause;
+                    task.machine_hold_cause = stored.machine_hold_cause.clone();
                     task.disk_resume_run = stored.disk_resume_run.clone();
                     task.disk_checked_at = stored.disk_checked_at;
                     task.hold_reason = stored.hold_reason.clone();
@@ -2845,7 +2868,7 @@ impl Queue {
                     task.resume_override = stored.resume_override.clone();
                     task.status = stored.status;
                     task.hold_source = stored.hold_source;
-                    task.machine_hold_cause = stored.machine_hold_cause;
+                    task.machine_hold_cause = stored.machine_hold_cause.clone();
                     task.disk_resume_run = stored.disk_resume_run.clone();
                     task.disk_checked_at = stored.disk_checked_at;
                     task.hold_reason = stored.hold_reason.clone();
@@ -3667,7 +3690,7 @@ fn read_path(path: &Path) -> Result<Task> {
             .as_deref()
             .is_some_and(crate::disk::is_gate_reason)
     {
-        task.machine_hold_cause = Some(MachineHoldCause::DiskCapacity);
+        task.mark_disk_capacity();
     }
     Ok(task)
 }

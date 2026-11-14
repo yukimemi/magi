@@ -2165,7 +2165,7 @@ fn settle_and_diagnose(
         if matches!(block.kind.as_str(), "disk pressure" | "disk admission")
             && matches!(block.cause, crate::run::ResourceBlockCause::Other)
         {
-            task.machine_hold_cause = Some(crate::queue::MachineHoldCause::DiskCapacity);
+            task.mark_disk_capacity();
             task.disk_checked_at = disk_checked_at;
         }
         if let Some(pass) = state.passes.last() {
@@ -4658,7 +4658,7 @@ async fn attempt(
         task.last_error = Some(reason.clone());
         let disk_checked_at = task.disk_checked_at;
         task.hold_machine(Some(reason.clone()));
-        task.machine_hold_cause = Some(crate::queue::MachineHoldCause::DiskCapacity);
+        task.mark_disk_capacity();
         task.disk_checked_at = disk_checked_at;
         record(queue, task);
         tracing::warn!("holding {} for want of disk space: {reason}", task.short());
@@ -10656,7 +10656,7 @@ mod tests {
         let mut waiting = task();
         waiting.repo = opts.repo.clone();
         waiting.hold_machine(crate::disk::gate(1, 100));
-        waiting.machine_hold_cause = Some(crate::queue::MachineHoldCause::DiskCapacity);
+        waiting.mark_disk_capacity();
         waiting.attempts = 2;
         queue.put(&mut waiting).unwrap();
         let mut busy = task();

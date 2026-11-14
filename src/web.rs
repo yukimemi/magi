@@ -5112,7 +5112,7 @@ fn task_recovery(task: &Task) -> Option<String> {
     }
     text.push_str(match task.hold_source {
         Some(HoldSource::Manual) => "Manual hold: an operator must explicitly Release when ready.",
-        Some(HoldSource::Machine) if task.machine_hold_cause == Some(crate::queue::MachineHoldCause::DiskCapacity) || crate::triage::disk_wait_eligible(task) =>
+        Some(HoldSource::Machine) if task.has_disk_capacity_cause() || crate::triage::disk_wait_eligible(task) =>
             "Disk wait (automatically monitored): the same task resumes when disk floors and output reservations permit. Recorded figures describe the hold time, not current capacity; triage rechecks admission automatically. Untouched automatic disk triage questions are superseded without an owner answer; owner decisions and unrelated approvals still require explicit resolution.",
         Some(HoldSource::Machine) => "Machine hold: triage rechecks supported recovery conditions; otherwise resolve the recovery decision in the owning task chat.",
         None => "Hold origin unknown: inspect the recorded reason and task chat before explicitly releasing.",
@@ -22331,7 +22331,7 @@ mod tests {
         assert!(text.contains("restores held"));
         assert!(text.contains("clears its dependency references"));
         task.hold_source = Some(HoldSource::Machine);
-        task.machine_hold_cause = Some(crate::queue::MachineHoldCause::DiskCapacity);
+        task.mark_disk_capacity();
         task.hold_reason = crate::disk::gate(2_667_941_888, 3_221_225_472);
         let view = TaskView::with_inventory(
             task.clone(),
