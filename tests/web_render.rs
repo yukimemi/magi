@@ -6245,7 +6245,10 @@ async fn run_progress_live_pipeline_observation_and_phone_layout() {
             )
             .await
             .unwrap();
-        browser.wait_for(&page, "window.deck && deck.state.detail.evidenceError === false && document.querySelectorAll('#run-active > li').length === 2 && document.querySelectorAll('#progress-phases .progress-implementers li').length === 2", Duration::from_secs(30)).await.unwrap();
+        // The global health strip and stream connection settle independently
+        // of run evidence. Do not measure a live-clock update while startup
+        // can still resize the page header above the run.
+        browser.wait_for(&page, "window.deck && deck.state.health && deck.state.streamOpen && deck.state.detail.evidenceError === false && document.getElementById('progress-connection').textContent === 'Stream connected' && document.querySelectorAll('#run-active > li').length === 2 && document.querySelectorAll('#progress-phases .progress-implementers li').length === 2", Duration::from_secs(30)).await.unwrap();
         browser
             .eval(
                 &page,
@@ -6257,6 +6260,8 @@ async fn run_progress_live_pipeline_observation_and_phone_layout() {
           await deck.loadRun(deck.state.detail.id);
           await deck.observeRunProgress(true);
           await new Promise(resolve => setTimeout(resolve, 600));
+          await document.fonts.ready;
+          await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
           const pipeline = document.getElementById('progress-pipeline');
           const summary = pipeline.querySelector('summary');
           const row = document.querySelector('#progress-phases .progress-implementers li');
@@ -6285,6 +6290,7 @@ async fn run_progress_live_pipeline_observation_and_phone_layout() {
             scrollY, viewport: [innerWidth, innerHeight],
             document: [document.documentElement.clientWidth, document.documentElement.scrollHeight],
             nodes: Object.fromEntries([
+              '.top', '.daemon', '#view-run .view-head', '#run-h', '#run-meta',
               '#run-progress', '#progress-freshness', '#progress-recent',
               '#run-active-panel', '#run-active > li', '#progress-pipeline',
               '#progress-pipeline summary'
