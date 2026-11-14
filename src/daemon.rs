@@ -2127,6 +2127,7 @@ fn settle_and_diagnose(
     // can re-check, so the same run resumes with the same agents once the
     // resource is free. A park request still wins (it is the operator's).
     if let Some(block) = state.resource_block.as_ref().filter(|_| !verdict.parked) {
+        let disk_checked_at = task.disk_checked_at;
         task.notice_cause(
             &format!("resource:{}:{}", block.kind, block.node),
             None,
@@ -2160,6 +2161,12 @@ fn settle_and_diagnose(
                 crate::cache::RESOURCE_HOLD,
                 block.description()
             )));
+        }
+        if matches!(block.kind.as_str(), "disk pressure" | "disk admission")
+            && matches!(block.cause, crate::run::ResourceBlockCause::Other)
+        {
+            task.mark_disk_capacity();
+            task.disk_checked_at = disk_checked_at;
         }
         if let Some(pass) = state.passes.last() {
             task.record_pass_at(
@@ -3709,16 +3716,23 @@ async fn start_service(
             !(queued.is_empty() && stalled.is_empty() && finished.is_empty())
                 && load_conductor(home)?.worth_a_look(queue, &stalled, &finished)
         }
-        "maintenance" => Questions::at(home.join("questions"))
-            .list_for_effects()
-            .iter()
-            .any(|q| {
-                q.chosen_action().is_some_and(|action| action.maintenance())
-                    && !home
-                        .join("choice-actions")
-                        .join(format!("{}.json", q.id))
-                        .exists()
-            }),
+        "maintenance" => {
+            queue.list().iter().any(|task| {
+                crate::triage::disk_wait_eligible(task)
+                    && task
+                        .disk_checked_at
+                        .is_none_or(|at| now.as_second() - at.as_second() >= 60)
+            }) || Questions::at(home.join("questions"))
+                .list_for_effects()
+                .iter()
+                .any(|q| {
+                    q.chosen_action().is_some_and(|action| action.maintenance())
+                        && !home
+                            .join("choice-actions")
+                            .join(format!("{}.json", q.id))
+                            .exists()
+                })
+        }
         "housekeeping" => !busy && runnable(queue).is_empty(),
         "cache" => {
             !busy
@@ -3785,7 +3799,15 @@ pub async fn run_service_worker(home: &Path, payload: serde_json::Value) -> Resu
     let queue = Queue::at(request.queue);
     let questions = Questions::at(home.join("questions"));
     match request.operation.as_str() {
-        "maintenance" => apply_maintenance_choices(&queue, &questions, home).await,
+        "maintenance" => {
+            apply_maintenance_choices(&queue, &questions, home).await;
+            triage::monitor_disk_waits(
+                &queue,
+                &questions,
+                opts.config.as_deref(),
+                Timestamp::now(),
+            );
+        }
         "conductor" => {
             let path = home.join("conductor-state.json");
             let mut conductor = load_conductor(home)?;
@@ -4459,6 +4481,14 @@ async fn attempt(
         .flatten()
         .filter(|id| RunState::load(id).is_ok_and(|run| may_resume_run(&run, task)));
     let previous = resume_runs.last().and_then(|id| RunState::load(id).ok());
+    if let Some(id) = &task.disk_resume_run
+        && unfinished.as_ref() != Some(id)
+    {
+        task.hold_manual(Some("Automatic disk recovery cannot resume the retained execution safely. Inspect its state and recovery approvals; no replacement competition was started.".into()));
+        record(queue, task);
+        return Vec::new();
+    }
+
     if !task.fresh_start
         && task.pr_recovery.is_none()
         && task.review_branch.is_none()
@@ -4619,14 +4649,17 @@ async fn attempt(
     // The free-space gate, checked *before* anything is minted: a task that
     // waits out a full disk costs nothing yet, and must not spend an attempt
     // or start a run the machine cannot finish. Held tasks stay in the list
-    // for the human to see, and `magi task release` re-queues them when space
-    // comes back - the same recovery as any other hold. A volume whose free
+    // for the human to see; triage requeues them automatically when capacity
+    // and output reservations permit the same execution to resume. A volume whose free
     // space cannot be measured closes the gate too: starting a run blind on a
     // disk that may be full is how the machine ends up with 6.7 GB free.
     if let Some(reason) = disk_gate(&repo, &config) {
         task.notice_cause("disk-space", None, None);
         task.last_error = Some(reason.clone());
+        let disk_checked_at = task.disk_checked_at;
         task.hold_machine(Some(reason.clone()));
+        task.mark_disk_capacity();
+        task.disk_checked_at = disk_checked_at;
         record(queue, task);
         tracing::warn!("holding {} for want of disk space: {reason}", task.short());
         // Stable wording - the free-space figures live in the task's hold
@@ -4634,7 +4667,7 @@ async fn attempt(
         notices::raise(
             Notice::warn(
                 &format!("disk:{}", repo.display()),
-                format!("Task {} held for want of free disk space: {reason}. Free some, then release it from the queue.", task.id),
+                format!("Task {} is waiting for disk space. It will resume automatically when disk and output admission checks succeed.", task.id),
             )
             .link(Link::Task {
                 id: task.id.clone(),
@@ -4751,6 +4784,16 @@ async fn attempt(
             "pinned run cannot resume; inspect `magi show {run}` and restore the existing run before `magi task release {}`; no replacement task was started",
             task.id
         )));
+        record(queue, task);
+        return Vec::new();
+    }
+    // Automatic disk recovery resumes its retained run or stops: a changed
+    // seat count or review branch must not turn it into a new competition.
+    // No attempt is spent here.
+    if let Some(run) = &task.disk_resume_run
+        && starter != Starter::Resume(run.clone())
+    {
+        task.hold_manual(Some("Automatic disk recovery cannot resume the retained execution safely: the task's current settings would start a different run. Inspect its state and recovery approvals; no replacement competition was started.".into()));
         record(queue, task);
         return Vec::new();
     }
@@ -5671,9 +5714,13 @@ fn disk_gate_with<F: Fn(&Path) -> Result<u64>>(
     if let Some(cache) = config.cache_dir() {
         paths.push(cache);
     }
-    if let Some(root) = &config.graph.worktree_root {
-        paths.push(root.clone());
-    }
+    paths.push(
+        config
+            .graph
+            .worktree_root
+            .clone()
+            .unwrap_or_else(crate::run::default_worktree_root),
+    );
     for path in paths {
         let probe = if path == repo {
             path.as_path()
@@ -7581,6 +7628,43 @@ mod tests {
             None,
             "comfortably above the floor is open"
         );
+    }
+
+    #[test]
+    fn disk_gate_with_checks_cache_and_worktree_volumes_and_measurement_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let cache = dir.path().join("cache");
+        let worktrees = dir.path().join("worktrees");
+        for path in [&repo, &cache, &worktrees] {
+            std::fs::create_dir(path).unwrap();
+        }
+        let mut cfg = Config::default();
+        cfg.graph.worktree_root = Some(worktrees.clone());
+        cfg.verify.gate = vec![format!(
+            "CARGO_TARGET_DIR='{}' cargo build",
+            cache.display()
+        )];
+        for blocked in [&cache, &worktrees] {
+            for unmeasured in [false, true] {
+                assert!(
+                    disk_gate_with(&repo, &cfg, |path| {
+                        if path == blocked {
+                            if unmeasured {
+                                Err(anyhow::anyhow!("measurement failed"))
+                            } else {
+                                Ok(0)
+                            }
+                        } else {
+                            Ok(u64::MAX)
+                        }
+                    })
+                    .is_some(),
+                    "a blocked secondary output volume must close admission"
+                );
+            }
+        }
+        assert!(disk_gate_with(&repo, &cfg, |_| Ok(u64::MAX)).is_none());
     }
 
     #[test]
@@ -10573,6 +10657,38 @@ mod tests {
             home,
             worktrees,
         )
+    }
+
+    #[tokio::test]
+    async fn disk_wait_maintenance_recovers_while_another_task_is_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let (opts, queue, _, home, worktrees) = idle_loop(dir.path());
+        let mut waiting = task();
+        waiting.repo = opts.repo.clone();
+        waiting.hold_machine(crate::disk::gate(1, 100));
+        waiting.mark_disk_capacity();
+        waiting.attempts = 2;
+        queue.put(&mut waiting).unwrap();
+        let mut busy = task();
+        busy.status = TaskStatus::Running;
+        queue.put(&mut busy).unwrap();
+        let payload = serde_json::to_value(ServiceWorker {
+            opts,
+            queue: queue.root().to_owned(),
+            worktrees_root: worktrees,
+            operation: "maintenance".into(),
+        })
+        .unwrap();
+        run_service_worker(&home, payload.clone()).await.unwrap();
+        assert_eq!(queue.get(&waiting.id).unwrap().status, TaskStatus::Queued);
+        assert_eq!(queue.get(&waiting.id).unwrap().attempts, 2);
+        assert_eq!(queue.get(&busy.id).unwrap().status, TaskStatus::Running);
+        run_service_worker(&home, payload).await.unwrap();
+        assert!(
+            crate::worker::active(&home).unwrap().is_empty(),
+            "monitoring only queues; normal dispatch owns launches"
+        );
+        assert_eq!(queue.get(&waiting.id).unwrap().attempts, 2);
     }
 
     #[tokio::test]

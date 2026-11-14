@@ -5112,8 +5112,8 @@ fn task_recovery(task: &Task) -> Option<String> {
     }
     text.push_str(match task.hold_source {
         Some(HoldSource::Manual) => "Manual hold: an operator must explicitly Release when ready.",
-        Some(HoldSource::Machine) if task.hold_reason.as_deref().is_some_and(crate::disk::is_gate_reason) =>
-            "Machine disk hold: free disk space or restore measurement. Recorded disk figures describe the hold time, not current capacity. If no recovery decision is pending, triage rechecks the disk gate and can automatically queue after recovery is verified. Pending decisions must be resolved or applied first; disk admission checks still apply.",
+        Some(HoldSource::Machine) if task.has_disk_capacity_cause() || crate::triage::disk_wait_eligible(task) =>
+            "Disk wait (automatically monitored): the same task resumes when disk floors and output reservations permit. Recorded figures describe the hold time, not current capacity; triage rechecks admission automatically. Untouched automatic disk triage questions are superseded without an owner answer; owner decisions and unrelated approvals still require explicit resolution.",
         Some(HoldSource::Machine) => "Machine hold: triage rechecks supported recovery conditions; otherwise resolve the recovery decision in the owning task chat.",
         None => "Hold origin unknown: inspect the recorded reason and task chat before explicitly releasing.",
     });
@@ -22239,6 +22239,7 @@ mod tests {
             Source::Human,
         );
         task.hold_machine(crate::disk::gate(2_667_941_888, 3_221_225_472));
+        task.mark_disk_capacity();
         queue.put(&mut task).unwrap();
         let mut records = Vec::new();
         for node in [crate::triage::NODE, crate::triage::DEPS_NODE] {
@@ -22268,7 +22269,7 @@ mod tests {
             view["recovery"]
                 .as_str()
                 .unwrap()
-                .contains("If no recovery decision is pending")
+                .contains("Disk wait (automatically monitored)")
         );
         for blocker in view["blockers"].as_array().unwrap() {
             assert!(blocker["destination"].is_null());
@@ -22332,6 +22333,7 @@ mod tests {
         assert!(text.contains("clears its dependency references"));
         task.hold_source = Some(HoldSource::Machine);
         task.hold_reason = crate::disk::gate(2_667_941_888, 3_221_225_472);
+        task.mark_disk_capacity();
         let view = TaskView::with_inventory(
             task.clone(),
             &crate::blockers::Inventory::new(vec![task.clone()], &[]),

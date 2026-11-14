@@ -139,7 +139,8 @@ use crate::id_reserve::{IdSource, path_exists};
 /// Old passes default to unknown and use settlement order as an approximation.
 /// 20: persist the task decision chat destination, defaulting to absent.
 /// 21: repository assignment history and execution boundaries, empty on old tasks.
-pub const SCHEMA: u32 = 21;
+/// 22: typed disk resource waits and a retained execution pin for automatic recovery.
+pub const SCHEMA: u32 = 22;
 
 /// Candidate order only: all claims, lanes and eligibility gates still apply.
 /// Upgrade-parked runs retain their pass-start order ahead of ordinary work,
@@ -153,6 +154,22 @@ pub(crate) fn dispatch_order(a: &Task, b: &Task) -> std::cmp::Ordering {
         (None, Some(_)) => std::cmp::Ordering::Greater,
         (None, None) => b.priority.cmp(&a.priority).then(a.id.cmp(&b.id)),
     }
+}
+
+/// Resource waits eligible for automatic admission checks, never owner approval.
+///
+/// Bound to the `hold_reason` it was recorded with: [`Task::has_disk_capacity_cause`]
+/// honours it only while the task still carries that exact reason, so a later
+/// hold that rewrites the reason invalidates it even if a transition forgets to
+/// clear the cause.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum MachineHoldCause {
+    /// The disk floor or an output reservation prevented execution.
+    DiskCapacity {
+        /// The exact `hold_reason` the hold was placed with.
+        reason: String,
+    },
 }
 
 /// Who placed the current hold.
@@ -396,6 +413,15 @@ pub struct Task {
     /// see [`Task::operator_held`] for its deliberately conservative meaning.
     #[serde(default)]
     pub hold_source: Option<HoldSource>,
+    /// Disk resource wait recorded by the admission gate; never owner consent.
+    #[serde(default)]
+    pub machine_hold_cause: Option<MachineHoldCause>,
+    /// Automatic resource recovery must resume this execution, never compete again.
+    #[serde(default)]
+    pub disk_resume_run: Option<String>,
+    /// Last bounded disk-monitor pass; persisted across scheduler replacement.
+    #[serde(default)]
+    pub disk_checked_at: Option<Timestamp>,
     /// Diagnostic detail excerpted from the run that led to a hold - what a
     /// human would have found opening `artifacts/` by hand, not the one-line
     /// reason in [`Task::last_error`]. Set only when a run's own attempts are
@@ -987,6 +1013,9 @@ impl Task {
             last_error: None,
             hold_reason: None,
             hold_source: None,
+            machine_hold_cause: None,
+            disk_resume_run: None,
+            disk_checked_at: None,
             diagnostic: None,
             blocked_by: Vec::new(),
             block_reason: None,
@@ -1364,6 +1393,9 @@ impl Task {
         self.interrupt = false;
         // The answer has been honoured: the task got its turn.
         self.resume_override = None;
+        // The automatic disk recovery pin is consumed by this start; a later
+        // failure and requeue must retry normally.
+        self.disk_resume_run = None;
     }
 
     /// Attribute a failed reservation once without spending an execution attempt.
@@ -1402,6 +1434,9 @@ impl Task {
         self.park_reason = None;
         self.hold_reason = None;
         self.hold_source = None;
+        self.machine_hold_cause = None;
+        self.disk_resume_run = None;
+        self.disk_checked_at = None;
         self.diagnostic = None;
         self.blocked_by.clear();
         self.block_reason = None;
@@ -1529,6 +1564,9 @@ impl Task {
         self.status = if self.attempts >= self.effective_attempt_limit(max_attempts) {
             self.note_held();
             self.hold_source = Some(HoldSource::Machine);
+            self.machine_hold_cause = None;
+            self.disk_resume_run = None;
+            self.disk_checked_at = None;
             self.hold_reason = Some(why.clone());
             TaskStatus::Held
         } else {
@@ -1664,6 +1702,9 @@ impl Task {
             self.hold_reason = reason;
         }
         self.hold_source = Some(HoldSource::Manual);
+        self.machine_hold_cause = None;
+        self.disk_resume_run = None;
+        self.disk_checked_at = None;
         self.blocked_by.clear();
         self.block_reason = None;
         self.blocked_from = None;
@@ -1681,9 +1722,39 @@ impl Task {
             self.hold_reason = reason;
         }
         self.hold_source = Some(HoldSource::Machine);
+        self.machine_hold_cause = None;
+        self.disk_resume_run = None;
+        self.disk_checked_at = None;
         self.blocked_by.clear();
         self.block_reason = None;
         self.blocked_from = None;
+    }
+
+    /// Record the disk-capacity cause bound to the current `hold_reason`.
+    pub(crate) fn mark_disk_capacity(&mut self) {
+        self.machine_hold_cause = Some(MachineHoldCause::DiskCapacity {
+            reason: self.hold_reason.clone().unwrap_or_default(),
+        });
+    }
+
+    /// Does the structured disk-capacity cause still match the current hold?
+    pub fn has_disk_capacity_cause(&self) -> bool {
+        matches!(
+            (&self.machine_hold_cause, self.hold_reason.as_deref()),
+            (Some(MachineHoldCause::DiskCapacity { reason }), Some(now)) if reason == now
+        )
+    }
+
+    /// Admission waits preserve all execution and approval evidence on recovery.
+    pub(crate) fn resume_disk_wait(&mut self) {
+        let retained = self.execution_runs().last().cloned();
+        self.status = TaskStatus::Queued;
+        self.held_at = None;
+        self.hold_source = None;
+        self.hold_reason = None;
+        self.machine_hold_cause = None;
+        self.last_error = None;
+        self.disk_resume_run = retained;
     }
 
     /// Block this task on other task ids and/or open question ids, chosen by
@@ -1982,6 +2053,12 @@ impl Task {
             // this revised instruction. Title-only edits preserve the pin.
             self.resume_override = None;
         }
+        if self.status == TaskStatus::Held && self.machine_hold_cause.is_some() {
+            self.hold_manual(self.hold_reason.clone());
+        }
+        self.machine_hold_cause = None;
+        self.disk_resume_run = None;
+        self.disk_checked_at = None;
         self.title = title;
         self.instruction = instruction;
         Ok(())
@@ -2012,6 +2089,9 @@ impl Task {
         self.note_held();
         self.status = TaskStatus::Held;
         self.hold_source = Some(HoldSource::Machine);
+        self.machine_hold_cause = None;
+        self.disk_resume_run = None;
+        self.disk_checked_at = None;
         self.hold_reason = Some(why.clone());
         self.last_error = Some(why);
     }
@@ -2143,6 +2223,9 @@ impl Task {
         // belonged to whatever it was waiting on last time.
         self.hold_reason = None;
         self.hold_source = None;
+        self.machine_hold_cause = None;
+        self.disk_resume_run = None;
+        self.disk_checked_at = None;
         self.diagnostic = None;
         // A release also un-blocks: the dependency or question `blocked_by`
         // named may still be unresolved, but a human (or `crate::conduct`)
@@ -2718,6 +2801,17 @@ impl Queue {
         self.put_unlocked(task)
     }
 
+    /// Save a disk monitor transition only while its complete task snapshot matches.
+    pub(crate) fn commit_disk_wait(&self, task: &mut Task, expected: &Task) -> Result<()> {
+        let _lock = self.lock_task(&task.id)?;
+        anyhow::ensure!(
+            serde_json::to_value(self.get(&task.id)?)? == serde_json::to_value(expected)?,
+            "task changed during disk monitoring"
+        );
+        task.schema = task.schema.max(SCHEMA);
+        self.write_record_inner(task, false)
+    }
+
     /// Commit one validated reassignment under the task write lock.
     pub(crate) fn commit_reassignment(&self, task: &mut Task, expected: &Task) -> Result<()> {
         let _lock = self.lock_task(&task.id)?;
@@ -2762,6 +2856,9 @@ impl Queue {
                     task.resume_override = stored.resume_override.clone();
                     task.status = stored.status;
                     task.hold_source = stored.hold_source;
+                    task.machine_hold_cause = stored.machine_hold_cause.clone();
+                    task.disk_resume_run = stored.disk_resume_run.clone();
+                    task.disk_checked_at = stored.disk_checked_at;
                     task.hold_reason = stored.hold_reason.clone();
                     task.held_at = stored.held_at;
                 }
@@ -2774,6 +2871,9 @@ impl Queue {
                     task.resume_override = stored.resume_override.clone();
                     task.status = stored.status;
                     task.hold_source = stored.hold_source;
+                    task.machine_hold_cause = stored.machine_hold_cause.clone();
+                    task.disk_resume_run = stored.disk_resume_run.clone();
+                    task.disk_checked_at = stored.disk_checked_at;
                     task.hold_reason = stored.hold_reason.clone();
                     task.held_at = stored.held_at;
                 }
@@ -2848,6 +2948,10 @@ impl Queue {
 
     /// Stamp and write `task` atomically; the caller holds the id's lock.
     fn write_record(&self, task: &mut Task) -> Result<()> {
+        self.write_record_inner(task, true)
+    }
+
+    fn write_record_inner(&self, task: &mut Task, notify: bool) -> Result<()> {
         task.import_chat_notice();
         task.updated_at = Timestamp::now();
         std::fs::create_dir_all(&self.root)
@@ -2862,7 +2966,7 @@ impl Queue {
         // through a process-global, so a queue in a temp directory notifies
         // into that directory.
         if let (Some(notice), Some(home)) = (
-            crate::notices::task_held(task),
+            notify.then(|| crate::notices::task_held(task)).flatten(),
             self.root.parent().filter(|p| !p.as_os_str().is_empty()),
         ) {
             crate::notices::raise_in(home, notice);
@@ -3565,7 +3669,7 @@ fn read_path(path: &Path) -> Result<Task> {
     #[cfg(test)]
     TASK_READS.with(|count| count.set(count.get() + 1));
     let body = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    let task: Task =
+    let mut task: Task =
         serde_json::from_str(&body).with_context(|| format!("parse {}", path.display()))?;
     // Greater-than, not not-equal: every field added since schema 1 carries
     // `#[serde(default)]`, so an older task has nothing to say about it and
@@ -3579,6 +3683,17 @@ fn read_path(path: &Path) -> Result<Task> {
             task.id,
             task.schema
         );
+    }
+    if task.schema < 22
+        && task.status == TaskStatus::Held
+        && task.hold_source == Some(HoldSource::Machine)
+        && task.resume_override.is_none()
+        && task
+            .hold_reason
+            .as_deref()
+            .is_some_and(crate::disk::is_gate_reason)
+    {
+        task.mark_disk_capacity();
     }
     Ok(task)
 }
@@ -4125,6 +4240,14 @@ mod tests {
         let listed = crate::notices::Notices::at(dir.path().join("notifications")).list();
         assert_eq!(listed.len(), 1);
         assert!(listed[0].message.contains("out of attempts"));
+    }
+
+    #[test]
+    fn start_consumes_the_disk_resume_pin() {
+        let mut t = task("pin");
+        t.disk_resume_run = Some("run-1".into());
+        t.start("run-1".into());
+        assert!(t.disk_resume_run.is_none());
     }
 
     fn task(title: &str) -> Task {

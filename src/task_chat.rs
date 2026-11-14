@@ -132,7 +132,7 @@ pub(crate) fn destination_in(talks: &Talks, repo: &Path, id: &str) -> Result<tal
 }
 
 /// Build task-owned discussion and control guidance for current intent.
-fn live_record(home: &Path, task: &Task, q: &Question) -> crate::task_inquiry::Inquiry {
+pub(crate) fn live_record(home: &Path, task: &Task, q: &Question) -> crate::task_inquiry::Inquiry {
     let run = if q.run == task.id {
         task.runs.last().map(String::as_str).unwrap_or("none")
     } else {

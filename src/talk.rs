@@ -3250,6 +3250,10 @@ pub fn briefing_for(
          the queue or a registered watch; do not promise an unregistered future message. A task you file reports back \
          into this conversation automatically when it finishes, is held or \
          fails, as a message headed \"{notice}\".\n\n\
+         Recognized disk-capacity holds are automatically monitored resource waits. \
+         They resume the same task after disk and output admission succeed; do not \
+         release them individually. Owner holds, discussion and unrelated approvals \
+         still require explicit resolution in the task chat.\n\n\
          For a background command you run yourself, register it with \
          `magi talk watch --timeout 900 -- <executable> <arguments...>`, for \
          example `magi talk watch -- cargo test --locked`. It uses your \
