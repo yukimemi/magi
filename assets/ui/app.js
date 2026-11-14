@@ -2653,7 +2653,7 @@ function updateTaskCard(row, task) {
     ? `${meta.note} Waiting on: ${waitingOn}`
     : meta.note || (waitingOn ? `Waiting on: ${waitingOn}` : "");
   if (status === "parked" && task.park_reason) noteText = `${meta.note} ${task.park_reason}`;
-  if (status === "held" && task.machine_hold_cause === "disk_capacity") {
+  if (status === "held" && (task.machine_hold_cause && task.machine_hold_cause.kind === "disk_capacity")) {
     noteText = `Disk wait (automatically monitored). Capacity and output reservations are rechecked before resuming. ${waitingOn || ""}`;
   }
 

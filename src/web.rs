@@ -22239,6 +22239,7 @@ mod tests {
             Source::Human,
         );
         task.hold_machine(crate::disk::gate(2_667_941_888, 3_221_225_472));
+        task.mark_disk_capacity();
         queue.put(&mut task).unwrap();
         let mut records = Vec::new();
         for node in [crate::triage::NODE, crate::triage::DEPS_NODE] {
@@ -22268,7 +22269,7 @@ mod tests {
             view["recovery"]
                 .as_str()
                 .unwrap()
-                .contains("If no recovery decision is pending")
+                .contains("Disk wait (automatically monitored)")
         );
         for blocker in view["blockers"].as_array().unwrap() {
             assert!(blocker["destination"].is_null());
@@ -22331,8 +22332,8 @@ mod tests {
         assert!(text.contains("restores held"));
         assert!(text.contains("clears its dependency references"));
         task.hold_source = Some(HoldSource::Machine);
-        task.mark_disk_capacity();
         task.hold_reason = crate::disk::gate(2_667_941_888, 3_221_225_472);
+        task.mark_disk_capacity();
         let view = TaskView::with_inventory(
             task.clone(),
             &crate::blockers::Inventory::new(vec![task.clone()], &[]),
