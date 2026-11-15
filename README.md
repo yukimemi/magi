@@ -773,6 +773,15 @@ without an owner answer. Manual holds, owner replies or discussion, unrelated
 approvals and ambiguous old records still require explicit resolution; the task
 chat explains these exceptions while eligible tasks continue recovering.
 
+Triage displays use saved question status, not migration's execution-only
+unanswered projection. An answered question is history, even while its decision
+still needs application or confirmation in Pending decisions. Applied answers
+are never replayed. After “not yet”, the task stays manually held; after seven
+untouched days, triage can file a fresh question with resume, keep-held and
+discard choices. To change course immediately, use `magi task release <id>` or
+`magi task rm <id>` (their existing safety checks still apply), as shown by
+`magi task show`. Do not answer the consumed question again.
+
 The notification store is a durable outbox. The daemon coalesces queued reports
 per chat, checks whether the cause cleared, and suppresses reports already
 covered by a related question or posted completion report. Read/dismissed legacy

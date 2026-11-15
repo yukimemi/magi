@@ -31,7 +31,7 @@
 //! on why the dedupe check there also filters on `node`, not `run` alone: an
 //! ordinary graph question's `run` is a real run id, and a coincidental
 //! equality with some task's id must not be read as "about this task").
-//! [`latest_triage_question`] follows the identical rule.
+//! [`RecoveryIndex`] follows the identical rule.
 //!
 //! # Why answers apply here rather than through `crate::queue::Task::block`
 //!
@@ -57,7 +57,7 @@
 //! `crate::conduct` and a later triage pass leave alone.
 //!
 //! The choice is read by its **position** in [`Question::choices`]
-//! ([`Wording::choices3`]/[`Wording::choices2`] always put "resume" first and
+//! ([`Wording::choices3`] always puts "resume" first and
 //! "discard" third), never by comparing the answer text against [`Wording`]'s
 //! own strings picked from whatever config is in force *now* - the language a
 //! question was filed in and the language a later `run_once` call happens to
@@ -127,8 +127,6 @@ struct Wording {
     resume: &'static str,
     wait: &'static str,
     discard: &'static str,
-    resume_now: &'static str,
-    keep_held: &'static str,
 }
 
 const EN: Wording = Wording {
@@ -136,8 +134,6 @@ const EN: Wording = Wording {
     resume: "resume it",
     wait: "not yet",
     discard: "discard it",
-    resume_now: "resume it",
-    keep_held: "keep it held",
 };
 
 const JA: Wording = Wording {
@@ -145,8 +141,6 @@ const JA: Wording = Wording {
     resume: "再開してよい",
     wait: "まだ待って",
     discard: "捨ててよい",
-    resume_now: "再開する",
-    keep_held: "まだ止めておく",
 };
 
 /// Pick the wording. Codes and names both, the same acceptance
@@ -166,10 +160,6 @@ impl Wording {
             self.wait.to_owned(),
             self.discard.to_owned(),
         ]
-    }
-
-    fn choices2(&self) -> Vec<String> {
-        vec![self.resume_now.to_owned(), self.keep_held.to_owned()]
     }
 
     fn source_label(&self, source: Option<HoldSource>) -> &'static str {
@@ -558,19 +548,19 @@ fn already_applied(task: &Task, q: &Question) -> bool {
         .is_some_and(|r| r.contains(marker.as_str()))
 }
 
-/// The most recent question this module filed for `task_id`, any status -
-/// open (still waiting), answered (may need applying), or abandoned (settled
-/// with nothing decided). Filters on both `node` and `run`, never `run`
-/// alone - see this module's doc on why a bare `run` match is not safe.
-fn latest_triage_question(questions: &Questions, task_id: &str) -> Option<Question> {
-    latest_question(questions, NODE, task_id)
+/// Applied answers remain consumed even when migration fences their saved reply.
+fn consumed(task: &Task, q: &Question) -> bool {
+    if q.node == NODE {
+        already_applied(task, q)
+    } else {
+        task.triage_applied(&q.id)
+    }
 }
 
 /// Latest recovery questions from one effect-view scan. Task filename ids
 /// participate in prefix resolution even when their records are unreadable.
 pub(crate) struct RecoveryIndex {
     latest: std::collections::HashMap<(String, String), Question>,
-    open: std::collections::BTreeSet<String>,
 }
 
 impl RecoveryIndex {
@@ -609,7 +599,6 @@ impl RecoveryIndex {
         }
         let mut index = Self {
             latest: Default::default(),
-            open: Default::default(),
         };
         for q in all {
             if q.node != NODE && q.node != DEPS_NODE {
@@ -626,9 +615,6 @@ impl RecoveryIndex {
                 })
             {
                 continue;
-            }
-            if q.status.open() {
-                index.open.insert(q.run.clone());
             }
             let key = (q.node.clone(), q.run.clone());
             let entry = index.latest.entry(key).or_insert_with(|| q.clone());
@@ -650,23 +636,25 @@ impl RecoveryIndex {
             .into_iter()
             .filter_map(|node| {
                 self.latest(node, &task.id).filter(|q| {
-                    q.status.open()
-                        || awaiting_task_chat(q, task)
-                        || (q.status == QuestionStatus::Answered
-                            && if node == NODE {
-                                !already_applied(task, q)
-                            } else {
-                                !task.triage_applied(&q.id)
-                            })
+                    !consumed(task, q)
+                        && (q.status.open()
+                            || awaiting_task_chat(q, task)
+                            || q.status == QuestionStatus::Answered)
                 })
             })
             .collect()
     }
-}
 
-/// Single-task compatibility entry point; batch callers retain the index.
-fn latest_question(questions: &Questions, node: &str, task_id: &str) -> Option<Question> {
-    RecoveryIndex::load(questions).latest(node, task_id)
+    fn displayed_open(&self, task: &Task) -> Option<Question> {
+        [NODE, DEPS_NODE]
+            .into_iter()
+            .filter(|node| {
+                task.status == TaskStatus::Held
+                    || (*node == DEPS_NODE && task.status == TaskStatus::Blocked)
+            })
+            .filter_map(|node| self.latest(node, &task.id))
+            .find(|q| q.status.open() && !consumed(task, q))
+    }
 }
 
 /// What an answered triage question's choice means, independent of which
@@ -674,7 +662,7 @@ fn latest_question(questions: &Questions, node: &str, task_id: &str) -> Option<Q
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AnswerAction {
     /// The first choice, always "resume it" / "再開してよい" / "再開する" -
-    /// see [`Wording::choices3`] and [`Wording::choices2`], whose first entry
+    /// see [`Wording::choices3`], whose first entry
     /// is always the resume choice.
     Resume,
     /// The third choice, present only in [`Wording::choices3`]: "discard it"
@@ -731,7 +719,7 @@ fn keep_held_note(task: &Task, q: &Question, resolution: &str) -> String {
 
 /// File a fresh triage question for `task` and return it. The caller is
 /// responsible for having already established there is no open one - see
-/// [`latest_triage_question`] - so this never checks again.
+/// [`RecoveryIndex`] - so this never checks again.
 fn file_question(
     questions: &Questions,
     ownership: &crate::task_chat::InquiryOwnership,
@@ -764,7 +752,7 @@ fn file_question(
             (
                 w.summary_manual_stale(task, days),
                 w.why_manual().to_owned(),
-                w.choices2(),
+                w.choices3(),
             )
         }
     };
@@ -1160,6 +1148,9 @@ fn ask_about_stuck_roots(
         .filter(|q| q.node == DEPS_NODE && q.status.open())
         .cloned()
     {
+        if inv.task(&q.run).is_some_and(|task| consumed(task, &q)) {
+            continue;
+        }
         if !frozen.contains_key(&q.run) {
             q.abandon("nothing waits on this task anymore");
             let _ = questions.put_executable_in(&mut q, &ownership);
@@ -1201,8 +1192,10 @@ fn ask_about_stuck_roots(
         }
         let latest = recovery.latest(DEPS_NODE, root_id);
         match latest.as_ref() {
-            Some(q) if q.status.open() || awaiting_task_chat(q, root) => continue,
-            Some(q) if q.status == QuestionStatus::Answered && !root.triage_applied(&q.id) => {
+            Some(q) if !consumed(root, q) && (q.status.open() || awaiting_task_chat(q, root)) => {
+                continue;
+            }
+            Some(q) if q.status == QuestionStatus::Answered && !consumed(root, q) => {
                 continue;
             }
             Some(q) if q.status == QuestionStatus::Abandoned => {
@@ -1747,7 +1740,7 @@ fn run_once_with_probe(
         }
 
         if let Some(q) = recovery.latest(NODE, &task.id) {
-            if q.status.open() || awaiting_task_chat(&q, &task) {
+            if !consumed(&task, &q) && (q.status.open() || awaiting_task_chat(&q, &task)) {
                 // Already asked, still waiting - nothing to do this pass.
                 continue;
             }
@@ -1818,7 +1811,9 @@ fn run_once_with_probe(
 /// its hold reason. `None` once it is answered or abandoned: nothing is
 /// waiting on it anymore.
 pub fn open_question_for(questions: &Questions, task_id: &str) -> Option<Question> {
-    latest_triage_question(questions, task_id).filter(|q| q.status.open())
+    let queue = question_queue(questions);
+    let task = queue.get(task_id).ok()?;
+    display_index(questions, &queue, std::slice::from_ref(&task)).displayed_open(&task)
 }
 
 /// Does this module still have unfinished business with `task`?
@@ -1857,8 +1852,9 @@ fn awaiting_task_chat(q: &Question, task: &Task) -> bool {
 /// answer and the next [`run_once`] pass must not be walked through.
 fn deps_pending_in(recovery: &RecoveryIndex, task: &Task) -> bool {
     match recovery.latest(DEPS_NODE, &task.id) {
+        Some(q) if consumed(task, &q) => false,
         Some(q) if q.status.open() || awaiting_task_chat(&q, task) => true,
-        Some(q) if q.status == QuestionStatus::Answered => !task.triage_applied(&q.id),
+        Some(q) if q.status == QuestionStatus::Answered => true,
         _ => false,
     }
 }
@@ -1868,7 +1864,29 @@ fn deps_pending_in(recovery: &RecoveryIndex, task: &Task) -> bool {
 /// decision, rather than have it read identically to one nobody has looked
 /// at yet.
 pub fn open_task_ids(questions: &Questions) -> std::collections::BTreeSet<String> {
-    RecoveryIndex::load(questions).open
+    let queue = question_queue(questions);
+    let tasks = queue.list();
+    let index = display_index(questions, &queue, &tasks);
+    tasks
+        .iter()
+        .filter(|task| index.displayed_open(task).is_some())
+        .map(|task| task.id.clone())
+        .collect()
+}
+
+fn question_queue(questions: &Questions) -> Queue {
+    Queue::at(
+        questions
+            .root()
+            .parent()
+            .unwrap_or(Path::new(""))
+            .join("queue"),
+    )
+}
+
+/// Presentation reads saved answers, never the execution-only migration fence.
+fn display_index(questions: &Questions, queue: &Queue, tasks: &[Task]) -> RecoveryIndex {
+    RecoveryIndex::from_scan(queue, tasks, questions.list())
 }
 
 #[cfg(test)]
@@ -2381,15 +2399,17 @@ mod tests {
         );
         queue.put(&mut t).unwrap();
         let index = RecoveryIndex::from_scan(&queue, &[t.clone()], all.clone());
-        assert!(index.open.is_empty());
+        assert!(index.latest.is_empty());
         // Unreadable filenames still make prefixes and suffixes ambiguous.
         std::fs::write(queue.path_of("task-alphabet-other"), "{").unwrap();
         std::fs::write(queue.path_of("broken-end"), "{").unwrap();
         let index = RecoveryIndex::from_scan(&queue, &[t.clone()], all.clone());
-        assert_eq!(index.open, ["end".into(), "task-alpha".into()].into());
+        assert!(index.latest(NODE, "end").is_some());
+        assert!(index.latest(NODE, "task-alpha").is_some());
+        assert!(index.latest(NODE, &t.id).is_none());
         all[0].detail.push_str("changed evidence");
         let index = RecoveryIndex::from_scan(&queue, &[t], all);
-        assert!(index.open.contains("task-alpha-end"));
+        assert!(index.latest(NODE, "task-alpha-end").is_some());
         assert_eq!(questions.list().len(), 0);
     }
 
@@ -3389,7 +3409,7 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_manual_hold_earns_a_two_choice_question() {
+    fn a_stale_manual_hold_can_be_discarded() {
         let (dir, q, questions) = store();
         let mut t = task("been sitting a while", dir.path().join("repo"));
         t.hold_manual(Some("waiting on a decision".to_owned()));
@@ -3411,7 +3431,13 @@ mod tests {
             .filter(|q| q.status.open())
             .collect();
         assert_eq!(open.len(), 1);
-        assert_eq!(open[0].choices.len(), 2);
+        let mut asked = open[0].clone();
+        asked
+            .answer(Answer::Choice(asked.choices[2].clone()))
+            .unwrap();
+        questions.put(&mut asked).unwrap();
+        run_once(&q, &questions, None, Timestamp::now());
+        assert!(q.get(&t.id).is_err());
     }
 
     #[test]
@@ -3698,5 +3724,102 @@ mod tests {
             !pending_for(&questions, &after),
             "the answer is applied now, nothing left pending"
         );
+    }
+
+    #[test]
+    fn migrated_keep_held_is_consumed_but_can_be_reviewed_and_discarded_again() {
+        let (dir, queue, questions) = store();
+        let mut t = task("keep held", dir.path().join("repo"));
+        t.hold_machine(Some("unresolved cause".into()));
+        queue.put(&mut t).unwrap();
+        run_once(&queue, &questions, None, Timestamp::now());
+        let mut old = questions.list().remove(0);
+        old.answer(Answer::Choice(old.choices[1].clone())).unwrap();
+        questions.put(&mut old).unwrap();
+        run_once(&queue, &questions, None, Timestamp::now());
+        let held = queue.get(&t.id).unwrap();
+        assert!(held.triage_applied(&old.id));
+
+        let migration = dir.path().join("notifications/task-chat-migration-v1");
+        std::fs::create_dir_all(&migration).unwrap();
+        std::fs::write(
+            migration.join("state.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schema": 1, "classification_revision": 1, "pending": [], "sources": [old.id]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(questions.list_for_effects()[0].status.open());
+        assert!(!pending_for(&questions, &held));
+        assert!(open_question_for(&questions, &t.id).is_none());
+        assert!(!open_task_ids(&questions).contains(&t.id));
+        assert!(old.answer(Answer::Choice(old.choices[2].clone())).is_err());
+        assert!(
+            run_once(&queue, &questions, None, Timestamp::now())
+                .answered
+                .is_empty()
+        );
+
+        let later = held.updated_at + SignedDuration::from_hours(24 * 8);
+        assert_eq!(
+            run_once(&queue, &questions, None, later).asked,
+            [t.id.clone()]
+        );
+        let mut fresh = open_question_for(&questions, &t.id).unwrap();
+        assert_ne!(fresh.id, old.id);
+        assert_eq!(fresh.choices[2], EN.discard);
+        fresh
+            .answer(Answer::Choice(fresh.choices[2].clone()))
+            .unwrap();
+        questions.put(&mut fresh).unwrap();
+        assert_eq!(
+            run_once(&queue, &questions, None, later).answered,
+            [t.id.clone()]
+        );
+        assert!(queue.get(&t.id).is_err());
+        assert_eq!(
+            questions.read_history(&old.id).unwrap().resolution(),
+            Some(EN.wait.into())
+        );
+    }
+
+    #[test]
+    fn migrated_unapplied_answers_remain_fenced_but_are_not_displayed_open() {
+        for node in [NODE, DEPS_NODE] {
+            let (dir, queue, questions) = store();
+            let mut t = task("unapplied", dir.path().join("repo"));
+            t.hold_manual(Some("waiting".into()));
+            queue.put(&mut t).unwrap();
+            let mut q = Question::new(
+                t.id.clone(),
+                node.into(),
+                SEAT.into(),
+                "unapplied".into(),
+                String::new(),
+                EN.choices3(),
+            );
+            q.answer(Answer::Choice(q.choices[0].clone())).unwrap();
+            questions.put(&mut q).unwrap();
+            let migration = dir.path().join("notifications/task-chat-migration-v1");
+            std::fs::create_dir_all(&migration).unwrap();
+            std::fs::write(
+                migration.join("state.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "schema": 1, "classification_revision": 1, "pending": [], "sources": [q.id]
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            assert!(pending_for(&questions, &t));
+            assert!(open_question_for(&questions, &t.id).is_none());
+            assert!(!open_task_ids(&questions).contains(&t.id));
+            assert!(apply_answers(&queue, &questions).is_empty());
+            assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Held);
+            t.mark_triage_applied(&q.id);
+            queue.put(&mut t).unwrap();
+            assert!(!pending_for(&questions, &t));
+            assert!(!deps_pending_in(&RecoveryIndex::load(&questions), &t));
+        }
     }
 }

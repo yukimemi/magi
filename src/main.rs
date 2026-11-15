@@ -3712,6 +3712,19 @@ async fn task_cmd_inner(command: TaskCmd, q: Queue) -> Result<()> {
                     question.choices.join(" / "),
                     question.summary
                 );
+            } else if t.status == TaskStatus::Held
+                && triage::pending_for(&ask::Questions::open(), &t)
+            {
+                println!(
+                    "triage    decision application or confirmation pending; see Pending decisions"
+                );
+            }
+            if t.status == TaskStatus::Held {
+                println!(
+                    "actions   `magi task release {}` to resume; `magi task rm {}` to discard (existing safety checks apply)",
+                    t.short(),
+                    t.short()
+                );
             }
             if let Some(d) = &t.diagnostic {
                 println!("\ndiagnostic\n{d}");
