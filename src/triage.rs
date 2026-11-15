@@ -162,6 +162,15 @@ impl Wording {
         ]
     }
 
+    fn choices_manual(&self) -> Vec<String> {
+        let (resume, wait) = if self.lang == "ja" {
+            ("再開する", "まだ止めておく")
+        } else {
+            ("resume it", "keep it held")
+        };
+        vec![resume.to_owned(), wait.to_owned(), self.discard.to_owned()]
+    }
+
     fn source_label(&self, source: Option<HoldSource>) -> &'static str {
         match (self.lang, source) {
             ("ja", Some(HoldSource::Machine)) => "machine（機械による自動保留）",
@@ -752,7 +761,7 @@ fn file_question(
             (
                 w.summary_manual_stale(task, days),
                 w.why_manual().to_owned(),
-                w.choices3(),
+                w.choices_manual(),
             )
         }
     };
@@ -3432,6 +3441,11 @@ mod tests {
             .collect();
         assert_eq!(open.len(), 1);
         let mut asked = open[0].clone();
+        assert_eq!(asked.choices, ["resume it", "keep it held", "discard it"]);
+        assert_eq!(
+            JA.choices_manual(),
+            ["再開する", "まだ止めておく", "捨ててよい"]
+        );
         asked
             .answer(Answer::Choice(asked.choices[2].clone()))
             .unwrap();

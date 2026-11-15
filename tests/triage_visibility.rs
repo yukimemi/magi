@@ -26,6 +26,7 @@ fn answered_triage_is_history_and_done_tasks_have_no_open_annotation() {
     );
     task.hold_manual(Some("waiting".into()));
     queue.put(&mut task).unwrap();
+    assert!(!cli(home.path(), &["task", "show", &task.id]).contains("actions   "));
     let mut question = Question::new(
         task.id.clone(),
         magi::triage::NODE.into(),
@@ -41,6 +42,10 @@ fn answered_triage_is_history_and_done_tasks_have_no_open_annotation() {
     question.answer(Answer::Choice("not yet".into())).unwrap();
     questions.put(&mut question).unwrap();
     task.mark_triage_applied(&question.id);
+    task.hold_manual(Some(format!(
+        "[triage:{}] operator: not yet",
+        question.short()
+    )));
     queue.put(&mut task).unwrap();
     let migration = home.path().join("notifications/task-chat-migration-v1");
     std::fs::create_dir_all(&migration).unwrap();

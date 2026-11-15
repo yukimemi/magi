@@ -3719,7 +3719,11 @@ async fn task_cmd_inner(command: TaskCmd, q: Queue) -> Result<()> {
                     "triage    decision application or confirmation pending; see Pending decisions"
                 );
             }
-            if t.status == TaskStatus::Held {
+            if t.status == TaskStatus::Held
+                && t.hold_reason
+                    .as_deref()
+                    .is_some_and(|r| r.contains("[triage:"))
+            {
                 println!(
                     "actions   `magi task release {}` to resume; `magi task rm {}` to discard (existing safety checks apply)",
                     t.short(),
