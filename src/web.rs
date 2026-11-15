@@ -22254,7 +22254,10 @@ mod tests {
             "a phone must be able to notice a talk's reply without polling every store"
         );
         let Json(observed) = health(State(ui)).await.expect("health");
-        assert_eq!(observed.talks_rev, after, "health exposes the same revision");
+        assert_eq!(
+            observed.talks_rev, after,
+            "health exposes the same revision"
+        );
     }
 
     #[test]
