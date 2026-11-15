@@ -1289,6 +1289,14 @@ version_files = [
   declared files disagreeing on the version, the merged change already raising
   the version itself (the repository's auto-tag releases it; no duplicate PR),
   and a change touching only the release files.
+- **The merged PR is the evidence boundary.** Its complete paginated file list
+  and additions/deletions feed both the release-only guard and the decision
+  prompt; a stale local base branch is never a diff base. Missing, empty or
+  incomplete forge evidence stops the bump and raises a release-step notice.
+  Declared-version comparisons use the confirmed merge commit and its first
+  parent only when that diff matches the PR file statistics. Unavailable commits
+  or a mismatched range (for example, a multi-commit rebase merge) stop rather
+  than infer that the version stayed unchanged.
 - The bump PR, automerge or the owner approval gate (`land_approval`, local
   mode) and the repository's own tagging are unchanged: magi never tags by hand.
 

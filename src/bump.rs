@@ -1408,16 +1408,177 @@ async fn base_has_file(repo: &Path, remote: &str, base: &str, path: &str) -> Res
     Ok(!out.trim().is_empty())
 }
 
-/// The commit a change was cut from: the merge-base of `<remote>/<base>` and
-/// the branch, never a possibly stale local branch. `None` when it cannot be
-/// found or the branch is already contained in the remote base (unknown).
-async fn change_base(dir: &Path, remote: &str, base: &str, branch: &str) -> Option<String> {
-    let tip = git::rev_parse(dir, branch).await.ok()?;
-    let mb = git::git(dir, &["merge-base", &format!("{remote}/{base}"), branch])
+/// Immutable evidence for one merged PR. File/stat evidence comes from the
+/// complete PR file listing, not a local or remote branch that can move.
+#[derive(Debug)]
+struct MergedChange {
+    files: Vec<String>,
+    stat: String,
+    merge: String,
+    numstat: Vec<(String, u64, u64)>,
+}
+
+#[derive(Deserialize)]
+struct PrFile {
+    filename: String,
+    previous_filename: Option<String>,
+    additions: u64,
+    deletions: u64,
+}
+
+fn merged_change_from_pages(
+    merge: String,
+    expected: usize,
+    pages: Vec<Vec<PrFile>>,
+) -> Result<MergedChange> {
+    anyhow::ensure!(
+        merge.len() == 40 && merge.bytes().all(|b| b.is_ascii_hexdigit()),
+        "merged PR has no valid merge commit"
+    );
+    let entries: Vec<_> = pages.into_iter().flatten().collect();
+    let mut seen = std::collections::HashSet::new();
+    anyhow::ensure!(
+        expected > 0
+            && entries.len() == expected
+            && entries.iter().all(|f| seen.insert(&f.filename)),
+        "merged PR file listing is empty, incomplete or duplicated"
+    );
+    let mut files = Vec::new();
+    let mut stat = String::new();
+    let (mut added, mut removed) = (0_u64, 0_u64);
+    let mut numstat: Vec<_> = entries
+        .iter()
+        .map(|f| (f.filename.clone(), f.additions, f.deletions))
+        .collect();
+    numstat.sort();
+    for file in entries {
+        added = added
+            .checked_add(file.additions)
+            .context("PR additions overflow")?;
+        removed = removed
+            .checked_add(file.deletions)
+            .context("PR deletions overflow")?;
+        writeln!(
+            stat,
+            " {} | +{} -{}",
+            file.filename, file.additions, file.deletions
+        )?;
+        // A rename out of a source path is not a release-only change.
+        if let Some(previous) = file.previous_filename {
+            files.push(previous);
+        }
+        files.push(file.filename);
+    }
+    writeln!(
+        stat,
+        " {expected} files changed, {added} insertions(+), {removed} deletions(-)"
+    )?;
+    Ok(MergedChange {
+        files,
+        stat,
+        merge,
+        numstat,
+    })
+}
+
+async fn merged_change(repo: &Path, pr_url: &str) -> Result<MergedChange> {
+    let args = [
+        "pr",
+        "view",
+        pr_url,
+        "--json",
+        "state,mergeCommit,changedFiles,number,url",
+    ]
+    .map(str::to_owned);
+    let (ok, out) = land::gh(repo, &args).await?;
+    anyhow::ensure!(ok, "read merged PR metadata: {out}");
+    let metadata: serde_json::Value = serde_json::from_str(&out)?;
+    anyhow::ensure!(metadata["state"] == "MERGED", "PR is not confirmed merged");
+    let merge = metadata["mergeCommit"]["oid"]
+        .as_str()
+        .context("merged PR has no merge commit")?
+        .to_owned();
+    let expected = metadata["changedFiles"]
+        .as_u64()
+        .and_then(|n| usize::try_from(n).ok())
+        .context("PR has no file count")?;
+    // Use the forge's canonical URL, including the repository for fork PRs.
+    let url = metadata["url"]
+        .as_str()
+        .context("PR has no canonical URL")?;
+    let parts: Vec<_> = url.split('/').collect();
+    anyhow::ensure!(
+        parts.len() == 7
+            && parts[5] == "pull"
+            && parts[6].parse::<u64>().ok() == metadata["number"].as_u64(),
+        "unrecognized PR URL"
+    );
+    let endpoint = format!(
+        "repos/{}/{}/pulls/{}/files?per_page=100",
+        parts[3], parts[4], parts[6]
+    );
+    let args = ["api", "--paginate", "--slurp", &endpoint].map(str::to_owned);
+    let (ok, out) = land::gh(repo, &args).await?;
+    anyhow::ensure!(ok, "read merged PR files: {out}");
+    merged_change_from_pages(merge, expected, serde_json::from_str(&out)?)
+}
+
+/// Compare versions only across the forge-confirmed merge and its first
+/// parent. Neither the winner's ancestry nor a current merge-base proves
+/// which upstream version the PR actually changed.
+async fn merged_versions(
+    repo: &Path,
+    change: &MergedChange,
+    primary: &str,
+) -> Result<(String, String)> {
+    let before = git::rev_parse(repo, &format!("{}^1", change.merge))
         .await
-        .ok()?;
-    let mb = mb.trim().to_owned();
-    (!mb.is_empty() && mb != tip).then_some(mb)
+        .context("read merged PR's first parent")?;
+    // In particular, the final commit of a multi-commit rebase merge may not
+    // represent the whole PR. Refuse a mismatched range rather than guessing.
+    let raw = git::git(
+        repo,
+        &[
+            "diff",
+            "--numstat",
+            "-z",
+            "--no-renames",
+            &before,
+            &change.merge,
+        ],
+    )
+    .await?;
+    let mut actual = Vec::new();
+    for entry in raw.split('\0').filter(|entry| !entry.is_empty()) {
+        let mut fields = entry.splitn(3, '\t');
+        let count = |field: Option<&str>| -> Result<u64> {
+            let field = field.context("missing merged diff count")?;
+            if field == "-" {
+                Ok(0)
+            } else {
+                Ok(field.parse()?)
+            }
+        };
+        let additions = count(fields.next())?;
+        let deletions = count(fields.next())?;
+        let path = fields
+            .next()
+            .context("missing merged diff path")?
+            .to_owned();
+        actual.push((path, additions, deletions));
+    }
+    actual.sort();
+    anyhow::ensure!(
+        actual == change.numstat,
+        "merge first-parent diff does not match the complete PR; version comparison is unknown"
+    );
+    let before = primary_version_at(repo, &before, primary)
+        .await
+        .context("read version before merged PR")?;
+    let after = primary_version_at(repo, &change.merge, primary)
+        .await
+        .context("read version after merged PR")?;
+    Ok((before, after))
 }
 
 /// The version of record's version at `rev`, read in `dir`. `None` when it
@@ -1441,8 +1602,19 @@ async fn after_merge_at(
     home: Option<&Path>,
     store: Option<&Notices>,
 ) -> Result<()> {
+    let repo = state.repo.clone();
+    after_merge_using(state, pr_url, home, store, merged_change(&repo, pr_url)).await
+}
+
+async fn after_merge_using(
+    state: &mut RunState,
+    pr_url: &str,
+    home: Option<&Path>,
+    store: Option<&Notices>,
+    change: impl Future<Output = Result<MergedChange>>,
+) -> Result<()> {
     let mut progress = Progress::default();
-    let result = after_merge_inner(state, pr_url, home, &mut progress).await;
+    let result = after_merge_inner(state, pr_url, home, &mut progress, change).await;
     if let Some(skip) = &progress.skip {
         record_skip(state, store, skip);
     }
@@ -1468,52 +1640,21 @@ async fn after_merge_inner(
     pr_url: &str,
     home: Option<&Path>,
     progress: &mut Progress,
+    change: impl Future<Output = Result<MergedChange>>,
 ) -> Result<()> {
     if !state.config.merge.release_bump {
         return Ok(());
     }
-    let Some(winner) = state.winner().cloned() else {
+    if state.winner().is_none() {
         return Ok(());
-    };
+    }
     let repo = state.repo.clone();
     let base = state.base_branch.clone();
     let remote = state.config.merge.remote.clone();
 
-    let files = git::changed_files(&winner.worktree, &base, &winner.branch)
-        .await
-        .unwrap_or_default();
     let declared = state.config.release.version_files.clone();
     let custom = release_manifest::is_custom(&declared);
     let primary = release_manifest::primary_path(&declared).to_owned();
-    if release_manifest::release_only(&files, &declared) {
-        // With declared files the file names alone are not enough (a
-        // dependency update touches `package.json` too): the version of
-        // record must not be provably unchanged.
-        let mb = change_base(&winner.worktree, &remote, &base, &winner.branch).await;
-        let unchanged = custom
-            && match mb {
-                Some(mb) => matches!(
-                    (
-                        primary_version_at(&winner.worktree, &mb, &primary).await,
-                        primary_version_at(&winner.worktree, &winner.branch, &primary).await,
-                    ),
-                    (Some(before), Some(after)) if before == after
-                ),
-                None => false,
-            };
-        if !unchanged {
-            state.event(
-                "bump",
-                "the merged change touches only the release manifest; not treating it as a trigger",
-            );
-            progress.skip = Some(Skip {
-                reason: "the merged change touches only the release files; not a trigger"
-                    .to_owned(),
-                action: None,
-            });
-            return Ok(());
-        }
-    }
 
     // Outside the lock, and before anything that assumes a Rust manifest.
     // Fetch first so a stale remote-tracking ref cannot misjudge the base.
@@ -1592,38 +1733,44 @@ async fn after_merge_inner(
             return Ok(());
         }
     };
+    let change = change.await.context("read the merged PR's own change")?;
+    let files = &change.files;
+    let versions = if custom {
+        Some(merged_versions(&repo, &change, &primary).await?)
+    } else {
+        None
+    };
+    if release_manifest::release_only(files, &declared)
+        && !versions
+            .as_ref()
+            .is_some_and(|(before, after)| before == after)
+    {
+        progress.skip = Some(Skip {
+            reason: "the merged change touches only the release files; not a trigger".to_owned(),
+            action: None,
+        });
+        return Ok(());
+    }
     // Local mode has no auto-tag to hand the release to: the bump PR and the
     // watcher's approval are the release path, so it always proceeds.
-    if custom && !state.config.release.is_local() {
-        // The change itself may already have raised the version; the
-        // repository's own auto-tag then releases it, and a second bump
-        // would publish a duplicate. Measured against the remote base the
-        // branch was cut from, never a possibly stale local branch; a branch
-        // already contained in it (merged without squashing) is unknown.
-        let mb = change_base(&winner.worktree, &remote, &base, &winner.branch)
-            .await
-            .unwrap_or_default();
-        if !mb.is_empty()
-            && let (Some(before), Some(after)) = (
-                primary_version_at(&winner.worktree, &mb, &primary).await,
-                primary_version_at(&winner.worktree, &winner.branch, &primary).await,
-            )
-            && before != after
-        {
-            state.event(
+    if custom
+        && !state.config.release.is_local()
+        && let Some((before, after)) = versions
+        && before != after
+    {
+        state.event(
                 "bump",
                 format!(
                     "the merged change already moved {primary} from v{before} to v{after}; leaving the release to the repository's auto-tag"
                 ),
             );
-            progress.skip = Some(Skip {
-                reason: format!(
-                    "the change itself raised {primary} from v{before} to v{after}; the repository's auto-tag releases it"
-                ),
-                action: None,
-            });
-            return Ok(());
-        }
+        progress.skip = Some(Skip {
+            reason: format!(
+                "the change itself raised {primary} from v{before} to v{after}; the repository's auto-tag releases it"
+            ),
+            action: None,
+        });
+        return Ok(());
     }
 
     let mut pending = read_marker(&marker);
@@ -1690,10 +1837,13 @@ async fn after_merge_inner(
         crate::graph::landing_title(state, &title),
         &crate::graph::landing_subject_source(state),
     );
-    let stat = git::diff_stat(&winner.worktree, &base, &winner.branch)
-        .await
-        .unwrap_or_default();
-    let prompt = decision_prompt(&subject, &state.instruction, &stat, &files, &base_version);
+    let prompt = decision_prompt(
+        &subject,
+        &state.instruction,
+        &change.stat,
+        files,
+        &base_version,
+    );
 
     let (spec, mut seat, mut decision) =
         ask_decision(state, &repo, &prompt, DECISION_TIMEOUT).await?;
@@ -2662,6 +2812,196 @@ mod tests {
     use super::*;
     use crate::notices::Severity;
 
+    // Inject forge evidence without changing PATH or contacting a real forge.
+    // Existing fixtures represent a single merged commit at HEAD.
+    async fn after_merge_at(
+        state: &mut RunState,
+        pr_url: &str,
+        home: Option<&Path>,
+        store: Option<&Notices>,
+    ) -> Result<()> {
+        let repo = state.repo.clone();
+        after_merge_using(state, pr_url, home, store, fixture_change(&repo)).await
+    }
+
+    async fn fixture_change(repo: &Path) -> Result<MergedChange> {
+        let merge = git::rev_parse(repo, "HEAD").await?;
+        let raw = git::git(
+            repo,
+            &["diff", "--numstat", "--no-renames", "HEAD^1", "HEAD"],
+        )
+        .await?;
+        let entries: Vec<PrFile> = raw
+            .lines()
+            .map(|line| {
+                let mut parts = line.splitn(3, '\t');
+                PrFile {
+                    additions: parts.next().unwrap().parse().unwrap(),
+                    deletions: parts.next().unwrap().parse().unwrap(),
+                    filename: parts.next().unwrap().to_owned(),
+                    previous_filename: None,
+                }
+            })
+            .collect();
+        merged_change_from_pages(merge, entries.len(), vec![entries])
+    }
+
+    #[tokio::test]
+    async fn merged_release_pr_does_not_trigger_from_a_stale_local_base() {
+        for squash in [true, false] {
+            let (_dir, repo) = origin_with(&[
+                ("Cargo.toml", "[package]\nname=\"x\"\nversion=\"0.1.0\"\n"),
+                ("Cargo.lock", "old\n"),
+            ])
+            .await;
+            let stale = git::rev_parse(&repo, "HEAD").await.unwrap();
+            git::git(&repo, &["checkout", "-b", "landing"])
+                .await
+                .unwrap();
+            tokio::fs::write(repo.join("feature.rs"), "upstream feature\n")
+                .await
+                .unwrap();
+            git::git(&repo, &["add", "-A"]).await.unwrap();
+            git::git(&repo, &["commit", "-m", "upstream feature"])
+                .await
+                .unwrap();
+            git::git(&repo, &["push", "origin", "HEAD:main"])
+                .await
+                .unwrap();
+            git::git(&repo, &["checkout", "-b", "release"])
+                .await
+                .unwrap();
+            tokio::fs::write(
+                repo.join("Cargo.toml"),
+                "[package]\nname=\"x\"\nversion=\"0.1.1\"\n",
+            )
+            .await
+            .unwrap();
+            tokio::fs::write(repo.join("Cargo.lock"), "new\n")
+                .await
+                .unwrap();
+            git::git(&repo, &["commit", "-am", "release"])
+                .await
+                .unwrap();
+            git::git(&repo, &["checkout", "landing"]).await.unwrap();
+            if squash {
+                git::git(&repo, &["merge", "--squash", "release"])
+                    .await
+                    .unwrap();
+                git::git(&repo, &["commit", "-m", "merged release"])
+                    .await
+                    .unwrap();
+            } else {
+                git::git(
+                    &repo,
+                    &["merge", "--no-ff", "release", "-m", "merged release"],
+                )
+                .await
+                .unwrap();
+            }
+            git::git(&repo, &["push", "origin", "HEAD:main"])
+                .await
+                .unwrap();
+            assert_eq!(git::rev_parse(&repo, "main").await.unwrap(), stale);
+            assert!(!is_release_only(
+                &git::changed_files(&repo, "main", "release").await.unwrap()
+            ));
+            let evidence = fixture_change(&repo).await.unwrap();
+            assert_eq!(
+                merged_versions(&repo, &evidence, "Cargo.toml")
+                    .await
+                    .unwrap(),
+                ("0.1.0".to_owned(), "0.1.1".to_owned())
+            );
+            let mut mismatched = fixture_change(&repo).await.unwrap();
+            mismatched.numstat.pop();
+            assert!(
+                merged_versions(&repo, &mismatched, "Cargo.toml")
+                    .await
+                    .is_err()
+            );
+            for custom in [false, true] {
+                let mut state = winner_state(&repo, "main");
+                state.candidates[0].branch = "release".to_owned();
+                if custom {
+                    state.config.release.version_files = release_manifest::effective(&[]);
+                }
+                let home = tempfile::tempdir().unwrap();
+                let store = Notices::at(home.path().join("notifications"));
+                after_merge_at(
+                    &mut state,
+                    "https://example.invalid/pull/1",
+                    Some(home.path()),
+                    Some(&store),
+                )
+                .await
+                .unwrap();
+                assert!(
+                    state
+                        .release_bump
+                        .as_ref()
+                        .unwrap()
+                        .skipped
+                        .as_ref()
+                        .unwrap()
+                        .contains("only the release files")
+                );
+                assert!(state.bump_decision_attempts.is_empty());
+                assert!(read_marker(&marker_path(home.path(), &repo)).is_none());
+                assert!(store.list().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn merged_pr_pages_share_complete_guard_and_prompt_evidence() {
+        let pages = serde_json::from_value(serde_json::json!([
+            [{"filename":"Cargo.toml","additions":1,"deletions":1}],
+            [{"filename":"src/fix.rs","additions":7,"deletions":2}]
+        ]))
+        .unwrap();
+        let change = merged_change_from_pages("a".repeat(40), 2, pages).unwrap();
+        assert!(!is_release_only(&change.files));
+        let prompt = decision_prompt("fix", "task", &change.stat, &change.files, "1.0.0");
+        assert!(prompt.contains("src/fix.rs"));
+        assert!(prompt.contains("2 files changed, 8 insertions(+), 3 deletions(-)"));
+        let partial = serde_json::from_value(serde_json::json!([
+            [{"filename":"Cargo.toml","additions":1,"deletions":1}]
+        ]))
+        .unwrap();
+        assert!(merged_change_from_pages("a".repeat(40), 2, partial).is_err());
+        assert!(merged_change_from_pages("a".repeat(40), 0, vec![]).is_err());
+    }
+
+    #[tokio::test]
+    async fn unavailable_merged_pr_evidence_notifies_without_a_decision() {
+        let (_dir, repo) =
+            origin_with(&[("Cargo.toml", "[package]\nname=\"x\"\nversion=\"0.1.0\"\n")]).await;
+        let home = tempfile::tempdir().unwrap();
+        let store = Notices::at(home.path().join("notifications"));
+        let mut state = winner_state(&repo, "main");
+        after_merge_using(
+            &mut state,
+            "https://example.invalid/pull/1",
+            Some(home.path()),
+            Some(&store),
+            async { bail!("incomplete PR file listing") },
+        )
+        .await
+        .unwrap_err();
+        assert!(state.bump_decision_attempts.is_empty());
+        assert_eq!(store.list().len(), 1);
+        assert!(
+            state
+                .release_bump
+                .as_ref()
+                .unwrap()
+                .problem
+                .as_ref()
+                .unwrap()
+                .contains("merged PR")
+        );
+    }
     #[test]
     fn github_facing_bump_text_is_english() {
         let (title, body) =
