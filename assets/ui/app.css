@@ -2905,8 +2905,8 @@ h1 { overflow-wrap: anywhere; letter-spacing: 0; }
   main[data-split] .cards > li.card.task-card > .task-card-actions { display: flex; margin-top: var(--s2); }
 }
 
-/* Queue summaries use the same compact rows at every width. Full instructions,
-   history and destructive controls remain on the existing task detail page. */
+/* Queue summaries use the same compact rows at every width. Instructions and
+   history stay in the detail page; inline actions retain drafts across refresh. */
 #view-queue { container-type: inline-size; }
 :is(#queue-sections, #queue-search-results) .card.task-card {
   display: grid; grid-template-columns: auto minmax(0, 1fr) auto;
@@ -2920,11 +2920,9 @@ h1 { overflow-wrap: anywhere; letter-spacing: 0; }
   gap: var(--s1); min-width: 0; font-size: var(--t1);
 }
 :is(#queue-sections, #queue-search-results) .task-card > .task-card-actions {
-  grid-column: 2 / -1; grid-row: 3; margin: 0; display: none;
+  grid-column: 2 / -1; grid-row: 3; margin: 0; display: flex; min-width: 0;
 }
-:is(#queue-sections, #queue-search-results) .task-card[aria-current="true"] > .task-card-actions { display: flex; }
-:is(#queue-sections, #queue-search-results) .task-card > :is(.card-meta, .card-note, .err, .advanced),
-:is(#queue-sections, #queue-search-results) .task-card-actions > :not(.task-priority-box) { display: none; }
+:is(#queue-sections, #queue-search-results) .task-card > :is(.card-meta, .card-note, .err, .advanced) { display: none; }
 :is(#queue-sections, #queue-search-results) .task-card > .reorder-handle {
   grid-column: 1; grid-row: 1 / 4; align-self: center;
 }

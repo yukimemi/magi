@@ -357,7 +357,8 @@ run first, ties use ascending task ID. Running tasks cannot move. Upgrade
 resumes occupy a fixed lane ahead of ordinary priorities; admission, urgent
 slots and other eligibility gates still apply. Saves are sequential, not atomic:
 if a write is refused, remaining writes stop and the list reloads the saved order.
-The +/− priority controls remain available.
+The +/− priority controls, Edit and Actions remain available on every row,
+without selecting it first. Open confirmations and drafts survive list refreshes.
 
 Competition rows already use the existing run detail. Their handles reorder within
 a section in this browser after clearing search; scope and state filters may stay
@@ -381,8 +382,8 @@ briefly reach `max_concurrent_runs + 1` runs at once instead of just one.
 Change an existing task with `magi task urgent <ID>` to enable urgent, or
 `magi task urgent <ID> --clear` to disable it. IDs may be unambiguous short IDs.
 `magi task show <ID>` reports the saved enabled/disabled state. In the Web
-Queue, select the task and use its detail action sheet's **Urgent: off/on**
-toggle. The URGENT badge reflects the saved setting.
+Queue, use **Actions → Urgent: off/on**, or the same toggle in the task detail's
+action sheet. The URGENT badge reflects the saved setting.
 Only unclaimed queued or held tasks can change urgent. Changing a held task
 keeps it held, with its reason and attempts intact; release it separately when
 ready. Claimed, running, and other task states are refused; wait for the claim
