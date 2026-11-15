@@ -22212,14 +22212,15 @@ mod tests {
 
     #[tokio::test]
     async fn a_new_turn_on_a_talk_moves_the_change_stream_revision() {
-        let f = Fixture::start().await;
-        let before = f.get("/api/health").await.json()["talks_rev"]
-            .as_u64()
-            .expect("talks_rev");
-
-        let talk = seed_talk(&f, "20260904-014455-ab12", "open");
-        std::thread::sleep(Duration::from_millis(10));
-        let mut on_disk = f.talks().get(&talk).expect("get seeded talk");
+        let home = TempDir::new().expect("temp home");
+        let ui = delta_test_ui(home.path());
+        let talk = seed_talk_at(&ui.talks, "20260904-014455-ab12", "open");
+        // Establish the existing conversation's baseline before appending.
+        // Wait on the stream's shared notification rather than repeatedly
+        // rebuilding health (config, process and disk observations included).
+        let before = ui.monitor.revisions(&ui).await.expect("initial scan").3;
+        let mut changes = ui.monitor.broadcaster.subscribe();
+        let mut on_disk = ui.talks.get(&talk).expect("get seeded talk");
         on_disk.turns.push(crate::talk::Turn {
             sender: None,
             breaks: Some(Vec::new()),
@@ -22231,17 +22232,19 @@ mod tests {
             attachments: Vec::new(),
             usage: None,
         });
-        f.talks().put(&mut on_disk).expect("record a turn");
+        ui.talks.put(&mut on_disk).expect("record a turn");
 
         let after = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                let revision = f.get("/api/health").await.json()["talks_rev"]
-                    .as_u64()
-                    .unwrap();
+                let change = changes.recv().await.expect("monitor notification");
+                let revision = change.payload["talks_rev"].as_u64().expect("talks_rev");
                 if revision != before {
+                    assert_eq!(
+                        change.payload["talks_delta"]["changed"],
+                        serde_json::json!([talk])
+                    );
                     break revision;
                 }
-                tokio::time::sleep(Duration::from_millis(50)).await;
             }
         })
         .await
@@ -22250,6 +22253,8 @@ mod tests {
             before, after,
             "a phone must be able to notice a talk's reply without polling every store"
         );
+        let Json(observed) = health(State(ui)).await.expect("health");
+        assert_eq!(observed.talks_rev, after, "health exposes the same revision");
     }
 
     #[test]
