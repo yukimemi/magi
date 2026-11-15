@@ -56,6 +56,35 @@ async fn advisor_proposals_are_gathered_and_synthesized_into_the_implementer_bri
 }
 
 common::e2e! {
+async fn advisor_stray_files_do_not_block_completion() {
+    let home = common::home_lock().await;
+    let mut fx = fixture_with_advise(home, 3);
+    fx.config.graph.implementers = 1;
+    for agent in &mut fx.config.agents {
+        agent.env.insert("MOCK_ADVISOR_DIRTY_SEAT".into(), "advisor-3".into());
+    }
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
+        .await
+        .expect("start");
+    runner.execute().await.expect("execute");
+    let state = &runner.state;
+    assert_eq!(state.status, magi::run::RunStatus::Ready);
+    let saved = magi::run::RunState::load(&state.id).expect("saved run");
+    assert!(saved.advice.as_ref().unwrap().records.iter()
+        .any(|record| record.seat == "advisor-3" && record.proposal.is_some()));
+    assert!(saved.events.iter().any(|event| event.node == "fold"
+        && event.message.contains("advisor-3")
+        && event.message.contains("design_proposal.json")));
+    let listing = magi::git::git(&fx.repo, &["worktree", "list", "--porcelain"]).await.unwrap();
+    for k in 1..=3 {
+        let seat = format!("advisor-{k}");
+        assert!(!state.worktree_root().join(&seat).exists());
+        assert!(!listing.contains(&seat), "{listing}");
+    }
+}
+}
+
+common::e2e! {
 async fn the_synthesizer_role_pins_the_synthesis_seat_to_a_named_agent() {
     let home = common::home_lock().await;
     let mut fx = fixture_with_advise(home, 2);

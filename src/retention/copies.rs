@@ -390,17 +390,6 @@ fn disposable(state: &RunState, path: &Path) -> bool {
                 .any(|c| c.worktree == path && c.empty && c.commits == 0)
 }
 
-fn read_seat(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|s| s.to_str())
-        .is_some_and(|name| {
-            ["review-", "judge-", "advisor-"].iter().any(|prefix| {
-                name.strip_prefix(prefix)
-                    .is_some_and(|n| n.parse::<usize>().is_ok_and(|n| n > 0))
-            })
-        })
-}
-
 async fn proof(
     home: &Path,
     state: &RunState,

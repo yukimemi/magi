@@ -2494,12 +2494,12 @@ impl Runner {
         }
         let seats = self.roles.judges.len().max(self.state.config.graph.judges);
         for j in 1..=seats {
-            git::worktree_remove_clean(repo, &root.join(format!("judge-{j}")))
+            remove_read_seat_worktree(&mut self.state, &root.join(format!("judge-{j}")))
                 .await
                 .ok();
         }
         for k in 1..=self.state.config.graph.advisors {
-            git::worktree_remove_clean(repo, &root.join(format!("advisor-{k}")))
+            remove_read_seat_worktree(&mut self.state, &root.join(format!("advisor-{k}")))
                 .await
                 .ok();
         }
@@ -5330,7 +5330,8 @@ impl Runner {
         for j in 1..=self.roles.judges.len() {
             let wt = root.join(format!("judge-{j}"));
             if wt.exists() {
-                remove_preserved_worktree(&repo, &wt).await?;
+                remove_read_seat_worktree(&mut self.state, &wt).await?;
+                self.state.save()?;
             }
         }
         // The design-deliberation stage is finished by the time a tally
@@ -5339,7 +5340,8 @@ impl Runner {
             for k in 1..=self.state.config.graph.advisors {
                 let wt = root.join(format!("advisor-{k}"));
                 if wt.exists() {
-                    remove_preserved_worktree(&repo, &wt).await?;
+                    remove_read_seat_worktree(&mut self.state, &wt).await?;
+                    self.state.save()?;
                 }
             }
         }
@@ -13327,6 +13329,51 @@ async fn remove_preserved_worktree(repo: &Path, path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Read seats return replies, not working-tree changes. Only registered,
+/// detached seats directly inside this run's root may discard those changes.
+async fn remove_read_seat_worktree(state: &mut RunState, path: &Path) -> Result<()> {
+    if !crate::retention::read_seat(path) || !path.exists() {
+        return remove_preserved_worktree(&state.repo, path).await;
+    }
+    let owned = std::fs::symlink_metadata(path)?.is_dir()
+        && path.parent().map(Path::canonicalize).transpose()?
+            == Some(state.worktree_root().canonicalize()?)
+        && crate::retention::worktrees(state)
+            .await?
+            .contains(&path.canonicalize()?);
+    let common = crate::repo_lock::common_dir(&state.repo).await?;
+    if !owned
+        || common.is_none()
+        || crate::repo_lock::common_dir(path).await? != common
+        || git::git_raw(path, &["symbolic-ref", "-q", "HEAD"])
+            .await?
+            .ok()
+        || state.candidates.iter().any(|c| c.worktree == path)
+    {
+        return remove_preserved_worktree(&state.repo, path).await;
+    }
+    let changes = git::status_porcelain(path).await?;
+    if !git::worktree_remove(&state.repo, path).await? {
+        bail!(
+            "read-only seat worktree removal refused: {}",
+            path.display()
+        );
+    }
+    if !changes.is_empty() {
+        let paths = changes.lines().take(20).collect::<Vec<_>>().join("; ");
+        let paths: String = paths.chars().take(1024).collect();
+        state.event(
+            "fold",
+            format!(
+                "discarded read-only seat {} changes ({} status entries; first 20, at most 1024 chars): {paths}",
+                path.file_name().unwrap_or_default().to_string_lossy(),
+                changes.lines().count()
+            ),
+        );
+    }
+    Ok(())
+}
+
 /// Tear a run's worktrees and branches down.
 ///
 /// `home` is where the updated `run.json` is saved (via
@@ -13417,7 +13464,7 @@ pub async fn fold_run(state: &mut RunState, drop_winner: bool, home: &Path) -> R
         if keep {
             continue;
         }
-        remove_preserved_worktree(&repo, &path).await?;
+        remove_read_seat_worktree(state, &path).await?;
         removed.push(path.to_string_lossy().into_owned());
     }
 
@@ -15893,6 +15940,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fold_losers_persists_discard_before_later_teardown_failure() {
+        let (_tmp, mut runner) = preservation_resume_fixture().await;
+        runner.state.candidates[0].folded = true;
+        runner.state.config.graph.advise = true;
+        runner.state.config.graph.advisors = 2;
+        let repo = runner.state.repo.clone();
+        let root = runner.state.worktree_root();
+        let discarded = root.join("advisor-1");
+        git::worktree_add_detached(&repo, &discarded, "main")
+            .await
+            .unwrap();
+        std::fs::write(discarded.join("design_proposal.json"), "{}").unwrap();
+        let protected = root.join("advisor-2");
+        git::worktree_add_branch(&repo, &protected, "attached-advisor", "main")
+            .await
+            .unwrap();
+        std::fs::write(protected.join("keep"), "uncommitted").unwrap();
+        runner.state.save().unwrap();
+
+        assert!(runner.fold_losers().await.is_err());
+        assert!(!discarded.exists());
+        assert!(protected.join("keep").exists());
+        let saved = RunState::load(&runner.state.id).unwrap();
+        assert!(saved.events.iter().any(|event| {
+            event.message.contains("advisor-1") && event.message.contains("design_proposal.json")
+        }));
+    }
+
+    #[tokio::test]
+    async fn read_seat_teardown_discards_only_owned_detached_seats() {
+        let (tmp, mut runner) = preservation_resume_fixture().await;
+        let repo = runner.state.repo.clone();
+        let root = runner.state.worktree_root();
+        for name in ["advisor-3", "judge-1", "review-2"] {
+            let path = root.join(name);
+            git::worktree_add_detached(&repo, &path, "main")
+                .await
+                .unwrap();
+            std::fs::write(path.join("README.md"), "uncommitted edit").unwrap();
+            std::fs::write(path.join("design_proposal.json"), "{}").unwrap();
+            remove_read_seat_worktree(&mut runner.state, &path)
+                .await
+                .unwrap();
+            assert!(!path.exists());
+        }
+        let outside = tmp.path().join("advisor-1");
+        let unknown = root.join("unknown");
+        let attached = root.join("advisor-4");
+        git::worktree_add_detached(&repo, &outside, "main")
+            .await
+            .unwrap();
+        git::worktree_add_detached(&repo, &unknown, "main")
+            .await
+            .unwrap();
+        git::worktree_add_branch(&repo, &attached, "attached-advisor", "main")
+            .await
+            .unwrap();
+        let foreign = tmp.path().join("foreign");
+        std::fs::create_dir(&foreign).unwrap();
+        init_repo(&foreign);
+        let wrong_repo = root.join("judge-2");
+        git::worktree_add_detached(&foreign, &wrong_repo, "main")
+            .await
+            .unwrap();
+        let candidate = runner.state.candidates[0].worktree.clone();
+        for path in [outside, unknown, attached, wrong_repo, candidate] {
+            std::fs::write(path.join("uncommitted"), "keep").unwrap();
+            assert!(
+                remove_read_seat_worktree(&mut runner.state, &path)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                std::fs::read_to_string(path.join("uncommitted")).unwrap(),
+                "keep"
+            );
+        }
+    }
+
+    #[tokio::test]
     #[cfg(unix)]
     async fn disk_interrupted_empty_implementation_retries_after_reload_and_failed_checkpoint() {
         for (solo, failed_checkpoint) in
@@ -16212,6 +16339,9 @@ mod tests {
             .await
             .unwrap();
         std::fs::write(judge.join("uncommitted"), "retain").unwrap();
+        git::git(&repo, &["worktree", "lock", &git::path_arg(&judge)])
+            .await
+            .unwrap();
         runner.roles.judges = vec![spec("judge")];
         assert!(runner.fold_losers().await.is_err());
         runner.state = RunState::load(&runner.state.id).unwrap();
@@ -16221,7 +16351,9 @@ mod tests {
         );
         assert!(!git::branch_exists(&repo, "candidate-A").await.unwrap());
         assert!(judge.join("uncommitted").exists());
-        std::fs::remove_file(judge.join("uncommitted")).unwrap();
+        git::git(&repo, &["worktree", "unlock", &git::path_arg(&judge)])
+            .await
+            .unwrap();
         runner.fold_losers().await.unwrap();
         assert!(!judge.exists());
         runner.fold_losers().await.unwrap();
