@@ -368,7 +368,7 @@ fn parse_worktree_holder(listing: &str, branch: &str) -> Option<PathBuf> {
 /// Candidate work must use [`worktree_remove_clean`] instead.
 /// Returns `Ok(false)` on refusal; callers must retain their ownership record.
 pub async fn worktree_remove(repo: &Path, path: &Path) -> Result<bool> {
-    let path_s = path.to_string_lossy().to_string();
+    let path_s = path_arg(path);
     let out = git_raw(repo, &["worktree", "remove", "--force", &path_s]).await?;
     if out.ok() {
         return Ok(true);
@@ -1224,22 +1224,59 @@ pub async fn rebase_start(
     branch: &str,
     onto: &str,
 ) -> Result<RebaseStart> {
-    // Removed first so a leftover from an interrupted attempt cannot make
-    // `worktree add` fail on a path that already exists.
-    worktree_remove(repo, scratch).await.ok();
-    git_raw(
-        repo,
-        &[
-            "worktree",
-            "add",
-            "--force",
-            &scratch.to_string_lossy(),
-            branch,
-        ],
-    )
-    .await?;
+    rebase_prepare(repo, scratch, branch).await?;
+    rebase_execute(repo, scratch, onto).await
+}
 
-    std::fs::write(rebase_file(scratch, "magi-rebase-heads").await?, "")?;
+/// Preparation failed before any commits were replayed.
+#[derive(Debug)]
+pub struct RebasePreparationError(pub String);
+
+impl std::fmt::Display for RebasePreparationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for RebasePreparationError {}
+
+/// Create the scratch checkout without starting the sequencer.
+/// An interrupted sequencer belongs to its existing operation and is kept.
+pub(crate) async fn rebase_prepare(repo: &Path, scratch: &Path, branch: &str) -> Result<()> {
+    if rebase_in_progress(scratch).await {
+        return Ok(());
+    }
+    let result = async {
+        worktree_remove(repo, scratch).await.ok();
+        let path = path_arg(scratch);
+        let args = ["worktree", "add", "--force", &path, branch];
+        let out = git_raw(repo, &args).await?;
+        ensure!(
+            out.ok(),
+            "git {} (exit {:?}): {}",
+            args.join(" "),
+            out.code,
+            if out.stderr.trim().is_empty() {
+                &out.stdout
+            } else {
+                &out.stderr
+            }
+        );
+        std::fs::write(rebase_file(scratch, "magi-rebase-heads").await?, "")?;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    result.map_err(|e| {
+        RebasePreparationError(format!(
+            "prepare rebase scratch {}: {e:#}",
+            scratch.display()
+        ))
+        .into()
+    })
+}
+
+/// Start the sequencer only after the caller has persisted its reservation.
+pub(crate) async fn rebase_execute(repo: &Path, scratch: &Path, onto: &str) -> Result<RebaseStart> {
     let out = git_raw(
         scratch,
         &["rebase", "--empty=drop", "--exec", REBASE_EXEC, onto],
