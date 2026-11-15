@@ -1291,8 +1291,10 @@ version_files = [
   and a change touching only the release files.
 - **The merged PR is the evidence boundary.** Its complete paginated file list
   and additions/deletions feed both the release-only guard and the decision
-  prompt; a stale local base branch is never a diff base. Missing, empty or
-  incomplete forge evidence stops the bump and raises a release-step notice.
+  prompt; a stale local base branch is never a diff base. Rename sources and
+  destinations are included without duplicate paths. Missing, empty, incomplete
+  or potentially truncated forge evidence (3,000 files or more) stops the bump
+  and raises a release-step notice.
   Declared-version comparisons use the confirmed merge commit and its first
   parent only when that diff matches the PR file statistics. Unavailable commits
   or a mismatched range (for example, a multi-commit rebase merge) stop rather

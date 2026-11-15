@@ -1426,6 +1426,9 @@ struct PrFile {
     deletions: u64,
 }
 
+/// GitHub may truncate a PR file listing at this boundary.
+const PR_FILES_CEILING: usize = 3000;
+
 fn merged_change_from_pages(
     merge: String,
     expected: usize,
@@ -1436,6 +1439,10 @@ fn merged_change_from_pages(
         "merged PR has no valid merge commit"
     );
     let entries: Vec<_> = pages.into_iter().flatten().collect();
+    anyhow::ensure!(
+        expected < PR_FILES_CEILING && entries.len() < PR_FILES_CEILING,
+        "merged PR file listing reached the 3000-file limit and may be truncated"
+    );
     let mut seen = std::collections::HashSet::new();
     anyhow::ensure!(
         expected > 0
@@ -1464,10 +1471,14 @@ fn merged_change_from_pages(
             file.filename, file.additions, file.deletions
         )?;
         // A rename out of a source path is not a release-only change.
-        if let Some(previous) = file.previous_filename {
+        if let Some(previous) = file.previous_filename
+            && !files.contains(&previous)
+        {
             files.push(previous);
         }
-        files.push(file.filename);
+        if !files.contains(&file.filename) {
+            files.push(file.filename);
+        }
     }
     writeln!(
         stat,
@@ -1492,7 +1503,16 @@ async fn merged_change(repo: &Path, pr_url: &str) -> Result<MergedChange> {
     .map(str::to_owned);
     let (ok, out) = land::gh(repo, &args).await?;
     anyhow::ensure!(ok, "read merged PR metadata: {out}");
-    let metadata: serde_json::Value = serde_json::from_str(&out)?;
+    let (merge, expected, endpoint) = merged_pr_metadata(&out)?;
+    let args = ["api", "--paginate", "--slurp", &endpoint].map(str::to_owned);
+    let (ok, out) = land::gh(repo, &args).await?;
+    anyhow::ensure!(ok, "read merged PR files: {out}");
+    parse_merged_pr_files(merge, expected, &out)
+}
+
+/// Decode forge metadata and build the canonical file endpoint. No I/O.
+fn merged_pr_metadata(json: &str) -> Result<(String, usize, String)> {
+    let metadata: serde_json::Value = serde_json::from_str(json)?;
     anyhow::ensure!(metadata["state"] == "MERGED", "PR is not confirmed merged");
     let merge = metadata["mergeCommit"]["oid"]
         .as_str()
@@ -1517,10 +1537,12 @@ async fn merged_change(repo: &Path, pr_url: &str) -> Result<MergedChange> {
         "repos/{}/{}/pulls/{}/files?per_page=100",
         parts[3], parts[4], parts[6]
     );
-    let args = ["api", "--paginate", "--slurp", &endpoint].map(str::to_owned);
-    let (ok, out) = land::gh(repo, &args).await?;
-    anyhow::ensure!(ok, "read merged PR files: {out}");
-    merged_change_from_pages(merge, expected, serde_json::from_str(&out)?)
+    Ok((merge, expected, endpoint))
+}
+
+/// Decode `gh api --paginate --slurp` output. No I/O.
+fn parse_merged_pr_files(merge: String, expected: usize, json: &str) -> Result<MergedChange> {
+    merged_change_from_pages(merge, expected, serde_json::from_str(json)?)
 }
 
 /// Compare versions only across the forge-confirmed merge and its first
@@ -2951,6 +2973,66 @@ mod tests {
                 assert!(store.list().is_empty());
             }
         }
+    }
+
+    #[test]
+    fn merged_pr_files_reject_the_forge_ceiling() {
+        for count in [PR_FILES_CEILING - 1, PR_FILES_CEILING, PR_FILES_CEILING + 1] {
+            let entries = (0..count)
+                .map(|n| PrFile {
+                    filename: format!("file-{n}"),
+                    previous_filename: None,
+                    additions: 1,
+                    deletions: 0,
+                })
+                .collect();
+            let result = merged_change_from_pages("a".repeat(40), count, vec![entries]);
+            assert_eq!(result.is_ok(), count < PR_FILES_CEILING);
+        }
+    }
+
+    #[test]
+    fn merged_pr_files_deduplicate_rename_paths_without_losing_source_evidence() {
+        let change = parse_merged_pr_files(
+            "a".repeat(40),
+            2,
+            r#"[
+                [{"filename":"Cargo.toml","previous_filename":"src/old.rs","additions":1,"deletions":2}],
+                [{"filename":"Cargo.lock","previous_filename":"Cargo.toml","additions":3,"deletions":4}]
+            ]"#,
+        )
+        .unwrap();
+        assert_eq!(change.files, ["src/old.rs", "Cargo.toml", "Cargo.lock"]);
+        assert!(!is_release_only(&change.files));
+        assert!(
+            change
+                .stat
+                .contains("2 files changed, 4 insertions(+), 6 deletions(-)")
+        );
+        assert_eq!(change.numstat.len(), 2);
+        assert!(parse_merged_pr_files("a".repeat(40), 2, "invalid").is_err());
+        assert!(parse_merged_pr_files("a".repeat(40), 2, "[[]]").is_err());
+    }
+
+    #[test]
+    fn merged_pr_metadata_builds_the_canonical_repository_endpoint() {
+        let mut metadata = serde_json::json!({
+            "state": "MERGED",
+            "mergeCommit": {"oid": "a".repeat(40)},
+            "changedFiles": 2,
+            "number": 380,
+            "url": "https://github.com/owner/repo/pull/380"
+        });
+        let (merge, expected, endpoint) = merged_pr_metadata(&metadata.to_string()).unwrap();
+        assert_eq!(merge, "a".repeat(40));
+        assert_eq!(expected, 2);
+        assert_eq!(endpoint, "repos/owner/repo/pulls/380/files?per_page=100");
+        metadata["number"] = serde_json::json!(381);
+        assert!(merged_pr_metadata(&metadata.to_string()).is_err());
+        metadata["number"] = serde_json::json!(380);
+        metadata["state"] = serde_json::json!("OPEN");
+        assert!(merged_pr_metadata(&metadata.to_string()).is_err());
+        assert!(merged_pr_metadata("invalid").is_err());
     }
 
     #[test]
