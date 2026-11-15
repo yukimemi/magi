@@ -3003,6 +3003,7 @@ impl DiskView {
 struct DaemonView {
     running: bool,
     idle: Option<bool>,
+    dispatch_wait: Option<daemon::DispatchWait>,
     pid: Option<u32>,
     /// Every task and run currently in flight. Empty when idle; more than
     /// one entry when `Config::daemon.max_concurrent_runs` has more than one
@@ -3021,6 +3022,7 @@ impl DaemonView {
             return Self {
                 running: false,
                 idle: None,
+                dispatch_wait: None,
                 pid: None,
                 current: Vec::new(),
                 completed: None,
@@ -3032,6 +3034,7 @@ impl DaemonView {
         Self {
             running: status.running(now),
             idle: Some(status.idle),
+            dispatch_wait: status.dispatch_wait,
             pid: status.pid,
             current: status.current,
             completed: Some(status.completed),

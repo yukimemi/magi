@@ -1003,7 +1003,33 @@ function announceQuietly(message) {
    be right the moment it becomes true. */
 function runnableTasks() {
   if (state.queue === null) return null;
-  return state.queue.filter((task) => (task.status_str || task.status) === "queued").length;
+  return state.queue.filter((task) => ["queued", "failed", "parked"].includes(task.status_str || task.status)).length;
+}
+
+/* Plain text without its final stop, so the completed-task tail stays part of
+   the same sentence. Missing diagnostics must not imply an empty queue. */
+function daemonIdleWording(dispatchWait, runnable) {
+  if (dispatchWait == null) {
+    if (runnable === 0) return "Nothing runnable in the queue";
+    if (runnable === null) return "Queue state unavailable; dispatch diagnostic unavailable";
+    return `${runnable} ${runnable === 1 ? "task" : "tasks"} queued, none started: dispatch diagnostic unavailable`;
+  }
+  const reasons = dispatchWait.reasons.map(({ reason, count }) => {
+    let wording;
+    switch (reason) {
+      case "claim_unavailable": wording = "could not be claimed"; break;
+      case "reread_failed": wording = "could not be reread"; break;
+      case "no_longer_runnable": wording = "no longer runnable"; break;
+      case "waiting_on_landing": wording = "waiting on landing"; break;
+      case "cooling_down": wording = "cooling down"; break;
+      case "ordinary_capacity": wording = "waiting for ordinary capacity"; break;
+      case "urgent_capacity": wording = "waiting for urgent capacity"; break;
+      case "interrupt_gate": wording = "waiting on interrupt gate"; break;
+      default: wording = reason;
+    }
+    return `${count} ${wording}`;
+  }).join(", ");
+  return `${dispatchWait.runnable} ${dispatchWait.runnable === 1 ? "task" : "tasks"} queued, none started: ${reasons || "reasons not recorded"}`;
 }
 
 /* The run the loop is on, as a link when there is one to point at. `current`
@@ -1424,7 +1450,7 @@ function renderLoop() {
     );
   } else if (daemon.idle) {
     setAttr(box, "data-state", "idle");
-    text.append(el("b", { text: "Loop idle." }), ` Nothing runnable in the queue${tail}.`);
+    text.append(el("b", { text: "Loop idle." }), ` ${daemonIdleWording(daemon.dispatch_wait, runnableTasks())}${tail}.`);
   } else if (daemon.running) {
     setAttr(box, "data-state", "working");
     text.append(el("b", { text: "Working." }), ` Claiming a task${tail}.`);
