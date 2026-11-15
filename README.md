@@ -353,6 +353,15 @@ daemon killed mid-run leaves a queue the next one picks up.
 parallel inside — candidates times judges — and two graphs at once doubles the
 burn on the agent-CLI quota that is the real constraint.
 
+If queued work is not starting, the Web loop's idle line reports the latest
+completed dispatch scan's reason counts (landing waits, cooldown, occupied
+ordinary/urgent slots, interrupt withholding, or claim/re-read failures).
+`daemon.json` exposes the same observation as `dispatch_wait`, including the
+pre-gate runnable count. It is cleared when work starts or the scan is incomplete;
+it is not a fresh queue census. Tracing logs the full task/reason set only when
+it changes, including when the set becomes empty. These diagnostics do not
+change dispatch policy.
+
 `magi task add --urgent` is the escape hatch for the rare task that genuinely
 cannot wait. It dispatches the moment it is runnable, through one extra,
 temporary slot, alongside whatever is already running — the run already in
