@@ -5947,15 +5947,23 @@ function scheduleTalkPosition(initial) {
     if (target) {
       // Sections can insert siblings after placement. In split view the parent
       // has a fixed height, so watch its child list as well as element sizes.
-      const turns = $("talk-turns");
+      // Elements earlier in the document (daemon banner, ask bar, alerts) can
+      // also resize, so watch every earlier sibling of each ancestor up to body.
+      const watched = new Set();
       const observeSiblings = () => {
-        for (let sibling = turns.previousElementSibling; sibling; sibling = sibling.previousElementSibling)
-          observer.observe(sibling);
+        for (let node = $("talk-turns"); node && node !== document.body; node = node.parentElement) {
+          for (let sibling = node.previousElementSibling; sibling; sibling = sibling.previousElementSibling)
+            observer.observe(sibling);
+          const parent = node.parentElement;
+          if (parent && !watched.has(parent)) {
+            watched.add(parent);
+            observer.observe(parent);
+            mutations.observe(parent, { childList: true });
+          }
+        }
       };
-      observeSiblings();
-      observer.observe(turns.parentElement);
       mutations = new MutationObserver(() => { observeSiblings(); correct(); });
-      mutations.observe(turns.parentElement, { childList: true });
+      observeSiblings();
     }
     if (header) observer.observe(header);
     if (!target) timer = setTimeout(stop, 2000);
