@@ -1203,6 +1203,14 @@ been folded — that is the guard that keeps "delete" meaning "remove a record"
 rather than "throw away a worktree". A run left unfinished by a killed daemon
 is a leftover, not work in progress, and can be removed once it is folded.
 
+The run's **Report** tab opens as collapsible cards, with the tally first and
+separate candidate-choice and review-vote badges. Review approvals are green,
+approvals with findings yellow, and rejections red; missing answers never count
+as approval. Reasoning uses Markdown, while raw command output and diffs stay
+literal and collapsed. Recovery, startup, merge repair and release execution
+evidence remain available in the cards. **Raw** shows the terminal-style report;
+its **Wrap** toggle is unchanged.
+
 **A stalled run can be folded and resumed from the phone.** Those are the two
 halves of "this run is in the way", and they are opposites, so the run's page
 offers both and says so:

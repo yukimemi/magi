@@ -84,6 +84,10 @@ pub struct Header {
     pub task: String,
     /// Where the task came from.
     pub origin: String,
+    /// Startup kind, branch and durable boundary, when recorded.
+    pub startup: Option<String>,
+    /// Original startup failure, verbatim.
+    pub startup_failure: Option<String>,
     /// The run's state directory.
     pub state_dir: String,
 }
@@ -141,14 +145,14 @@ pub enum Section {
         /// The count.
         tally: TallyView,
     },
-    /// Seats handed over, files withheld, blindness warnings: one line each.
+    /// Operational facts and warnings, with multiline prose preserved.
     Notes {
         /// Title, tone and default state.
         #[serde(flatten)]
         head: Head,
         /// Which kind of note.
         key: &'static str,
-        /// One line each.
+        /// Entries, which may contain multiline prose.
         lines: Vec<String>,
     },
     /// The graft round: runner-up strengths ported onto the winner.
@@ -264,7 +268,7 @@ pub struct CandidateRow {
     pub agent: String,
     /// `failed`, `verified_noop`, `no_change` or `changed`.
     pub state: &'static str,
-    /// The failure, the no-op evidence or the candidate's summary, one line.
+    /// The failure, the no-op evidence or the candidate's summary.
     pub detail: Option<String>,
     /// Files touched.
     pub files: usize,
@@ -291,6 +295,10 @@ pub struct JudgeRow {
     pub confidence: Option<u8>,
     /// Why no ranking, when none.
     pub failed: Option<String>,
+    /// Per-candidate justifications, verbatim.
+    pub reasons: BTreeMap<String, String>,
+    /// Parsed markdown for each candidate's justification.
+    pub reasons_md: BTreeMap<String, Vec<crate::md::Node>>,
 }
 
 /// One judge's final vote.
@@ -376,6 +384,8 @@ pub struct RoundView {
     pub head: String,
     /// Commit e2e ran against, when recorded.
     pub verified_head: Option<String>,
+    /// When verification actually ran; unknown on older records.
+    pub verified_at: Option<String>,
     /// Findings raised across reviewers.
     pub raised: usize,
     /// Blocking findings the round recorded.
@@ -456,6 +466,12 @@ pub struct ReviewerRow {
     pub agent: String,
     /// Initial vote.
     pub vote: Option<&'static str>,
+    /// Revote when usable, initial vote otherwise, from `final_votes`.
+    pub final_vote: Option<&'static str>,
+    /// The reviewer's original prose, verbatim.
+    pub reason: String,
+    /// Parsed markdown for the original prose.
+    pub reason_md: Vec<crate::md::Node>,
     /// Why it produced nothing.
     pub failed: Option<String>,
 }
@@ -469,6 +485,8 @@ pub struct RevoteRow {
     pub vote: Option<&'static str>,
     /// Reason, or the failure.
     pub reason: String,
+    /// Parsed markdown for the reason or failure.
+    pub reason_md: Vec<crate::md::Node>,
 }
 
 /// One finding.
@@ -560,7 +578,7 @@ pub struct BaseSyncView {
     pub episode_limit: usize,
     /// Actual next operation for this checkpoint.
     pub next_action: String,
-    /// First line of the conflict.
+    /// The conflict, verbatim.
     pub conflict: Option<String>,
     /// `a as b (proof match)`, when already in the base.
     pub already_in: Option<String>,
@@ -573,7 +591,7 @@ pub struct MergeView {
     pub mode: String,
     /// `not_landed_by_design`, `published`, `ok`, `empty` or `not_merged`.
     pub state: &'static str,
-    /// First line of magi's own detail.
+    /// Magi's own detail, verbatim.
     pub detail: String,
     /// The branch left unmerged, for the by-design case.
     pub branch: Option<String>,
@@ -603,7 +621,7 @@ pub struct ReleaseBumpView {
     pub automerge: &'static str,
     /// Why no bump was made; a skipped bump is not a release.
     pub skipped: Option<String>,
-    /// First line of the problem.
+    /// The problem, verbatim.
     pub problem: Option<String>,
     /// What a person must do.
     pub action_required: Option<String>,
@@ -788,12 +806,15 @@ fn round_view(r: &ReviewRound, last: bool) -> RoundView {
         }
     }
 
+    let final_votes = r.final_votes();
+
     RoundView {
         round: r.round,
         status,
         tone,
         head: short(&r.head),
         verified_head: r.verified_head.as_deref().map(short),
+        verified_at: r.verified_at.map(|at| at.to_string()),
         raised,
         blocking: r.blocking,
         answered: r.answered,
@@ -814,6 +835,12 @@ fn round_view(r: &ReviewRound, last: bool) -> RoundView {
                 reviewer: x.reviewer,
                 agent: x.agent.clone(),
                 vote: x.vote.map(vote_name),
+                final_vote: final_votes
+                    .iter()
+                    .find(|(reviewer, _, _)| *reviewer == x.reviewer)
+                    .map(|(_, _, vote)| vote_name(*vote)),
+                reason: x.summary.clone(),
+                reason_md: crate::md::to_nodes(&x.summary, &crate::md::ImageBase::None),
                 failed: x.failed.clone(),
             })
             .collect(),
@@ -821,13 +848,17 @@ fn round_view(r: &ReviewRound, last: bool) -> RoundView {
         reconsideration: r
             .reconsideration
             .iter()
-            .map(|rv| RevoteRow {
-                reviewer: rv.reviewer,
-                vote: rv.vote.map(vote_name),
-                reason: match rv.vote {
+            .map(|rv| {
+                let reason = match rv.vote {
                     Some(_) => rv.reason.clone(),
                     None => format!("no revote ({})", rv.failed.as_deref().unwrap_or("unknown")),
-                },
+                };
+                RevoteRow {
+                    reviewer: rv.reviewer,
+                    vote: rv.vote.map(vote_name),
+                    reason_md: crate::md::to_nodes(&reason, &crate::md::ImageBase::None),
+                    reason,
+                }
             })
             .collect(),
         default_open: last || status != "clean",
@@ -1139,11 +1170,14 @@ pub fn build_with(
                 let is_winner = state.tally.as_ref().is_some_and(|t| t.winner == c.label);
                 let (st, detail) = match (&c.failed, c.empty, &c.verified_noop) {
                     (Some(e), _, _) => ("failed", Some(e.clone())),
-                    (None, true, Some(ev)) => ("verified_noop", Some(first_line(ev))),
-                    (None, true, None) => ("no_change", None),
+                    (None, true, Some(ev)) => ("verified_noop", Some(ev.clone())),
+                    (None, true, None) => (
+                        "no_change",
+                        Some(c.summary.clone()).filter(|s| !s.trim().is_empty()),
+                    ),
                     _ => (
                         "changed",
-                        Some(first_line(&c.summary)).filter(|s| !s.is_empty()),
+                        Some(c.summary.clone()).filter(|s| !s.trim().is_empty()),
                     ),
                 };
                 CandidateRow {
@@ -1173,6 +1207,17 @@ pub fn build_with(
                     ranking: j.ranking.iter().collect(),
                     confidence: j.confidence,
                     failed: j.failed.clone(),
+                    reasons: j.reasons.clone(),
+                    reasons_md: j
+                        .reasons
+                        .iter()
+                        .map(|(candidate, reason)| {
+                            (
+                                candidate.clone(),
+                                crate::md::to_nodes(reason, &crate::md::ImageBase::None),
+                            )
+                        })
+                        .collect(),
                 })
                 .collect(),
             deliberation: state
@@ -1270,6 +1315,24 @@ pub fn build_with(
             lines,
         })
     };
+    if state.tally.is_some() {
+        sections.extend(notes(
+            "quota_details",
+            "unavailable seats",
+            Tone::Warn,
+            state
+                .quota
+                .iter()
+                .map(|loss| {
+                    if loss.cause == crate::agent::QuotaCause::Authentication {
+                        format!("{} ({}: re-authenticate)", loss.seat, loss.agent)
+                    } else {
+                        format!("{} (usage limit)", loss.seat)
+                    }
+                })
+                .collect(),
+        ));
+    }
     sections.extend(notes(
         "handovers",
         "seats handed over",
@@ -1300,6 +1363,42 @@ pub fn build_with(
             })
             .collect(),
     ));
+
+    if let Some(recovery) = &state.recovery {
+        use crate::recovery::Repair;
+        let mut lines = vec![recovery.summary()];
+        if recovery.criteria_inherited {
+            lines.push("the task's own completion criteria were kept".to_owned());
+        }
+        let tone = match &recovery.repair {
+            Repair::NotStarted => Tone::Neutral,
+            Repair::WaitingForRestore { .. } => {
+                lines.push("repair: waiting to restore and retry".to_owned());
+                Tone::Warn
+            }
+            Repair::Started { .. } => {
+                lines.push("repair: unfinished".to_owned());
+                Tone::Warn
+            }
+            Repair::Done {
+                failed: Some(why), ..
+            } => {
+                lines.push(format!("repair: nothing kept: {why}"));
+                Tone::Warn
+            }
+            Repair::Done {
+                committed: true, ..
+            } => {
+                lines.push("repair: committed".to_owned());
+                Tone::Ok
+            }
+            Repair::Done { .. } => {
+                lines.push("repair: no commit".to_owned());
+                Tone::Neutral
+            }
+        };
+        sections.extend(notes("recovery", "recovery", tone, lines));
+    }
 
     if let Some(g) = &state.graft {
         let view = graft_view(state, g, graft);
@@ -1339,6 +1438,43 @@ pub fn build_with(
             rounds,
             handed_off,
         });
+    }
+
+    if !state.merge_repairs.is_empty() {
+        let mut lines = Vec::new();
+        for repair in &state.merge_repairs {
+            lines.push(format!(
+                "question {}  head {}  {:?}\n{}",
+                repair.question,
+                crate::run::short_of(&repair.head),
+                repair.phase,
+                repair.pr
+            ));
+            if let Some(why) = &repair.failure {
+                lines.push(format!("held: {why}"));
+            }
+            if let Some(round) = repair.reviews.last() {
+                for finding in round.reviews.iter().flat_map(|review| &review.findings) {
+                    lines.push(format!(
+                        "original [{}] {:?}: {}",
+                        finding.id, finding.severity, finding.title
+                    ));
+                }
+                for (seat, _, vote) in round.final_votes() {
+                    lines.push(format!("original reviewer #{seat}: {vote:?}"));
+                }
+            }
+        }
+        lines.push(
+            "Repair never approves a merge; updated results require a fresh owner decision."
+                .to_owned(),
+        );
+        sections.extend(notes(
+            "merge_repairs",
+            "merge-gate repairs",
+            Tone::Warn,
+            lines,
+        ));
     }
 
     if !state.operator_fixes.is_empty() {
@@ -1412,7 +1548,7 @@ pub fn build_with(
                 episode_used: state.base_episode_used(),
                 episode_limit: crate::graph::BASE_SYNC_ROUNDS,
                 next_action: state.base_sync_next_action(),
-                conflict: bs.conflict.as_deref().map(first_line),
+                conflict: bs.conflict.clone(),
                 already_in: bs
                     .already_in
                     .as_ref()
@@ -1478,7 +1614,7 @@ pub fn build_with(
             merge: MergeView {
                 mode: format!("{:?}", m.mode).to_lowercase(),
                 state: st,
-                detail: m.detail.lines().next().unwrap_or("").to_owned(),
+                detail: m.detail.clone(),
                 branch: by_design
                     .then(|| state.winner().map(|w| w.branch.clone()))
                     .flatten(),
@@ -1506,6 +1642,18 @@ pub fn build_with(
         });
     }
 
+    sections.extend(notes(
+        "release_decision_attempts",
+        "release decision attempts",
+        Tone::Neutral,
+        state
+            .bump_decision_attempts
+            .iter()
+            .enumerate()
+            .map(|(n, attempt)| format!("{}. {}: {}", n + 1, attempt.agent, attempt.outcome))
+            .collect(),
+    ));
+
     if let Some(b) = &state.release_bump {
         let automerge = if b.skipped.is_some() && b.pr_url.is_none() {
             "skipped"
@@ -1523,7 +1671,11 @@ pub fn build_with(
         sections.push(Section::ReleaseBump {
             head: head(
                 "release bump",
-                if automerge == "failed" || automerge == "skipped" || b.action_required.is_some() {
+                if automerge == "failed"
+                    || automerge == "skipped"
+                    || b.action_required.is_some()
+                    || b.release.as_ref().is_some_and(|release| !release.finished)
+                {
                     Tone::Warn
                 } else {
                     Tone::Neutral
@@ -1534,11 +1686,53 @@ pub fn build_with(
                 version: b.version.clone(),
                 pr_url: b.pr_url.clone(),
                 automerge,
-                problem: b.problem.as_deref().map(first_line),
+                problem: b.problem.clone(),
                 action_required: b.action_required.clone(),
                 skipped: b.skipped.clone(),
             },
         });
+        if let Some(release) = &b.release {
+            let status = if release.finished {
+                "finished"
+            } else {
+                release.failed.as_deref().unwrap_or("unfinished")
+            };
+            let mut lines = vec![format!(
+                "release {} at {}: {status}",
+                release.tag(),
+                release.commit
+            )];
+            lines.push(format!(
+                "tag on remote: {}; {} command(s) completed",
+                release.tag_done, release.done
+            ));
+            if let Some(running) = &release.running {
+                lines.push(format!("started step: {running}"));
+            }
+            for step in &release.log {
+                let code = step.code.map_or("none".to_owned(), |code| code.to_string());
+                let mut line = format!("{} (exit {code})", step.name);
+                if let Some(output) = &step.output {
+                    line.push_str(" output ");
+                    line.push_str(output);
+                }
+                if !step.tail.is_empty() {
+                    line.push('\n');
+                    line.push_str(&step.tail);
+                }
+                lines.push(line);
+            }
+            sections.extend(notes(
+                "release_execution",
+                "release execution",
+                if release.finished {
+                    Tone::Ok
+                } else {
+                    Tone::Warn
+                },
+                lines,
+            ));
+        }
     }
 
     sections.extend(notes(
@@ -1579,6 +1773,19 @@ pub fn build_with(
             created: state.created_local(),
             task: first_line(&state.instruction),
             origin: crate::run::origin_label(state.origin.as_ref()),
+            startup: state.startup.as_ref().map(|startup| {
+                format!(
+                    "{} branch={} stage={} complete={}",
+                    startup.kind,
+                    startup.branch.as_deref().unwrap_or("-"),
+                    startup.stage,
+                    startup.complete
+                )
+            }),
+            startup_failure: state
+                .startup
+                .as_ref()
+                .and_then(|startup| startup.failure.clone()),
             state_dir: state.dir().display().to_string(),
         },
         sections,
@@ -1698,6 +1905,379 @@ mod tests {
         let jobs = json["sections"].as_array().expect("a").last().expect("l");
         assert_eq!(jobs["default_open"], false, "jobs start collapsed");
         assert_eq!(jobs["groups"][0]["jobs"][0]["status"], "completed");
+    }
+
+    fn note<'a>(json: &'a serde_json::Value, key: &str) -> &'a serde_json::Value {
+        json["sections"]
+            .as_array()
+            .expect("sections")
+            .iter()
+            .find(|section| section["kind"] == "notes" && section["key"] == key)
+            .expect("note")
+    }
+
+    #[test]
+    fn recovery_notes_preserve_the_recorded_repair_state_and_tone() {
+        for (repair, expected, tone) in [
+            (serde_json::json!("not-started"), None, "neutral"),
+            (
+                serde_json::json!({"waiting-for-restore": {"before": "abc"}}),
+                Some("repair: waiting to restore and retry"),
+                "warn",
+            ),
+            (
+                serde_json::json!({"started": {"before": "abc"}}),
+                Some("repair: unfinished"),
+                "warn",
+            ),
+            (
+                serde_json::json!({"done": {
+                    "before": "abc", "after": "def", "committed": true, "failed": null
+                }}),
+                Some("repair: committed"),
+                "ok",
+            ),
+            (
+                serde_json::json!({"done": {
+                    "before": "abc", "after": "abc", "committed": false, "failed": null
+                }}),
+                Some("repair: no commit"),
+                "neutral",
+            ),
+            (
+                serde_json::json!({"done": {
+                    "before": "abc", "after": "abc", "committed": false,
+                    "failed": "restore failed\ninspect the checkout"
+                }}),
+                Some("repair: nothing kept: restore failed\ninspect the checkout"),
+                "warn",
+            ),
+        ] {
+            let mut s = state();
+            s.recovery = Some(
+                serde_json::from_value(serde_json::json!({
+                    "from_run": "20260902-140501-1234", "generation": 1,
+                    "mode": "full-review", "reasons": ["head moved\nreview it again"],
+                    "criteria_inherited": true, "repair": repair
+                }))
+                .expect("recovery"),
+            );
+            let json = serde_json::to_value(build(&s, Liveness::Unknown)).expect("view");
+            let recovery = note(&json, "recovery");
+            assert_eq!(recovery["title"], "recovery");
+            assert_eq!(recovery["tone"], tone);
+            assert_eq!(recovery["default_open"], true);
+            assert_eq!(
+                recovery["lines"][0],
+                s.recovery.as_ref().expect("record").summary()
+            );
+            assert!(
+                recovery["lines"][0]
+                    .as_str()
+                    .unwrap()
+                    .contains("head moved\nreview it again")
+            );
+            assert_eq!(
+                recovery["lines"][1],
+                "the task's own completion criteria were kept"
+            );
+            if let Some(expected) = expected {
+                assert_eq!(recovery["lines"][2], expected);
+            } else {
+                assert_eq!(recovery["lines"].as_array().unwrap().len(), 2);
+            }
+        }
+    }
+
+    #[test]
+    fn reviewer_final_votes_and_verification_times_keep_initial_evidence() {
+        let mut s = state();
+        let mut r = round(1);
+        r.verified_head = Some("fedcba9876543210".to_owned());
+        r.verified_at = Some("2026-09-02T14:05:01Z".parse().expect("timestamp"));
+        r.reviews = serde_json::from_value(serde_json::json!([
+            {"reviewer": 1, "agent": "one", "vote": "reject",
+             "summary": "Initial **concern**.\n\nNeeds inspection."},
+            {"reviewer": 2, "agent": "two", "vote": "approve"},
+            {"reviewer": 3, "agent": "legacy"}
+        ]))
+        .expect("reviewers");
+        r.reconsideration = serde_json::from_value(serde_json::json!([
+            {"reviewer": 1, "agent": "one", "vote": "approve_with_findings",
+             "reason": "Resolved the blocker.\nStill one minor issue."},
+            {"reviewer": 2, "agent": "two", "vote": null, "failed": "lost\nconnection"}
+        ]))
+        .expect("revotes");
+        s.reviews = vec![r, round(2)];
+        let json = serde_json::to_value(build(&s, Liveness::Unknown)).expect("view");
+        let rounds = &json["sections"][1]["rounds"];
+        let first = &rounds[0];
+        assert_eq!(first["verified_head"], "fedcba9");
+        assert_eq!(first["verified_at"], "2026-09-02T14:05:01Z");
+        assert!(rounds[1]["verified_head"].is_null());
+        assert!(
+            rounds[1]["verified_at"].is_null(),
+            "old records stay unknown"
+        );
+        assert_eq!(first["reviewers"][0]["vote"], "reject");
+        assert_eq!(first["reviewers"][0]["final_vote"], "approve_with_findings");
+        assert_eq!(
+            first["reviewers"][1]["final_vote"], "approve",
+            "lost revote retains initial vote"
+        );
+        assert!(first["reviewers"][2]["final_vote"].is_null());
+        assert_eq!(
+            first["reviewers"][0]["reason"],
+            "Initial **concern**.\n\nNeeds inspection."
+        );
+        assert!(
+            !first["reviewers"][0]["reason_md"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            first["reconsideration"][0]["reason"],
+            "Resolved the blocker.\nStill one minor issue."
+        );
+        assert_eq!(
+            first["reconsideration"][1]["reason"],
+            "no revote (lost\nconnection)"
+        );
+        assert!(
+            !first["reconsideration"][0]["reason_md"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !first["reconsideration"][1]["reason_md"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn merge_repairs_and_release_execution_keep_facts_order_and_multiline_text() {
+        let mut s = state();
+        s.startup = Some(crate::run::Startup {
+            kind: "review".into(),
+            branch: Some("topic".into()),
+            stage: "fetch".into(),
+            complete: false,
+            failure: Some("fetch refused\ncredentials expired".into()),
+        });
+        let mut original = round(1);
+        original.reviews[0].vote = Some(ReviewVote::Reject);
+        original.reviews[0].findings = vec![finding("R1-1-1", Severity::Major)];
+        original.reconsideration = serde_json::from_value(serde_json::json!([{
+            "reviewer": 1, "agent": "a", "vote": "approve_with_findings",
+            "reason": "nonblocking after reconsideration"
+        }]))
+        .unwrap();
+        s.merge_repairs.push(crate::run::MergeRepair {
+            question: "question-42".into(),
+            head: "abcdef012345".into(),
+            pr: "https://example.test/pull/42".into(),
+            reviews: vec![original],
+            gate: vec![],
+            gate_head: None,
+            gate_fixes: vec![],
+            pre_gate: vec![],
+            phase: crate::run::MergeRepairPhase::Failed,
+            failure: Some("owner decision required\ninspect new results".into()),
+        });
+        s.bump_decision_attempts = vec![
+            crate::bump::DecisionAttempt {
+                agent: "first".into(),
+                outcome: "unavailable".into(),
+            },
+            crate::bump::DecisionAttempt {
+                agent: "second".into(),
+                outcome: "patch\naccepted".into(),
+            },
+        ];
+        s.release_bump = Some(crate::run::ReleaseBump {
+            version: Some("1.2.3".into()),
+            local: true,
+            problem: Some("publish failed\nregistry refused".into()),
+            release: Some(crate::release_local::Job {
+                version: "1.2.3".into(),
+                commit: "fedcba9876543210".into(),
+                tag_done: true,
+                done: 1,
+                failed: Some("registry refused\ntry after approval".into()),
+                log: vec![crate::release_local::StepLog {
+                    name: "cargo publish".into(),
+                    code: Some(1),
+                    tail: "first output line\nsecond output line".into(),
+                    output: Some("/logs/publish.log".into()),
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let json = serde_json::to_value(build(&s, Liveness::Unknown)).expect("view");
+        assert_eq!(json["schema"], 1);
+        assert_eq!(
+            json["header"]["startup"],
+            "review branch=topic stage=fetch complete=false"
+        );
+        assert_eq!(
+            json["header"]["startup_failure"],
+            "fetch refused\ncredentials expired"
+        );
+        let repairs = note(&json, "merge_repairs");
+        assert_eq!(repairs["tone"], "warn");
+        assert_eq!(
+            repairs["lines"][0],
+            "question question-42  head abcdef012345  Failed\nhttps://example.test/pull/42"
+        );
+        assert_eq!(
+            repairs["lines"][1],
+            "held: owner decision required\ninspect new results"
+        );
+        assert_eq!(repairs["lines"][2], "original [R1-1-1] Major: title R1-1-1");
+        assert_eq!(
+            repairs["lines"][3],
+            "original reviewer #1: ApproveWithFindings"
+        );
+        assert_eq!(
+            repairs["lines"][4],
+            "Repair never approves a merge; updated results require a fresh owner decision."
+        );
+        let attempts = note(&json, "release_decision_attempts");
+        assert_eq!(attempts["tone"], "neutral");
+        assert_eq!(
+            attempts["lines"],
+            serde_json::json!(["1. first: unavailable", "2. second: patch\naccepted"])
+        );
+        assert_eq!(
+            json["sections"][3]["bump"]["problem"],
+            "publish failed\nregistry refused"
+        );
+        let execution = note(&json, "release_execution");
+        assert_eq!(execution["tone"], "warn");
+        assert_eq!(
+            execution["lines"][0],
+            "release v1.2.3 at fedcba9876543210: registry refused\ntry after approval"
+        );
+        assert_eq!(
+            execution["lines"][1],
+            "tag on remote: true; 1 command(s) completed"
+        );
+        assert_eq!(
+            execution["lines"][2],
+            "cargo publish (exit 1) output /logs/publish.log\nfirst output line\nsecond output line"
+        );
+        let labels: Vec<_> = json["sections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|section| {
+                section["key"]
+                    .as_str()
+                    .or_else(|| section["kind"].as_str())
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "candidates",
+                "merge_repairs",
+                "release_decision_attempts",
+                "release_bump",
+                "release_execution"
+            ]
+        );
+
+        let release = s.release_bump.as_mut().unwrap().release.as_mut().unwrap();
+        release.failed = None;
+        release.running = Some("cargo publish".into());
+        let json = serde_json::to_value(build(&s, Liveness::Unknown)).unwrap();
+        let execution = note(&json, "release_execution");
+        assert_eq!(execution["tone"], "warn");
+        assert_eq!(
+            execution["lines"][0],
+            "release v1.2.3 at fedcba9876543210: unfinished"
+        );
+        assert_eq!(execution["lines"][2], "started step: cargo publish");
+
+        let release = s.release_bump.as_mut().unwrap().release.as_mut().unwrap();
+        release.finished = true;
+        release.running = None;
+        let json = serde_json::to_value(build(&s, Liveness::Unknown)).unwrap();
+        assert_eq!(note(&json, "release_execution")["tone"], "ok");
+        assert_eq!(
+            note(&json, "release_execution")["lines"][0],
+            "release v1.2.3 at fedcba9876543210: finished"
+        );
+    }
+
+    #[test]
+    fn judge_reasons_preserve_candidate_keys_and_markdown_bodies() {
+        let mut s = state();
+        s.judgements = serde_json::from_value(serde_json::json!([{
+            "judge": 1, "seat": "judge-1", "agent": "judge", "ranking": ["A", "B"],
+            "reasons": {"A": "**Better** tests.\n\nKeeps the API.", "B": "Drops validation."}
+        }]))
+        .unwrap();
+        let json = serde_json::to_value(build(&s, Liveness::Unknown)).unwrap();
+        let judge = &json["sections"][1]["judges"][0];
+        assert_eq!(judge["reasons"]["A"], "**Better** tests.\n\nKeeps the API.");
+        assert_eq!(judge["reasons"]["B"], "Drops validation.");
+        assert!(!judge["reasons_md"]["A"].as_array().unwrap().is_empty());
+        assert!(!judge["reasons_md"]["B"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn no_change_summaries_and_quota_recovery_guidance_are_not_lost() {
+        let mut s = state();
+        s.candidates = serde_json::from_value(serde_json::json!([
+            {
+                "index": 0, "label": "A", "agent": "a", "branch": "a", "worktree": "/a",
+                "empty": true, "folded": true, "summary": "Already covered.\nNo patch needed."
+            },
+            {
+                "index": 1, "label": "B", "agent": "b", "branch": "b", "worktree": "/b",
+                "empty": true, "folded": true, "summary": " \n "
+            }
+        ]))
+        .unwrap();
+        s.tally = Some(tally(false));
+        s.quota = serde_json::from_value(serde_json::json!([
+            {
+                "seat": "judge-1", "node": "judge", "at": "2026-09-02T14:05:01Z",
+                "agent": "signed-out", "cause": "authentication"
+            },
+            {"seat": "judge-2", "node": "judge", "at": "2026-09-02T14:05:01Z"}
+        ]))
+        .unwrap();
+        let json = serde_json::to_value(build(&s, Liveness::Unknown)).unwrap();
+        let candidates = &json["sections"][0]["items"];
+        assert_eq!(candidates[0]["state"], "no_change");
+        assert_eq!(
+            candidates[0]["detail"],
+            "Already covered.\nNo patch needed."
+        );
+        assert_eq!(candidates[1]["state"], "no_change");
+        assert!(candidates[1]["detail"].is_null());
+        assert_eq!(
+            json["sections"][1]["tally"]["rate_limited"],
+            serde_json::json!(["judge-1", "judge-2"]),
+            "the existing seat list remains compatible"
+        );
+        let unavailable = note(&json, "quota_details");
+        assert_eq!(unavailable["tone"], "warn");
+        assert_eq!(
+            unavailable["lines"],
+            serde_json::json!([
+                "judge-1 (signed-out: re-authenticate)",
+                "judge-2 (usage limit)"
+            ])
+        );
     }
 
     #[test]

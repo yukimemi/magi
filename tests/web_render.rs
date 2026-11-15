@@ -1176,6 +1176,20 @@ async fn run_detail_tabs_landing_and_strip_hold_at_both_widths_and_themes() {
             ],
         },
     ];
+    run.reviews.push(
+        serde_json::from_value(serde_json::json!({
+            "round": 1, "head": "abcdef0", "answered": 3, "expected": 4,
+            "reviews": [
+                {"reviewer": 1, "agent": "reviewer-1", "vote": "approve", "summary": "**Sound** implementation"},
+                {"reviewer": 2, "agent": "reviewer-2", "vote": "approve_with_findings"},
+                {"reviewer": 3, "agent": "reviewer-3", "vote": "reject"},
+                {"reviewer": 4, "agent": "reviewer-4", "failed": "timed out"}
+            ],
+            "e2e": [{"command": "check", "code": 1, "duration_ms": 1,
+                "output_tail": "<script>raw output</script>\nsecond line"}]
+        }))
+        .expect("report review"),
+    );
     run.save_under(&home).expect("seed run");
 
     let base = serve(&home, queue, talks, home.join("runs"), &fx.repo).await;
@@ -1279,6 +1293,51 @@ async fn run_detail_tabs_landing_and_strip_hold_at_both_widths_and_themes() {
             assert_eq!(cards["titles"], true, "{tag}: {cards}");
             assert_eq!(cards["inside"], true, "{tag}: card spills out: {cards}");
             assert!(cards["n"].as_u64().unwrap_or(0) >= 1, "{tag}: {cards}");
+            let report_facts = browser
+                .eval(
+                    &page,
+                    r#"(() => {
+                const box = document.getElementById('run-report-cards');
+                const badges = [...box.querySelectorAll('.tag')];
+                const tone = text => badges.find(b => b.textContent.startsWith(text))?.dataset.tone;
+                const first = box.querySelector('.rcard-title').textContent;
+                const output = [...box.querySelectorAll('.rout')].find(d => d.textContent.includes('raw output'));
+                return { first, approve: tone('approve '), caution: tone('approve w/ findings'),
+                    reject: tone('reject'), missing: tone('no vote'),
+                    collapsed: !!output && !output.open,
+                    literal: !!output && output.querySelector('pre').textContent.includes('<script>'),
+                    markdown: !!box.querySelector('.rturn-body strong'),
+                    inside: box.scrollWidth <= box.clientWidth + 1 };
+            })()"#,
+                )
+                .await
+                .unwrap();
+            assert_eq!(report_facts["first"], "tally", "{tag}: {report_facts}");
+            assert_eq!(report_facts["approve"], "teal", "{tag}: {report_facts}");
+            assert_eq!(report_facts["caution"], "gold", "{tag}: {report_facts}");
+            assert_eq!(report_facts["reject"], "rust", "{tag}: {report_facts}");
+            assert_eq!(report_facts["missing"], "gold", "{tag}: {report_facts}");
+            for key in ["collapsed", "literal", "markdown", "inside"] {
+                assert_eq!(report_facts[key], true, "{tag}: {report_facts}");
+            }
+            assert_eq!(
+                browser
+                    .eval(
+                        &page,
+                        r#"(() => {
+                const output = [...document.querySelectorAll('#run-report-cards .rout')]
+                    .find(d => d.textContent.includes('raw output'));
+                output.querySelector('summary').click();
+                const pre = output.querySelector('pre');
+                return output.open && pre.getBoundingClientRect().width > 0
+                    && pre.getBoundingClientRect().right <= document.documentElement.clientWidth;
+            })()"#,
+                    )
+                    .await
+                    .unwrap(),
+                true,
+                "{tag}: output expands inside viewport"
+            );
 
             // The judging section rendered deliberation turns with judge 1.
             let has_judge_turn = browser
@@ -1318,6 +1377,22 @@ async fn run_detail_tabs_landing_and_strip_hold_at_both_widths_and_themes() {
                     .unwrap(),
                 true,
                 "{tag}: the Raw toggle shows the text report"
+            );
+            assert_eq!(
+                browser
+                    .eval(
+                        &page,
+                        r#"(() => {
+                const button = document.getElementById('wrap-toggle');
+                const before = document.getElementById('run-report').dataset.wrap;
+                button.click();
+                return !button.hidden && document.getElementById('run-report').dataset.wrap !== before;
+            })()"#,
+                    )
+                    .await
+                    .unwrap(),
+                true,
+                "{tag}: Raw wrap toggles"
             );
             browser
                 .eval(

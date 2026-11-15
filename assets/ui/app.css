@@ -1577,6 +1577,7 @@ li[data-tone="wait"] > .card-tail { border-left-color: var(--gold-line); border-
 .rwide { flex-basis: 100%; font-size: var(--t3); color: var(--ink-2); overflow-wrap: anywhere; }
 .rlist, .rfindings { display: flex; flex-direction: column; gap: var(--s2); margin: 0; padding: 0; list-style: none; min-width: 0; }
 .rrow { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--s2); min-width: 0; overflow-wrap: anywhere; }
+.rnote { white-space: pre-wrap; }
 .rblock { display: flex; flex-direction: column; gap: var(--s1); }
 .rfinding { padding-left: var(--s3); border-left: 3px solid var(--line-2); min-width: 0; }
 .rfinding[data-blocking="1"] { border-left-color: var(--rust); background: var(--hatch); }
