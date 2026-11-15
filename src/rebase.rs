@@ -1547,11 +1547,15 @@ mod tests {
         assert!(git::is_ancestor(&d, &onto, "winner").await);
         assert!(git::is_ancestor(&d, &base, "winner").await);
         assert_eq!(
-            std::fs::read_to_string(winner.join("change")).unwrap(),
+            std::fs::read_to_string(winner.join("change"))
+                .unwrap()
+                .replace("\r\n", "\n"),
             "change\n"
         );
         assert_eq!(
-            std::fs::read_to_string(winner.join("advance")).unwrap(),
+            std::fs::read_to_string(winner.join("advance"))
+                .unwrap()
+                .replace("\r\n", "\n"),
             "advance\n"
         );
         assert!(git::is_clean(&winner).await.unwrap());
