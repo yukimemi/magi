@@ -6854,8 +6854,14 @@ async fn chat_search_click_waits_for_early_message_in_long_transcript() {
               && r.top < (document.getElementById('main').dataset.split === '1' ? pane.getBoundingClientRect().bottom : innerHeight);
           };
           const describe = () => JSON.stringify({rect:document.getElementById('talk-message-0-0').getBoundingClientRect().toJSON(), header:document.querySelector('.top').getBoundingClientRect().toJSON(), y:scrollY, calls:scrollCalls});
+          // Placement is corrected by observers after layout settles; wait for
+          // the real condition, bounded, instead of sampling a single frame.
+          const settled = async () => {
+            for (let i = 0; i < 120 && !visible(); i++) await frame();
+            return visible();
+          };
           await frame();
-          if (!visible()) return 'target hidden after core: ' + describe();
+          if (!await settled()) return 'target hidden after core: ' + describe();
           if (!document.getElementById('talk-message-0-0').classList.contains('reply-highlight')) return 'target not highlighted';
           const shift = document.createElement('div');
           shift.style.height = '23px';
@@ -6880,12 +6886,19 @@ async fn chat_search_click_waits_for_early_message_in_long_transcript() {
           // Cross the same paint boundary as afterTalkPaint before measuring.
           const frame = () => new Promise(resolve => requestAnimationFrame(() => setTimeout(resolve, 0)));
           const {visible, describe} = window.searchPlacement;
+          // Placement is corrected by observers after layout settles; wait for
+          // the real condition, bounded, instead of sampling a single frame.
+          const settled = async () => {
+            for (let i = 0; i < 120 && !visible(); i++) await frame();
+            return visible();
+          };
           await frame();
-          if (!visible()) return 'target hidden after sections: ' + describe();
+          if (!await settled()) return 'target hidden after sections: ' + describe();
           // Late sections above the opener must not hide the search target.
           document.getElementById('talk-task-progress').style.minHeight = '240px';
           await frame(); await frame(); await frame();
           if (!visible()) return 'header layout shift hid opener';
+          await frame(); await frame();
           const calls = scrollCalls.length;
           for (let i = 0; i < 3; i++) deck.renderTalk();
           deck.state.talkDetail.talk.turns.push({who:'agent', body:'Subsequent reply', at:new Date().toISOString()});
