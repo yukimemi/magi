@@ -490,6 +490,9 @@ pub fn sweep(home: &Path, talks: &Talks) {
     let sweep = || -> Result<()> {
         let _store = lock(&root(home).join("store.lock"))?;
         for dir in directories(home)? {
+            if crate::daemon::lap_stop_requested() {
+                break;
+            }
             let Some(_lease) = try_lock(&dir.join("lease.lock"))? else {
                 continue;
             };

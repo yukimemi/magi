@@ -1177,6 +1177,9 @@ pub fn reconcile_decisions(queue: &Queue, home: &Path) -> Result<()> {
         errors.push(format!("{unreadable} unreadable inquiry record(s)"));
     }
     for inquiry in inquiries {
+        if crate::daemon::lap_stop_requested() {
+            break;
+        }
         let id = inquiry.id.clone();
         if let Err(error) = reconcile_inquiry(queue, home, &outbox, inquiry) {
             let message = format!(
