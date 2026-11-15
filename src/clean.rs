@@ -478,6 +478,23 @@ fn write_external_merge_cursor(home: &Path, cursor: usize) {
 /// asking GitHub raises a notice, since "nothing found" is the ordinary,
 /// expected shape of a run that really is just blocked.
 async fn reconcile_external_merges(runs: &Path, home: &Path, disk: &Disk, now: Timestamp) -> usize {
+    reconcile_external_merges_with(runs, home, disk, now, |state| async move {
+        crate::land::find_external_merge(&state).await
+    })
+    .await
+}
+
+async fn reconcile_external_merges_with<F, Fut>(
+    runs: &Path,
+    home: &Path,
+    disk: &Disk,
+    now: Timestamp,
+    check: F,
+) -> usize
+where
+    F: Fn(RunState) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<crate::land::ExternalMerge>>>,
+{
     let mut ids: Vec<String> = std::fs::read_dir(runs)
         .into_iter()
         .flatten()
@@ -534,7 +551,14 @@ async fn reconcile_external_merges(runs: &Path, home: &Path, disk: &Disk, now: T
             Ok(state) => state,
             Err(_) => continue,
         };
-        match crate::land::find_external_merge(&state).await {
+        if let Ok(record) = serde_json::to_value(&state)
+            && let Some(reason) =
+                crate::external_merge_attention::historical_reason(home, &id, &record)
+        {
+            tracing::info!("housekeep: external merge for {id}: {reason}");
+            continue;
+        }
+        match check(state.clone()).await {
             Ok(Some(found)) => {
                 match crate::land::correct_confirmed_external_merge(&mut state, &found.url).await {
                     Ok(_) => {
@@ -1254,17 +1278,14 @@ mod tests {
         );
     }
 
-    /// A `Blocked` run with a decided winner, so `land::find_external_merge`
-    /// has a branch to ask `gh` about instead of returning early for lack of
-    /// one - which is what makes an unreachable `/nonexistent/repo` fail
-    /// loudly (an `Err`, raising a notice) rather than silently (an early
-    /// `Ok(None)`, raising nothing) when this run's sweep is exercised.
+    /// A blocked run with a winner in an isolated repository directory.
+    /// Consumer tests inject forge results without invoking a real CLI.
     fn write_blocked_run(runs: &Path, id: &str, updated_at: Timestamp) {
         use crate::run::{Candidate, Tally};
         use std::collections::BTreeMap;
 
         let mut state = RunState::new(
-            PathBuf::from("/nonexistent/repo"),
+            runs.parent().unwrap().to_path_buf(),
             "main".to_owned(),
             "0000000000000000000000000000000000000000".to_owned(),
             String::new(),
@@ -1278,7 +1299,7 @@ mod tests {
             label: 'A',
             agent: "agent".to_owned(),
             branch: format!("magi/{id}/A"),
-            worktree: PathBuf::from("/nonexistent/repo"),
+            worktree: runs.parent().unwrap().join("candidate"),
             summary: String::new(),
             stat: String::new(),
             files: 0,
@@ -1313,8 +1334,8 @@ mod tests {
         .unwrap();
     }
 
-    /// No run here can be confirmed merged - one has no repository `gh` can
-    /// even ask about, one has not sat blocked long enough, and one is
+    /// No run here can be confirmed merged - one has a forge error,
+    /// one has not sat blocked long enough, and one is
     /// claimed by a live daemon - so the sweep must leave every one of them
     /// exactly as it found them and never panic on the failures in between.
     #[tokio::test]
@@ -1347,11 +1368,11 @@ mod tests {
         status.updated_at = now;
         crate::daemon::write_status_to(&home.join("daemon.json"), &status).unwrap();
 
-        let reconciled = reconcile_external_merges(&runs, &home, &disk, now).await;
-        assert_eq!(
-            reconciled, 0,
-            "an unreachable repository can never be confirmed merged"
-        );
+        let reconciled = reconcile_external_merges_with(&runs, &home, &disk, now, |_| async {
+            anyhow::bail!("injected forge authentication failure")
+        })
+        .await;
+        assert_eq!(reconciled, 0, "a forge failure can never confirm a merge");
         for id in [due_id, fresh_id, live_id] {
             assert_eq!(
                 read_meta(&runs, id).unwrap().status,
@@ -1370,6 +1391,61 @@ mod tests {
                 id: due_id.to_owned(),
             })
         );
+    }
+
+    #[tokio::test]
+    async fn historical_external_merge_check_preserves_unknown_history() {
+        let home = tempfile::tempdir().unwrap();
+        let runs = home.path().join("runs");
+        let id = "legacy";
+        write_blocked_run(&runs, id, ts("2026-08-01T00:00:00Z"));
+        let path = runs.join(id).join("run.json");
+        let mut state = read_state(&runs, id).unwrap();
+        state.repo = home.path().join("removed");
+        state.candidates[0].folded = true;
+        let original = serde_json::to_vec(&state).unwrap();
+        std::fs::write(&path, &original).unwrap();
+        let count = reconcile_external_merges_with(
+            &runs,
+            home.path(),
+            &Disk::default(),
+            ts("2026-11-14T00:00:00Z"),
+            |_| async { panic!("historical unavailable checkout must not invoke the forge") },
+        )
+        .await;
+        assert_eq!(count, 0);
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert!(
+            crate::notices::Notices::at(home.path().join("notifications"))
+                .all()
+                .is_empty()
+        );
+
+        // The same folded run is actionable when a current task owns it.
+        let queue = crate::queue::Queue::at(home.path().join("queue"));
+        let mut task = crate::queue::Task::new(
+            "current".into(),
+            "current".into(),
+            state.repo.clone(),
+            crate::queue::Source::Human,
+        );
+        task.runs.push(id.into());
+        queue.put(&mut task).unwrap();
+        reconcile_external_merges_with(
+            &runs,
+            home.path(),
+            &Disk::default(),
+            ts("2026-11-14T00:00:00Z"),
+            |_| async { anyhow::bail!("current checkout unavailable") },
+        )
+        .await;
+        assert_eq!(
+            crate::notices::Notices::at(home.path().join("notifications"))
+                .list()
+                .len(),
+            1
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original);
     }
 
     /// The bug this exists to pin: a first version rotated on
@@ -1404,18 +1480,24 @@ mod tests {
         let notices = crate::notices::Notices::at(home.join("notifications"));
 
         // Two passes at the exact same `now`, exactly what a fast pass on a
-        // short poll interval looks like. Each of the 8 unreachable-repo
+        // short poll interval looks like. Each of the 8 injected forge-failure
         // runs raises its own notice the first time it is looked at, so the
         // count of distinct notices is a direct readout of how many distinct
         // ids have been checked so far.
-        reconcile_external_merges(&runs, &home, &disk, now).await;
+        reconcile_external_merges_with(&runs, &home, &disk, now, |_| async {
+            anyhow::bail!("injected forge authentication failure")
+        })
+        .await;
         let after_first = notices.list().len();
         assert_eq!(
             after_first, MAX_EXTERNAL_MERGE_CHECKS_PER_PASS,
             "the first pass checks exactly one cap's worth"
         );
 
-        reconcile_external_merges(&runs, &home, &disk, now).await;
+        reconcile_external_merges_with(&runs, &home, &disk, now, |_| async {
+            anyhow::bail!("injected forge authentication failure")
+        })
+        .await;
         let after_second = notices.list().len();
         assert_eq!(
             after_second,

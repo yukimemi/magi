@@ -19,8 +19,12 @@ fn run_of(n: &Notice) -> Option<&str> {
         return Some(id);
     }
     n.key.split_once(':').and_then(|(kind, subject)| {
-        (!subject.is_empty() && matches!(kind, "run" | "release-bump" | "merged-red"))
-            .then_some(subject)
+        (!subject.is_empty()
+            && matches!(
+                kind,
+                "run" | "release-bump" | "merged-red" | "merged-unrecorded"
+            ))
+        .then_some(subject)
     })
 }
 
@@ -134,6 +138,15 @@ fn reconcile(n: &Notice, queue: &Queue, talks: &Talks, home: &Path, repo: &Path)
         return acknowledge(&store, n, None);
     }
     let run = run_of(n).map(|id| read_run(home, id)).transpose()?;
+    if n.key.starts_with("merged-unrecorded:")
+        && let (Some(id), Some(run)) = (run_of(n), run.as_ref())
+        && (crate::external_merge_attention::historical_reason(home, id, run).is_some()
+            || crate::external_merge_attention::recorded_merge(run))
+    {
+        // Transport acknowledgement only: retain the notice and any transcript,
+        // without reserving/reopening a destination or claiming work succeeded.
+        return acknowledge(&store, n, None);
+    }
     if cleared(n, task, run.as_ref()) {
         return acknowledge(&store, n, None);
     }
@@ -250,6 +263,162 @@ pub fn sweep(queue: &Queue, talks: &Talks, home: &Path, repo: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A destination conversation written directly: creating one through
+    /// `task_chat::destination_in` resolves an installed agent CLI, which the
+    /// environment running the tests may not have.
+    fn seed_chat(talks: &Talks, repo: &Path, id: &str) -> talk::Talk {
+        let mut chat = talk::seeded_for_test(id, repo.to_path_buf());
+        talks.put(&mut chat).unwrap();
+        talks.get(id).unwrap()
+    }
+
+    #[test]
+    fn historical_external_merge_transport_never_reopens_or_replays() {
+        for existing in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let queue = Queue::at(home.path().join("queue"));
+            let talks = Talks::at(home.path().join("talks"));
+            let notices = Notices::at(home.path().join("notifications"));
+            let id = "legacy";
+            let repo = home.path().join("removed");
+            let run = serde_json::json!({
+                "status": "blocked", "repo": repo, "merge": null, "pr": null,
+                "candidates": [{"folded": true}]
+            });
+            let path = home.path().join("runs").join(id).join("run.json");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let original = serde_json::to_vec(&run).unwrap();
+            std::fs::write(&path, &original).unwrap();
+            let before = if existing {
+                let prior = notices
+                    .raise(Notice::warn("run:legacy", "Original audit report"))
+                    .unwrap();
+                seed_chat(&talks, &repo, "notice-run-legacy");
+                reconcile(&prior, &queue, &talks, home.path(), home.path()).unwrap();
+                let mut chat = talks.get("notice-run-legacy").unwrap();
+                chat.status = talk::TalkStatus::Closed;
+                talks.put(&mut chat).unwrap();
+                Some(serde_json::to_value(talks.get(&chat.id).unwrap()).unwrap())
+            } else {
+                None
+            };
+            let notice = notices
+                .raise(Notice::warn(
+                    "merged-unrecorded:legacy",
+                    "Historical check failed",
+                ))
+                .unwrap();
+            for _ in 0..2 {
+                // Reconstruct stores just as a scheduler restart would.
+                sweep(
+                    &Queue::at(home.path().join("queue")),
+                    &Talks::at(home.path().join("talks")),
+                    home.path(),
+                    home.path(),
+                );
+                let saved = notices.get(&notice.id).unwrap();
+                assert!(!saved.unread());
+                assert_eq!(saved.delivered, saved.generation);
+                assert_eq!(saved.message, notice.message);
+                assert!(saved.covered_by.is_none());
+                assert_eq!(std::fs::read(&path).unwrap(), original);
+                let chats = talks.list();
+                if let Some(before) = &before {
+                    assert_eq!(chats.len(), 1);
+                    assert_eq!(&serde_json::to_value(&chats[0]).unwrap(), before);
+                } else {
+                    assert!(chats.is_empty());
+                }
+            }
+            assert!(queue.list().is_empty());
+            assert_eq!(notices.all().len(), if existing { 2 } else { 1 });
+        }
+    }
+
+    #[test]
+    fn available_external_merge_failure_still_delivers() {
+        let home = tempfile::tempdir().unwrap();
+        let queue = Queue::at(home.path().join("queue"));
+        let talks = Talks::at(home.path().join("talks"));
+        let notices = Notices::at(home.path().join("notifications"));
+        let path = home.path().join("runs/current/run.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            path,
+            serde_json::to_vec(&serde_json::json!({
+                "status": "blocked", "repo": home.path(),
+                "candidates": [{"folded": true}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        seed_chat(&talks, home.path(), "notice-run-current");
+        notices
+            .raise(Notice::warn(
+                "merged-unrecorded:current",
+                "Forge auth failed",
+            ))
+            .unwrap();
+        sweep(&queue, &talks, home.path(), home.path());
+        let chat = talks.get("notice-run-current").unwrap();
+        assert!(
+            chat.pending
+                .contains(crate::prompt::ATTENTION_NOTICE_HEADING)
+        );
+    }
+
+    #[test]
+    fn owned_missing_checkout_and_release_failures_still_deliver() {
+        for key in ["merged-unrecorded:current", "release-bump:current"] {
+            let home = tempfile::tempdir().unwrap();
+            let queue = Queue::at(home.path().join("queue"));
+            let talks = Talks::at(home.path().join("talks"));
+            let notices = Notices::at(home.path().join("notifications"));
+            let repo = home.path().join("removed");
+            let owned = key.starts_with("merged-unrecorded:");
+            if owned {
+                let mut task = Task::new(
+                    "current".into(),
+                    "current".into(),
+                    repo.clone(),
+                    crate::queue::Source::Human,
+                );
+                task.runs.push("current".into());
+                queue.put(&mut task).unwrap();
+            }
+            let run = serde_json::json!({
+                "status": "blocked", "repo": repo,
+                "candidates": [{"folded": true}]
+            });
+            let path = home.path().join("runs/current/run.json");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, serde_json::to_vec(&run).unwrap()).unwrap();
+            if owned {
+                // The owning task keeps the check actionable; the destination
+                // is reserved through the task, which needs an agent CLI, so
+                // the decision itself is asserted here.
+                assert!(
+                    crate::external_merge_attention::historical_reason(
+                        home.path(),
+                        "current",
+                        &run
+                    )
+                    .is_none()
+                );
+                continue;
+            }
+            seed_chat(&talks, &repo, "notice-run-current");
+            notices.raise(Notice::warn(key, "Action required")).unwrap();
+            sweep(&queue, &talks, home.path(), home.path());
+            let chat = talks.get("notice-run-current").unwrap();
+            assert!(
+                chat.pending
+                    .contains(crate::prompt::ATTENTION_NOTICE_HEADING),
+                "{key}"
+            );
+        }
+    }
 
     #[test]
     fn unchanged_conductor_representations_are_history_without_chat_delivery() {
