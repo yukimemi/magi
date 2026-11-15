@@ -133,6 +133,9 @@ pub struct Status {
     pub completed: usize,
     /// Queue polls since start, so a wedged loop shows up as a frozen count.
     pub polls: u64,
+    /// Last completed candidate scan that started no tasks; absent otherwise.
+    #[serde(default)]
+    pub dispatch_wait: Option<DispatchWait>,
     /// Effective startup capabilities of the question recovery loops.
     #[serde(default)]
     pub question_recovery: Option<crate::question_delivery::Recovery>,
@@ -155,6 +158,7 @@ impl Status {
             current: Vec::new(),
             completed: 0,
             polls: 0,
+            dispatch_wait: None,
             question_recovery: None,
             worker_protocol: Some(1),
         }
@@ -404,6 +408,8 @@ pub struct Reading {
     pub completed: u64,
     /// Queue polls this daemon process has made.
     pub polls: u64,
+    /// Last no-start scan, retaining unknown reason keys from newer writers.
+    pub dispatch_wait: Option<DispatchWait>,
     /// Effective startup capabilities of the question recovery loops.
     #[serde(default)]
     pub question_recovery: Option<crate::question_delivery::Recovery>,
@@ -3509,6 +3515,105 @@ fn available_slots(requests: &[TaskWorker], limit: usize) -> (usize, usize) {
     )
 }
 
+/// Why a runnable candidate was not dispatched. This does not alter policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum SkipReason {
+    ClaimUnavailable,
+    RereadFailed,
+    NoLongerRunnable,
+    WaitingOnLanding,
+    CoolingDown,
+    OrdinaryCapacity,
+    UrgentCapacity,
+    InterruptGate,
+}
+
+impl SkipReason {
+    fn key(self) -> &'static str {
+        match self {
+            Self::ClaimUnavailable => "claim_unavailable",
+            Self::RereadFailed => "reread_failed",
+            Self::NoLongerRunnable => "no_longer_runnable",
+            Self::WaitingOnLanding => "waiting_on_landing",
+            Self::CoolingDown => "cooling_down",
+            Self::OrdinaryCapacity => "ordinary_capacity",
+            Self::UrgentCapacity => "urgent_capacity",
+            Self::InterruptGate => "interrupt_gate",
+        }
+    }
+
+    fn describe(self) -> &'static str {
+        match self {
+            Self::ClaimUnavailable => "could not claim it (held elsewhere or claim failed)",
+            Self::RereadFailed => "could not re-read it",
+            Self::NoLongerRunnable => "no longer runnable",
+            Self::WaitingOnLanding => "waiting on landing",
+            Self::CoolingDown => "quota cooldown",
+            Self::OrdinaryCapacity => "no free ordinary slot",
+            Self::UrgentCapacity => "urgent slot busy",
+            Self::InterruptGate => "withheld by the interrupt sequence",
+        }
+    }
+}
+
+/// A reason count from a completed dispatch scan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DispatchReasonCount {
+    /// Stable string key, so readers can preserve future reasons.
+    pub reason: String,
+    /// Candidates skipped for this reason.
+    pub count: usize,
+}
+
+/// Observations from a completed scan, not a fresh queue estimate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DispatchWait {
+    /// Runnable candidates before the interrupt gate.
+    pub runnable: usize,
+    /// Counts in descending order, with stable reason order for ties.
+    pub reasons: Vec<DispatchReasonCount>,
+}
+
+type DispatchSkips = std::collections::BTreeSet<(String, SkipReason)>;
+
+fn aggregate_dispatch_wait(runnable: usize, skips: &DispatchSkips) -> Option<DispatchWait> {
+    if runnable == 0 {
+        return None;
+    }
+    let mut counts = std::collections::BTreeMap::new();
+    for (_, reason) in skips {
+        *counts.entry(*reason).or_insert(0usize) += 1;
+    }
+    let mut counts: Vec<_> = counts.into_iter().collect();
+    counts.sort_by(|(a, n), (b, m)| m.cmp(n).then(a.cmp(b)));
+    Some(DispatchWait {
+        runnable,
+        reasons: counts
+            .into_iter()
+            .map(|(reason, count)| DispatchReasonCount {
+                reason: reason.key().to_owned(),
+                count,
+            })
+            .collect(),
+    })
+}
+
+fn interrupt_skips(before: &[String], after: &[Task]) -> DispatchSkips {
+    before
+        .iter()
+        .filter(|id| !after.iter().any(|task| &task.id == *id))
+        .map(|id| (id.clone(), SkipReason::InterruptGate))
+        .collect()
+}
+
+fn changed_dispatch_skips(previous: &mut DispatchSkips, current: DispatchSkips) -> bool {
+    if *previous == current {
+        return false;
+    }
+    *previous = current;
+    true
+}
+
 struct DispatchClaim {
     task: Task,
     claim: crate::queue::Claim,
@@ -3523,33 +3628,40 @@ fn claim_dispatch(
     cooling_down: bool,
     ordinary: &Arc<tokio::sync::Semaphore>,
     urgent: &Arc<tokio::sync::Semaphore>,
-) -> Option<DispatchClaim> {
-    let Ok(claim) = queue.claim(&candidate.id) else {
-        tracing::info!("task {} is claimed elsewhere; skipping", candidate.short());
-        return None;
-    };
+) -> std::result::Result<DispatchClaim, SkipReason> {
+    let claim = queue
+        .claim(&candidate.id)
+        .map_err(|_| SkipReason::ClaimUnavailable)?;
     let task = match queue.get(&candidate.id) {
         Ok(t) if t.status.runnable() => t,
-        Ok(_) => return None,
+        Ok(_) => return Err(SkipReason::NoLongerRunnable),
         Err(e) => {
             tracing::warn!("could not re-read task {}: {e:#}", candidate.short());
-            return None;
+            return Err(SkipReason::RereadFailed);
         }
     };
     let resume = land_resume_state(&task);
     if resume == LandResume::StillWaiting {
-        return None;
+        return Err(SkipReason::WaitingOnLanding);
     }
     let priority = resume == LandResume::Ready;
     if !priority && cooling_down {
-        return None;
+        return Err(SkipReason::CoolingDown);
     }
     // Never borrow an ordinary slot when the single urgent slot is busy.
     // Keep scanning other candidates when either pool has no free slot.
     let permit = match permit_kind(priority, task.urgent) {
         PermitKind::None => None,
-        PermitKind::Urgent => Some(Arc::clone(urgent).try_acquire_owned().ok()?),
-        PermitKind::Ordinary => Some(Arc::clone(ordinary).try_acquire_owned().ok()?),
+        PermitKind::Urgent => Some(
+            Arc::clone(urgent)
+                .try_acquire_owned()
+                .map_err(|_| SkipReason::UrgentCapacity)?,
+        ),
+        PermitKind::Ordinary => Some(
+            Arc::clone(ordinary)
+                .try_acquire_owned()
+                .map_err(|_| SkipReason::OrdinaryCapacity)?,
+        ),
     };
     // Persist the dispatch order under the claim, before config discovery or
     // coordination waits can reorder concurrent starts.
@@ -3562,7 +3674,7 @@ fn claim_dispatch(
     }) {
         tracing::warn!("could not record dispatch order of {}: {e:#}", task.short());
     }
-    Some(DispatchClaim {
+    Ok(DispatchClaim {
         task,
         claim,
         permit,
@@ -3998,6 +4110,7 @@ async fn poll(
         Err(error) => return Err(error.into()),
     };
     let mut previous = std::collections::BTreeSet::<String>::new();
+    let mut previous_skips = DispatchSkips::new();
     while !stop.stopped() {
         let jobs: Vec<_> = crate::worker::active(home)?
             .into_iter()
@@ -4036,6 +4149,7 @@ async fn poll(
             snapshot.completed += previous.difference(&owned).count();
             snapshot.current = current;
             snapshot.idle = owned.is_empty();
+            snapshot.dispatch_wait = None;
         }
         previous = owned.clone();
         stop.busy.store(owned.len(), Ordering::SeqCst);
@@ -4166,7 +4280,9 @@ async fn poll(
                 }
             }
         }
+        let candidate_ids: Vec<_> = candidates.iter().map(|task| task.id.clone()).collect();
         let candidates = interrupt_gate(&interrupt, &in_flight, candidates);
+        let mut skips = interrupt_skips(&candidate_ids, &candidates);
         let cooling = read_cooldown(home)?.is_some_and(|until| Timestamp::now() < until);
         let mut started = false;
         let mut resync = false;
@@ -4174,13 +4290,16 @@ async fn poll(
             if stop.stopped() {
                 break;
             }
-            let Some(DispatchClaim {
+            let DispatchClaim {
                 task,
                 claim,
                 permit,
-            }) = claim_dispatch(queue, &candidate, cooling, &sem, &urgent_sem)
-            else {
-                continue;
+            } = match claim_dispatch(queue, &candidate, cooling, &sem, &urgent_sem) {
+                Ok(claim) => claim,
+                Err(reason) => {
+                    skips.insert((candidate.id, reason));
+                    continue;
+                }
             };
             if crate::worker::active(home)?
                 .iter()
@@ -4218,6 +4337,25 @@ async fn poll(
             attempted.push(task.id);
             started = true;
         }
+        if !resync && !stop.stopped() {
+            if !started {
+                lock(status).dispatch_wait = aggregate_dispatch_wait(candidate_ids.len(), &skips);
+            }
+            if changed_dispatch_skips(&mut previous_skips, skips) {
+                if previous_skips.is_empty() {
+                    tracing::info!("dispatch skips cleared");
+                }
+                for (task, reason) in &previous_skips {
+                    tracing::info!(
+                        task,
+                        reason = reason.key(),
+                        "task {} skipped: {}",
+                        crate::run::short_of(task),
+                        reason.describe()
+                    );
+                }
+            }
+        }
         if started || resync {
             continue;
         }
@@ -4250,6 +4388,7 @@ async fn poll(
     // Dropping a scheduler only drops dispatch bookkeeping. The workers own
     // every queue claim and Runner driver lease through outcome settlement.
     stop.busy.store(0, Ordering::SeqCst);
+    lock(status).dispatch_wait = None;
     Ok(())
 }
 
@@ -6638,6 +6777,85 @@ mod tests {
         )
     }
 
+    #[test]
+    fn dispatch_wait_aggregates_unique_skips_in_stable_count_order() {
+        let skips = DispatchSkips::from([
+            ("a".into(), SkipReason::CoolingDown),
+            ("b".into(), SkipReason::WaitingOnLanding),
+            ("c".into(), SkipReason::WaitingOnLanding),
+            ("d".into(), SkipReason::OrdinaryCapacity),
+        ]);
+        let wait = aggregate_dispatch_wait(4, &skips).unwrap();
+        assert_eq!(wait.runnable, 4);
+        assert_eq!(
+            wait.reasons
+                .iter()
+                .map(|r| (r.reason.as_str(), r.count))
+                .collect::<Vec<_>>(),
+            [
+                ("waiting_on_landing", 2),
+                ("cooling_down", 1),
+                ("ordinary_capacity", 1)
+            ]
+        );
+        assert_eq!(aggregate_dispatch_wait(0, &DispatchSkips::new()), None);
+        assert!(
+            aggregate_dispatch_wait(2, &DispatchSkips::new())
+                .unwrap()
+                .reasons
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn dispatch_wait_tracks_interrupt_withholding_and_set_changes() {
+        let before = vec!["a".into(), "b".into(), "c".into()];
+        let allowed = vec![task_with_id("b")];
+        let skips = interrupt_skips(&before, &allowed);
+        assert_eq!(
+            skips,
+            DispatchSkips::from([
+                ("a".into(), SkipReason::InterruptGate),
+                ("c".into(), SkipReason::InterruptGate),
+            ])
+        );
+        let mut previous = DispatchSkips::new();
+        assert!(!changed_dispatch_skips(&mut previous, DispatchSkips::new()));
+        assert!(changed_dispatch_skips(&mut previous, skips.clone()));
+        assert!(!changed_dispatch_skips(&mut previous, skips));
+        assert!(changed_dispatch_skips(
+            &mut previous,
+            DispatchSkips::from([("a".into(), SkipReason::CoolingDown),])
+        ));
+        assert!(changed_dispatch_skips(&mut previous, DispatchSkips::new()));
+    }
+
+    #[test]
+    fn dispatch_wait_status_reads_legacy_and_future_reason_keys() {
+        let mut value = serde_json::to_value(Status::new()).unwrap();
+        value.as_object_mut().unwrap().remove("dispatch_wait");
+        assert!(
+            serde_json::from_value::<Status>(value.clone())
+                .unwrap()
+                .dispatch_wait
+                .is_none()
+        );
+        assert!(
+            serde_json::from_value::<Reading>(value.clone())
+                .unwrap()
+                .dispatch_wait
+                .is_none()
+        );
+        value["dispatch_wait"] = serde_json::json!({
+            "runnable": 3, "reasons": [{"reason": "future_reason", "count": 3}]
+        });
+        let reading = serde_json::from_value::<Reading>(value).unwrap();
+        assert_eq!(
+            reading.dispatch_wait.unwrap().reasons[0].reason,
+            "future_reason"
+        );
+    }
+
     fn starting_task_reservation(home: &Path, request: &TaskWorker) -> crate::worker::Job {
         let job = crate::worker::Job {
             id: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa".into(),
@@ -7486,19 +7704,22 @@ mod tests {
         let candidates = runnable(&queue);
         assert_eq!(candidates[0].id, parked.id);
         let first = claim_dispatch(&queue, &candidates[0], false, &ordinary, &urgent).unwrap();
-        assert!(claim_dispatch(&queue, &fresh, false, &ordinary, &urgent).is_none());
-        assert!(claim_dispatch(&queue, &urgent_task, false, &ordinary, &urgent).is_some());
+        assert!(claim_dispatch(&queue, &fresh, false, &ordinary, &urgent).is_err());
+        assert!(claim_dispatch(&queue, &urgent_task, false, &ordinary, &urgent).is_ok());
         drop(first);
         let claimed_elsewhere = queue.claim(&parked.id).unwrap();
         let next = runnable(&queue)
             .into_iter()
-            .find_map(|t| claim_dispatch(&queue, &t, false, &ordinary, &urgent))
+            .find_map(|t| claim_dispatch(&queue, &t, false, &ordinary, &urgent).ok())
             .unwrap();
         assert_eq!(next.task.id, fresh.id);
         assert_eq!(queue.get(&parked.id).unwrap().attempts, 0);
         drop(claimed_elsewhere);
         drop(next);
-        assert!(claim_dispatch(&queue, &parked, true, &ordinary, &urgent).is_none());
+        assert!(matches!(
+            claim_dispatch(&queue, &parked, true, &ordinary, &urgent),
+            Err(SkipReason::CoolingDown)
+        ));
     }
 
     #[test]
@@ -7516,14 +7737,20 @@ mod tests {
         let dispatched = claim_dispatch(&queue, &stale_plain, false, &ordinary, &urgent).unwrap();
         let mut second = urgent_task("second");
         queue.put(&mut second).unwrap();
-        assert!(claim_dispatch(&queue, &second, false, &ordinary, &urgent).is_none());
+        assert!(matches!(
+            claim_dispatch(&queue, &second, false, &ordinary, &urgent),
+            Err(SkipReason::UrgentCapacity)
+        ));
         drop(queue.claim(&second.id).unwrap());
         assert_eq!(queue.get(&second.id).unwrap().attempts, 0);
         drop(dispatched);
         let stale_urgent = queue.get(&first.id).unwrap();
         first.set_urgent(false).unwrap();
         queue.put(&mut first).unwrap();
-        assert!(claim_dispatch(&queue, &stale_urgent, false, &ordinary, &urgent).is_none());
+        assert!(matches!(
+            claim_dispatch(&queue, &stale_urgent, false, &ordinary, &urgent),
+            Err(SkipReason::OrdinaryCapacity)
+        ));
         assert_eq!(urgent.available_permits(), 1);
         drop(queue.claim(&first.id).unwrap());
         drop(occupied);
@@ -7559,22 +7786,37 @@ mod tests {
         t.set_urgent(true).unwrap();
         queue.put(&mut t).unwrap();
         let occupied = Arc::clone(&urgent).try_acquire_owned().unwrap();
-        assert!(claim_dispatch(&queue, &t, false, &ordinary, &urgent).is_none());
+        assert!(matches!(
+            claim_dispatch(&queue, &t, false, &ordinary, &urgent),
+            Err(SkipReason::UrgentCapacity)
+        ));
         assert_eq!(ordinary.available_permits(), 1, "no ordinary fallback");
         drop(queue.claim(&t.id).unwrap());
         assert_eq!(queue.get(&t.id).unwrap().attempts, t.attempts);
         drop(occupied);
-        assert!(claim_dispatch(&queue, &t, true, &ordinary, &urgent).is_none());
+        assert!(matches!(
+            claim_dispatch(&queue, &t, true, &ordinary, &urgent),
+            Err(SkipReason::CoolingDown)
+        ));
         drop(queue.claim(&t.id).unwrap());
         let held = queue.claim(&t.id).unwrap();
-        assert!(claim_dispatch(&queue, &t, false, &ordinary, &urgent).is_none());
+        assert!(matches!(
+            claim_dispatch(&queue, &t, false, &ordinary, &urgent),
+            Err(SkipReason::ClaimUnavailable)
+        ));
         drop(held);
         t.status = TaskStatus::Held;
         queue.put(&mut t).unwrap();
-        assert!(claim_dispatch(&queue, &t, false, &ordinary, &urgent).is_none());
+        assert!(matches!(
+            claim_dispatch(&queue, &t, false, &ordinary, &urgent),
+            Err(SkipReason::NoLongerRunnable)
+        ));
         drop(queue.claim(&t.id).unwrap());
         std::fs::remove_file(queue.path_of(&t.id)).unwrap();
-        assert!(claim_dispatch(&queue, &t, false, &ordinary, &urgent).is_none());
+        assert!(matches!(
+            claim_dispatch(&queue, &t, false, &ordinary, &urgent),
+            Err(SkipReason::RereadFailed)
+        ));
         drop(queue.claim(&t.id).unwrap());
         assert_eq!(urgent.available_permits(), 1);
     }
@@ -13498,11 +13740,20 @@ mod tests {
         queue.put(&mut task).unwrap();
         let empty = Arc::new(tokio::sync::Semaphore::new(0));
         let free = Arc::new(tokio::sync::Semaphore::new(1));
-        assert!(claim_dispatch(&queue, &task, false, &empty, &free).is_none());
-        assert!(claim_dispatch(&queue, &task, true, &free, &free).is_none());
+        assert!(matches!(
+            claim_dispatch(&queue, &task, false, &empty, &free),
+            Err(SkipReason::OrdinaryCapacity)
+        ));
+        assert!(matches!(
+            claim_dispatch(&queue, &task, true, &free, &free),
+            Err(SkipReason::CoolingDown)
+        ));
         let claim = claim_dispatch(&queue, &task, false, &free, &free).unwrap();
         assert!(claim.permit.is_some());
-        assert!(claim_dispatch(&queue, &task, false, &free, &free).is_none());
+        assert!(matches!(
+            claim_dispatch(&queue, &task, false, &free, &free),
+            Err(SkipReason::ClaimUnavailable)
+        ));
         drop(claim);
         Questions::open()
             .update(&q.id, |q| {
@@ -13757,7 +14008,7 @@ mod tests {
                     assert!(!waiting.action_applied(&q.id));
                     assert!(runnable(&queue).is_empty());
                     let free = Arc::new(tokio::sync::Semaphore::new(1));
-                    assert!(claim_dispatch(&queue, &t, false, &free, &free).is_none());
+                    assert!(claim_dispatch(&queue, &t, false, &free, &free).is_err());
                 }
                 std::fs::remove_file(questions.root().join(format!("{}.lease", q.id))).unwrap();
 
