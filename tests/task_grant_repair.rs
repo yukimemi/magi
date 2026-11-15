@@ -837,7 +837,10 @@ async fn superseded_dependency_question_does_not_deadlock_triage_after_repair_fa
     let mut changed = questions.get(&generic.id).unwrap(); changed.detail.push_str(" changed source");
     questions.put(&mut changed).unwrap();
     assert!(magi::triage::pending_for(&questions, &recovered));
-    assert!(magi::triage::open_task_ids(&questions).contains(&task.id));
+    // Execution still fences changed evidence, but a queued task is outside
+    // triage's display scope until it becomes held or dependency-blocked again.
+    assert_eq!(recovered.status, TaskStatus::Queued);
+    assert!(!magi::triage::open_task_ids(&questions).contains(&task.id));
     let mut restore = generic.clone(); questions.put(&mut restore).unwrap();
 
     let mut resumed = Runner::resume(&request.run).unwrap(); resumed.execute().await.unwrap();

@@ -4693,7 +4693,9 @@ async fn queue_compact_controls_and_edit_save_fit_and_preserve_drafts() {
             return originalFetch(url, options);
           }};
           await deck.saveTaskEdit();
-          assert(dialog.open && document.querySelector('#task-edit-error').textContent.includes('Title and instruction saved'), 'partial save explained');
+          const partialError = document.querySelector('#task-edit-error').textContent;
+          assert(dialog.open && partialError.includes('Title and instruction saved'),
+            `partial save explained at {width}px: ${{partialError}}`);
           calls.length = 0;
           window.fetch = async (url, options) => {{
             if (isTaskWrite(url, options)) calls.push(url);
