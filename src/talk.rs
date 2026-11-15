@@ -1095,6 +1095,39 @@ const TICKET_GENERATIONS: u32 = 16;
 /// Tickets are forgotten only this long after their last write.
 const TICKET_SWEEP_AGE: Duration = Duration::from_secs(3600);
 
+/// An empty open conversation for tests of other modules. Creating one through
+/// `begin` resolves an installed agent CLI, which a test host may not have.
+#[cfg(test)]
+pub(crate) fn seeded_for_test(id: &str, repo: PathBuf) -> Talk {
+    Talk {
+        title: None,
+        title_attempted_at: None,
+        retired_recommendations: None,
+        posts_read_through: None,
+        pending_breaks: None,
+        pending_messages: Vec::new(),
+        schema: SCHEMA,
+        id: id.to_owned(),
+        repo,
+        agent: "test".to_owned(),
+        status: TalkStatus::Open,
+        turns: Vec::new(),
+        pending: String::new(),
+        pending_attachments: Vec::new(),
+        fallback: false,
+        persona: String::new(),
+        persona_dirty: false,
+        implementers: 1,
+        implementers_dirty: false,
+        notified: Vec::new(),
+        notice_receipts: Vec::new(),
+        completion_notices: Vec::new(),
+        created_at: Timestamp::now(),
+        updated_at: Timestamp::now(),
+        seat: SeatState::new(SEAT, "test", 1),
+    }
+}
+
 /// Create `path` exclusively with `body`; `false` when it already exists.
 #[cfg(test)]
 fn create_exclusive(path: &Path, body: &str) -> Result<bool> {

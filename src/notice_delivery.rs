@@ -264,6 +264,15 @@ pub fn sweep(queue: &Queue, talks: &Talks, home: &Path, repo: &Path) {
 mod tests {
     use super::*;
 
+    /// A destination conversation written directly: creating one through
+    /// `task_chat::destination_in` resolves an installed agent CLI, which the
+    /// environment running the tests may not have.
+    fn seed_chat(talks: &Talks, repo: &Path, id: &str) -> talk::Talk {
+        let mut chat = talk::seeded_for_test(id, repo.to_path_buf());
+        talks.put(&mut chat).unwrap();
+        talks.get(id).unwrap()
+    }
+
     #[test]
     fn historical_external_merge_transport_never_reopens_or_replays() {
         for existing in [false, true] {
@@ -285,9 +294,9 @@ mod tests {
                 let prior = notices
                     .raise(Notice::warn("run:legacy", "Original audit report"))
                     .unwrap();
+                seed_chat(&talks, &repo, "notice-run-legacy");
                 reconcile(&prior, &queue, &talks, home.path(), home.path()).unwrap();
-                let mut chat =
-                    crate::task_chat::destination_in(&talks, &repo, "notice-run-legacy").unwrap();
+                let mut chat = talks.get("notice-run-legacy").unwrap();
                 chat.status = talk::TalkStatus::Closed;
                 talks.put(&mut chat).unwrap();
                 Some(serde_json::to_value(talks.get(&chat.id).unwrap()).unwrap())
@@ -344,6 +353,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+        seed_chat(&talks, home.path(), "notice-run-current");
         notices
             .raise(Notice::warn(
                 "merged-unrecorded:current",
@@ -351,7 +361,11 @@ mod tests {
             ))
             .unwrap();
         sweep(&queue, &talks, home.path(), home.path());
-        assert_eq!(talks.list().len(), 1);
+        let chat = talks.get("notice-run-current").unwrap();
+        assert!(
+            chat.pending
+                .contains(crate::prompt::ATTENTION_NOTICE_HEADING)
+        );
     }
 
     #[test]
@@ -362,7 +376,8 @@ mod tests {
             let talks = Talks::at(home.path().join("talks"));
             let notices = Notices::at(home.path().join("notifications"));
             let repo = home.path().join("removed");
-            if key.starts_with("merged-unrecorded:") {
+            let owned = key.starts_with("merged-unrecorded:");
+            if owned {
                 let mut task = Task::new(
                     "current".into(),
                     "current".into(),
@@ -372,20 +387,36 @@ mod tests {
                 task.runs.push("current".into());
                 queue.put(&mut task).unwrap();
             }
+            let run = serde_json::json!({
+                "status": "blocked", "repo": repo,
+                "candidates": [{"folded": true}]
+            });
             let path = home.path().join("runs/current/run.json");
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(
-                path,
-                serde_json::to_vec(&serde_json::json!({
-                    "status": "blocked", "repo": repo,
-                    "candidates": [{"folded": true}]
-                }))
-                .unwrap(),
-            )
-            .unwrap();
+            std::fs::write(path, serde_json::to_vec(&run).unwrap()).unwrap();
+            if owned {
+                // The owning task keeps the check actionable; the destination
+                // is reserved through the task, which needs an agent CLI, so
+                // the decision itself is asserted here.
+                assert!(
+                    crate::external_merge_attention::historical_reason(
+                        home.path(),
+                        "current",
+                        &run
+                    )
+                    .is_none()
+                );
+                continue;
+            }
+            seed_chat(&talks, &repo, "notice-run-current");
             notices.raise(Notice::warn(key, "Action required")).unwrap();
             sweep(&queue, &talks, home.path(), home.path());
-            assert_eq!(talks.list().len(), 1, "{key}");
+            let chat = talks.get("notice-run-current").unwrap();
+            assert!(
+                chat.pending
+                    .contains(crate::prompt::ATTENTION_NOTICE_HEADING),
+                "{key}"
+            );
         }
     }
 
