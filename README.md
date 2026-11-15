@@ -358,9 +358,10 @@ completed dispatch scan's reason counts (landing waits, cooldown, occupied
 ordinary/urgent slots, interrupt withholding, or claim/re-read failures).
 `daemon.json` exposes the same observation as `dispatch_wait`, including the
 pre-gate runnable count. It is cleared when work starts or the scan is incomplete;
-it is not a fresh queue census. Tracing logs the full task/reason set only when
-it changes, including when the set becomes empty. These diagnostics do not
-change dispatch policy.
+it is not a fresh queue census. Tracing logs a readable explanation per skipped
+task only when the task/reason set changes, and reports when the set clears.
+Claim failures do not distinguish contention from other claim errors.
+These diagnostics do not change dispatch policy.
 
 `magi task add --urgent` is the escape hatch for the rare task that genuinely
 cannot wait. It dispatches the moment it is runnable, through one extra,

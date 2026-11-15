@@ -3541,6 +3541,19 @@ impl SkipReason {
             Self::InterruptGate => "interrupt_gate",
         }
     }
+
+    fn describe(self) -> &'static str {
+        match self {
+            Self::ClaimUnavailable => "could not claim it (held elsewhere or claim failed)",
+            Self::RereadFailed => "could not re-read it",
+            Self::NoLongerRunnable => "no longer runnable",
+            Self::WaitingOnLanding => "waiting on landing",
+            Self::CoolingDown => "quota cooldown",
+            Self::OrdinaryCapacity => "no free ordinary slot",
+            Self::UrgentCapacity => "urgent slot busy",
+            Self::InterruptGate => "withheld by the interrupt sequence",
+        }
+    }
 }
 
 /// A reason count from a completed dispatch scan.
@@ -4329,7 +4342,18 @@ async fn poll(
                 lock(status).dispatch_wait = aggregate_dispatch_wait(candidate_ids.len(), &skips);
             }
             if changed_dispatch_skips(&mut previous_skips, skips) {
-                tracing::info!(skips = ?previous_skips, "dispatch skip set changed");
+                if previous_skips.is_empty() {
+                    tracing::info!("dispatch skips cleared");
+                }
+                for (task, reason) in &previous_skips {
+                    tracing::info!(
+                        task,
+                        reason = reason.key(),
+                        "task {} skipped: {}",
+                        crate::run::short_of(task),
+                        reason.describe()
+                    );
+                }
             }
         }
         if started || resync {
