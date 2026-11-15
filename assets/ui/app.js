@@ -2324,11 +2324,17 @@ function orderedRuns(key, runs) {
     (ranks.get(a.id) ?? -1) - (ranks.get(b.id) ?? -1));
 }
 
+function rememberRunMove(key, visible) {
+  const saved = Array.isArray(runOrder[key]) ? runOrder[key] : [];
+  const shown = new Set(visible);
+  const full = [...visible.filter((id) => !saved.includes(id)), ...saved];
+  let cursor = 0;
+  // Only refill visible slots; filtered and unloaded runs retain their places.
+  runOrder[key] = full.map((id) => shown.has(id) ? visible[cursor++] : id);
+}
+
 function reorderAllowed(scope) {
-  return !rowSaving && (scope === "queue"
-    ? !searchText("queue")
-    : !searchText("runs") && !state.runsFilter.section && !state.runsFilter.status
-      && state.runsStateFilter === "all");
+  return !rowSaving && !searchText(scope);
 }
 
 function reorderSnapshot(scope) {
@@ -2344,6 +2350,13 @@ function priorityEdits(tasks, from, to) {
   const desired = [...tasks];
   const [moved] = desired.splice(from, 1);
   desired.splice(to, 0, moved);
+  const prev = desired[to - 1], next = desired[to + 1];
+  const low = next ? next.priority + (moved.id < next.id ? 0 : 1) : -2147483648;
+  const high = prev ? prev.priority - (prev.id < moved.id ? 0 : 1) : 2147483647;
+  if (low <= high) {
+    const priority = Math.max(low, Math.min(high, moved.priority));
+    return priority === moved.priority ? [] : [{ id: moved.id, priority }];
+  }
   for (let size = 1; size <= desired.length; size += 1) {
     for (let left = Math.max(0, to - size + 1); left <= to && left + size <= desired.length; left += 1) {
       const right = left + size;
@@ -2357,6 +2370,22 @@ function priorityEdits(tasks, from, to) {
   }
   throw new Error("No integer priority space is available.");
 }
+
+function queueMoveEdits(tasks, key, prevKey, nextKey, section) {
+  const moved = tasks.find((task) => task.id === key);
+  if (!moved || queueSection(moved) !== section || moved.upgrade_resume_at || section === "running") {
+    throw new Error("The task is no longer movable in this section.");
+  }
+  const items = tasks.filter((task) => queueSection(task) === section).sort(queueOrder);
+  const rest = items.filter((task) => task.id !== key);
+  const prev = rest.findIndex((task) => task.id === prevKey);
+  const next = rest.findIndex((task) => task.id === nextKey);
+  const to = prev >= 0 ? prev + 1 : next >= 0 ? next : rest.length === 0 ? 0 : -1;
+  if (to < 0 || rest[to - 1]?.upgrade_resume_at || rest[to]?.upgrade_resume_at) {
+    throw new Error("The list changed; the requested position is no longer available.");
+  }
+  return priorityEdits(items, items.indexOf(moved), to);
+}
 function reorderNotice(scope, message) {
   setText($(`${scope}-reorder-status`), message);
   announce(message);
@@ -2364,7 +2393,7 @@ function reorderNotice(scope, message) {
 
 
 async function moveListRow(scope, row, target, snapshot) {
-  if (!reorderAllowed(scope) || (snapshot && snapshot !== reorderSnapshot(scope))) {
+  if (!reorderAllowed(scope) || (scope === "runs" && snapshot && snapshot !== reorderSnapshot(scope))) {
     reorderNotice(scope, "List changed. Reorder cancelled; try again.");
     return;
   }
@@ -2374,22 +2403,23 @@ async function moveListRow(scope, row, target, snapshot) {
   const to = ids.indexOf(rowId(target));
   if (from < 0 || to < 0 || from === to) return;
   const focusId = rowId(row);
+  const section = list.closest(".list-section").dataset.key;
+  const desired = [...ids];
+  desired.splice(from, 1);
+  desired.splice(to, 0, focusId);
+  const prevKey = desired[to - 1], nextKey = desired[to + 1];
   let result = "Row order saved.";
   rowSaving = true;
   for (const control of document.querySelectorAll(".reorder-handle, #queue-sections .btn-step")) control.disabled = true;
   try {
     if (scope === "runs") {
-      const [id] = ids.splice(from, 1);
-      ids.splice(to, 0, id);
-      runOrder[list.closest(".list-section").dataset.key] = ids;
+      rememberRunMove(section, desired);
       try { localStorage.setItem(RUN_ORDER_KEY, JSON.stringify(runOrder)); }
       catch { result = "Run order changed for this tab only; browser storage is unavailable."; }
     } else {
-      const tasks = ids.map((id) => state.queue.find((task) => task.id === id));
-      if (tasks.some((task) => !task || task.upgrade_resume_at || queueSection(task) === "running")) {
-        throw new Error("Running tasks and upgrade resumes have fixed positions.");
-      }
-      for (const edit of priorityEdits(tasks, from, to)) {
+      // Read at drop time. A failed refresh must never plan from cached state.
+      const tasks = await getJson(API.queue);
+      for (const edit of queueMoveEdits(tasks, focusId, prevKey, nextKey, section)) {
         await postJson(API.priority(edit.id), { priority: edit.priority });
       }
       await loadQueue();

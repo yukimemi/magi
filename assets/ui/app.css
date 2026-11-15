@@ -2920,14 +2920,18 @@ h1 { overflow-wrap: anywhere; letter-spacing: 0; }
   gap: var(--s1); min-width: 0; font-size: var(--t1);
 }
 :is(#queue-sections, #queue-search-results) .task-card > .task-card-actions {
-  grid-column: 2 / -1; grid-row: 3; margin: 0; display: flex;
+  grid-column: 2 / -1; grid-row: 3; margin: 0; display: none;
 }
+:is(#queue-sections, #queue-search-results) .task-card[aria-current="true"] > .task-card-actions { display: flex; }
 :is(#queue-sections, #queue-search-results) .task-card > :is(.card-meta, .card-note, .err, .advanced),
 :is(#queue-sections, #queue-search-results) .task-card-actions > :not(.task-priority-box) { display: none; }
 :is(#queue-sections, #queue-search-results) .task-card > .reorder-handle {
   grid-column: 1; grid-row: 1 / 4; align-self: center;
 }
-#queue-sections .cards, #runs-sections .cards { gap: var(--s1); }
+#queue-sections .cards, #runs-sections .cards {
+  display: flex; flex-direction: column; gap: var(--s1); width: 100%; min-width: 0;
+}
+#queue-sections .cards > li, #runs-sections .cards > li { width: 100%; min-width: 0; }
 #runs-sections .cards > li { position: relative; padding-left: calc(var(--tap) + var(--s1)); }
 #runs-sections .reorder-handle { position: absolute; left: 0; top: var(--s2); }
 .reorder-handle { touch-action: none; cursor: grab; padding: var(--s1); min-width: var(--tap); }

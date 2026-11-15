@@ -359,12 +359,13 @@ slots and other eligibility gates still apply. Saves are sequential, not atomic:
 if a write is refused, remaining writes stop and the list reloads the saved order.
 The +/− priority controls remain available.
 
-Competition rows already use the existing run detail. With **All** selected
-and search/scope filters cleared, their handles reorder within a section only
-in this browser. New runs appear before remembered rows; **Reset order** restores
-the default section order. Storage refusal keeps the choice for the current tab.
-Refreshes retain row identity and disclosures; a changed scheduling snapshot
-cancels an in-progress drag rather than applying stale positions.
+Competition rows already use the existing run detail. Their handles reorder within
+a section in this browser after clearing search; scope and state filters may stay
+active. Filtered and unloaded runs retain their remembered positions. New runs
+appear before remembered rows; **Reset order** restores the default section order.
+Storage refusal keeps the choice for the current tab. Refreshes retain row identity
+and disclosures, freezing the DOM during a drag. Queue drops read fresh priorities
+and resolve the destination by neighbouring task IDs before saving.
 
 `magi serve` runs **one competition at a time** on purpose. The graph is already
 parallel inside — candidates times judges — and two graphs at once doubles the

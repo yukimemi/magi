@@ -5,7 +5,9 @@ import { test } from 'node:test';
 const source = readFileSync(new URL('../assets/ui/app.js', import.meta.url), 'utf8');
 const logic = source.slice(source.indexOf('const priorityOrder ='), source.indexOf('async function moveListRow('));
 function harness(order = {}) {
-  return runInNewContext(`${logic}\n({priorityEdits, queueOrder, orderedRuns})`, { runOrder: order });
+  return runInNewContext(`${logic}\n({priorityEdits, queueMoveEdits, queueOrder, orderedRuns, rememberRunMove})`, {
+    runOrder: order, queueSection: task => task.status || 'upnext',
+  });
 }
 test('every insertion preserves exact dispatch order at ties and integer boundaries', () => {
   const { priorityEdits, queueOrder } = harness();
@@ -27,6 +29,27 @@ test('a free integer gap only writes the moved task', () => {
   const { priorityEdits } = harness();
   const edits = priorityEdits([{ id: 'a', priority: 10 }, { id: 'b', priority: 5 }, { id: 'c', priority: 0 }], 2, 1);
   assert.deepEqual(JSON.parse(JSON.stringify(edits)), [{ id: 'c', priority: 6 }]);
+});
+test('an ID tie-break allows a single write without raising its neighbours', () => {
+  const { priorityEdits } = harness();
+  const edits = priorityEdits([{ id: 'b', priority: 1 }, { id: 'c', priority: 0 }, { id: 'a', priority: -1 }], 2, 1);
+  assert.deepEqual(JSON.parse(JSON.stringify(edits)), [{ id: 'a', priority: 0 }]);
+});
+test('drop planning uses fresh priorities and surviving neighbour IDs', () => {
+  const { queueMoveEdits, queueOrder } = harness();
+  const tasks = [{ id: 'a', priority: 100 }, { id: 'new', priority: 90 }, { id: 'b', priority: 80 }, { id: 'c', priority: 0 }];
+  const edits = queueMoveEdits(tasks, 'c', 'a', 'b', 'upnext');
+  const saved = tasks.map(task => ({ ...task, priority: edits.find(edit => edit.id === task.id)?.priority ?? task.priority }));
+  assert.deepEqual(saved.sort(queueOrder).map(task => task.id), ['a', 'c', 'new', 'b']);
+  assert.throws(() => queueMoveEdits(tasks, 'c', 'gone', 'missing', 'upnext'), /list changed/);
+  assert.throws(() => queueMoveEdits(tasks.map(task => task.id === 'c' ? { ...task, status: 'running' } : task), 'c', 'a', 'b', 'upnext'), /no longer movable/);
+});
+test('filtered and unloaded runs keep their remembered slots after visible moves', () => {
+  const order = { flight: ['a', 'hidden', 'b', 'unloaded'] };
+  const { rememberRunMove, orderedRuns } = harness(order);
+  rememberRunMove('flight', ['b', 'a']);
+  assert.deepEqual(Array.from(order.flight), ['b', 'hidden', 'a', 'unloaded']);
+  assert.deepEqual(Array.from(orderedRuns('flight', ['a', 'hidden', 'b', 'unloaded'].map(id => ({ id }))), row => row.id), ['b', 'hidden', 'a', 'unloaded']);
 });
 test('upgrade resumes stay ahead of priority and order by dispatch time', () => {
   const { queueOrder } = harness();
