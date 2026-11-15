@@ -4,11 +4,12 @@ import { runInNewContext } from 'node:vm';
 import { test } from 'node:test';
 const source = readFileSync(new URL('../assets/ui/app.js', import.meta.url), 'utf8');
 const loading = source.slice(source.indexOf('const storeReads ='), source.indexOf('function loadRuns('));
+const ordering = source.slice(source.indexOf('const priorityOrder ='), source.indexOf('function orderedRuns('));
 const flush = () => new Promise(resolve => setImmediate(resolve));
 function harness(existing = null) {
   const requests = [], renders = [], notices = [];
   const state = { queue: existing, talks: null, rev: {}, talkWaits: new Map() };
-  const api = runInNewContext(`${loading}\n({loadStore})`, {
+  const api = runInNewContext(`${ordering}\n${loading}\n({loadStore})`, {
     state, getJson: url => new Promise((resolve, reject) => requests.push({ url, resolve, reject })),
     sectionNotice: (...args) => notices.push(args), ok() {},
     setTimeout: () => 1, clearTimeout() {},
@@ -73,7 +74,7 @@ test('continuous updates cannot starve older pages and contiguous deltas reconci
   h.requests[4].resolve([row('retained'), row('inserted'), row('middle', 2)]);
   await done;
   assert.equal(h.state.rev.queue, 4);
-  assert.deepEqual(Array.from(h.state.queue, r => r.id), ['middle', 'retained', 'oldest', 'older', 'inserted']);
+  assert.deepEqual(Array.from(h.state.queue, r => r.id), ['middle', 'inserted', 'older', 'oldest', 'retained']);
 });
 
 test('a skipped delta base still finishes enumeration before starting a fresh snapshot', async () => {

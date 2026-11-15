@@ -349,6 +349,23 @@ One task is one JSON file under `<data_local>/magi/queue`, so the backlog is
 readable, editable, and greppable with the tools already on the machine, and a
 daemon killed mid-run leaves a queue the next one picks up.
 
+The Web Queue uses compact rows with the existing task detail alongside them
+on wide screens. Drag the ↕ handle (mouse or touch), or focus it and press
+Arrow Up / Down, to reorder within a section after clearing search. Queue
+moves persist priorities through the ordinary priority endpoint: higher values
+run first, ties use ascending task ID. Running tasks cannot move. Upgrade
+resumes occupy a fixed lane ahead of ordinary priorities; admission, urgent
+slots and other eligibility gates still apply. Saves are sequential, not atomic:
+if a write is refused, remaining writes stop and the list reloads the saved order.
+The +/− priority controls remain available.
+
+Competition rows already use the existing run detail. With **All** selected
+and search/scope filters cleared, their handles reorder within a section only
+in this browser. New runs appear before remembered rows; **Reset order** restores
+the default section order. Storage refusal keeps the choice for the current tab.
+Refreshes retain row identity and disclosures; a changed scheduling snapshot
+cancels an in-progress drag rather than applying stale positions.
+
 `magi serve` runs **one competition at a time** on purpose. The graph is already
 parallel inside — candidates times judges — and two graphs at once doubles the
 burn on the agent-CLI quota that is the real constraint.
@@ -363,8 +380,8 @@ briefly reach `max_concurrent_runs + 1` runs at once instead of just one.
 Change an existing task with `magi task urgent <ID>` to enable urgent, or
 `magi task urgent <ID> --clear` to disable it. IDs may be unambiguous short IDs.
 `magi task show <ID>` reports the saved enabled/disabled state. In the Web
-Queue, open **Actions** and press **Urgent: off/on**; the task detail's action
-sheet has the same toggle. The URGENT badge reflects the saved setting.
+Queue, select the task and use its detail action sheet's **Urgent: off/on**
+toggle. The URGENT badge reflects the saved setting.
 Only unclaimed queued or held tasks can change urgent. Changing a held task
 keeps it held, with its reason and attempts intact; release it separately when
 ready. Claimed, running, and other task states are refused; wait for the claim

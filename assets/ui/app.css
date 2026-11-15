@@ -2905,6 +2905,47 @@ h1 { overflow-wrap: anywhere; letter-spacing: 0; }
   main[data-split] .cards > li.card.task-card > .task-card-actions { display: flex; margin-top: var(--s2); }
 }
 
+/* Queue summaries use the same compact rows at every width. Full instructions,
+   history and destructive controls remain on the existing task detail page. */
+#view-queue { container-type: inline-size; }
+:is(#queue-sections, #queue-search-results) .card.task-card {
+  display: grid; grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center; gap: var(--s1) var(--s2); padding: var(--s2) var(--s3);
+}
+:is(#queue-sections, #queue-search-results) .task-card > .card-title {
+  grid-column: 2 / -1; grid-row: 1; margin: 0; min-width: 0; font-size: var(--t3);
+}
+:is(#queue-sections, #queue-search-results) .task-card > .card-top {
+  display: flex; flex-wrap: wrap; grid-column: 2 / -1; grid-row: 2; margin: 0;
+  gap: var(--s1); min-width: 0; font-size: var(--t1);
+}
+:is(#queue-sections, #queue-search-results) .task-card > .task-card-actions {
+  grid-column: 2 / -1; grid-row: 3; margin: 0; display: flex;
+}
+:is(#queue-sections, #queue-search-results) .task-card > :is(.card-meta, .card-note, .err, .advanced),
+:is(#queue-sections, #queue-search-results) .task-card-actions > :not(.task-priority-box) { display: none; }
+:is(#queue-sections, #queue-search-results) .task-card > .reorder-handle {
+  grid-column: 1; grid-row: 1 / 4; align-self: center;
+}
+#queue-sections .cards, #runs-sections .cards { gap: var(--s1); }
+#runs-sections .cards > li { position: relative; padding-left: calc(var(--tap) + var(--s1)); }
+#runs-sections .reorder-handle { position: absolute; left: 0; top: var(--s2); }
+.reorder-handle { touch-action: none; cursor: grab; padding: var(--s1); min-width: var(--tap); }
+.reorder-handle:disabled { cursor: not-allowed; opacity: .4; }
+.row-dragging { opacity: .6; }
+[data-drop="before"] { box-shadow: 0 -3px 0 var(--focus); }
+[data-drop="after"] { box-shadow: 0 3px 0 var(--focus); }
+@container (min-width: 700px) {
+  :is(#queue-sections, #queue-search-results) .card.task-card {
+    grid-template-columns: auto minmax(0, 1fr) auto;
+  }
+  :is(#queue-sections, #queue-search-results) .task-card > .card-title { grid-column: 2; }
+  :is(#queue-sections, #queue-search-results) .task-card > .card-top { grid-column: 2; }
+  :is(#queue-sections, #queue-search-results) .task-card > .task-card-actions {
+    grid-column: 3; grid-row: 1 / 3;
+  }
+}
+
 /* Replies use the same compact action buttons as the conversation composer. */
 .reply-preview { display: flex; align-items: center; gap: .5rem; padding: .5rem; border-left: 3px solid var(--gold); }
 .reply-preview > span { flex: 1; min-width: 0; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow-wrap: anywhere; }
