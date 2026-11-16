@@ -1370,7 +1370,12 @@ fn notice_for_failure(progress: &Progress, err: &anyhow::Error) -> (Option<Strin
 
 /// Prefer Git's actual failure over a preceding progress line for short notices.
 fn failure_headline(reason: &str) -> Option<&str> {
-    let lines = || reason.lines().map(str::trim).filter(|line| !line.is_empty());
+    let lines = || {
+        reason
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+    };
     lines()
         .find(|line| line.starts_with("fatal:") || line.starts_with("error:"))
         .or_else(|| lines().next())
