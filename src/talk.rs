@@ -2513,6 +2513,165 @@ fn pending_matches(talk: &Talk, expected_text: &str, expected_attachments: &[Str
             .eq(expected_attachments.iter())
 }
 
+type RegisteredWork = std::collections::BTreeSet<(bool, String)>;
+
+fn registered_work(home: &Path, talk: &str) -> Result<RegisteredWork> {
+    let mut ids: RegisteredWork = crate::chat_watch::registered_ids(home, talk)?
+        .into_iter()
+        .map(|id| (false, id))
+        .collect();
+    let entries = match std::fs::read_dir(home.join("queue")) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(ids),
+        Err(e) => return Err(e.into()),
+    };
+    for entry in entries {
+        let path = entry?.path();
+        if path.extension().is_some_and(|ext| ext == "json") {
+            let task: crate::queue::Task = serde_json::from_slice(&std::fs::read(path)?)?;
+            if task.filed_by_chat() == Some(talk) {
+                ids.insert((true, task.id));
+            }
+        }
+    }
+    Ok(ids)
+}
+
+fn unbacked_promise(
+    reply: &str,
+    before: Option<&RegisteredWork>,
+    after: Option<&RegisteredWork>,
+) -> bool {
+    matches!((before, after), (Some(before), Some(after)) if after.is_subset(before))
+        && promises_later_report(reply)
+}
+
+/// Deliberately narrow: affirmative first-person promises in prose only.
+fn promises_later_report(reply: &str) -> bool {
+    let mut fence = None;
+    for line in reply.lines() {
+        let line = line.trim();
+        if let Some(marker) = ["```", "~~~"].into_iter().find(|m| line.starts_with(m)) {
+            if fence == Some(marker) {
+                fence = None;
+            } else if fence.is_none() {
+                fence = Some(marker);
+            }
+            continue;
+        }
+        if fence.is_some() || line.starts_with('>') {
+            continue;
+        }
+        let mut prose = String::new();
+        let mut chars = line.chars().peekable();
+        let mut code = 0;
+        while let Some(ch) = chars.next() {
+            if ch == '`' {
+                let mut ticks = 1;
+                while chars.next_if_eq(&'`').is_some() {
+                    ticks += 1;
+                }
+                if code == 0 {
+                    code = ticks;
+                } else if code == ticks {
+                    code = 0;
+                }
+            } else if code == 0 {
+                prose.push(ch);
+            }
+        }
+        let normalized = prose.to_lowercase().replace('’', "'");
+        for sentence in normalized.split_inclusive(['.', '!', '?', '。', '！', '？']) {
+            let sentence = sentence.trim();
+            // A question excludes only itself, not a later promise on the same line.
+            if sentence.ends_with(['?', '？']) || sentence.contains(['"', '「', '」', '“', '”'])
+            {
+                continue;
+            }
+            let sentence = sentence.trim_end_matches(['.', '!', '。', '！']).trim_end();
+            for clause in sentence
+                .split([',', ';', ':', '、', '；'])
+                .flat_map(|clause| clause.split(" but "))
+                .flat_map(|clause| clause.split(" however "))
+                .flat_map(|clause| clause.split(" although "))
+            {
+                if clause.contains(" not ")
+                    || clause.contains("n't")
+                    || clause.contains("never ")
+                    || clause.contains("cannot ")
+                    || clause.contains("できません")
+                    || clause.contains("しません")
+                    || clause.contains("しない")
+                    || clause.contains("とは言")
+                {
+                    continue;
+                }
+                if [
+                    "i will",
+                    "i'll",
+                    "we will",
+                    "we'll",
+                    "i am going to",
+                    "i'm going to",
+                ]
+                .iter()
+                .filter_map(|subject| clause.trim_start().strip_prefix(subject)?.strip_prefix(' '))
+                .any(|verb| {
+                    [
+                        "report back",
+                        "notify",
+                        "let you know",
+                        "tell you when",
+                        "tell you once",
+                        "ping you",
+                        "update you",
+                        "get back to you",
+                        "message you",
+                        "follow up with you",
+                        "report to you",
+                    ]
+                    .iter()
+                    .any(|phrase| verb.starts_with(phrase))
+                }) || (!["彼", "担当", "エージェント", "システム", "仕組み"]
+                    .iter()
+                    .any(|subject| clause.contains(subject))
+                    && [
+                        "報告します",
+                        "報告いたします",
+                        "通知します",
+                        "通知いたします",
+                        "知らせます",
+                        "連絡します",
+                        "連絡いたします",
+                    ]
+                    .iter()
+                    .any(|phrase| clause.ends_with(phrase)))
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn append_reply(talk: &mut Talk, reply: Turn, warn: bool) {
+    talk.turns.push(reply);
+    if warn {
+        talk.turns.push(Turn {
+            sender: Some(Sender::Magi),
+            breaks: None,
+            messages: Vec::new(),
+            posted_by: None,
+            who: Who::Agent,
+            body: format!("{MAGI_NOTE}warning: this promise of a later report is not backed by a registered watch or task."),
+            at: Timestamp::now(),
+            attachments: Vec::new(),
+            usage: None,
+        });
+    }
+}
+
 /// Invoke the conversation's agent once and append what it said.
 ///
 /// The first turn ever taken carries the full [`briefing`], because nothing
@@ -2651,6 +2810,9 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
         String::new()
     };
 
+    let registrations = home
+        .as_deref()
+        .and_then(|home| registered_work(home, &talk.id).ok());
     let mut outcome = None;
     let mut fell_back_from: Option<String> = None;
     // What the conversation looked like after the first agent's failed try,
@@ -2867,6 +3029,14 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
             None,
         ),
     };
+    let warn_promise = failure.is_none()
+        && unbacked_promise(
+            &reply.body,
+            registrations.as_ref(),
+            home.as_deref()
+                .and_then(|home| registered_work(home, &talk.id).ok())
+                .as_ref(),
+        );
 
     // A close landed on disk while this turn was in flight is read back here
     // rather than trusted from the snapshot this call started with. `store`
@@ -2924,7 +3094,7 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
             talk.implementers_dirty = false;
             talk.posts_read_through = Some(prompt_turns);
         }
-        talk.turns.push(reply);
+        append_reply(talk, reply, warn_promise);
         if let Err(put_err) = store.put(talk) {
             // `Talks::put` already retried the write itself - reaching here
             // means a passing race is not what this is. An agent's answer,
@@ -2934,6 +3104,9 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
             // replace it with a note the operator can actually see, the same
             // mechanism the failure branches above already use for a quota or a
             // timeout.
+            if warn_promise {
+                talk.turns.pop();
+            }
             let lost = talk.turns.pop().expect("just pushed above");
             let stash = stash_lost_turn(store, &talk.id, &stem, &lost);
             let why = match &stash {
@@ -3287,16 +3460,19 @@ pub fn briefing_for(
          They resume the same task after disk and output admission succeed; do not \
          release them individually. Owner holds, discussion and unrelated approvals \
          still require explicit resolution in the task chat.\n\n\
+         Before running anything that will outlive this turn, route it to exactly one \
+         of `magi talk watch` or `magi task add`. A command that will not finish within \
+         the turn must NOT be run as a plain background job (async tool option, `&`, \
+         nohup, detached shell): its result never reaches this conversation. \
          For a background command you run yourself, register it with \
          `magi talk watch --timeout 900 -- <executable> <arguments...>`, for \
          example `magi talk watch -- cargo test --locked`. It uses your \
          current directory; arguments are passed literally. For shell syntax, \
-         explicitly call `sh -c`. Only after watch registration succeeds may \
-         you promise a completion report. Watches default to 900 seconds, \
+         explicitly call `sh -c`. You may promise a later report only after a \
+         successful `magi talk watch` printed a watch id or a successful \
+         `magi task add` printed a task id. Watches default to 900 seconds, \
          accept at most 3600 seconds, and share four concurrent slots. Their \
-         automatic reports resume this conversation through its own turn. \
-         Never promise to report back on work that is neither a filed task \
-         nor a successfully registered watch.\n\n\
+         automatic reports resume this conversation through its own turn.\n\n\
          You can act on any task or run directly, whoever filed it: `magi task \
          control resume <full run id>` (queues the run for the loop to resume; \
          it starts nothing itself). Exhausted base movement needs the owner's explicit \
@@ -6384,9 +6560,160 @@ mod tests {
         assert!(b.contains("do not promise an unregistered future message"));
         assert!(b.contains(crate::prompt::CHAT_TASK_NOTICE_HEADING));
         assert!(b.contains("magi talk watch --timeout 900"));
-        assert!(b.contains("nor a successfully registered watch"));
+        assert!(b.contains("route it to exactly one"));
+        assert!(b.contains("must NOT be run as a plain background job"));
+        assert!(b.contains("async tool option, `&`, nohup, detached shell"));
+        assert!(b.contains("its result never reaches this conversation"));
+        assert!(b.contains("printed a watch id"));
+        assert!(b.contains("printed a task id"));
+        assert!(b.contains("You may promise a later report only after"));
+        assert!(!promises_later_report(&b));
         assert!(b.contains("magi task control resume <full run id>"));
         assert!(b.contains("magi task control abandon <full run id>"));
+    }
+
+    #[test]
+    fn later_report_promises_are_conservative_bilingual_prose() {
+        for text in [
+            "I will report back when it finishes.",
+            "I’ll notify you once it is done.",
+            "I will tell you when the tests finish.",
+            "I won't wait here. I will report back.",
+            "I cannot wait, I will notify you.",
+            "Any questions? I will report back.",
+            "I cannot wait but I will notify you.",
+            "I won't wait however I'll report back.",
+            "I cannot wait although I will report back.",
+            "I'll let you know when it finishes.",
+            "We will get back to you once it is done.",
+            "I am going to follow up with you.",
+            "I'm going to message you.",
+            "完了したら報告します。",
+            "結果を通知します。",
+            "終わったら知らせます。",
+            "今は待機しません。完了したら報告します。",
+            "続けますか？完了したら報告します。",
+            "完了したら連絡します。",
+            "結果を報告いたします。",
+            "結果を通知いたします。",
+            "完了したら連絡いたします。",
+        ] {
+            assert!(promises_later_report(text), "{text}");
+        }
+        for text in [
+            "I will not report back.",
+            "I won't notify you.",
+            "I reported back yesterday.",
+            "The service will notify you.",
+            "She says I will report back.",
+            "Will you report back?",
+            "I will notify you?",
+            "I'll let you know?",
+            "I will not get back to you.",
+            "We won't let you know.",
+            "The service will get back to you.",
+            "> I will report back",
+            "`I will report back`",
+            "``I will report back``",
+            "```text\nI will report back\n```",
+            "~~~\n通知します\n~~~",
+            "報告しません。",
+            "結果は報告しました。",
+            "通知しますか？",
+            "連絡しますか？",
+            "連絡いたしません。",
+            "彼が連絡いたします。",
+            "彼が報告します。",
+            "エージェントが通知します。",
+            "「報告します」と言いました。",
+            "> 報告します",
+            "`通知します`",
+            "No promise of a future message.",
+        ] {
+            assert!(!promises_later_report(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn later_report_warning_requires_known_absence_of_new_registration() {
+        let empty = RegisteredWork::new();
+        let old = RegisteredWork::from([(false, "old-watch".into())]);
+        for (before, after, expected) in [
+            (Some(&empty), Some(&empty), true),
+            (Some(&old), Some(&old), true),
+            (Some(&old), Some(&empty), true),
+            (None, Some(&empty), false),
+            (Some(&empty), None, false),
+        ] {
+            assert_eq!(unbacked_promise("報告します", before, after), expected);
+        }
+        for task in [false, true] {
+            let new = RegisteredWork::from([(task, "new-registration".into())]);
+            assert!(!unbacked_promise(
+                "I will report back",
+                Some(&old),
+                Some(&new)
+            ));
+        }
+        assert!(!unbacked_promise("Done.", Some(&empty), Some(&empty)));
+    }
+
+    #[test]
+    fn later_report_warning_is_saved_after_unchanged_reply() {
+        let (_tmp, talks) = store();
+        let empty = RegisteredWork::new();
+        for registered in [false, true] {
+            let after = if registered {
+                RegisteredWork::from([(true, "new-task".into())])
+            } else {
+                empty.clone()
+            };
+            let mut talk = ctx_talk("mock", Vec::new());
+            let mut answer = reply("I will report back.", None);
+            answer.sender = Some(Sender::Persona);
+            let warn = unbacked_promise(&answer.body, Some(&empty), Some(&after));
+            append_reply(&mut talk, answer, warn);
+            talks.put(&mut talk).unwrap();
+            let saved = talks.get(&talk.id).unwrap();
+            assert_eq!(saved.turns[0].body, "I will report back.");
+            assert_eq!(saved.turns[0].sender, Some(Sender::Persona));
+            assert_eq!(saved.turns.len(), if registered { 1 } else { 2 });
+            if !registered {
+                assert_eq!(saved.turns[1].sender, Some(Sender::Magi));
+                assert!(
+                    saved.turns[1]
+                        .body
+                        .contains("not backed by a registered watch or task")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn later_report_registration_snapshot_checks_task_provenance_and_read_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let before = registered_work(home, "chat-a").unwrap();
+        let queue = Queue::at(home.join("queue"));
+        for owner in ["chat-b", "chat-a"] {
+            let mut task = Task::new(
+                "work".into(),
+                "work".into(),
+                PathBuf::from("."),
+                Source::Agent {
+                    run: owner.into(),
+                    node: crate::queue::CHAT_NODE.into(),
+                },
+            );
+            queue.put(&mut task).unwrap();
+            let after = registered_work(home, "chat-a").unwrap();
+            assert_eq!(
+                unbacked_promise("報告します", Some(&before), Some(&after)),
+                owner == "chat-b"
+            );
+        }
+        std::fs::write(home.join("queue/broken.json"), "{").unwrap();
+        assert!(registered_work(home, "chat-a").is_err());
     }
 
     #[test]

@@ -142,6 +142,34 @@ fn directories(home: &Path) -> Result<Vec<PathBuf>> {
         .collect())
 }
 
+/// Successful startup acknowledgements, not merely reserved jobs.
+pub(crate) fn registered_ids(
+    home: &Path,
+    talk: &str,
+) -> Result<std::collections::BTreeSet<String>> {
+    let entries = match std::fs::read_dir(root(home)) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut ids = std::collections::BTreeSet::new();
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() || entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
+        let dir = entry.path();
+        let job = load(&dir)?;
+        if job.talk == talk
+            && job.supervisor.is_some()
+            && (job.child.is_some() || job.result.is_some())
+        {
+            ids.insert(job.id);
+        }
+    }
+    Ok(ids)
+}
+
 /// Only the standing chat's own environment chooses the destination.
 pub fn authorize(talks: &Talks, run: &str, node: &str) -> Result<String> {
     if node != crate::queue::CHAT_NODE || run.trim().is_empty() {
@@ -843,6 +871,48 @@ pub(crate) mod windows {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn later_report_watch_evidence_requires_successful_registration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        assert!(registered_ids(home, "chat").unwrap().is_empty());
+        let dir = root(home).join("watch-id");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut job = Job {
+            id: "watch-id".into(),
+            talk: "chat".into(),
+            cwd: PathBuf::from("."),
+            command: vec!["test".into()],
+            timeout: 1,
+            supervisor: None,
+            child: None,
+            result: Some("supervisor startup failed".into()),
+            tail: String::new(),
+            delivered: false,
+        };
+        save(&dir, &job).unwrap();
+        assert!(registered_ids(home, "chat").unwrap().is_empty());
+        job.supervisor = Some((1, "identity".into()));
+        save(&dir, &job).unwrap();
+        // The same supervisor + child/result condition acknowledged by start().
+        assert_eq!(
+            registered_ids(home, "chat").unwrap(),
+            ["watch-id".into()].into()
+        );
+        assert!(registered_ids(home, "another-chat").unwrap().is_empty());
+        job.result = None;
+        save(&dir, &job).unwrap();
+        assert!(registered_ids(home, "chat").unwrap().is_empty());
+        job.child = Some((2, "child".into()));
+        save(&dir, &job).unwrap();
+        assert_eq!(
+            registered_ids(home, "chat").unwrap(),
+            ["watch-id".into()].into()
+        );
+        std::fs::write(dir.join("job.json"), "{").unwrap();
+        assert!(registered_ids(home, "chat").is_err());
+    }
 
     struct EndlessOutput;
     impl Read for EndlessOutput {
