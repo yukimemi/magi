@@ -7557,12 +7557,21 @@ async fn chat_close_is_scoped_and_does_not_wait_for_the_list() {
 
     // Delay the mutation and all subsequent list reads. Returning an old list
     // snapshot after confirmation must not reopen the local card.
-    browser.eval(&page, r#"(() => {
+    browser
+        .eval(
+            &page,
+            r#"(() => {
         const native = window.fetch.bind(window);
         window.releaseClose = null; window.releaseLists = [];
+        window.completedCloses = new Set();
         window.fetch = async (url, init) => {
             const path = String(url);
-            if (path.endsWith('/close')) await new Promise(resolve => window.releaseClose = resolve);
+            if (path.endsWith('/close')) {
+                await new Promise(resolve => window.releaseClose = resolve);
+                const response = await native(url, init);
+                if (response.ok) window.completedCloses.add(path);
+                return response;
+            }
             if (path.startsWith('/api/talks?') || path.startsWith('/api/talks/page')) {
                 const response = await native(url, init);
                 await new Promise(resolve => window.releaseLists.push(resolve));
@@ -7572,7 +7581,10 @@ async fn chat_close_is_scoped_and_does_not_wait_for_the_list() {
         };
         document.querySelector('#talk-close-go').click();
         return true;
-    })()"#).await.unwrap();
+    })()"#,
+        )
+        .await
+        .unwrap();
     browser.wait_for(&page, "typeof releaseClose === 'function' && document.querySelector('#talk-close-go').textContent === 'Closing…'", w).await.unwrap();
     browser
         .eval(
@@ -7588,9 +7600,38 @@ async fn chat_close_is_scoped_and_does_not_wait_for_the_list() {
         .wait_for(&page, "releaseClose !== releaseFirst", w)
         .await
         .unwrap();
-    browser.eval(&page, "releaseFirst(); true").await.unwrap();
+    // Reproduce the old wait's false positive: a list response can arrive
+    // while neither close has even been sent to the server.
+    browser
+        .eval(&page, "void fetch('/api/talks?page_size=1'); true")
+        .await
+        .unwrap();
     browser
         .wait_for(&page, "releaseLists.length > 0", w)
+        .await
+        .unwrap();
+    assert_eq!(talks.get(&first.id).unwrap().status, talk::TalkStatus::Open);
+    assert_eq!(
+        talks.get(&second.id).unwrap().status,
+        talk::TalkStatus::Open
+    );
+    assert_eq!(
+        browser.eval(&page, "completedCloses.size").await.unwrap(),
+        0
+    );
+    eprintln!("Reproduced: list wait satisfied while both close requests remain unsent");
+    browser.eval(&page, "releaseFirst(); true").await.unwrap();
+    // Only this conversation's successful mutation response proves its close
+    // completed. Keep every list response blocked throughout both closes.
+    browser
+        .wait_for(
+            &page,
+            &format!(
+                "completedCloses.has('/api/talks/{}/close') && releaseLists.length > 0",
+                first.id
+            ),
+            w,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -7601,11 +7642,21 @@ async fn chat_close_is_scoped_and_does_not_wait_for_the_list() {
         true
     );
     assert_eq!(
+        browser
+            .eval(
+                &page,
+                "document.querySelector('#talk-close-go').textContent"
+            )
+            .await
+            .unwrap(),
+        "Closing…"
+    );
+    assert_eq!(
         talks.get(&first.id).unwrap().status,
         talk::TalkStatus::Closed
     );
     browser.eval(&page, "releaseClose(); true").await.unwrap();
-    browser.wait_for(&page, "!document.querySelector('#talk-reopen-go').hidden && !document.querySelector('#talk-reopen-go').disabled", w).await.unwrap();
+    browser.wait_for(&page, &format!("completedCloses.has('/api/talks/{}/close') && releaseLists.length > 0 && !document.querySelector('#talk-reopen-go').hidden && !document.querySelector('#talk-reopen-go').disabled", second.id), w).await.unwrap();
     assert_eq!(
         talks.get(&second.id).unwrap().status,
         talk::TalkStatus::Closed
