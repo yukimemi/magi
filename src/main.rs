@@ -686,13 +686,16 @@ enum TalkCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Read a conversation's transcript, optionally after a returned cursor.
+    /// 会話履歴を読む。--after なしでは最新の --limit 件を返す。
     History {
         /// Conversation id or unambiguous prefix.
         id: String,
         /// Cursor returned by an earlier history response.
         #[arg(long)]
         after: Option<String>,
+        /// 最大メッセージ数 (1..=500)。--after 指定時はカーソルの次から取得する。
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
         /// Print machine-readable JSON on one line.
         #[arg(long)]
         json: bool,
@@ -2177,11 +2180,17 @@ async fn dispatch(command: Command) -> Result<()> {
                 let value = magi::talk::external::list(&magi::talk::Talks::open())?;
                 print_external_talk_result(&value, json)
             }
-            TalkCmd::History { id, after, json } => {
+            TalkCmd::History {
+                id,
+                after,
+                limit,
+                json,
+            } => {
                 let value = magi::talk::external::history(
                     &magi::talk::Talks::open(),
                     &id,
                     after.as_deref(),
+                    limit,
                 )?;
                 print_external_talk_result(&value, json)
             }
@@ -2297,6 +2306,9 @@ fn print_external_talk_result(value: &serde_json::Value, json: bool) -> Result<(
         }
         if let Some(cursor) = value["cursor"].as_str() {
             println!("cursor: {cursor}");
+        }
+        if value["more"] == true {
+            println!("続きあり: --after <cursor> で次のページを取得できます");
         }
     } else {
         println!(

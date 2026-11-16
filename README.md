@@ -683,8 +683,8 @@ An external tool can join an existing standing conversation without the web UI:
 
 ```sh
 magi talk list --json
-magi talk history <conversation-id> --json
-magi talk history <conversation-id> --after '<cursor>' --json
+magi talk history <conversation-id> --limit 20 --json
+magi talk history <conversation-id> --after '<cursor>' --limit 20 --json
 magi talk send <conversation-id> --request <request-id> --sender 'Claude CLI' 'Hello' --json
 magi talk send <conversation-id> --request <request-id> --sender 'Claude CLI' - --json < message.txt
 magi talk reply <conversation-id> --request <request-id> --wait 30 --json
@@ -692,10 +692,14 @@ magi talk reply <conversation-id> --request <request-id> --wait 30 --json
 
 Use a full conversation ID, or a unique prefix; suffixes are not selectors.
 `list` returns `talks` (including IDs, repository, agent, status and title) and
-`unreadable` entries. `history` returns `talk`, `messages` and `cursor`; each
-message has `id`, `sender`, `body` and `at`. Save the returned cursor unchanged:
-`--after` is exclusive. Default output is a conversation list, labelled transcript,
-or request status and reply; `--json` emits one JSON value on one stdout line.
+`unreadable` entries.
+`history` は `talk`、`messages`、`cursor`、`more` を返します。各メッセージの
+フィールドは `id`、`sender`、`body`、`at` です。`--limit` は 1〜500 件
+（既定 20 件）。`--after` なしでは最新の指定件数を古い順に返し、指定時は
+そのカーソルの次から指定件数を返します。`more: true` なら、返された
+`cursor` をそのまま `--after` に渡して次ページを取得してください。
+空ページでも指定したカーソルは維持されます。通常出力は会話一覧、
+送信者付き履歴、または要求状態と返信、`--json` は標準出力の一行に JSON を出力します。
 
 `send` records a caller-generated request ID and starts the existing detached
 chat worker, not an HTTP-only or foreground agent. Persist the request ID,

@@ -93,33 +93,43 @@ fn cursor(talk: &Talk, turn: usize, message: usize) -> String {
 }
 
 /// Conversation-bound coordinates and occurrence fingerprints form stable IDs.
-pub fn history(store: &Talks, selector: &str, after: Option<&str>) -> Result<Value> {
+pub fn history(store: &Talks, selector: &str, after: Option<&str>, limit: usize) -> Result<Value> {
+    anyhow::ensure!(
+        (1..=500).contains(&limit),
+        "limit must be between 1 and 500"
+    );
     let talk = match resolve(store, selector)? {
         Ok(t) => t,
         Err(v) => return Ok(v),
     };
-    let mut messages = Vec::new();
-    for (i, turn) in talk.turns.iter().enumerate() {
-        if turn.messages.is_empty() {
-            messages.push(json!({"id":cursor(&talk,i,0),"sender":sender(turn,None),"body":turn.body,"at":turn.at}));
-        } else {
-            for (j, message) in turn.messages.iter().enumerate() {
-                messages.push(json!({"id":cursor(&talk,i,j),"sender":sender(turn,Some(message)),"body":message.body,"at":turn.at}));
-            }
+    let mut coordinates = talk
+        .turns
+        .iter()
+        .enumerate()
+        .flat_map(|(i, turn)| (0..turn.messages.len().max(1)).map(move |j| (i, j)));
+    if let Some(after) = after {
+        coordinates
+            .find(|&(i, j)| cursor(&talk, i, j) == after)
+            .context("cursor is not a message in this conversation")?;
+    } else {
+        let count: usize = talk.turns.iter().map(|t| t.messages.len().max(1)).sum();
+        for _ in 0..count.saturating_sub(limit) {
+            coordinates.next();
         }
     }
-    let last = messages
-        .last()
-        .and_then(|v| v["id"].as_str())
-        .map(str::to_owned);
-    if let Some(after) = after {
-        let index = messages
-            .iter()
-            .position(|v| v["id"].as_str() == Some(after))
-            .context("cursor is not a message in this conversation")?;
-        messages.drain(..=index);
-    }
-    Ok(json!({"talk":talk.id,"messages":messages,"cursor":last}))
+    let messages: Vec<_> = coordinates
+        .by_ref()
+        .take(limit)
+        .map(|(i, j)| {
+            let turn = &talk.turns[i];
+            let message = turn.messages.get(j);
+            let body = message.map_or(turn.body.as_str(), |m| m.body.as_str());
+            json!({"id":cursor(&talk,i,j),"sender":sender(turn,message),"body":body,"at":turn.at})
+        })
+        .collect();
+    let more = coordinates.next().is_some();
+    let last = messages.last().and_then(|v| v["id"].as_str()).or(after);
+    Ok(json!({"talk":talk.id,"messages":messages,"cursor":last,"more":more}))
 }
 
 fn view(store: &Talks, talk: &Talk, record: &Request) -> Value {

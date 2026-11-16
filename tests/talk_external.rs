@@ -335,7 +335,7 @@ async fn external_admission_preserves_drafts_and_uncertain_occurrences() {
         f.cli(&["history", &f.id[..8], "--json"], None)["status"],
         "ambiguous"
     );
-    assert!(talk::external::history(&f.talks, &f.id, Some("another-talk:0:0")).is_err());
+    assert!(talk::external::history(&f.talks, &f.id, Some("another-talk:0:0"), 20).is_err());
     // Started-but-lost worker receipts likewise cannot be replayed.
     let mut t = f.talks.get(&f.id).unwrap();
     t.external_requests[0].status = "started".into();
@@ -375,4 +375,65 @@ async fn external_worker_unavailability_keeps_the_request_without_starting_a_dra
     assert_eq!(saved.turns[0].sender, Some(talk::Sender::External));
     assert!(saved.pending.is_empty());
     assert!(!f.repo().join("entered").exists());
+}
+
+#[tokio::test]
+async fn external_history_pages_messages_without_skipping_or_repeating() {
+    let _guard = common::home_lock().await;
+    let f = Fixture::new();
+    let empty = f.cli(&["history", &f.id, "--json"], None);
+    assert_eq!(empty["messages"], json!([]));
+    assert!(empty["cursor"].is_null());
+    assert_eq!(empty["more"], false);
+
+    let mut t = f.talks.get(&f.id).unwrap();
+    for i in 0..25 {
+        talk::record(&mut t, &f.talks, &format!("message-{i}"), vec![]).unwrap();
+    }
+    let mut extra = t.turns[0].messages[0].clone();
+    extra.body = "second send in first turn".into();
+    t.turns[0].messages.push(extra);
+    t.turns[1].messages.clear();
+    f.talks.put(&mut t).unwrap();
+    let all = f.cli(&["history", &f.id, "--limit", "500", "--json"], None);
+    let expected = all["messages"].as_array().unwrap();
+    let latest = f.cli(&["history", &f.id, "--json"], None);
+    assert_eq!(latest["messages"], json!(&expected[6..]));
+    assert_eq!(latest["more"], false);
+    let mut cursor = expected[0]["id"].as_str().unwrap().to_owned();
+    let split = f.cli(
+        &[
+            "history", &f.id, "--after", &cursor, "--limit", "1", "--json",
+        ],
+        None,
+    );
+    assert_eq!(split["messages"], json!([expected[1]]));
+    assert_eq!(split["more"], true);
+
+    let mut collected = vec![expected[0].clone()];
+    loop {
+        let page = f.cli(
+            &[
+                "history", &f.id, "--after", &cursor, "--limit", "7", "--json",
+            ],
+            None,
+        );
+        collected.extend_from_slice(page["messages"].as_array().unwrap());
+        cursor = page["cursor"].as_str().unwrap().to_owned();
+        if page["more"] == false {
+            break;
+        }
+    }
+    assert_eq!(&collected, expected);
+    let end = f.cli(&["history", &f.id, "--after", &cursor, "--json"], None);
+    assert_eq!(end["messages"], json!([]));
+    assert_eq!(end["cursor"], cursor);
+    assert_eq!(end["more"], false);
+    talk::record(&mut t, &f.talks, "new message", vec![]).unwrap();
+    let appended = f.cli(&["history", &f.id, "--after", &cursor, "--json"], None);
+    assert_eq!(appended["messages"][0]["body"], "new message");
+    assert_eq!(appended["cursor"], appended["messages"][0]["id"]);
+    for limit in [0, 501] {
+        assert!(talk::external::history(&f.talks, &f.id, None, limit).is_err());
+    }
 }
