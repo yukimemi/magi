@@ -5025,6 +5025,8 @@ struct TaskView {
     reassignment_notes: Vec<String>,
     source_link: Option<SourceLink>,
     status_str: &'static str,
+    /// Fixed scheduling lane, ahead of ordinary priority order.
+    upgrade_resume_at: Option<Timestamp>,
     /// The instruction, parsed as markdown, for the Queue card's "Full
     /// instruction" panel. `task.instruction` is unchanged and still carries
     /// the raw text.
@@ -5047,6 +5049,7 @@ impl From<Task> for TaskView {
             reassignment_notes: Vec::new(),
             source_link: source_link(&task.source),
             status_str: task.status.as_str(),
+            upgrade_resume_at: task.upgrade_resume_key().map(|(at, _)| at),
             instruction_md: md::to_nodes(&task.instruction, &md::ImageBase::None),
             waits_on: Vec::new(),
             stuck_roots: Vec::new(),
@@ -18020,6 +18023,63 @@ mod tests {
         // `magi task list` both use - GET /api/queue must agree with it
         // immediately, not just once the loop claims the task.
         assert_eq!(names[0], older.id, "the raised task now sorts first");
+    }
+
+    #[tokio::test]
+    async fn row_priorities_follow_dispatch_order_and_preserve_upgrade_lane() {
+        let f = Fixture::start().await;
+        let queue = f.queue();
+        let mut tasks = Vec::new();
+        for id in [
+            "20260101-000001-aaaa",
+            "20260101-000002-bbbb",
+            "20260101-000003-cccc",
+        ] {
+            let mut task = Task::new(
+                id.into(),
+                "x".into(),
+                PathBuf::from("/repo/magi"),
+                Source::Human,
+            );
+            task.id = id.into();
+            queue.put(&mut task).unwrap();
+            tasks.push(task);
+        }
+        assert_eq!(
+            queue.next_runnable().unwrap().id,
+            tasks[0].id,
+            "equal priorities use ascending id"
+        );
+        let route = format!("/api/queue/{}/priority", tasks[2].id);
+        assert_eq!(f.post(&route, Some(r#"{"priority":1}"#)).await.status, 200);
+        assert_eq!(queue.next_runnable().unwrap().id, tasks[2].id);
+        tasks[1].start("upgrade-run".into());
+        tasks[1].park("upgrade");
+        tasks[1].record_pass_at(
+            "upgrade-run",
+            0,
+            Some("2026-01-01T00:00:00Z".parse().unwrap()),
+            1,
+            Some(crate::run::ParkCause::Upgrade {
+                from: "old".into(),
+                to: None,
+            }),
+        );
+        queue.put(&mut tasks[1]).unwrap();
+        let rows = f.get("/api/queue").await.json();
+        let upgrade = rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == tasks[1].id)
+            .unwrap();
+        assert_eq!(upgrade["upgrade_resume_at"], "2026-01-01T00:00:00Z");
+        assert_eq!(queue.next_runnable().unwrap().id, tasks[1].id);
+        tasks[2] = queue.get(&tasks[2].id).unwrap();
+        tasks[2].start("running-run".into());
+        queue.put(&mut tasks[2]).unwrap();
+        assert_eq!(f.post(&route, Some(r#"{"priority":2}"#)).await.status, 400);
+        assert_eq!(queue.get(&tasks[2].id).unwrap().priority, 1);
     }
 
     #[tokio::test]

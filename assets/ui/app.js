@@ -2323,6 +2323,229 @@ function syncSections(root, sectionDefs, itemsByKey, createFn, updateFn) {
   for (const stale of existing.values()) stale.remove();
 }
 
+/* Reordering is confined to complete sections. Store refreshes still update
+   state during a gesture/save, but leave the keyed DOM (and pointer capture)
+   alone until it ends. No requested queue order is shown before persistence. */
+let rowGesture = null;
+let rowSaving = false;
+const RUN_ORDER_KEY = "magi-run-order";
+let runOrder = loadCollapsed(RUN_ORDER_KEY);
+const rowId = (row) => row.dataset.key;
+const priorityOrder = (a, b) => b.priority - a.priority || a.id.localeCompare(b.id);
+function queueOrder(a, b) {
+  if (a.upgrade_resume_at || b.upgrade_resume_at) {
+    if (!a.upgrade_resume_at) return 1;
+    if (!b.upgrade_resume_at) return -1;
+    const stamp = (value) => value.replace(/(?:\.(\d+))?Z$/, (_, fraction = "") => `.${fraction.padEnd(9, "0")}Z`);
+    return stamp(a.upgrade_resume_at).localeCompare(stamp(b.upgrade_resume_at)) || a.id.localeCompare(b.id);
+  }
+  return priorityOrder(a, b);
+}
+
+function orderedRuns(key, runs) {
+  const saved = Array.isArray(runOrder[key]) ? runOrder[key] : [];
+  const ranks = new Map(saved.map((id, i) => [id, i]));
+  // New arrivals retain their default order, ahead of the remembered rows.
+  return [...runs].sort((a, b) =>
+    (ranks.get(a.id) ?? -1) - (ranks.get(b.id) ?? -1));
+}
+
+function rememberRunMove(key, visible) {
+  const saved = Array.isArray(runOrder[key]) ? runOrder[key] : [];
+  const shown = new Set(visible);
+  const full = [...visible.filter((id) => !saved.includes(id)), ...saved];
+  let cursor = 0;
+  // Only refill visible slots; filtered and unloaded runs retain their places.
+  runOrder[key] = full.map((id) => shown.has(id) ? visible[cursor++] : id);
+}
+
+function reorderAllowed(scope) {
+  return !rowSaving && !searchText(scope);
+}
+
+function reorderSnapshot(scope) {
+  return JSON.stringify((scope === "queue" ? state.queue : state.runs).map((item) =>
+    scope === "queue"
+      ? [item.id, queueSection(item), item.priority, item.upgrade_resume_at]
+      : [item.id, runSection(item), item.superseded_by]));
+}
+
+/* Pick one integer if possible; otherwise expand only the contiguous interval
+   needed to fit distinct priorities between its unchanged neighbours. */
+function priorityEdits(tasks, from, to) {
+  const desired = [...tasks];
+  const [moved] = desired.splice(from, 1);
+  desired.splice(to, 0, moved);
+  const prev = desired[to - 1], next = desired[to + 1];
+  const low = next ? next.priority + (moved.id < next.id ? 0 : 1) : -2147483648;
+  const high = prev ? prev.priority - (prev.id < moved.id ? 0 : 1) : 2147483647;
+  if (low <= high) {
+    const priority = Math.max(low, Math.min(high, moved.priority));
+    return priority === moved.priority ? [] : [{ id: moved.id, priority }];
+  }
+  for (let size = 1; size <= desired.length; size += 1) {
+    for (let left = Math.max(0, to - size + 1); left <= to && left + size <= desired.length; left += 1) {
+      const right = left + size;
+      const high = left ? desired[left - 1].priority - 1 : 2147483647;
+      const low = right < desired.length ? desired[right].priority + 1 : -2147483648;
+      if (high - low + 1 < size) continue;
+      const start = Math.max(low + size - 1, Math.min(high, moved.priority));
+      return desired.slice(left, right).map((task, i) => ({ id: task.id, priority: start - i }))
+        .filter((edit) => tasks.find((t) => t.id === edit.id).priority !== edit.priority);
+    }
+  }
+  throw new Error("No integer priority space is available.");
+}
+
+function queueMoveEdits(tasks, key, prevKey, nextKey, section) {
+  const moved = tasks.find((task) => task.id === key);
+  if (!moved || queueSection(moved) !== section || moved.upgrade_resume_at || section === "running") {
+    throw new Error("The task is no longer movable in this section.");
+  }
+  const items = tasks.filter((task) => queueSection(task) === section).sort(queueOrder);
+  const rest = items.filter((task) => task.id !== key);
+  const prev = rest.findIndex((task) => task.id === prevKey);
+  const next = rest.findIndex((task) => task.id === nextKey);
+  const to = prev >= 0 ? prev + 1 : next >= 0 ? next : rest.length === 0 ? 0 : -1;
+  if (to < 0 || rest[to - 1]?.upgrade_resume_at || rest[to]?.upgrade_resume_at) {
+    throw new Error("The list changed; the requested position is no longer available.");
+  }
+  return priorityEdits(items, items.indexOf(moved), to);
+}
+function reorderNotice(scope, message) {
+  setText($(`${scope}-reorder-status`), message);
+  announce(message);
+}
+
+
+async function moveListRow(scope, row, target, snapshot) {
+  if (!reorderAllowed(scope) || (scope === "runs" && snapshot && snapshot !== reorderSnapshot(scope))) {
+    reorderNotice(scope, "List changed. Reorder cancelled; try again.");
+    return;
+  }
+  const list = row.parentElement;
+  const ids = [...list.children].map(rowId);
+  const from = ids.indexOf(rowId(row));
+  const to = ids.indexOf(rowId(target));
+  if (from < 0 || to < 0 || from === to) return;
+  const focusId = rowId(row);
+  const section = list.closest(".list-section").dataset.key;
+  const desired = [...ids];
+  desired.splice(from, 1);
+  desired.splice(to, 0, focusId);
+  const prevKey = desired[to - 1], nextKey = desired[to + 1];
+  let result = "Row order saved.";
+  rowSaving = true;
+  for (const control of document.querySelectorAll(".reorder-handle, #queue-sections .btn-step")) control.disabled = true;
+  try {
+    if (scope === "runs") {
+      rememberRunMove(section, desired);
+      try { localStorage.setItem(RUN_ORDER_KEY, JSON.stringify(runOrder)); }
+      catch { result = "Run order changed for this tab only; browser storage is unavailable."; }
+    } else {
+      // Read at drop time. A failed refresh must never plan from cached state.
+      const tasks = await getJson(API.queue);
+      for (const edit of queueMoveEdits(tasks, focusId, prevKey, nextKey, section)) {
+        await postJson(API.priority(edit.id), { priority: edit.priority });
+      }
+      await loadQueue();
+    }
+    reorderNotice(scope, result);
+  } catch (error) {
+    reorderNotice(scope, `Could not reorder: ${error.message}. Refreshing saved order.`);
+    if (scope === "queue") await loadQueue();
+  } finally {
+    rowSaving = false;
+    renderQueue();
+    renderRuns();
+    const root = $(scope === "queue" ? "queue-sections" : "runs-sections");
+    [...root.querySelectorAll(".reorder-handle")].find((button) =>
+      rowId(button.closest("li")) === focusId)?.focus({ preventScroll: true });
+  }
+}
+
+function addReorderHandle(row, scope) {
+  const handle = el("button", { type: "button", class: "btn btn-quiet reorder-handle",
+    text: "↕", "aria-label": "Reorder row. Use Arrow Up or Arrow Down.",
+    title: "Drag to reorder, or use Arrow Up / Arrow Down" });
+  row.prepend(handle);
+  row.refs.reorder = handle;
+  handle.addEventListener("keydown", (event) => {
+    if (!["ArrowUp", "ArrowDown"].includes(event.key)) return;
+    event.preventDefault();
+    const target = event.key === "ArrowUp" ? row.previousElementSibling : row.nextElementSibling;
+    if (!handle.disabled && target) void moveListRow(scope, row, target);
+  });
+  handle.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0 || handle.disabled || !reorderAllowed(scope)) return;
+    event.preventDefault();
+    const snapshot = reorderSnapshot(scope);
+    const list = row.parentElement;
+    let target = row;
+    let y = event.clientY;
+    let frame;
+    rowGesture = { scope };
+    row.classList.add("row-dragging");
+    handle.setPointerCapture(event.pointerId);
+    const indicate = () => {
+      for (const child of list.children) child.removeAttribute("data-drop");
+      const candidates = [...list.children];
+      target = candidates.reduce((best, child) => {
+        const box = child.getBoundingClientRect();
+        const distance = Math.abs(y - (box.top + box.height / 2));
+        return distance < best.distance ? { child, distance } : best;
+      }, { child: row, distance: Infinity }).child;
+      if (target !== row) target.dataset.drop =
+        candidates.indexOf(target) < candidates.indexOf(row) ? "before" : "after";
+    };
+    const scroll = () => {
+      const pane = list.closest(".view");
+      const scroller = pane && pane.scrollHeight > pane.clientHeight ? pane : document.scrollingElement;
+      const box = scroller === document.scrollingElement
+        ? { top: 0, bottom: innerHeight } : scroller.getBoundingClientRect();
+      const dy = y < box.top + 48 ? -10 : y > box.bottom - 48 ? 10 : 0;
+      if (dy) { scroller.scrollTop += dy; indicate(); }
+      frame = requestAnimationFrame(scroll);
+    };
+    const move = (e) => { y = e.clientY; indicate(); };
+    const finish = (e) => {
+      cancelAnimationFrame(frame);
+      handle.removeEventListener("pointermove", move);
+      handle.removeEventListener("pointerup", finish);
+      handle.removeEventListener("pointercancel", finish);
+      handle.removeEventListener("lostpointercapture", finish);
+      handle.removeEventListener("keydown", cancel);
+      row.classList.remove("row-dragging");
+      for (const child of list.children) child.removeAttribute("data-drop");
+      rowGesture = null;
+      if (handle.hasPointerCapture(event.pointerId)) handle.releasePointerCapture(event.pointerId);
+      if (e.type === "pointerup") void moveListRow(scope, row, target, snapshot);
+      renderQueue();
+      renderRuns();
+    };
+    const cancel = (e) => { if (e.key === "Escape") finish(e); };
+    handle.addEventListener("pointermove", move);
+    handle.addEventListener("pointerup", finish);
+    handle.addEventListener("pointercancel", finish);
+    handle.addEventListener("lostpointercapture", finish);
+    handle.addEventListener("keydown", cancel);
+    frame = requestAnimationFrame(scroll);
+  });
+}
+
+function updateReorderHandles(node, scope, items) {
+  for (const row of node.refs.list.children) {
+    const task = items.find((item) => item.id === rowId(row));
+    row.refs.reorder.setAttribute("aria-label", `Reorder ${task.title || task.task || task.id}. Use Arrow Up or Arrow Down.`);
+    row.refs.reorder.disabled = !reorderAllowed(scope) || (scope === "queue"
+      && (queueSection(task) === "running" || Boolean(task.upgrade_resume_at)));
+    if (scope === "queue") {
+      row.refs.priorityDown.disabled = rowSaving || queueSection(task) === "running" || task.priority <= -2147483648;
+      row.refs.priorityUp.disabled = rowSaving || queueSection(task) === "running" || task.priority >= 2147483647;
+    }
+  }
+}
+
 /* ---- runs: one section, plus the folded-attempts count Backlog has no
    equivalent of ------------------------------------------------------- */
 function createRunSection(def) {
@@ -2330,6 +2553,16 @@ function createRunSection(def) {
   const folded = el("span", { class: "runs-section-folded" });
   section.refs.summary.append(folded);
   section.refs.folded = folded;
+  const reset = el("button", { type: "button", class: "btn btn-quiet", text: "Reset order",
+    "aria-label": `Reset ${def.label} run order` });
+  reset.addEventListener("click", (event) => {
+    event.preventDefault();
+    if (rowGesture || rowSaving) return;
+    delete runOrder[def.key];
+    saveCollapsed(RUN_ORDER_KEY, runOrder);
+    renderRuns();
+  });
+  section.refs.summary.append(reset);
   return section;
 }
 
@@ -2339,9 +2572,10 @@ function updateRunSection(node, heads, childrenOf) {
   setText(node.refs.folded, foldedTotal
     ? `, ${plural(foldedTotal, "earlier attempt", "earlier attempts")} folded`
     : "");
-  syncList(node.refs.list, heads, (r) => r.id, createRunRow,
+  syncList(node.refs.list, orderedRuns(node.dataset.key, heads), (r) => r.id, createRunRow,
     (row, run) => updateRunRow(row, run, childrenOf.get(run.id) || []),
     (run) => [run, ...(childrenOf.get(run.id) || [])]);
+  updateReorderHandles(node, "runs", heads);
 }
 
 function syncRunSections(root, bySection, childrenOf) {
@@ -2356,6 +2590,7 @@ function syncRunSections(root, bySection, childrenOf) {
  * interactive element. */
 function createRunRow() {
   const row = createRunCard();
+  addReorderHandle(row, "runs");
   const summary = el("summary", { class: "run-folded-summary" });
   const list = el("ul", { class: "run-folded-list" });
   const folded = el("details", { class: "run-folded advanced" }, summary, list);
@@ -2387,6 +2622,7 @@ function updateRunRow(row, run, children) {
 }
 
 function renderRuns() {
+  if (rowGesture || rowSaving) return;
   const runs = state.runs;
   const sectionsRoot = $("runs-sections");
 
@@ -2618,6 +2854,7 @@ function createTaskCard() {
     outcome, note, snippet, error, instruction, answers, answersList, runLink, actionMenu,
     priorityDown, priorityUp, priorityValue, editBtn, urgentBox, holdBox, doneBox, deleteBox,
   };
+  addReorderHandle(card, "queue");
   return card;
 }
 
@@ -2625,6 +2862,7 @@ function updateTaskCard(row, task) {
   const r = row.refs;
   const status = String(task.status_str || task.status || "");
   const meta = TASK_STATUS[status] || {};
+  row.refs.reorder.disabled = !reorderAllowed("queue") || status === "running" || Boolean(task.upgrade_resume_at);
 
   setAttr(r.card, "data-tone", toneOf(status, TASK_STATUS));
   /* The full id, a stable hook for jumpToTask() that does not depend on
@@ -3111,6 +3349,7 @@ async function mutateTask(id, action, button, host) {
  * duplicate that distinction. */
 const QUEUE_SECTIONS = [
   { key: "running", label: "Running", defaultOpen: true },
+  { key: "upgrade", label: "Upgrade resumes — fixed ahead of ordinary priority", defaultOpen: true },
   { key: "upnext", label: "Up next", defaultOpen: true },
   /* Distinct from `held`: a blocked task was not taken out of the loop by
      hand, it is waiting on another task or question and moves on its own the
@@ -3122,6 +3361,7 @@ const QUEUE_SECTIONS = [
 ];
 
 function queueSection(task) {
+  if (task.upgrade_resume_at) return "upgrade";
   const status = String(task.status_str || task.status || "");
   if (status === "running") return "running";
   if (status === "queued" || status === "failed" || status === "parked") return "upnext";
@@ -3135,7 +3375,7 @@ function queueSection(task) {
    priority-then-recency order. */
 function groupQueueBySection(tasks) {
   const bySection = new Map(QUEUE_SECTIONS.map((s) => [s.key, []]));
-  for (const task of tasks) bySection.get(queueSection(task)).push(task);
+  for (const task of [...tasks].sort(queueOrder)) bySection.get(queueSection(task)).push(task);
   return bySection;
 }
 
@@ -3146,6 +3386,7 @@ function createQueueSection(def) {
 function updateQueueSection(node, tasks) {
   setText(node.refs.count, plural(tasks.length, "task", "tasks"));
   syncList(node.refs.list, tasks, (t) => t.id, createTaskCard, updateTaskCard);
+  updateReorderHandles(node, "queue", tasks);
 }
 
 function syncQueueSections(root, bySection) {
@@ -4075,6 +4316,7 @@ function renderStatsQueue(q) {
 }
 
 function renderQueue(allowSearchJump = false) {
+  if (rowGesture || rowSaving) return;
   const sectionsRoot = $("queue-sections");
   const tasks = state.queue;
 
@@ -9986,7 +10228,7 @@ function mergeStore(name, rows, delta) {
   for (const row of rows) merged.set(row.id, row);
   const list = [...merged.values()];
   if (name === "runs") return list.sort((a, b) => b.id.localeCompare(a.id)).slice(0, RUN_LIMIT);
-  if (name === "queue") return list.sort((a, b) => b.priority - a.priority || b.id.localeCompare(a.id));
+  if (name === "queue") return list.sort(queueOrder);
   return sortTalks(list);
 }
 
