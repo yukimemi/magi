@@ -954,12 +954,42 @@ fn detached_command(home: &Path, job: &Job, generation: &Generation) -> Result<C
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
+        detached_standard_handles().context("exclude caller pipes from detached worker")?;
         command.creation_flags(
             crate::chat_watch::windows::detached_flags()
                 .context("prepare independent Windows worker")?,
         );
     }
     Ok(command)
+}
+
+#[cfg(windows)]
+fn detached_standard_handles() -> std::io::Result<()> {
+    use std::ffi::c_void;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetStdHandle(kind: u32) -> *mut c_void;
+        fn SetHandleInformation(handle: *mut c_void, mask: u32, flags: u32) -> i32;
+    }
+    // Explicit Stdio entries are duplicated by Command for the child. The
+    // caller's original inherited handles must not also leak into a detached
+    // process: that keeps an external caller's stdout pipe open after exit.
+    // Leave them non-inheritable; subsequent ordinary Command launches still
+    // inherit their explicitly selected standard streams.
+    for kind in [-10_i32, -11, -12] {
+        let handle = unsafe { GetStdHandle(kind as u32) };
+        if handle.is_null() || handle as isize == -1 {
+            continue;
+        }
+        if unsafe { SetHandleInformation(handle, 1, 0) } == 0 {
+            let error = std::io::Error::last_os_error();
+            // Console pseudo handles have no inheritable kernel handle flag.
+            if error.raw_os_error() != Some(6) {
+                return Err(error);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Reserve an exclusive operation and detach its immutable executable. Returns

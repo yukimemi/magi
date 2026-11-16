@@ -4615,11 +4615,28 @@ async fn queue_compact_controls_and_edit_save_fit_and_preserve_drafts() {
           const id = {id};
           let card = document.querySelector(`#queue-sections li.card[data-task-id="${{id}}"]`);
           const assert = (ok, message) => {{ if (!ok) throw new Error(message); }};
-          // Clicks start async handlers; observe their result rather than
-          // racing the POST and refresh against a fixed sleep.
+          // A change-stream refresh can observe the saved task before the
+          // mutation request releases its claim. Wait for both the visible
+          // result and the POST response before starting another mutation.
+          const pendingWrites = new Set();
+          const nativeFetch = window.fetch;
+          window.fetch = (url, options) => {{
+            const response = nativeFetch(url, options);
+            if (options?.method === 'POST' && url.startsWith(`/api/queue/${{id}}/`)) {{
+              pendingWrites.add(response);
+              const settled = () => pendingWrites.delete(response);
+              response.then(settled, settled);
+            }}
+            return response;
+          }};
           const taskCard = () => document.querySelector(`#queue-sections li.card[data-task-id="${{id}}"]`);
           const clickUntil = (button, ready) => new Promise((resolve, reject) => {{
-            const check = () => {{ if (ready()) {{ observer.disconnect(); resolve(); }} }};
+            const check = () => {{
+              if (ready()) {{
+                observer.disconnect();
+                Promise.all([...pendingWrites]).then(resolve, reject);
+              }}
+            }};
             const observer = new MutationObserver(check);
             observer.observe(document.body, {{subtree: true, childList: true, attributes: true, characterData: true}});
             try {{ button.click(); check(); }} catch (error) {{ observer.disconnect(); reject(error); }}
@@ -7589,8 +7606,15 @@ async fn chat_close_is_scoped_and_does_not_wait_for_the_list() {
         .await
         .unwrap();
     browser.eval(&page, "releaseFirst(); true").await.unwrap();
+    // Navigation can already have queued a delayed list response. Observe the
+    // close handler's confirmation, not an unrelated list read, before checking
+    // persisted state and the second conversation's still-pending control.
     browser
-        .wait_for(&page, "releaseLists.length > 0", w)
+        .wait_for(
+            &page,
+            "document.getElementById('live').textContent === 'Conversation closed.' && releaseLists.length > 0",
+            w,
+        )
         .await
         .unwrap();
     assert_eq!(

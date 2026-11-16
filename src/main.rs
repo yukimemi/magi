@@ -445,7 +445,7 @@ enum Command {
         #[command(subcommand)]
         command: TaskCmd,
     },
-    /// Write into a chat conversation from a task seat.
+    /// Inspect standing chats, send external messages, or report from a task seat.
     Talk {
         /// What to do with the conversation.
         #[command(subcommand)]
@@ -680,6 +680,57 @@ enum Command {
 /// Operations on a chat conversation.
 #[derive(Debug, Subcommand)]
 enum TalkCmd {
+    /// List standing conversations and their current availability.
+    List {
+        /// Print machine-readable JSON on one line.
+        #[arg(long)]
+        json: bool,
+    },
+    /// 会話履歴を読む。--after なしでは最新の --limit 件を返す。
+    History {
+        /// Conversation id or unambiguous prefix.
+        id: String,
+        /// Cursor returned by an earlier history response.
+        #[arg(long)]
+        after: Option<String>,
+        /// 最大メッセージ数 (1..=500)。--after 指定時はカーソルの次から取得する。
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Print machine-readable JSON on one line.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Submit an external message once; persist the request ID before calling.
+    Send {
+        /// Conversation id or unambiguous prefix.
+        id: String,
+        /// Stable caller-generated request ID; never replace after a timeout.
+        #[arg(long)]
+        request: String,
+        /// Self-reported display label, not an authenticated identity.
+        #[arg(long)]
+        sender: String,
+        /// Message text, or - to read all of stdin, preserving line breaks.
+        #[arg(value_name = "TEXT|-")]
+        text: String,
+        /// Print machine-readable JSON on one line.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Query the exact external request's reply without sending again.
+    Reply {
+        /// Conversation id or unambiguous prefix.
+        id: String,
+        /// Request ID originally supplied to send.
+        #[arg(long)]
+        request: String,
+        /// Maximum seconds to wait; zero queries the current state.
+        #[arg(long, default_value_t = 0)]
+        wait: u64,
+        /// Print machine-readable JSON on one line.
+        #[arg(long)]
+        json: bool,
+    },
     /// Run a supervised background job and report completion in this chat.
     Watch {
         /// Duration in seconds (1..=3600).
@@ -1266,6 +1317,7 @@ async fn async_main() -> Result<()> {
             json: false,
         }
     });
+    guard_external_chat_command(&command)?;
 
     // Overlap the release check with the command: a run spends minutes waiting
     // on agent latency, so this is free, and it is drained with a bounded wait
@@ -1276,11 +1328,50 @@ async fn async_main() -> Result<()> {
     result
 }
 
+/// External conversation turns are not owner instructions. Keep this before
+/// update checks and dispatch so refused commands never reach mutating code.
+fn guard_external_chat_command(command: &Command) -> Result<()> {
+    if std::env::var("MAGI_NODE").as_deref() == Ok("external-chat")
+        && !external_chat_read_only(command)
+    {
+        bail!(
+            "external-chat turns have no owner authority; only read-only inspection commands are allowed"
+        );
+    }
+    Ok(())
+}
+
+fn external_chat_read_only(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::List { .. }
+            | Command::Show { .. }
+            | Command::Stats { .. }
+            | Command::Repos { .. }
+            | Command::Doctor { .. }
+            | Command::Completion { .. }
+            | Command::SourceEvidence { restore: None, .. }
+            | Command::SelfUpdate {
+                check_only: true,
+                ..
+            }
+            | Command::Task {
+                command: TaskCmd::List { .. } | TaskCmd::Show { .. },
+            }
+            | Command::Talk {
+                command: TalkCmd::List { .. } | TalkCmd::History { .. } | TalkCmd::Reply { .. },
+            }
+    )
+}
+
 /// Start the background release check, unless this command is about updating,
 /// printing static text, or holding the whole screen.
 fn spawn_update_check(command: &Command) -> Option<updater::Pending> {
     // Helpers launched by a worker must stay on its immutable generation.
-    if std::env::var_os("MAGI_WORKER_GENERATION").is_some() {
+    // An external turn must not trigger automatic installation as a side effect.
+    if std::env::var_os("MAGI_WORKER_GENERATION").is_some()
+        || std::env::var("MAGI_NODE").as_deref() == Ok("external-chat")
+    {
         return None;
     }
     if matches!(
@@ -2085,6 +2176,62 @@ async fn dispatch(command: Command) -> Result<()> {
         Command::Task { command } => task_cmd(command).await,
 
         Command::Talk { command } => match command {
+            TalkCmd::List { json } => {
+                let value = magi::talk::external::list(&magi::talk::Talks::open())?;
+                print_external_talk_result(&value, json)
+            }
+            TalkCmd::History {
+                id,
+                after,
+                limit,
+                json,
+            } => {
+                let value = magi::talk::external::history(
+                    &magi::talk::Talks::open(),
+                    &id,
+                    after.as_deref(),
+                    limit,
+                )?;
+                print_external_talk_result(&value, json)
+            }
+            TalkCmd::Send {
+                id,
+                request,
+                sender,
+                text,
+                json,
+            } => {
+                let text = if text == "-" {
+                    use std::io::Read as _;
+                    let mut body = String::new();
+                    std::io::stdin()
+                        .read_to_string(&mut body)
+                        .context("read the external chat message from stdin")?;
+                    body
+                } else {
+                    text
+                };
+                let value = magi::talk::external::send(
+                    &magi::talk::Talks::open(),
+                    &id,
+                    &request,
+                    &sender,
+                    &text,
+                )
+                .await?;
+                print_external_talk_result(&value, json)
+            }
+            TalkCmd::Reply {
+                id,
+                request,
+                wait,
+                json,
+            } => {
+                let value =
+                    magi::talk::external::reply(&magi::talk::Talks::open(), &id, &request, wait)
+                        .await?;
+                print_external_talk_result(&value, json)
+            }
             TalkCmd::Post { talk_id, message } => talk_post(&talk_id, &message),
             TalkCmd::Watch { timeout, command } => {
                 let id = magi::chat_watch::start(
@@ -2129,6 +2276,62 @@ async fn dispatch(command: Command) -> Result<()> {
             updater::run_self_update(yes, check_only, !std::io::stdin().is_terminal()).await
         }
     }
+}
+
+fn print_external_talk_result(value: &serde_json::Value, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string(value)?);
+    } else if let Some(talks) = value["talks"].as_array() {
+        for talk in talks {
+            println!(
+                "{}  {}  {}  {}",
+                talk["id"].as_str().unwrap_or(""),
+                talk["status"].as_str().unwrap_or(""),
+                talk["agent"].as_str().unwrap_or(""),
+                talk["title"]["text"].as_str().unwrap_or("")
+            );
+        }
+        if let Some(count) = value["unreadable"].as_u64().filter(|count| *count > 0) {
+            println!("{count} unreadable conversation(s)");
+        }
+    } else if let Some(messages) = value["messages"].as_array() {
+        for message in messages {
+            println!(
+                "{}  {}  {}\n{}\n",
+                message["id"].as_str().unwrap_or(""),
+                message["sender"].as_str().unwrap_or(""),
+                message["at"].as_str().unwrap_or(""),
+                message["body"].as_str().unwrap_or("")
+            );
+        }
+        if let Some(cursor) = value["cursor"].as_str() {
+            println!("cursor: {cursor}");
+        }
+        if value["more"] == true {
+            println!("続きあり: --after <cursor> で次のページを取得できます");
+        }
+    } else {
+        println!(
+            "{}  {}  {}",
+            value["status"].as_str().unwrap_or("unknown"),
+            value["talk"].as_str().unwrap_or(""),
+            value["request"].as_str().unwrap_or("")
+        );
+        for field in ["state", "input_id", "reply_id", "worker", "error"] {
+            if let Some(text) = value[field].as_str() {
+                println!("{field}: {text}");
+            }
+        }
+        if let Some(candidates) = value["candidates"].as_array() {
+            for candidate in candidates.iter().filter_map(serde_json::Value::as_str) {
+                println!("candidate: {candidate}");
+            }
+        }
+        if let Some(reply) = value["reply"].as_str() {
+            println!("\n{reply}");
+        }
+    }
+    Ok(())
 }
 
 /// One line describing an [`magi::cache::EntryStatus`] for `magi cache list`:
@@ -5103,6 +5306,112 @@ async fn probe(program: &str, args: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn external_talk_cli_exposes_request_sender_stdin_cursor_and_wait() {
+        let parsed = Cli::try_parse_from([
+            "magi",
+            "talk",
+            "send",
+            "chat",
+            "--request",
+            "req-1",
+            "--sender",
+            "Claude CLI",
+            "--json",
+            "-",
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Some(Command::Talk {
+                command: TalkCmd::Send { id, request, sender, text, json: true },
+            }) if id == "chat" && request == "req-1" && sender == "Claude CLI" && text == "-"
+        ));
+        let parsed = Cli::try_parse_from([
+            "magi", "talk", "history", "chat", "--after", "cursor", "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Some(Command::Talk {
+                command: TalkCmd::History { after: Some(cursor), json: true, .. },
+            }) if cursor == "cursor"
+        ));
+        let parsed = Cli::try_parse_from([
+            "magi",
+            "talk",
+            "reply",
+            "chat",
+            "--request",
+            "req-1",
+            "--wait",
+            "30",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Some(Command::Talk {
+                command: TalkCmd::Reply { request, wait: 30, json: true, .. },
+            }) if request == "req-1"
+        ));
+        assert!(Cli::try_parse_from(["magi", "talk", "list", "--json"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "magi",
+                "talk",
+                "send",
+                "chat",
+                "--sender",
+                "Claude CLI",
+                "hello",
+            ])
+            .is_err()
+        );
+        assert!(Cli::try_parse_from(["magi", "talk", "reply", "chat"]).is_err());
+        assert!(Cli::try_parse_from(["magi", "talk", "post", "chat", "hello"]).is_ok());
+        assert!(Cli::try_parse_from(["magi", "talk", "watch", "--", "echo", "hello"]).is_ok());
+    }
+
+    #[test]
+    fn external_chat_cli_allows_inspection_but_not_owner_actions() {
+        for args in [
+            vec!["task", "list", "--json"],
+            vec!["task", "show", "task"],
+            vec!["talk", "list", "--json"],
+            vec!["talk", "history", "chat"],
+            vec!["talk", "reply", "chat", "--request", "req"],
+            vec!["show"],
+        ] {
+            let cli = Cli::try_parse_from(std::iter::once("magi").chain(args)).unwrap();
+            assert!(external_chat_read_only(&cli.command.unwrap()));
+        }
+        for args in [
+            vec!["task", "add", "do work"],
+            vec!["task", "hold", "task"],
+            vec!["task", "control", "hold", "task"],
+            vec!["ask", "--summary", "decision"],
+            vec!["answer", "question", "--reply", "approve"],
+            vec![
+                "talk",
+                "send",
+                "chat",
+                "--request",
+                "req",
+                "--sender",
+                "Claude",
+                "hello",
+            ],
+            vec!["talk", "post", "chat", "hello"],
+            vec!["talk", "watch", "--", "echo", "hello"],
+            vec!["init"],
+            vec!["serve"],
+        ] {
+            let cli = Cli::try_parse_from(std::iter::once("magi").chain(args)).unwrap();
+            assert!(!external_chat_read_only(&cli.command.unwrap()));
+        }
+    }
 
     #[test]
     fn reconciliation_cli_requires_explicit_authority_and_separate_apply() {

@@ -5906,6 +5906,7 @@ const MAGI_PREFIX = "magi: ";
 function turnWho(turn) {
   if (turn.sender === "magi") return "system";
   if (turn.sender === "operator") return "operator";
+  if (turn.sender === "external") return "external";
   if (turn.sender === "persona") return "agent";
   if (turn.posted_by) return "system";
   if (turn.who === "agent" && String(turn.body || "").startsWith(MAGI_PREFIX)) return "system";
@@ -5973,14 +5974,14 @@ function renderNoticeDisplay(display, md) {
 function updateTurnIdentity(row, kind, item) {
   const r = row.refs;
   setAvatar(r.avatar, kind === "agent" ? item.personaAvatar
-    : kind === "operator" ? item.operatorAvatar : (item.magiAvatar || magiIconState.avatar));
+    : kind === "external" ? "" : kind === "operator" ? item.operatorAvatar : (item.magiAvatar || magiIconState.avatar));
   setText(r.who, kind === "operator" ? (item.operatorName || "YOU")
-    : kind === "system" ? "MAGI" : (item.personaName || "AGENT"));
+    : kind === "external" ? "External" : kind === "system" ? "MAGI" : (item.personaName || "AGENT"));
   const action = r.actions.firstElementChild;
   if (action) setAttr(action, "aria-label", `Reply to ${r.who.textContent}`);
   if (row.replyQuote && r.reply.firstElementChild) {
     const reply = row.replyQuote;
-    setText(r.reply.firstElementChild, `${reply.sender === "magi" ? "MAGI" : reply.who === "operator" ? (item.operatorName || "YOU") : (item.personaName || "AGENT")}: ${reply.excerpt}`);
+    setText(r.reply.firstElementChild, `${reply.sender === "external" ? "External" : reply.sender === "magi" ? "MAGI" : reply.who === "operator" ? (item.operatorName || "YOU") : (item.personaName || "AGENT")}: ${reply.excerpt}`);
   }
 }
 
@@ -6053,7 +6054,7 @@ function updateTurnRow(row, item) {
   if (turn.reply) {
     const reply = turn.reply;
     r.reply.append(el("button", { class: "reply-quote", type: "button",
-      text: `${reply.sender === "magi" ? "MAGI" : reply.who === "operator" ? (item.operatorName || "YOU") : (item.personaName || "AGENT")}: ${reply.excerpt}`,
+      text: `${reply.sender === "external" ? "External" : reply.sender === "magi" ? "MAGI" : reply.who === "operator" ? (item.operatorName || "YOU") : (item.personaName || "AGENT")}: ${reply.excerpt}`,
       onclick: () => {
         const target = document.getElementById(`talk-message-${reply.target.turn}-${reply.target.message}`);
         if (target) {
@@ -7330,10 +7331,10 @@ function renderTalkPending(talk) {
   ]);
   (talk.pending_messages || []).forEach((message, index) => {
     const avatar = avatarImg("turn-avatar");
-    setAvatar(avatar, message.sender === "magi" ? (talk.magi_avatar || magiIconState.avatar) : talk.operator_avatar);
+    setAvatar(avatar, message.sender === "external" ? "" : message.sender === "magi" ? (talk.magi_avatar || magiIconState.avatar) : talk.operator_avatar);
     box.append(el("div", { class: `queued-message${message.sender === "magi" ? " magi-pending" : ""}` }, avatar,
-      message.reply ? el("p", { class: "reply-quote", text: `Reply to ${message.reply.sender === "magi" ? "MAGI" : message.reply.who}: ${message.reply.excerpt}` }) : null,
-      el("strong", { text: message.sender === "magi" ? "MAGI" : (talk.operator_name || "YOU") }),
+      message.reply ? el("p", { class: "reply-quote", text: `Reply to ${message.reply.sender === "external" ? "External" : message.reply.sender === "magi" ? "MAGI" : message.reply.who}: ${message.reply.excerpt}` }) : null,
+      el("strong", { text: message.sender === "external" ? "External" : message.sender === "magi" ? "MAGI" : (talk.operator_name || "YOU") }),
       message.display ? renderNoticeDisplay(message.display, talk.pending_messages_md?.[index])
         : message.sender === "magi" && Array.isArray(talk.pending_messages_md?.[index])
           ? mdBlock("notification-prose", talk.pending_messages_md[index]) : el("p", { class: "turn-text", text: message.body || `${message.attachments.length} attachment(s)` }),

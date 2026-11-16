@@ -157,7 +157,14 @@ fn repository_writer(inv: &Invocation<'_>) -> bool {
     inv.allow_write
         && (matches!(
             inv.node,
-            "implement" | "fix" | "graft" | "gate-fix" | "land" | "rebase" | "base-conflict"
+            "implement"
+                | "fix"
+                | "graft"
+                | "gate-fix"
+                | "land"
+                | "rebase"
+                | "base-conflict"
+                | "external-chat"
         ) || inv.node == crate::queue::CHAT_NODE)
 }
 
@@ -169,7 +176,7 @@ fn repository_seat(inv: &Invocation<'_>) -> bool {
     // scheduling, including waiter delivery.
     !matches!(
         inv.node,
-        crate::queue::CHAT_NODE | "talk-title" | "deputy" | "conduct" | "dupes"
+        crate::queue::CHAT_NODE | "external-chat" | "talk-title" | "deputy" | "conduct" | "dupes"
     )
 }
 
@@ -583,6 +590,8 @@ pub async fn invoke(
     #[cfg(any(unix, windows))]
     let _chat_controls = {
         use crate::chat_control::bridge::{self, Bridge};
+        // Strip inherited and per-agent capabilities for every invocation,
+        // including external-chat; only an ordinary owner chat gets a new one.
         bridge::clear_environment(&mut cmd);
         let bridge = if inv.node == crate::queue::CHAT_NODE {
             crate::run::try_home().and_then(|home| {
@@ -2181,6 +2190,7 @@ mod tests {
                 "rebase",
                 "base-conflict",
                 crate::queue::CHAT_NODE,
+                "external-chat",
             ] {
                 let mut invocation = inv(Path::new("."), Path::new("/art"), true);
                 invocation.node = node;
@@ -2207,6 +2217,7 @@ mod tests {
                 ("waiter", false),
                 ("talk-title", false),
                 (crate::queue::CHAT_NODE, false),
+                ("external-chat", false),
                 ("deputy", true),
             ] {
                 let mut invocation = inv(Path::new("."), Path::new("/art"), write);
@@ -2486,6 +2497,7 @@ mod tests {
             "rebase",
             "base-conflict",
             "chat",
+            "external-chat",
         ] {
             i.node = node;
             assert!(repository_writer(&i), "{node}");
@@ -2515,6 +2527,7 @@ mod tests {
         let roots = [PathBuf::from("/questions")];
         for node in [
             crate::queue::CHAT_NODE,
+            "external-chat",
             "implement",
             "fix",
             "graft",
@@ -2540,11 +2553,16 @@ mod tests {
                         repository_seat(&i),
                         !matches!(
                             node,
-                            crate::queue::CHAT_NODE | "talk-title" | "deputy" | "conduct" | "dupes"
+                            crate::queue::CHAT_NODE
+                                | "external-chat"
+                                | "talk-title"
+                                | "deputy"
+                                | "conduct"
+                                | "dupes"
                         ),
                         "{node}, allow_write={allow_write}, writable={writable:?}"
                     );
-                    if node == crate::queue::CHAT_NODE {
+                    if matches!(node, crate::queue::CHAT_NODE | "external-chat") {
                         assert_eq!(repository_writer(&i), allow_write);
                     }
                 }
