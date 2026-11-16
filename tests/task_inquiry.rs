@@ -109,6 +109,7 @@ async fn native_delivery_creates_the_configured_solo_chat_and_reopens_it_for_new
     assert_eq!(chat.implementers, 1);
     assert!(chat.persona.is_empty());
     assert_eq!(chat.agent, "alpha");
+    talk::drain(&mut chat, &talks).unwrap();
     talk::close(&mut chat, &talks).unwrap();
     // Replaying an acknowledged delivery must not reopen a closed conversation.
     outbox.deliver(&queue, &talks, &first.id).unwrap();

@@ -27,6 +27,26 @@ use the same serialized list loader; dashboard filter changes cancel older
 requests. The event stream starts without waiting for initial HTTP requests.
 Unchanged task histories and run timelines retain their DOM nodes.
 
+## Conversation close/reopen
+
+Close and Reopen use standard buttons, not the muted quiet style. Their pending
+state belongs to the conversation ID: switching chats never inherits another
+chat's disabled control or releases its pending request. API confirmation updates
+the conversation immediately; list refreshes run independently, and older list
+responses cannot undo a confirmed status. A failed mutation response triggers a
+core read; if that also fails, the UI reports an unknown outcome rather than
+claiming the conversation stayed open.
+
+`changeTalkStatus` が close/reopen の通信を共有し、`renderTalkStatusButton` が
+両ボタンの disabled・aria-busy・ラベルをまとめて描画する。入力保護の理由と
+composer の状態は `renderTalkClose` が引き続き管理する。
+
+An active reply alone does not block closing or cancel its worker. Close refuses
+unsent text, attachments, sends awaiting acknowledgement, and durable queued input,
+with an adjacent explanation. The server rechecks queued input under the existing
+store guard and returns 409 without discarding it. Send or explicitly clear that
+input first. No turn lease or worker-completion grace period is changed.
+
 ## Server work
 
 - Exact task, conversation and run IDs use direct filesystem lookup; short IDs
