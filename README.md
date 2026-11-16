@@ -1591,6 +1591,14 @@ a dedicated built-in avatar. Operator sends and conversation persona replies
 keep their own names and icons. Older operator records retain their original
 attribution; message text alone is not evidence that MAGI wrote them.
 
+Chat agents must route work that outlives their turn to `magi talk watch` or
+`magi task add`, never a plain background shell job. A later-report promise
+requires a successful command to print a watch or task ID. After a successful
+reply, MAGI adds a warning note for explicit English or Japanese promises
+without a new registration during that turn (including fallback attempts).
+The reply is unchanged; no decision or task is created. Quoted/code examples
+are ignored, and unreadable registration evidence suppresses the warning.
+
 In the web **Settings** page, use **MAGI sender icon** to choose an image from
 your phone's image picker. Review the preview and tap **Save MAGI icon**, or
 **Reset to built-in** to restore the supplied artwork. The choice applies to

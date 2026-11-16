@@ -142,6 +142,49 @@ fn directories(home: &Path) -> Result<Vec<PathBuf>> {
         .collect())
 }
 
+/// Successful startup acknowledgements, not merely reserved jobs.
+pub(crate) fn registered_ids(
+    home: &Path,
+    talk: &str,
+) -> Result<std::collections::BTreeSet<String>> {
+    let entries = match std::fs::read_dir(root(home)) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Default::default()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut ids = std::collections::BTreeSet::new();
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() || entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
+        let dir = entry.path();
+        let path = dir.join("registered");
+        match std::fs::read_to_string(path) {
+            Ok(owner) if owner == talk => {
+                ids.insert(
+                    dir.file_name()
+                        .context("watch directory name")?
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let job = load(&dir)?;
+                if job.talk == talk
+                    && job.supervisor.is_some()
+                    && (job.child.is_some() || job.result.is_some())
+                {
+                    bail!("watch startup acknowledged without a registration receipt");
+                }
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(ids)
+}
+
 /// Only the standing chat's own environment chooses the destination.
 pub fn authorize(talks: &Talks, run: &str, node: &str) -> Result<String> {
     if node != crate::queue::CHAT_NODE || run.trim().is_empty() {
@@ -239,6 +282,11 @@ pub fn start(
     loop {
         let fresh = load(&dir)?;
         if fresh.supervisor.is_some() && (fresh.child.is_some() || fresh.result.is_some()) {
+            // Separate from job.json: the supervisor may still be saving it.
+            // Failure must not cancel a job that is already running.
+            if let Err(e) = std::fs::write(dir.join("registered"), &fresh.talk) {
+                tracing::warn!("could not record watch registration: {e}");
+            }
             // Reap while the calling process is alive; after it exits the
             // detached supervisor is reparented and reaped by the platform.
             std::thread::spawn(move || {
@@ -843,6 +891,42 @@ pub(crate) mod windows {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn later_report_watch_evidence_requires_successful_registration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        assert!(registered_ids(home, "chat").unwrap().is_empty());
+        let dir = root(home).join("watch-id");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut job = Job {
+            id: "watch-id".into(),
+            talk: "chat".into(),
+            cwd: PathBuf::from("."),
+            command: vec!["test".into()],
+            timeout: 1,
+            supervisor: None,
+            child: None,
+            result: Some("supervisor startup failed".into()),
+            tail: String::new(),
+            delivered: false,
+        };
+        save(&dir, &job).unwrap();
+        assert!(registered_ids(home, "chat").unwrap().is_empty());
+        job.supervisor = Some((1, "identity".into()));
+        save(&dir, &job).unwrap();
+        // An acknowledged job without a receipt is unknown (including an
+        // older job or a failed receipt write), never proof of no registration.
+        assert!(registered_ids(home, "chat").is_err());
+        std::fs::write(dir.join("registered"), "chat").unwrap();
+        assert_eq!(
+            registered_ids(home, "chat").unwrap(),
+            ["watch-id".into()].into()
+        );
+        assert!(registered_ids(home, "another-chat").unwrap().is_empty());
+        std::fs::write(dir.join("registered"), [0xff]).unwrap();
+        assert!(registered_ids(home, "chat").is_err());
+    }
 
     struct EndlessOutput;
     impl Read for EndlessOutput {
