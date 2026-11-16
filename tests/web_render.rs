@@ -4654,6 +4654,7 @@ async fn queue_compact_controls_and_edit_save_fit_and_preserve_drafts() {
           const menu = card.querySelector('.task-action-menu');
           menu.querySelector('summary').click();
           card.querySelector('.task-hold-box button').click();
+          assert(location.hash === '#/queue', 'arming hold does not navigate when its button is replaced');
           const reason = card.querySelector('.task-hold-box input');
           reason.value = 'waiting on review'; reason.dispatchEvent(new Event('input'));
           reason.focus();
