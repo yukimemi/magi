@@ -7615,10 +7615,7 @@ async fn chat_close_is_scoped_and_does_not_wait_for_the_list() {
         talks.get(&second.id).unwrap().status,
         talk::TalkStatus::Open
     );
-    assert_eq!(
-        browser.eval(&page, "closedPaths.length").await.unwrap(),
-        0
-    );
+    assert_eq!(browser.eval(&page, "closedPaths.length").await.unwrap(), 0);
     eprintln!("Reproduced: list wait satisfied while both close requests remain unsent");
     browser.eval(&page, "releaseFirst(); true").await.unwrap();
     // Only this conversation's successful mutation response proves its close
