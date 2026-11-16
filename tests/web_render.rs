@@ -7606,8 +7606,15 @@ async fn chat_close_is_scoped_and_does_not_wait_for_the_list() {
         .await
         .unwrap();
     browser.eval(&page, "releaseFirst(); true").await.unwrap();
+    // Navigation can already have queued a delayed list response. Observe the
+    // close handler's confirmation, not an unrelated list read, before checking
+    // persisted state and the second conversation's still-pending control.
     browser
-        .wait_for(&page, "releaseLists.length > 0", w)
+        .wait_for(
+            &page,
+            "document.getElementById('live').textContent === 'Conversation closed.' && releaseLists.length > 0",
+            w,
+        )
         .await
         .unwrap();
     assert_eq!(
