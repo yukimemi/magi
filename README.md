@@ -718,6 +718,8 @@ and its saved request survive the sending CLI, web, or scheduler exiting.
 Live workers (including older executable generations), active turns and unsent
 drafts refuse new external admission before any message is appended. A failed
 or unknown worker launch retains the request and never promotes an owner draft.
+Queued owner messages wait behind previously accepted external input, including
+the interval before its worker acquires the conversation's turn lease.
 
 For example, this Bash workflow uses an external Claude CLI to compose a
 message. It requires `claude`, `magi`, `python3` and `jq`. Replace `talk_id` with

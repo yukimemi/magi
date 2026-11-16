@@ -246,6 +246,16 @@ pub async fn run_turn_worker(home: &std::path::Path, payload: serde_json::Value)
                     {
                         return false;
                     }
+                    if let Some(request) = job
+                        .payload
+                        .get("external_request")
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        return fresh.external_requests.iter().any(|record| {
+                            record.request == request
+                                && matches!(record.status.as_str(), "accepted" | "started")
+                        });
+                    }
                     let Some(index) = job
                         .payload
                         .get("recorded_turn")
@@ -261,9 +271,9 @@ pub async fn run_turn_worker(home: &std::path::Path, payload: serde_json::Value)
                         && !recorded_answered(&fresh, index)
                 })
             {
-                // A submitted immediate turn is already in the transcript,
-                // but its child has not acquired the lease yet. Do not let a
-                // queued follow-up overtake it during process startup.
+                // Submitted input is already in the transcript, but its
+                // owner or external worker may not have acquired the lease.
+                // Queued follow-ups must not overtake either during startup.
                 drop(publication);
                 drop(lease);
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -378,6 +388,109 @@ mod tests {
                 .is_some()
         );
         drop(turn);
+    }
+
+    #[tokio::test]
+    async fn queued_owner_worker_releases_the_turn_until_external_input_is_answered() {
+        for status in ["accepted", "started"] {
+            let (_home, talks, mut talk) = talks();
+            talk::record(&mut talk, &talks, "external input", Vec::new()).expect("input");
+            talk.turns[0].sender = Some(talk::Sender::External);
+            talk.turns[0].messages.clear();
+            talk.external_requests.push(talk::external::Request {
+                request: "external-first".to_owned(),
+                sender: "external-fixture".to_owned(),
+                text: "external input".to_owned(),
+                input_turn: 0,
+                reply_turn: None,
+                status: status.to_owned(),
+                worker: None,
+                error: None,
+            });
+            talks.put(&mut talk).expect("admitted external input");
+            talk::post(&talks, &talk.id, "unrelated task post", "task-seat").expect("post");
+            talk::queue(&mut talk, &talks, "later owner input", Vec::new()).expect("queue");
+
+            let reserve = |id: &str, payload: serde_json::Value| {
+                let dir = talks.home().join("workers/jobs").join(id);
+                std::fs::create_dir_all(&dir).expect("reservation directory");
+                let lease = crate::worker::execution_lease_for_test(&dir.join("live.lock"));
+                let job = crate::worker::Job {
+                    id: id.to_owned(),
+                    sequence: 1,
+                    kind: "chat".to_owned(),
+                    key: id.to_owned(),
+                    payload,
+                    generation: "fixture-generation".to_owned(),
+                    version: None,
+                    status: crate::worker::Status::Running,
+                    result: None,
+                    pid: None,
+                    created_at: 0,
+                    finished_at: None,
+                };
+                std::fs::write(dir.join("job.json"), serde_json::to_vec(&job).expect("job"))
+                    .expect("persist reservation");
+                lease
+            };
+            // Keep test-host worker identity local if verification inherited it.
+            // No environment mutation or access to the operator's worker store.
+            let _current = std::env::var("MAGI_WORKER_ID")
+                .ok()
+                .map(|id| reserve(&id, serde_json::json!({"talk": talk.id})));
+            let external_id = crate::rng::SplitMix64::new(crate::rng::entropy()).uuid_v4();
+            let _external = reserve(
+                &external_id,
+                serde_json::json!({"talk": talk.id, "external_request": "external-first"}),
+            );
+
+            // If the ordering fence regresses, fail before any backend can run.
+            std::fs::write(talk.repo.join("magi.toml"), "invalid = [")
+                .expect("invalid owner config");
+
+            // The owner worker wins TurnLease while the external worker has
+            // not acquired it yet. Poll the real drainer through that boundary.
+            let work = run_turn_worker(talks.home(), serde_json::json!({"talk": talk.id}));
+            tokio::pin!(work);
+            std::future::poll_fn(|cx| {
+                assert!(
+                    work.as_mut().poll(cx).is_pending(),
+                    "queued owner must wait"
+                );
+                std::task::Poll::Ready(())
+            })
+            .await;
+            let fresh = talks.get(&talk.id).expect("retained input");
+            assert_eq!(fresh.pending, "later owner input");
+            assert_eq!(
+                fresh.turns.len(),
+                2,
+                "no owner turn or response was appended"
+            );
+            assert!(
+                talks.claim_turn(&talk.id).expect("turn claim").is_some(),
+                "waiting owner worker must yield the lease to the external worker"
+            );
+            assert!(
+                try_publication_guard(&talks, &talk.id)
+                    .expect("publication claim")
+                    .is_some(),
+                "waiting owner worker must also yield publication"
+            );
+            let mut fresh = fresh;
+            let mut response = fresh.turns[1].clone();
+            response.sender = Some(talk::Sender::Persona);
+            response.posted_by = None;
+            response.body = "external response".to_owned();
+            fresh.external_requests[0].reply_turn = Some(fresh.turns.len());
+            fresh.external_requests[0].status = "replied".to_owned();
+            fresh.turns.push(response);
+            talks.put(&mut fresh).expect("external completion");
+            tokio::time::timeout(std::time::Duration::from_secs(5), work.as_mut())
+                .await
+                .expect("owner worker proceeds after the external reply")
+                .expect_err("invalid config stops execution before invoking any backend");
+        }
     }
 
     #[tokio::test]
