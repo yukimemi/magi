@@ -2581,14 +2581,20 @@ fn promises_later_report(reply: &str) -> bool {
             }
         }
         let normalized = prose.to_lowercase().replace('’', "'");
-        for sentence in normalized.split(['.', '!', '?', '。', '！', '？']) {
+        for sentence in normalized.split_inclusive(['.', '!', '?', '。', '！', '？']) {
             let sentence = sentence.trim();
-            // Ignore questions and quoted examples, rather than guessing intent.
-            if prose.contains(['?', '？']) || sentence.contains(['"', '「', '」', '“', '”'])
+            // A question excludes only itself, not a later promise on the same line.
+            if sentence.ends_with(['?', '？']) || sentence.contains(['"', '「', '」', '“', '”'])
             {
                 continue;
             }
-            for clause in sentence.split([',', ';', '、', '；']) {
+            let sentence = sentence.trim_end_matches(['.', '!', '。', '！']).trim_end();
+            for clause in sentence
+                .split([',', ';', ':', '、', '；'])
+                .flat_map(|clause| clause.split(" but "))
+                .flat_map(|clause| clause.split(" however "))
+                .flat_map(|clause| clause.split(" although "))
+            {
                 if clause.contains(" not ")
                     || clause.contains("n't")
                     || clause.contains("never ")
@@ -2601,21 +2607,45 @@ fn promises_later_report(reply: &str) -> bool {
                     continue;
                 }
                 if [
-                    "i will report back",
-                    "i'll report back",
-                    "i will notify",
-                    "i'll notify",
-                    "i will tell you when",
-                    "i'll tell you when",
+                    "i will",
+                    "i'll",
+                    "we will",
+                    "we'll",
+                    "i am going to",
+                    "i'm going to",
                 ]
                 .iter()
-                .any(|phrase| clause.trim_start().starts_with(phrase))
-                    || (!["彼", "担当", "エージェント", "システム", "仕組み"]
-                        .iter()
-                        .any(|subject| clause.contains(subject))
-                        && ["報告します", "通知します", "終わったら知らせます"]
-                            .iter()
-                            .any(|phrase| clause.ends_with(phrase)))
+                .filter_map(|subject| clause.trim_start().strip_prefix(subject)?.strip_prefix(' '))
+                .any(|verb| {
+                    [
+                        "report back",
+                        "notify",
+                        "let you know",
+                        "tell you when",
+                        "tell you once",
+                        "ping you",
+                        "update you",
+                        "get back to you",
+                        "message you",
+                        "follow up with you",
+                        "report to you",
+                    ]
+                    .iter()
+                    .any(|phrase| verb.starts_with(phrase))
+                }) || (!["彼", "担当", "エージェント", "システム", "仕組み"]
+                    .iter()
+                    .any(|subject| clause.contains(subject))
+                    && [
+                        "報告します",
+                        "報告いたします",
+                        "通知します",
+                        "通知いたします",
+                        "知らせます",
+                        "連絡します",
+                        "連絡いたします",
+                    ]
+                    .iter()
+                    .any(|phrase| clause.ends_with(phrase)))
                 {
                     return true;
                 }
@@ -3438,7 +3468,7 @@ pub fn briefing_for(
          `magi talk watch --timeout 900 -- <executable> <arguments...>`, for \
          example `magi talk watch -- cargo test --locked`. It uses your \
          current directory; arguments are passed literally. For shell syntax, \
-         explicitly call `sh -c`. You may say \"I will report back\" only after a \
+         explicitly call `sh -c`. You may promise a later report only after a \
          successful `magi talk watch` printed a watch id or a successful \
          `magi task add` printed a task id. Watches default to 900 seconds, \
          accept at most 3600 seconds, and share four concurrent slots. Their \
@@ -6536,6 +6566,8 @@ mod tests {
         assert!(b.contains("its result never reaches this conversation"));
         assert!(b.contains("printed a watch id"));
         assert!(b.contains("printed a task id"));
+        assert!(b.contains("You may promise a later report only after"));
+        assert!(!promises_later_report(&b));
         assert!(b.contains("magi task control resume <full run id>"));
         assert!(b.contains("magi task control abandon <full run id>"));
     }
@@ -6548,10 +6580,23 @@ mod tests {
             "I will tell you when the tests finish.",
             "I won't wait here. I will report back.",
             "I cannot wait, I will notify you.",
+            "Any questions? I will report back.",
+            "I cannot wait but I will notify you.",
+            "I won't wait however I'll report back.",
+            "I cannot wait although I will report back.",
+            "I'll let you know when it finishes.",
+            "We will get back to you once it is done.",
+            "I am going to follow up with you.",
+            "I'm going to message you.",
             "完了したら報告します。",
             "結果を通知します。",
             "終わったら知らせます。",
             "今は待機しません。完了したら報告します。",
+            "続けますか？完了したら報告します。",
+            "完了したら連絡します。",
+            "結果を報告いたします。",
+            "結果を通知いたします。",
+            "完了したら連絡いたします。",
         ] {
             assert!(promises_later_report(text), "{text}");
         }
@@ -6563,6 +6608,10 @@ mod tests {
             "She says I will report back.",
             "Will you report back?",
             "I will notify you?",
+            "I'll let you know?",
+            "I will not get back to you.",
+            "We won't let you know.",
+            "The service will get back to you.",
             "> I will report back",
             "`I will report back`",
             "``I will report back``",
@@ -6571,6 +6620,9 @@ mod tests {
             "報告しません。",
             "結果は報告しました。",
             "通知しますか？",
+            "連絡しますか？",
+            "連絡いたしません。",
+            "彼が連絡いたします。",
             "彼が報告します。",
             "エージェントが通知します。",
             "「報告します」と言いました。",

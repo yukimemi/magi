@@ -159,27 +159,12 @@ pub(crate) fn registered_ids(
             continue;
         }
         let dir = entry.path();
-        let path = dir.join("registered");
-        match std::fs::read_to_string(path) {
-            Ok(owner) if owner == talk => {
-                ids.insert(
-                    dir.file_name()
-                        .context("watch directory name")?
-                        .to_string_lossy()
-                        .into_owned(),
-                );
-            }
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let job = load(&dir)?;
-                if job.talk == talk
-                    && job.supervisor.is_some()
-                    && (job.child.is_some() || job.result.is_some())
-                {
-                    bail!("watch startup acknowledged without a registration receipt");
-                }
-            }
-            Err(e) => return Err(e.into()),
+        let job = load(&dir)?;
+        if job.talk == talk
+            && job.supervisor.is_some()
+            && (job.child.is_some() || job.result.is_some())
+        {
+            ids.insert(job.id);
         }
     }
     Ok(ids)
@@ -282,11 +267,6 @@ pub fn start(
     loop {
         let fresh = load(&dir)?;
         if fresh.supervisor.is_some() && (fresh.child.is_some() || fresh.result.is_some()) {
-            // Separate from job.json: the supervisor may still be saving it.
-            // Failure must not cancel a job that is already running.
-            if let Err(e) = std::fs::write(dir.join("registered"), &fresh.talk) {
-                tracing::warn!("could not record watch registration: {e}");
-            }
             // Reap while the calling process is alive; after it exits the
             // detached supervisor is reparented and reaped by the platform.
             std::thread::spawn(move || {
@@ -915,16 +895,22 @@ mod tests {
         assert!(registered_ids(home, "chat").unwrap().is_empty());
         job.supervisor = Some((1, "identity".into()));
         save(&dir, &job).unwrap();
-        // An acknowledged job without a receipt is unknown (including an
-        // older job or a failed receipt write), never proof of no registration.
-        assert!(registered_ids(home, "chat").is_err());
-        std::fs::write(dir.join("registered"), "chat").unwrap();
+        // The same supervisor + child/result condition acknowledged by start().
         assert_eq!(
             registered_ids(home, "chat").unwrap(),
             ["watch-id".into()].into()
         );
         assert!(registered_ids(home, "another-chat").unwrap().is_empty());
-        std::fs::write(dir.join("registered"), [0xff]).unwrap();
+        job.result = None;
+        save(&dir, &job).unwrap();
+        assert!(registered_ids(home, "chat").unwrap().is_empty());
+        job.child = Some((2, "child".into()));
+        save(&dir, &job).unwrap();
+        assert_eq!(
+            registered_ids(home, "chat").unwrap(),
+            ["watch-id".into()].into()
+        );
+        std::fs::write(dir.join("job.json"), "{").unwrap();
         assert!(registered_ids(home, "chat").is_err());
     }
 
