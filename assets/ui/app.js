@@ -815,6 +815,9 @@ const state = {
      serverId, mime, bytes }` with `status` one of `"uploading"` /
      `"done"` / `"error"` - see `renderTalkThumbs`. */
   talkAttachments: { id: null, items: [] },
+  talkStatusRequests: new Map(),
+  talkStatusUpdates: new Map(),
+  talkSubmissions: new Map(),
   /* Turns in flight, keyed by conversation id. The server allows one turn
      per conversation, not one per browser surface: an entry must never stop
      an unrelated conversation from sending. `target` is the transcript
@@ -6512,6 +6515,15 @@ function talkIsThinking(talk) {
 }
 
 let talksNext = null;
+function reconcileTalkStatus(talk) {
+  const saved = state.talkStatusUpdates?.get(talk.id);
+  if (!saved) return talk;
+  if (Date.parse(talk.updated_at) > Date.parse(saved.updated_at)) {
+    state.talkStatusUpdates.delete(talk.id);
+    return talk;
+  }
+  return { ...talk, status: saved.status };
+}
 let olderTalksFlight = null;
 let olderTalksRead = null;
 function talkReadOptions(rows) {
@@ -6580,7 +6592,7 @@ function loadOlderTalks() {
     // Deltas may finish while this page is in flight. Preserve both their
     // updated rows and their deletions, including IDs not previously loaded.
     const rows = page.rows.filter(row => !read.changed.has(row.id));
-    state.talks = mergeStore("talks", rows, {
+    state.talks = mergeStore("talks", rows.map(reconcileTalkStatus), {
       changed: (page.revalidated || []).filter(id => !read.changed.has(id)), removed: [],
     });
     talksNext = page.next;
@@ -6598,7 +6610,7 @@ function loadTalks(change) {
       } else olderTalksRead.superseded = true;
     }
     state.talkListGeneration = (state.talkListGeneration || 0) + 1;
-    state.talks = list;
+    state.talks = list.map(reconcileTalkStatus);
     for (const talk of fetched) trackTalkThinking(talk, observed.get(talk.id));
     renderStoreList(partial, renderTalks);
     refreshSearch("chats");
@@ -6885,6 +6897,34 @@ function renderTalkReply() {
       onclick: () => { state.talkReply = null; renderTalkReply(); } })]);
 }
 
+function talkCloseReason(talk) {
+  if (state.talkStatusRequests.has(talk.id)) return state.talkStatusRequests.get(talk.id) === "close"
+    ? "Closing this conversation…" : "Reopening this conversation…";
+  if (state.talkSubmissions.has(talk.id)) return "Wait for the message to be accepted before closing.";
+  if ($("f-talk-say").value.trim() || (state.talkAttachments.id === talk.id && state.talkAttachments.items.length))
+    return "Send or remove your unsent message and attachments before closing.";
+  if (talk.pending || talk.pending_messages?.length || talk.pending_attachments?.length)
+    return "Send or clear the queued input before closing.";
+  return "";
+}
+
+function renderTalkClose(talk = state.talkDetail.talk) {
+  if (!talk) return;
+  const action = state.talkStatusRequests.get(talk.id);
+  const reason = talk.status === "open" || action ? talkCloseReason(talk) : "";
+  $("talk-close-go").disabled = Boolean(reason);
+  $("talk-reopen-go").disabled = Boolean(action);
+  setAttr($("talk-close-go"), "aria-busy", action === "close" ? "true" : "false");
+  setAttr($("talk-reopen-go"), "aria-busy", action === "reopen" ? "true" : "false");
+  $("f-talk-say").disabled = Boolean(action);
+  $("talk-file-input").disabled = Boolean(action);
+  $("talk-send").disabled = Boolean(action) || talkAttachmentsBusy();
+  setText($("talk-close-go"), action === "close" ? "Closing…" : "Close this conversation");
+  setText($("talk-reopen-go"), action === "reopen" ? "Reopening…" : "Reopen this conversation");
+  setText($("talk-close-reason"), reason);
+  show($("talk-close-reason"), Boolean(reason));
+}
+
 function renderTalk() {
   if (state.talkReply && state.talkReply.id !== state.talkDetail.id) state.talkReply = null;
   renderTalkReply();
@@ -6919,6 +6959,7 @@ function renderTalk() {
     show($("talk-closed"), false);
     show($("talk-close-go"), false);
     show($("talk-reopen-go"), false);
+    show($("talk-close-reason"), false);
     show($("talk-wait"), false);
     if (!gone) {
       /* Nothing cached and no list row (a direct link): a disabled
@@ -7038,10 +7079,11 @@ function renderTalk() {
   show($("talk-closed"), !canSay);
   show($("talk-close-go"), canSay);
   show($("talk-reopen-go"), !canSay);
+  renderTalkClose(talk);
   renderTalkThumbs();
   const uploading = talkAttachmentsBusy();
-  $("f-talk-say").disabled = false;
-  $("talk-send").disabled = uploading;
+  $("f-talk-say").disabled = state.talkStatusRequests.has(talk.id);
+  $("talk-send").disabled = uploading || state.talkStatusRequests.has(talk.id);
   setText($("talk-send"), uploading ? "Uploading…" : busy ? "Queue next" : "Send");
   renderTalkPending(talk);
   renderTalkAgent(talk, busy);
@@ -7533,7 +7575,7 @@ function removeTalkAttachment(localId) {
 
 async function attachTalkFiles(files) {
   const id = state.talkDetail.id;
-  if (!id) return;
+  if (!id || state.talkStatusRequests.has(id)) return;
   if (state.talkAttachments.id !== id) resetTalkAttachments(id);
 
   const images = [...files].filter((file) => file.type.startsWith("image/"));
@@ -7603,7 +7645,7 @@ async function sendTalkTurn(event) {
   const id = state.talkDetail.id;
   const box = $("f-talk-say");
   const text = box.value;
-  if (!id || talkAttachmentsBusy()) return;
+  if (!id || talkAttachmentsBusy() || state.talkStatusRequests.has(id)) return;
   const attachments = state.talkAttachments.id === id
     ? state.talkAttachments.items.filter((item) => item.status === "done")
     : [];
@@ -7622,6 +7664,7 @@ async function sendTalkTurn(event) {
   const before = talkTurns(state.talkDetail.talk).length;
   const ownsTurn = !state.talkWaits.has(id) && !(state.talkDetail.talk && state.talkDetail.talk.thinking);
   if (ownsTurn) beginTalkTurn(id, before, before + 2, { body: text, at: new Date().toISOString() });
+  state.talkSubmissions.set(id, (state.talkSubmissions.get(id) || 0) + 1);
   box.value = "";
   renderTalk();
   $("talk-wait").scrollIntoView({ block: "nearest" });
@@ -7655,47 +7698,62 @@ async function sendTalkTurn(event) {
     if (state.talkDetail.id === id && !state.talkReply) state.talkReply = submissionReply;
     if (ownsTurn) endTalkTurn(id);
     talkError(`The message may not have been sent: ${error.message}`);
-    await loadTalk(id);
+    if (state.talkDetail.id === id) await loadTalk(id);
+  } finally {
+    const remaining = state.talkSubmissions.get(id) - 1;
+    if (remaining) state.talkSubmissions.set(id, remaining);
+    else state.talkSubmissions.delete(id);
+    if (state.talkDetail.id === id) renderTalkClose();
   }
 }
 
-async function closeTalk() {
+async function changeTalkStatus(action) {
   const id = state.talkDetail.id;
-  const button = $("talk-close-go");
-  if (!id) return;
-  button.disabled = true;
+  const current = state.talkDetail.talk;
+  if (!id || !current || state.talkStatusRequests.has(id)) return;
+  if (action === "close") {
+    const reason = talkCloseReason(current);
+    if (reason) { talkError(reason); return; }
+  }
+  state.talkStatusRequests.set(id, action);
+  talkError("");
+  renderTalkClose();
+  const accept = talk => {
+    state.talkStatusUpdates.set(id, { status: talk.status, updated_at: talk.updated_at });
+    state.talks = (state.talks || []).map(row => row.id === id ? { ...row, status: talk.status, updated_at: talk.updated_at } : row);
+    renderTalks();
+    if (state.talkDetail.id === id) {
+      acceptTalkUpdate(talk);
+      renderTalk();
+    }
+  };
   try {
-    const talk = await postJson(API.talkClose(id), {});
-    acceptTalkUpdate(talk);
-    renderTalk();
-    await loadTalks();
-    announce("Conversation closed.");
+    const talk = await postJson(action === "close" ? API.talkClose(id) : API.talkReopen(id), {});
+    accept(talk);
+    announce(`Conversation ${action === "close" ? "closed" : "reopened"}.`);
     ok();
+    // A list refresh is not part of the mutation's completion.
+    loadTalks().catch(error => failFor(true, `Conversation list: ${error.message}`, error));
   } catch (error) {
-    fail(`Could not close the conversation: ${error.message}`);
+    let confirmed;
+    try {
+      confirmed = await getJson(`${API.talk(id)}/core`);
+      accept(confirmed);
+    } catch (_) { /* A lost response cannot prove whether the write landed. */ }
+    if (state.talkDetail.id === id) {
+      const wanted = action === "close" ? "closed" : "open";
+      talkError(confirmed?.status === wanted
+        ? `Conversation ${action === "close" ? "closed" : "reopened"} (confirmed after a connection error).`
+        : `${confirmed ? `Conversation is ${confirmed.status}.` : "Conversation status could not be confirmed; refresh before retrying."} ${error.message}`);
+    }
   } finally {
-    button.disabled = false;
+    state.talkStatusRequests.delete(id);
+    if (state.talkDetail.id === id) renderTalkClose();
   }
 }
 
-async function reopenTalk() {
-  const id = state.talkDetail.id;
-  const button = $("talk-reopen-go");
-  if (!id) return;
-  button.disabled = true;
-  try {
-    const talk = await postJson(API.talkReopen(id), {});
-    acceptTalkUpdate(talk);
-    renderTalk();
-    await loadTalks();
-    announce("Conversation reopened.");
-    ok();
-  } catch (error) {
-    fail(`Could not reopen the conversation: ${error.message}`);
-  } finally {
-    button.disabled = false;
-  }
-}
+async function closeTalk() { return changeTalkStatus("close"); }
+async function reopenTalk() { return changeTalkStatus("reopen"); }
 
 /* Armed by the talk's own id, the same two-step confirm `renderRunDelete`
    uses: comparing against `talk.id` rather than a plain boolean means
@@ -12668,6 +12726,7 @@ function wire() {
   $("talks-mark-all-read").addEventListener("click", markAllTalksRead);
   $("talk-say").addEventListener("submit", sendTalkTurn);
   $("talk-close-go").addEventListener("click", closeTalk);
+  $("f-talk-say").addEventListener("input", () => renderTalkClose());
   $("talk-agent").addEventListener("change", switchTalkAgent);
   $("talk-persona").addEventListener("change", switchTalkPersona);
   $("talk-implementers").addEventListener("change", switchTalkImplementers);

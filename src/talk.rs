@@ -2249,9 +2249,17 @@ fn check_lease(lease: &TurnLease, talk: &Talk) -> Result<()> {
     Ok(())
 }
 
+/// Closing must not discard durable input, including automatic messages.
+#[derive(Debug, thiserror::Error)]
+#[error("cannot close a talk with pending input; send or clear the queued input first")]
+pub(crate) struct ClosePendingInput;
+
 /// Close a conversation. Idempotent: closing an already-closed conversation is
 /// not an error, since the operator's intent - "I am done with this" - is
 /// already satisfied.
+///
+/// Refuses pending text, messages or attachments, including automatic input.
+/// A reply already in flight may still finish when no pending input remains.
 ///
 /// Re-reads the record under [`Talks::guard`] rather than trusting the
 /// caller's copy of `talk`, and writes that fresh copy back rather than the
@@ -2271,12 +2279,13 @@ pub fn close(talk: &mut Talk, store: &Talks) -> Result<()> {
     let mut fresh = store
         .get(&talk.id)
         .with_context(|| format!("talk {} was deleted", talk.short()))?;
+    if !fresh.pending.is_empty()
+        || !fresh.pending_messages.is_empty()
+        || !fresh.pending_attachments.is_empty()
+    {
+        return Err(ClosePendingInput.into());
+    }
     fresh.status = TalkStatus::Closed;
-    // A closed conversation must not replay a draft if it is reopened later.
-    fresh.pending.clear();
-    fresh.pending_breaks = None;
-    fresh.pending_messages.clear();
-    fresh.pending_attachments.clear();
     store.put(&mut fresh)?;
     *talk = fresh;
     Ok(())
@@ -6056,6 +6065,65 @@ mod tests {
         let _ = &cfg; // config kept only to build the agent above
     }
 
+    #[test]
+    fn close_refuses_pending_input_saved_after_the_callers_snapshot() {
+        for input in ["text", "messages", "attachments", "operator", "automatic"] {
+            let (tmp, talks) = store();
+            let cfg = config(mock_agent(tmp.path(), REPLY, env("reply")));
+            let mut stale = begin(&talks, &cfg, tmp.path().to_owned(), None).expect("begin");
+            let writer = talks.clone();
+            let id = stale.id.clone();
+            std::thread::spawn(move || {
+                let mut fresh = writer.get(&id).expect("writer snapshot");
+                match input {
+                    "operator" => queue(&mut fresh, &writer, "queued send", Vec::new())
+                        .expect("queue operator input"),
+                    "automatic" => {
+                        queue_once(&mut fresh, &writer, "automatic notice", "notice-key")
+                            .expect("queue automatic input");
+                    }
+                    _ => {
+                        let _guard = writer.guard().expect("writer guard");
+                        match input {
+                            "text" => fresh.pending = " \t".to_owned(),
+                            "messages" => fresh.pending_messages.push(Message {
+                                display: None,
+                                sender: Some(Sender::Magi),
+                                body: "message-only input".to_owned(),
+                                attachments: Vec::new(),
+                                reply: None,
+                            }),
+                            "attachments" => fresh.pending_attachments.push(Attachment {
+                                id: "a".repeat(32),
+                                name: "queued.png".to_owned(),
+                                mime: "image/png".to_owned(),
+                                bytes: 3,
+                            }),
+                            _ => unreachable!(),
+                        }
+                        writer.put(&mut fresh).expect("save pending input");
+                    }
+                }
+            })
+            .join()
+            .expect("writer thread");
+
+            assert!(stale.pending.is_empty());
+            assert!(stale.pending_messages.is_empty());
+            assert!(stale.pending_attachments.is_empty());
+            let before = std::fs::read(talks.path_of(&stale.id)).expect("saved record");
+            let error = close(&mut stale, &talks).expect_err("pending input refuses close");
+            assert!(error.is::<ClosePendingInput>(), "{input}: {error}");
+            assert!(error.to_string().contains("send or clear"), "{error}");
+            assert_eq!(
+                std::fs::read(talks.path_of(&stale.id)).expect("preserved record"),
+                before,
+                "{input}: refusing close must not rewrite or discard pending input"
+            );
+            assert_eq!(talks.get(&stale.id).unwrap().status, TalkStatus::Open);
+        }
+    }
+
     #[tokio::test]
     async fn a_close_that_lands_while_a_turn_is_in_flight_is_not_undone_by_the_reply() {
         let (tmp, talks) = store();
@@ -6064,6 +6132,9 @@ mod tests {
         // The in-flight turn's own handle: loaded once, the way a spawned
         // background task in `web::talk_say` holds one for the whole turn.
         let mut in_flight = begin(&talks, &cfg, tmp.path().to_owned(), None).expect("begin");
+        let lease = talks.claim_turn(&in_flight.id).unwrap().unwrap();
+        let text = record(&mut in_flight, &talks, "one more question", Vec::new())
+            .expect("record the active turn");
 
         // The operator closes the conversation through a *different* handle
         // while the turn above is still running - exactly what a close typed
@@ -6080,15 +6151,10 @@ mod tests {
         // close - and finishing it must not resurrect the conversation the
         // operator already ended.
         assert_eq!(in_flight.status, TalkStatus::Open);
-        respond(
-            &talks.claim_turn(&in_flight.id).unwrap().unwrap(),
-            &mut in_flight,
-            &talks,
-            &cfg,
-            "one more question",
-        )
-        .await
-        .expect("the turn itself still completes");
+        assert!(lease.holds(), "closing must not cancel the active turn");
+        respond(&lease, &mut in_flight, &talks, &cfg, &text)
+            .await
+            .expect("the turn itself still completes");
 
         let on_disk = talks.get(&in_flight.id).expect("reread");
         assert_eq!(

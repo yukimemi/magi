@@ -7461,3 +7461,211 @@ async fn phone_pending_decisions_link_to_exact_inquiry_without_settling_it() {
     assert!(console_problems(&browser.take_events(&page.session)).is_empty());
     browser.close_page(&page).await;
 }
+
+// Real mobile controls with delayed/missing transport responses. The fixture
+// owns its home and binds port 0; no live agent or operator history is used.
+#[tokio::test]
+async fn chat_close_is_scoped_and_does_not_wait_for_the_list() {
+    let Some(chrome) = cdp::find_chrome() else {
+        assert!(std::env::var_os("CI").is_none(), "CI requires Chrome");
+        eprintln!("SKIP web_render: no Chrome/Chromium found");
+        return;
+    };
+    let guard = common::home_lock().await;
+    let fx = common::fixture(guard, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("magi-home");
+    let talks = Talks::at(home.join("talks"));
+    let mut first = talk::begin(&talks, &fx.config, fx.repo.clone(), None).unwrap();
+    talk::record(&mut first, &talks, "First conversation", Vec::new()).unwrap();
+    first.turns.push(
+        serde_json::from_value(serde_json::json!({
+            "who": "agent", "body": "Reply complete", "at": first.created_at
+        }))
+        .unwrap(),
+    );
+    talks.put(&mut first).unwrap();
+    let second = talk::begin(&talks, &fx.config, fx.repo.clone(), None).unwrap();
+    let base = serve(
+        &home,
+        Queue::at(home.join("queue")),
+        talks.clone(),
+        home.join("runs"),
+        &fx.repo,
+    )
+    .await;
+    let mut browser = cdp::Browser::launch(&chrome).await.unwrap();
+    let page = browser
+        .open_page(&format!("{base}#/chat/{}", first.id), 390, 844, true)
+        .await
+        .unwrap();
+    let w = Duration::from_secs(30);
+    browser.wait_for(&page, "document.querySelector('#talk-turns')?.textContent.includes('Reply complete') && !document.querySelector('#talk-close-go').hidden", w).await.unwrap();
+    let enabled = browser.eval(&page, r#"(() => {
+        const b = document.querySelector('#talk-close-go');
+        b.scrollIntoView({block:'center'});
+        const style = getComputedStyle(b), r = b.getBoundingClientRect();
+        return {disabled:b.disabled, opacity:style.opacity, quiet:b.classList.contains('btn-quiet'),
+            visible:r.width > 0 && r.height > 0, hit:b.contains(document.elementFromPoint(r.x+r.width/2,r.y+r.height/2))};
+    })()"#).await.unwrap();
+    assert_eq!(
+        enabled,
+        serde_json::json!({"disabled":false,"opacity":"1","quiet":false,"visible":true,"hit":true})
+    );
+    if let Ok(dir) = std::env::var("MAGI_CHAT_CLOSE_EVIDENCE") {
+        std::fs::create_dir_all(&dir).unwrap();
+        let shot = browser
+            .call(
+                Some(&page.session),
+                "Page.captureScreenshot",
+                serde_json::json!({"format": "png"}),
+            )
+            .await
+            .unwrap();
+        std::fs::write(
+            std::path::Path::new(&dir).join("chat-close-390.png.base64"),
+            shot["data"].as_str().unwrap(),
+        )
+        .unwrap();
+    }
+
+    // Unsent text is preserved, with an actionable reason.
+    browser.eval(&page, "const input = document.querySelector('#f-talk-say'); input.value = 'Keep this draft'; input.dispatchEvent(new Event('input', {bubbles:true})); true").await.unwrap();
+    browser.wait_for(&page, "document.querySelector('#talk-close-go').disabled && document.querySelector('#talk-close-reason').textContent.includes('unsent')", w).await.unwrap();
+    browser
+        .eval(
+            &page,
+            "document.querySelector('#talk-close-go').click(); true",
+        )
+        .await
+        .unwrap();
+    assert_eq!(talks.get(&first.id).unwrap().status, talk::TalkStatus::Open);
+    assert_eq!(
+        browser
+            .eval(&page, "document.querySelector('#f-talk-say').value")
+            .await
+            .unwrap(),
+        "Keep this draft"
+    );
+    browser
+        .eval(
+            &page,
+            "input.value = ''; input.dispatchEvent(new Event('input', {bubbles:true})); true",
+        )
+        .await
+        .unwrap();
+
+    // Delay the mutation and all subsequent list reads. Returning an old list
+    // snapshot after confirmation must not reopen the local card.
+    browser.eval(&page, r#"(() => {
+        const native = window.fetch.bind(window);
+        window.releaseClose = null; window.releaseLists = [];
+        window.fetch = async (url, init) => {
+            const path = String(url);
+            if (path.endsWith('/close')) await new Promise(resolve => window.releaseClose = resolve);
+            if (path.startsWith('/api/talks?') || path.startsWith('/api/talks/page')) {
+                const response = await native(url, init);
+                await new Promise(resolve => window.releaseLists.push(resolve));
+                return response;
+            }
+            return native(url, init);
+        };
+        document.querySelector('#talk-close-go').click();
+        return true;
+    })()"#).await.unwrap();
+    browser.wait_for(&page, "typeof releaseClose === 'function' && document.querySelector('#talk-close-go').textContent === 'Closing…'", w).await.unwrap();
+    browser
+        .eval(
+            &page,
+            &format!("location.hash = '#/chat/{}'; true", second.id),
+        )
+        .await
+        .unwrap();
+    browser.wait_for(&page, &format!("document.querySelector('#talk-meta')?.title.startsWith('{}\\n') && !document.querySelector('#talk-close-go').disabled && document.querySelector('#talk-close-go').getAttribute('aria-busy') !== 'true'", second.id), w).await.unwrap();
+    // Start another close before the old request finishes.
+    browser.eval(&page, r#"window.releaseFirst = releaseClose; document.querySelector('#talk-close-go').click(); true"#).await.unwrap();
+    browser
+        .wait_for(&page, "releaseClose !== releaseFirst", w)
+        .await
+        .unwrap();
+    browser.eval(&page, "releaseFirst(); true").await.unwrap();
+    browser
+        .wait_for(&page, "releaseLists.length > 0", w)
+        .await
+        .unwrap();
+    assert_eq!(
+        browser
+            .eval(&page, "document.querySelector('#talk-close-go').disabled")
+            .await
+            .unwrap(),
+        true
+    );
+    assert_eq!(
+        talks.get(&first.id).unwrap().status,
+        talk::TalkStatus::Closed
+    );
+    browser.eval(&page, "releaseClose(); true").await.unwrap();
+    browser.wait_for(&page, "!document.querySelector('#talk-reopen-go').hidden && !document.querySelector('#talk-reopen-go').disabled", w).await.unwrap();
+    assert_eq!(
+        talks.get(&second.id).unwrap().status,
+        talk::TalkStatus::Closed
+    );
+    browser
+        .eval(
+            &page,
+            "releaseLists.splice(0).forEach(release => release()); true",
+        )
+        .await
+        .unwrap();
+
+    // The server commits reopen, then its response is lost. Core recovery
+    // confirms the real state instead of claiming the write failed.
+    browser
+        .eval(
+            &page,
+            r#"(() => {
+        const native = window.fetch.bind(window);
+        window.fetch = async (url, init) => {
+            const response = await native(url, init);
+            if (String(url).endsWith('/reopen')) throw new Error('simulated lost response');
+            return response;
+        };
+        document.querySelector('#talk-reopen-go').click();
+        return true;
+    })()"#,
+        )
+        .await
+        .unwrap();
+    browser.wait_for(&page, "!document.querySelector('#talk-close-go').hidden && !document.querySelector('#talk-close-go').disabled && document.querySelector('#talk-error').textContent.includes('confirmed after')", w).await.unwrap();
+    assert_eq!(
+        talks.get(&second.id).unwrap().status,
+        talk::TalkStatus::Open
+    );
+
+    // A known failed request leaves the conversation open and permits retry.
+    browser
+        .eval(
+            &page,
+            r#"(() => {
+        const native = window.fetch.bind(window);
+        window.fetch = (url, init) => String(url).endsWith('/close')
+            ? Promise.reject(new Error('simulated request failure')) : native(url, init);
+        document.querySelector('#talk-close-go').click();
+        return true;
+    })()"#,
+        )
+        .await
+        .unwrap();
+    browser.wait_for(&page, "!document.querySelector('#talk-close-go').disabled && document.querySelector('#talk-error').textContent.includes('Conversation is open')", w).await.unwrap();
+    assert_eq!(
+        talks.get(&second.id).unwrap().status,
+        talk::TalkStatus::Open
+    );
+    browser
+        .eval(
+            &page,
+            "releaseLists.splice(0).forEach(release => release()); true",
+        )
+        .await
+        .unwrap();
+    browser.close_page(&page).await;
+}

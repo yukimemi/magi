@@ -678,8 +678,9 @@
       This conversation is closed.
     </p>
 
-    <button class="btn btn-quiet" type="button" id="talk-close-go">Close this conversation</button>
-    <button class="btn btn-quiet" type="button" id="talk-reopen-go" hidden>Reopen this conversation</button>
+    <button class="btn" type="button" id="talk-close-go" aria-describedby="talk-close-reason">Close this conversation</button>
+    <button class="btn" type="button" id="talk-reopen-go" aria-describedby="talk-close-reason" hidden>Reopen this conversation</button>
+    <p class="panel-note" id="talk-close-reason" role="status" hidden></p>
     <div id="talk-delete-box"></div>
   </section>
 </main>

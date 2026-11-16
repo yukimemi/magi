@@ -10434,7 +10434,13 @@ async fn talk_close(
     blocking(move || {
         let id = resolve_talk(&ui.talks, &id)?;
         let mut talk = ui.talks.get(&id)?;
-        talk::close(&mut talk, &ui.talks)?;
+        talk::close(&mut talk, &ui.talks).map_err(|error| {
+            if error.is::<talk::ClosePendingInput>() {
+                ApiError::conflict(format!("{error:#}"))
+            } else {
+                ApiError::from(error)
+            }
+        })?;
         let thinking = ui.is_thinking(&talk.id);
         Ok(Json(TalkView::new(talk, thinking, &ui)))
     })
@@ -13671,6 +13677,8 @@ mod tests {
         assert_eq!(fx.post(&path, None).await.status, 409);
 
         let mut talk = fx.talks().get(&talk.id).unwrap();
+        // This test closes the history view, not an unconsumed consultation.
+        crate::talk::clear_pending(&mut talk, &fx.talks()).unwrap();
         crate::talk::close(&mut talk, &fx.talks()).unwrap();
         let list = fx.get("/api/questions").await.json();
         assert_eq!(list[0]["origin_chat"], talk.id.as_str());
@@ -16647,6 +16655,36 @@ mod tests {
             )
             .await;
         assert_eq!(said.status, 409, "{}", said.body);
+    }
+
+    #[tokio::test]
+    async fn talk_close_refuses_pending_input_with_conflict_and_preserves_it() {
+        let f = Fixture::start().await;
+        let id = seed_talk(&f, "20260904-014455-cd34", "open");
+        let store = f.talks();
+        let mut queued = store.get(&id).expect("talk");
+        for automatic in [false, true] {
+            if automatic {
+                talk::queue_once(&mut queued, &store, "automatic notice", "notice-key")
+                    .expect("queue automatic input");
+            } else {
+                talk::queue(&mut queued, &store, "queued send", Vec::new())
+                    .expect("queue operator input");
+            }
+            let before = serde_json::to_value(store.get(&id).expect("queued talk")).unwrap();
+            let refused = f.post(&format!("/api/talks/{id}/close"), None).await;
+            assert_eq!(refused.status, 409, "{}", refused.body);
+            assert!(refused.body.contains("pending input"), "{}", refused.body);
+            assert_eq!(
+                serde_json::to_value(store.get(&id).expect("preserved talk")).unwrap(),
+                before,
+                "a close refusal must preserve the entire record"
+            );
+            talk::clear_pending(&mut queued, &store).expect("clear saved input");
+        }
+        let closed = f.post(&format!("/api/talks/{id}/close"), None).await;
+        assert_eq!(closed.status, 200, "{}", closed.body);
+        assert_eq!(closed.json()["status"], "closed");
     }
 
     #[tokio::test]
