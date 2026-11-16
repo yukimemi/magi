@@ -37,6 +37,10 @@ responses cannot undo a confirmed status. A failed mutation response triggers a
 core read; if that also fails, the UI reports an unknown outcome rather than
 claiming the conversation stayed open.
 
+`changeTalkStatus` が close/reopen の通信を共有し、`renderTalkStatusButton` が
+両ボタンの disabled・aria-busy・ラベルをまとめて描画する。入力保護の理由と
+composer の状態は `renderTalkClose` が引き続き管理する。
+
 An active reply alone does not block closing or cancel its worker. Close refuses
 unsent text, attachments, sends awaiting acknowledgement, and durable queued input,
 with an adjacent explanation. The server rechecks queued input under the existing

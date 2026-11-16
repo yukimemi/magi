@@ -6908,19 +6908,24 @@ function talkCloseReason(talk) {
   return "";
 }
 
+function renderTalkStatusButton(action, busy, disabled) {
+  const button = $(`talk-${action}-go`);
+  button.disabled = disabled;
+  setAttr(button, "aria-busy", busy ? "true" : "false");
+  setText(button, action === "close"
+    ? (busy ? "Closing…" : "Close this conversation")
+    : (busy ? "Reopening…" : "Reopen this conversation"));
+}
+
 function renderTalkClose(talk = state.talkDetail.talk) {
   if (!talk) return;
   const action = state.talkStatusRequests.get(talk.id);
   const reason = talk.status === "open" || action ? talkCloseReason(talk) : "";
-  $("talk-close-go").disabled = Boolean(reason);
-  $("talk-reopen-go").disabled = Boolean(action);
-  setAttr($("talk-close-go"), "aria-busy", action === "close" ? "true" : "false");
-  setAttr($("talk-reopen-go"), "aria-busy", action === "reopen" ? "true" : "false");
+  renderTalkStatusButton("close", action === "close", Boolean(reason));
+  renderTalkStatusButton("reopen", action === "reopen", Boolean(action));
   $("f-talk-say").disabled = Boolean(action);
   $("talk-file-input").disabled = Boolean(action);
   $("talk-send").disabled = Boolean(action) || talkAttachmentsBusy();
-  setText($("talk-close-go"), action === "close" ? "Closing…" : "Close this conversation");
-  setText($("talk-reopen-go"), action === "reopen" ? "Reopening…" : "Reopen this conversation");
   setText($("talk-close-reason"), reason);
   show($("talk-close-reason"), Boolean(reason));
 }
