@@ -257,6 +257,7 @@ async fn routed_merge_accepts_chat_decision_without_quote_or_button() {
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     assert!(!questions.get(&plain.id).unwrap().status.open());
     // A delivered approval never reopens a subsequently closed conversation.
+    talk::clear_pending(&mut chat, &talks).unwrap();
     talk::close(&mut chat, &talks).unwrap();
     magi::task_chat::sweep(&queue, &talks, &questions, &home);
     assert!(!talks.get(&chat.id).unwrap().status.open());
@@ -386,6 +387,8 @@ async fn approval_recovery_uses_chat_control_without_quote_evidence() {
         magi::task_chat::sweep(&queue, &talks, &questions, &home);
         assert!(talks.get(&chat.id).unwrap().pending.contains("non-merge recovery"));
         assert!(magi::chat_control::decide(&talks, &home, &chat.id, &q.id, "not offered").is_err());
+        // Closing now requires explicitly disposing of queued notification input.
+        talk::clear_pending(&mut chat, &talks).unwrap();
         talk::close(&mut chat, &talks).unwrap();
         assert!(magi::chat_control::decide(&talks, &home, &chat.id, &q.id, &choice).is_err(), "a closed chat speaks for nobody");
         // Any open chat records the owner's request: there is no routed-chat
