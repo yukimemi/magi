@@ -170,15 +170,12 @@ pub async fn git(cwd: &Path, args: &[&str]) -> Result<String> {
     let out = git_raw(cwd, args).await?;
     if !out.ok() {
         bail!(
-            "git {} failed in {} ({}): {}",
+            "git {} failed in {} ({}): stderr:\n{}\nstdout:\n{}",
             args.join(" "),
             cwd.display(),
             crate::notices::exit_status(out.code),
-            if out.stderr.is_empty() {
-                out.stdout.as_str()
-            } else {
-                out.stderr.as_str()
-            }
+            out.stderr,
+            out.stdout,
         );
     }
     Ok(out.stdout)
@@ -312,10 +309,29 @@ pub async fn worktree_add_branch(repo: &Path, path: &Path, branch: &str, base: &
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await.ok();
     }
-    let path_s = path.to_string_lossy().to_string();
+    let path_s = path_arg(path);
     git(repo, &["worktree", "add", "-b", branch, &path_s, base])
         .await
         .map(|_| ())
+}
+
+/// Check out an existing branch, optionally retaining the caller's force policy.
+pub(crate) async fn worktree_add_existing(
+    repo: &Path,
+    path: &Path,
+    branch: &str,
+    force: bool,
+) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await.ok();
+    }
+    let path_s = path_arg(path);
+    if force {
+        git(repo, &["worktree", "add", "--force", &path_s, branch]).await
+    } else {
+        git(repo, &["worktree", "add", &path_s, branch]).await
+    }
+    .map(|_| ())
 }
 
 /// Create a worktree at `path` with a detached HEAD at `rev`.

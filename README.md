@@ -1022,6 +1022,28 @@ the task is **held** with the reason, because the implementation exists and is
 waiting on CI or on you. Retrying would race a second branch against your open
 pull request and spend the whole competition budget again.
 
+### Release-bump checkout diagnostics
+
+Release bump creation and pending-release escalation use the same existing-branch
+checkout helper. Canonical Windows paths are converted through `git::path_arg`
+before Git receives them; branch creation still starts from the fetched remote
+base, independently of a detached primary checkout. Failed attempts remove only
+their own unpublished branch under the existing ownership checks.
+
+The run's `release_bump.problem` retains the complete scrubbed error chain,
+including Git's command, exit status, stderr and stdout. Short attention notices
+prefer the first `fatal:` or `error:` line; open the linked run for full details.
+
+Verification: Git for Windows 2.55.0 reproduced exit 128 for an existing branch
+checked out to a verbatim (`\\?\`) destination: stderr began with `Preparing
+worktree` and continued with `fatal: could not create leading directories ...
+Invalid argument`. The same destination in conventional spelling succeeded
+without changing the branch or repository. A standalone detached Git repository
+was sufficient; jj was not required to reproduce it.
+`RUSTUP_TOOLCHAIN=stable cargo test --locked --lib bump::tests::` covers canonical
+checkout paths (including spaces), remote-base contents, cleanup, and multiline
+diagnostics surviving failure reporting and run serialization.
+
 ### Release bumps for repositories without a root `Cargo.toml`
 
 After a merge, magi opens a `chore/release-vX.Y.Z` pull request that raises the

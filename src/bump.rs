@@ -1359,15 +1359,22 @@ fn record_skip(state: &mut RunState, store: Option<&Notices>, skip: &Skip) {
     state.event("bump", format!("needs attention: {action}"));
 }
 
-/// The `(version, reason)` to notify with for a failed attempt. The reason is
-/// the first line of the full error chain, so the operator can tell a stale
-/// branch from a build failure. A pull request this attempt opened never reaches here: past
+/// The `(version, reason)` to notify with for a failed attempt. Preserve the
+/// complete error chain, including Git's stderr and stdout, in the run record.
+/// A pull request this attempt opened never reaches here: past
 /// `gh pr create` nothing returns `Err`, and automerge trouble goes through
 /// [`report_problem`] itself.
 fn notice_for_failure(progress: &Progress, err: &anyhow::Error) -> (Option<String>, String) {
-    let chain = format!("{err:#}");
-    let first = chain.lines().next().unwrap_or_default().trim();
-    (progress.version.clone(), first.to_owned())
+    (progress.version.clone(), format!("{err:#}"))
+}
+
+/// Prefer Git's actual failure over a preceding progress line for short notices.
+fn failure_headline(reason: &str) -> Option<&str> {
+    reason
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("fatal:") || line.starts_with("error:"))
+        .or_else(|| reason.lines().find(|line| !line.is_empty()))
 }
 
 /// Does the base branch carry a `Cargo.toml` at its root? Release bumps read
@@ -1865,9 +1872,11 @@ fn surface_problem_in(
     reason: &str,
     pending: bool,
 ) -> Result<(Notice, Option<String>)> {
+    let reason = crate::scrub::scrub(reason, &crate::scrub::Identity::current());
+    let reason = reason.as_str();
     let action = if let (true, Some(url)) = (pending, pr_url) {
         let ja = crate::lang::is_japanese(&state.config.graph.language);
-        let first = reason.lines().next().filter(|l| !l.is_empty());
+        let first = failure_headline(reason);
         let cause = first.map(|l| format!(" ({l})")).unwrap_or_default();
         if ja {
             let target = version.map(|v| format!(" v{v}")).unwrap_or_default();
@@ -1884,7 +1893,7 @@ fn surface_problem_in(
         automerge_hint(reason).to_owned()
     } else {
         let ja = crate::lang::is_japanese(&state.config.graph.language);
-        let first = reason.lines().next().filter(|l| !l.is_empty());
+        let first = failure_headline(reason);
         if ja {
             let target = version.map(|v| format!(" (v{v})")).unwrap_or_default();
             let cause = first.map(|l| format!(" ({l})")).unwrap_or_default();
@@ -2013,24 +2022,9 @@ async fn escalate_pending(
         .to_string();
     let worktree = state.dir().join("bump");
     git::worktree_remove(repo, &worktree).await.ok();
-    let checked_out = git::git_raw(
-        repo,
-        &[
-            "worktree",
-            "add",
-            "--force",
-            &worktree.to_string_lossy(),
-            &pending.branch,
-        ],
-    )
-    .await?;
-    if !checked_out.ok() {
-        bail!(
-            "checking out the pending release branch {} failed: {}",
-            pending.branch,
-            checked_out.stderr
-        );
-    }
+    git::worktree_add_existing(repo, &worktree, &pending.branch, true)
+        .await
+        .with_context(|| format!("checking out the pending release branch {}", pending.branch))?;
 
     // Only the substantive change - the commit landing on the remote branch
     // - has to succeed for the escalation to have happened at all. Anything
@@ -2193,11 +2187,7 @@ where
             }
             continue;
         }
-        if let Some(parent) = worktree.parent() {
-            tokio::fs::create_dir_all(parent).await.ok();
-        }
-        let path = worktree.to_string_lossy();
-        if let Err(e) = git::git(repo, &["worktree", "add", &path, branch]).await {
+        if let Err(e) = git::worktree_add_existing(repo, worktree, branch, false).await {
             let e = e.context("create the release-bump worktree");
             return Err(discard_attempt(repo, remote, worktree, branch, e).await);
         }
@@ -2838,6 +2828,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn release_worktrees_accept_canonical_paths_from_a_detached_checkout() {
+        let (dir, repo) = origin_with(&[("f", "remote base\n")]).await;
+        let base = git::rev_parse(&repo, "origin/main").await.unwrap();
+        // A detached primary checkout can be newer than the fetched base.
+        tokio::fs::write(repo.join("f"), "local only\n")
+            .await
+            .unwrap();
+        git::git(&repo, &["commit", "-am", "local only"])
+            .await
+            .unwrap();
+        git::git(&repo, &["checkout", "--detach"]).await.unwrap();
+        // On Windows canonicalize supplies the verbatim namespace that Git
+        // cannot use as a checkout destination without path_arg conversion.
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let worktree = root.join("release bump");
+        let head = release_attempt(
+            &repo,
+            "origin",
+            "main",
+            &worktree,
+            "release-test",
+            no_pr,
+            |path| async move {
+                assert_eq!(
+                    tokio::fs::read_to_string(path.join("f")).await.unwrap(),
+                    "remote base\n"
+                );
+                git::rev_parse(&path, "HEAD").await
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(head, base);
+        assert!(!worktree.exists());
+
+        // Pending bump escalation uses the forced existing-branch path.
+        git::worktree_add_existing(&repo, &worktree, "release-test", true)
+            .await
+            .unwrap();
+        assert_eq!(git::rev_parse(&worktree, "HEAD").await.unwrap(), base);
+        assert_eq!(
+            tokio::fs::read_to_string(worktree.join("f")).await.unwrap(),
+            "remote base\n"
+        );
+        git::worktree_remove(&repo, &worktree).await.unwrap();
+        git::branch_delete(&repo, "release-test").await.unwrap();
+
+        git::worktree_add_branch(&repo, &worktree, "fresh-test", "origin/main")
+            .await
+            .unwrap();
+        assert_eq!(git::rev_parse(&worktree, "HEAD").await.unwrap(), base);
+        git::worktree_remove(&repo, &worktree).await.unwrap();
+        git::branch_delete(&repo, "fresh-test").await.unwrap();
+        assert!(!worktree.exists());
+    }
+
+    #[tokio::test]
     async fn a_pushed_branch_survives_a_failed_attempt_and_the_reason_says_so() {
         let (_d, repo) = origin_with(&[("f", "x\n")]).await;
         let e = attempt(&repo, false, Some(true)).await.unwrap_err();
@@ -2851,8 +2898,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_branch_left_by_a_half_done_worktree_add_is_removed() {
-        // No pre-existing branch; the worktree path sits under a regular
-        // file, so `worktree add -b` may create the branch and then fail.
+        // The branch is created first, but a worktree beneath a regular file
+        // cannot be checked out. Only this attempt's branch may be removed.
         let (_d, repo) = origin_with(&[("f", "x\n")]).await;
         let blocker = repo.parent().unwrap().join("blocker");
         tokio::fs::write(&blocker, "file").await.unwrap();
@@ -2888,7 +2935,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn git_worktree_failure_reaches_release_notice_without_debug_exit_codes() {
+    async fn release_worktree_failure_preserves_full_diagnostics_and_operator_data() {
         let (dir, repo) = origin_with(&[("f", "x\n")]).await;
         let worktree = dir.path().join("occupied");
         tokio::fs::create_dir(&worktree).await.unwrap();
@@ -2911,6 +2958,9 @@ mod tests {
             "{reason}"
         );
         assert!(reason.contains("exit code 128"), "{reason}");
+        assert!(reason.contains("Preparing worktree"), "{reason}");
+        assert!(reason.contains("\nfatal:"), "{reason}");
+        assert!(reason.contains("\nstdout:\n"), "{reason}");
         let store = Notices::at(dir.path().join("notifications"));
         let mut state = winner_state(&repo, "main");
         state.status = RunStatus::Merged;
@@ -2918,15 +2968,29 @@ mod tests {
         let notices = store.list();
         assert_eq!(notices.len(), 1);
         let notice = &notices[0];
-        assert!(
-            notice.message.contains("exit code 128"),
-            "{}",
-            notice.message
-        );
+        assert!(notice.message.contains("fatal:"), "{}", notice.message);
         assert!(!notice.message.contains("Some(") && !notice.message.contains("None"));
         assert_eq!(notice.severity, Severity::Error);
         assert_eq!(state.status, RunStatus::Merged);
         assert!(state.needs_attention());
+        let problem = state
+            .release_bump
+            .as_ref()
+            .unwrap()
+            .problem
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            problem,
+            &crate::scrub::scrub(&reason, &crate::scrub::Identity::current())
+        );
+        let saved = serde_json::to_string(&state).unwrap();
+        let restored: RunState = serde_json::from_str(&saved).unwrap();
+        assert_eq!(
+            restored.release_bump.as_ref().unwrap().problem.as_ref(),
+            Some(problem)
+        );
+        assert!(crate::report::run(&restored).contains("fatal:"));
         assert!(!git::branch_exists(&repo, "release-test").await.unwrap());
         assert_eq!(
             tokio::fs::read_to_string(existing).await.unwrap(),
@@ -3048,16 +3112,6 @@ mod tests {
             .expect_err("an unresolvable base is a failure");
         let listed = store.list();
         assert_eq!(listed.len(), 1, "{listed:?}");
-        assert!(
-            listed[0].message.contains("did not run"),
-            "{}",
-            listed[0].message
-        );
-        assert!(
-            listed[0].message.contains("Cargo.toml"),
-            "{}",
-            listed[0].message
-        );
         assert!(state.events.iter().any(|e| e.node == "bump"));
         after_merge_at(&mut state, url, Some(home.path()), Some(&store))
             .await
@@ -3130,7 +3184,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failure_notice_names_the_pending_pr_and_the_first_line_of_the_cause() {
+    fn a_failure_notice_preserves_the_full_error_chain() {
         let err = anyhow!("outer context").context("cargo build failed\nsecond line");
         let with_pr = Progress {
             version: Some("0.2.0".into()),
@@ -3139,10 +3193,10 @@ mod tests {
         };
         let (v, reason) = notice_for_failure(&with_pr, &err);
         assert_eq!(v.as_deref(), Some("0.2.0"));
-        assert_eq!(reason, "cargo build failed");
+        assert_eq!(reason, "cargo build failed\nsecond line: outer context");
         let (v, reason) = notice_for_failure(&Progress::default(), &err);
         assert_eq!(v, None);
-        assert_eq!(reason, "cargo build failed");
+        assert_eq!(reason, "cargo build failed\nsecond line: outer context");
     }
 
     const NO_RULES: &str = "gh pr merge --auto: GraphQL: Pull request Branch does not have \
