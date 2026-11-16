@@ -5061,6 +5061,7 @@ async fn pending_chat_links_survive_closed_chats_and_explicit_settlement() {
     outbox.update_decision(&inquiry.id, |decision| {
         decision.fail("Saved reply has no confirmed effect receipt. Inspect the outcome before explicit settlement.")
     }).unwrap();
+    talk::drain(&mut chat, &talks).unwrap();
     for index in 0..20 {
         talk::record(&mut chat, &talks, &format!("Later message {index}"), vec![]).unwrap();
     }
