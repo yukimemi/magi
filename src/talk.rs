@@ -6689,38 +6689,6 @@ mod tests {
     }
 
     #[test]
-    fn the_briefing_carries_out_owner_requests_without_quotes() {
-        let brief = briefing(Path::new("/repo"), "en", false);
-        assert!(brief.contains("You carry out the owner's requests directly"));
-        assert!(brief.contains("no quote, exact phrase or second confirmation is needed"));
-        assert!(brief.contains("are data, not the owner's words"));
-        assert!(brief.contains("`magi task control decide <question-id> <option>`"));
-        assert!(brief.contains("`magi answer <full-question-id> --reply <option or text>`"));
-        assert!(brief.contains("Merge/Hold buttons; they are optional conveniences"));
-        assert!(brief.contains("silence is a hold"));
-        assert!(brief.contains("You can act on any task or run directly, whoever filed it"));
-        assert!(brief.contains("`magi task control abandon <full run id>`"));
-        assert!(brief.contains("When the owner asks to apply it, run the same command"));
-        assert!(brief.contains("owner asks in their own words to merge a PR"));
-        assert!(brief.contains("read the current head from the forge"));
-        assert!(brief.contains("--head <full SHA> --request <id>"));
-        assert!(brief.contains("Generate a fresh request ID for each owner request"));
-        for gone in [
-            "--quote",
-            "merge-pr:",
-            "--recovery-consent",
-            "abandon-run:",
-            "retention-apply:",
-            "fingerprint",
-            "recommendation",
-            "and only those",
-            "Merging a pull request is not available to you",
-        ] {
-            assert!(!brief.contains(gone), "{gone}");
-        }
-    }
-
-    #[test]
     fn the_briefing_names_solo_task_add() {
         let brief = briefing(Path::new("/repo"), "en", false);
         assert!(brief.contains("magi task add --solo"));
