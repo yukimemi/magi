@@ -1031,8 +1031,9 @@ base, independently of a detached primary checkout. Failed attempts remove only
 their own unpublished branch under the existing ownership checks.
 
 The run's `release_bump.problem` retains the complete scrubbed error chain,
-including Git's command, exit status, stderr and stdout. Short attention notices
-prefer the first `fatal:` or `error:` line; open the linked run for full details.
+including Git's command, exit status and full stderr (stdout when stderr is empty).
+This uses the unchanged shared Git error format. Short attention notices prefer
+the first `fatal:` or `error:` line; open the linked run for full details.
 
 Verification: Git for Windows 2.55.0 reproduced exit 128 for an existing branch
 checked out to a verbatim (`\\?\`) destination: stderr began with `Preparing

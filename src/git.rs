@@ -170,12 +170,15 @@ pub async fn git(cwd: &Path, args: &[&str]) -> Result<String> {
     let out = git_raw(cwd, args).await?;
     if !out.ok() {
         bail!(
-            "git {} failed in {} ({}): stderr:\n{}\nstdout:\n{}",
+            "git {} failed in {} ({}): {}",
             args.join(" "),
             cwd.display(),
             crate::notices::exit_status(out.code),
-            out.stderr,
-            out.stdout,
+            if out.stderr.is_empty() {
+                out.stdout.as_str()
+            } else {
+                out.stderr.as_str()
+            }
         );
     }
     Ok(out.stdout)

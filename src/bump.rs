@@ -1360,7 +1360,7 @@ fn record_skip(state: &mut RunState, store: Option<&Notices>, skip: &Skip) {
 }
 
 /// The `(version, reason)` to notify with for a failed attempt. Preserve the
-/// complete error chain, including Git's stderr and stdout, in the run record.
+/// complete error chain, including Git's full stderr, in the run record.
 /// A pull request this attempt opened never reaches here: past
 /// `gh pr create` nothing returns `Err`, and automerge trouble goes through
 /// [`report_problem`] itself.
@@ -1370,11 +1370,10 @@ fn notice_for_failure(progress: &Progress, err: &anyhow::Error) -> (Option<Strin
 
 /// Prefer Git's actual failure over a preceding progress line for short notices.
 fn failure_headline(reason: &str) -> Option<&str> {
-    reason
-        .lines()
-        .map(str::trim)
+    let lines = || reason.lines().map(str::trim).filter(|line| !line.is_empty());
+    lines()
         .find(|line| line.starts_with("fatal:") || line.starts_with("error:"))
-        .or_else(|| reason.lines().find(|line| !line.is_empty()))
+        .or_else(|| lines().next())
 }
 
 /// Does the base branch carry a `Cargo.toml` at its root? Release bumps read
@@ -2960,7 +2959,6 @@ mod tests {
         assert!(reason.contains("exit code 128"), "{reason}");
         assert!(reason.contains("Preparing worktree"), "{reason}");
         assert!(reason.contains("\nfatal:"), "{reason}");
-        assert!(reason.contains("\nstdout:\n"), "{reason}");
         let store = Notices::at(dir.path().join("notifications"));
         let mut state = winner_state(&repo, "main");
         state.status = RunStatus::Merged;
@@ -3197,6 +3195,23 @@ mod tests {
         let (v, reason) = notice_for_failure(&Progress::default(), &err);
         assert_eq!(v, None);
         assert_eq!(reason, "cargo build failed\nsecond line: outer context");
+    }
+
+    #[test]
+    fn failure_headline_prefers_git_errors_and_skips_blank_lines() {
+        assert_eq!(
+            failure_headline("checkout failed\nPreparing worktree\n  fatal: invalid path\n"),
+            Some("fatal: invalid path")
+        );
+        assert_eq!(
+            failure_headline("Preparing worktree\n error: checkout failed\n"),
+            Some("error: checkout failed")
+        );
+        assert_eq!(
+            failure_headline("\n  \n first cause \nsecond"),
+            Some("first cause")
+        );
+        assert_eq!(failure_headline(" \n\t"), None);
     }
 
     const NO_RULES: &str = "gh pr merge --auto: GraphQL: Pull request Branch does not have \
