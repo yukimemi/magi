@@ -7563,13 +7563,13 @@ async fn chat_close_is_scoped_and_does_not_wait_for_the_list() {
             r#"(() => {
         const native = window.fetch.bind(window);
         window.releaseClose = null; window.releaseLists = [];
-        window.completedCloses = new Set();
+        window.closedPaths = [];
         window.fetch = async (url, init) => {
             const path = String(url);
             if (path.endsWith('/close')) {
                 await new Promise(resolve => window.releaseClose = resolve);
                 const response = await native(url, init);
-                if (response.ok) window.completedCloses.add(path);
+                if (response.ok) window.closedPaths.push(path);
                 return response;
             }
             if (path.startsWith('/api/talks?') || path.startsWith('/api/talks/page')) {
@@ -7616,7 +7616,7 @@ async fn chat_close_is_scoped_and_does_not_wait_for_the_list() {
         talk::TalkStatus::Open
     );
     assert_eq!(
-        browser.eval(&page, "completedCloses.size").await.unwrap(),
+        browser.eval(&page, "closedPaths.length").await.unwrap(),
         0
     );
     eprintln!("Reproduced: list wait satisfied while both close requests remain unsent");
@@ -7627,7 +7627,7 @@ async fn chat_close_is_scoped_and_does_not_wait_for_the_list() {
         .wait_for(
             &page,
             &format!(
-                "completedCloses.has('/api/talks/{}/close') && releaseLists.length > 0",
+                "closedPaths.includes('/api/talks/{}/close') && releaseLists.length > 0",
                 first.id
             ),
             w,
@@ -7656,7 +7656,7 @@ async fn chat_close_is_scoped_and_does_not_wait_for_the_list() {
         talk::TalkStatus::Closed
     );
     browser.eval(&page, "releaseClose(); true").await.unwrap();
-    browser.wait_for(&page, &format!("completedCloses.has('/api/talks/{}/close') && releaseLists.length > 0 && !document.querySelector('#talk-reopen-go').hidden && !document.querySelector('#talk-reopen-go').disabled", second.id), w).await.unwrap();
+    browser.wait_for(&page, &format!("closedPaths.includes('/api/talks/{}/close') && releaseLists.length > 0 && !document.querySelector('#talk-reopen-go').hidden && !document.querySelector('#talk-reopen-go').disabled", second.id), w).await.unwrap();
     assert_eq!(
         talks.get(&second.id).unwrap().status,
         talk::TalkStatus::Closed
