@@ -2844,11 +2844,13 @@ function createTaskCard() {
      row. Anything interactive inside it keeps its own behaviour. */
   card.addEventListener("click", (event) => {
     if (!(splitMedia && splitMedia.matches)) return;
-    /* `closest` walks past the card: a row sits inside its section's own
-       <details>, which would match every click. Only what is inside the card
-       counts. */
-    const inner = event.target.closest("a, button, input, select, textarea, summary, details, pre, label, .is-link");
-    if (inner && inner !== card && card.contains(inner)) return;
+    /* Inspect the original path: an action may replace its own button before
+       this listener runs. `contains(event.target)` then loses that action.
+       Stop at the card so an enclosing section's <details> does not count. */
+    for (const node of event.composedPath()) {
+      if (node === card) break;
+      if (node instanceof Element && node.matches("a, button, input, select, textarea, summary, details, pre, label, .is-link")) return;
+    }
     if (window.getSelection && String(window.getSelection())) return;
     openTask();
   });

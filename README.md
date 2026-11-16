@@ -359,6 +359,8 @@ slots and other eligibility gates still apply. Saves are sequential, not atomic:
 if a write is refused, remaining writes stop and the list reloads the saved order.
 The +/− priority controls, Edit and Actions remain available on every row,
 without selecting it first. Open confirmations and drafts survive list refreshes.
+Row actions keep the current view even when opening a confirmation replaces
+the clicked control; only non-interactive row content selects the task detail.
 
 Competition rows already use the existing run detail. Their handles reorder within
 a section in this browser after clearing search; scope and state filters may stay
