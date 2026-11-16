@@ -2855,8 +2855,13 @@ mod tests {
             "release-test",
             no_pr,
             |path| async move {
+                // Git may check the file out with CRLF (core.autocrlf); the
+                // contract is the remote base's content, not its line endings.
                 assert_eq!(
-                    tokio::fs::read_to_string(path.join("f")).await.unwrap(),
+                    tokio::fs::read_to_string(path.join("f"))
+                        .await
+                        .unwrap()
+                        .replace("\r\n", "\n"),
                     "remote base\n"
                 );
                 git::rev_parse(&path, "HEAD").await
@@ -2873,7 +2878,10 @@ mod tests {
             .unwrap();
         assert_eq!(git::rev_parse(&worktree, "HEAD").await.unwrap(), base);
         assert_eq!(
-            tokio::fs::read_to_string(worktree.join("f")).await.unwrap(),
+            tokio::fs::read_to_string(worktree.join("f"))
+                .await
+                .unwrap()
+                .replace("\r\n", "\n"),
             "remote base\n"
         );
         git::worktree_remove(&repo, &worktree).await.unwrap();
