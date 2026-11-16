@@ -677,6 +677,121 @@ Unlike a one-shot interview, Chat does not end when a task is filed: the agent
 runs `magi task add --solo` from inside the conversation, tells you the task
 id, and the conversation stays open for whatever comes up next.
 
+### External CLI conversations
+
+An external tool can join an existing standing conversation without the web UI:
+
+```sh
+magi talk list --json
+magi talk history <conversation-id> --json
+magi talk history <conversation-id> --after '<cursor>' --json
+magi talk send <conversation-id> --request <request-id> --sender 'Claude CLI' 'Hello' --json
+magi talk send <conversation-id> --request <request-id> --sender 'Claude CLI' - --json < message.txt
+magi talk reply <conversation-id> --request <request-id> --wait 30 --json
+```
+
+Use a full conversation ID, or a unique prefix; suffixes are not selectors.
+`list` returns `talks` (including IDs, repository, agent, status and title) and
+`unreadable` entries. `history` returns `talk`, `messages` and `cursor`; each
+message has `id`, `sender`, `body` and `at`. Save the returned cursor unchanged:
+`--after` is exclusive. Default output is a conversation list, labelled transcript,
+or request status and reply; `--json` emits one JSON value on one stdout line.
+
+`send` records a caller-generated request ID and starts the existing detached
+chat worker, not an HTTP-only or foreground agent. Persist the request ID,
+conversation ID, sender and exact message **before sending**. `-` reads all of
+stdin, preserving multiline text. Reusing a request ID cannot create another
+turn; changing its message or sender is a `conflict`. Do not use a new ID to
+work around an interrupted send: query the original request with `reply`.
+Only its linked reply is returned, never a later unrelated conversation turn.
+`--wait 0` queries immediately; a positive wait waits up to that many seconds.
+A wait timeout neither cancels execution nor sends again.
+
+These commands use the same local state home and repository configuration as
+the web Chat. The web server and scheduler need not be running: accepted work
+runs in the existing durable Chat worker without opening a listener. The worker
+and its saved request survive the sending CLI, web, or scheduler exiting.
+Live workers (including older executable generations), active turns and unsent
+drafts refuse new external admission before any message is appended. A failed
+or unknown worker launch retains the request and never promotes an owner draft.
+
+For example, this Bash workflow uses an external Claude CLI to compose a
+message. It requires `claude`, `magi`, `python3` and `jq`. Replace `talk_id` with
+the full ID from `list`; keep the exchange directory for recovery:
+
+```sh
+magi talk list --json
+talk_id='FULL-CONVERSATION-ID'
+exchange="$HOME/.local/state/magi-external/$(python3 -c 'import uuid; print(uuid.uuid4())')"
+mkdir -p "$exchange"
+printf '%s\n' "$talk_id" > "$exchange/talk-id"
+printf '%s\n' 'Claude CLI' > "$exchange/sender"
+python3 -c 'import uuid; print(uuid.uuid4())' > "$exchange/request-id"
+claude -p 'Write a short multiline message asking the standing chat to summarize its current work. Output only the message.' \
+  > "$exchange/message.txt" || exit 1
+
+# All request data is now on disk. Run this send only once.
+magi talk send "$(cat "$exchange/talk-id")" \
+  --request "$(cat "$exchange/request-id")" \
+  --sender "$(cat "$exchange/sender")" - --json \
+  < "$exchange/message.txt" > "$exchange/send.json"
+
+# Even if send exited unsuccessfully or its output was lost, query; do not resend.
+magi talk reply "$(cat "$exchange/talk-id")" \
+  --request "$(cat "$exchange/request-id")" --wait 30 --json \
+  > "$exchange/reply.json"
+cat "$exchange/reply.json"
+
+# Pending, timeout, or an interrupted query: requery the SAME request.
+magi talk reply "$(cat "$exchange/talk-id")" \
+  --request "$(cat "$exchange/request-id")" --wait 30 --json \
+  > "$exchange/reply.json"
+if jq -e '.status == "replied"' "$exchange/reply.json" >/dev/null; then
+  jq -r '.reply' "$exchange/reply.json" | claude -p 'Summarize this standing-chat reply.'
+fi
+
+# Read the transcript, then only messages after its saved cursor.
+magi talk history "$(cat "$exchange/talk-id")" --json > "$exchange/history.json"
+cursor=$(jq -r '.cursor // empty' "$exchange/history.json")
+if [ -n "$cursor" ]; then
+  magi talk history "$(cat "$exchange/talk-id")" --after "$cursor" --json
+fi
+```
+
+After a shell restart, set `exchange` to the same saved directory and resume
+at `reply`, not `send`. Inspect `status`, not just the process exit code:
+
+| Result | Meaning and safe next action |
+|---|---|
+| `accepted`, `started` | The request is recorded or executing. Query `reply` with the same ID. |
+| `replied` | Read `reply`; `input_id` and `reply_id` identify the exact linked transcript messages. |
+| `timeout` | The wait expired; `state` reports the underlying request status. Requery the same ID; execution is not canceled. |
+| `busy` | Another turn or pending draft prevents admission. Inspect history and the original request; do not automatically resend. |
+| `closed` | The conversation is closed. This interface does not reopen it. |
+| `not_found`, `ambiguous` | The conversation selector or request is missing, or the selector matches multiple conversations. Inspect `list` and the saved request; do not guess a target or resend. |
+| `conflict` | The request ID is already bound to different sender/text. Preserve its original data and inspect that request. |
+| `not_started`, `failed` | Execution did not start or failed. Read `error` and the transcript; this is not permission for an automatic resend. |
+| `uncertain` | Execution or delivery cannot be proven. Requery and inspect history; never replay the message automatically. |
+| Unavailable infrastructure / command error | Read stderr and any `error`/`worker` details. Repair availability, then query the saved request; a lost response does not prove non-admission. |
+
+Send/reply JSON includes `talk`, `request`, `status`, `input_id`, `reply_id`,
+`reply`, `error` and `worker` (unavailable values may be null). An observed JSON
+status, including a refusal or timeout, exits **0**. CLI execution/validation
+errors exit **1** with diagnostics on stderr; argument syntax errors exit **2**.
+Thus exit 0 does not mean a message was admitted or answered.
+
+The `--sender` label is **self-reported**, not an authenticated identity.
+External messages and their agent turns have **no owner authority**: they
+cannot approve merges, answer owner decisions, file or mutate tasks, or use
+the standing-chat control bridge. External turns run as
+`MAGI_NODE=external-chat`; the CLI rejects mutating commands early, allowing
+task `list`/`show` and other read-only inspection instead. They cannot send,
+post, or register watches recursively. Existing `talk post` (task-seat
+transcript reports) and `talk watch` (authorized standing-chat background jobs)
+retain their separate behavior. This restriction does **not** change the OS
+file sandbox, repository write policy, network access, or the permissions of
+the account running either CLI; a sender label is not an OS security boundary.
+
 ### Controlling tasks and runs
 
 The chat agent acts on queue work by command, with no question or offered

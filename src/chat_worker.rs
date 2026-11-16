@@ -195,6 +195,12 @@ pub async fn run_turn_worker(home: &std::path::Path, payload: serde_json::Value)
         .map(usize::try_from)
         .transpose()?;
     let talks = Talks::at(home.join("talks"));
+    if let Some(request) = payload
+        .get("external_request")
+        .and_then(serde_json::Value::as_str)
+    {
+        return talk::external::run_worker(&talks, id, request).await;
+    }
     let current = crate::worker::current_job(home)?;
     loop {
         let talk = talks.get(id)?;

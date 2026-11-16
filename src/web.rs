@@ -5837,7 +5837,7 @@ where
 }
 
 /// What a conversation is searched by: its list title and each turn's text,
-/// under `operator` / `agent` so the snippet says who spoke. Nothing else
+/// under their sender labels so the snippet says who spoke. Nothing else
 /// (session ids, repo paths, usage, drafts) is part of the document.
 ///
 /// Saved titles take precedence; otherwise mirror the opener fallback in `app.js`.
@@ -5864,16 +5864,19 @@ fn talk_search_doc(talk: &Talk) -> serde_json::Value {
         .turns
         .iter()
         .flat_map(|t| {
-            let who = match t.who {
-                crate::talk::Who::Operator => "operator",
-                crate::talk::Who::Agent => "agent",
+            let label = |message| match talk::sender(t, message) {
+                talk::Sender::External => "external",
+                _ => match t.who {
+                    talk::Who::Operator => "operator",
+                    talk::Who::Agent => "agent",
+                },
             };
             if t.messages.is_empty() {
-                vec![serde_json::json!({ who: t.body })]
+                vec![serde_json::json!({ label(None): t.body })]
             } else {
                 t.messages
                     .iter()
-                    .map(|m| serde_json::json!({ who: m.body }))
+                    .map(|m| serde_json::json!({ label(Some(m)): m.body }))
                     .collect()
             }
         })
@@ -19187,6 +19190,38 @@ mod tests {
         assert_eq!(doc["turns"][0]["operator"], "古い話題");
         talk.title.as_mut().unwrap().source = talk::TitleSource::Manual;
         assert_eq!(talk_search_doc(&talk)["title"], "最近の話題");
+    }
+
+    #[test]
+    fn chat_search_labels_external_turns_and_messages_without_operator_attribution() {
+        let mut talk = talk::seeded_for_test("external", PathBuf::from("."));
+        talk.title = Some(talk::ChatTitle {
+            text: "Saved title".into(),
+            source: talk::TitleSource::Manual,
+        });
+        talk.turns = serde_json::from_value(serde_json::json!([
+            {
+                "who": "operator", "sender": "external", "body": "External plain",
+                "at": "2026-09-08T20:58:02Z"
+            },
+            {
+                "who": "operator", "body": "External message",
+                "at": "2026-09-08T20:58:03Z",
+                "messages": [{
+                    "sender": "external", "body": "External message", "attachments": []
+                }]
+            }
+        ]))
+        .unwrap();
+        let doc = talk_search_doc(&talk);
+        assert_eq!(doc["turns"][0]["external"], "External plain");
+        assert_eq!(doc["turns"][1]["external"], "External message");
+        assert!(doc["turns"][0].get("operator").is_none());
+        assert!(doc["turns"][1].get("operator").is_none());
+        let hit = search_chat(&search_terms("message"), &talk).unwrap();
+        assert_eq!(hit.field, "external");
+        let target = hit.target.unwrap();
+        assert_eq!((target.turn, target.message), (1, 0));
     }
 
     #[test]
