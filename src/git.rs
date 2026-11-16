@@ -312,10 +312,29 @@ pub async fn worktree_add_branch(repo: &Path, path: &Path, branch: &str, base: &
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await.ok();
     }
-    let path_s = path.to_string_lossy().to_string();
+    let path_s = path_arg(path);
     git(repo, &["worktree", "add", "-b", branch, &path_s, base])
         .await
         .map(|_| ())
+}
+
+/// Check out an existing branch, optionally retaining the caller's force policy.
+pub(crate) async fn worktree_add_existing(
+    repo: &Path,
+    path: &Path,
+    branch: &str,
+    force: bool,
+) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await.ok();
+    }
+    let path_s = path_arg(path);
+    if force {
+        git(repo, &["worktree", "add", "--force", &path_s, branch]).await
+    } else {
+        git(repo, &["worktree", "add", &path_s, branch]).await
+    }
+    .map(|_| ())
 }
 
 /// Create a worktree at `path` with a detached HEAD at `rev`.
