@@ -3031,7 +3031,7 @@ function updateTaskCard(row, task) {
   // Keep confirmation nodes intact across polling, including focus and pending buttons.
   for (const [key, render] of [["hold", renderTaskHoldBox], ["done", renderTaskDoneBox], ["delete", renderTaskDeleteBox]]) {
     const box = r[`${key}Box`];
-    const signature = `${status}:${host.armed(key)}`;
+    const signature = `${status}:${host.armed(key)}:${key === "done" && host.armed("doneDiscard")}`;
     if (box.dataset.signature !== signature) {
       box.dataset.signature = signature;
       render(host, task, box);
@@ -3058,7 +3058,11 @@ function cardHost(row, task) {
       row.taskActionFocus = on;
       if (on) row.refs.actionMenu.open = true;
       if (key === "hold" && !on) row.taskHoldReason = "";
-      if (key === "done" && !on) { row.taskCompletionReason = ""; row.taskDiscard = false; }
+      if (key === "done" && !on) {
+        row.taskCompletionReason = ""; row.taskDiscard = false;
+        row.dataset.armedDoneDiscard = "";
+        doneWarnings.delete(task.id);
+      }
       const latest = (state.queue || []).find((t) => t.id === task.id) || task;
       updateTaskCard(row, latest);
     },
@@ -3157,9 +3161,12 @@ async function holdTask(id, reason, host, button) {
 }
 
 /* Both completion and reopening preserve the append-only audit trail. */
+const doneWarnings = new Map();
+
 function renderTaskDoneBox(host, task, box) {
   const status = String(task.status_str || task.status || "");
   const reopening = status === "done";
+  const discardWarning = !reopening && host.armed("doneDiscard");
   clear(box);
   if (host.armed("done")) {
     const reason = el("input", {
@@ -3177,8 +3184,8 @@ function renderTaskDoneBox(host, task, box) {
     });
     const confirm = el("button", {
       class: "btn btn-quiet", type: "button",
-      text: reopening ? "Reopen to Held" : "Yes, mark done",
-      onclick: () => doneTask(task.id, host, confirm, reopening, reason.value, discard.checked),
+      text: reopening ? "Reopen to Held" : discardWarning ? "Yes, close and discard" : "Yes, mark done",
+      onclick: () => doneTask(task.id, host, confirm, reopening, reason.value, discardWarning || discard.checked),
     });
     const form = el("div", { class: "stakes-confirm" },
       el("p", { class: "hint", text: reopening
@@ -3186,7 +3193,10 @@ function renderTaskDoneBox(host, task, box) {
         : "Keeps the task and records who closed it, why, and its run state. Done does not mean the PR merged." }),
       reason,
     );
-    if (!reopening) form.append(el("label", { class: "task-discard" }, discard,
+    if (discardWarning) {
+      form.append(el("p", { class: "stakes-warn", text: doneWarnings.get(task.id) }),
+        el("p", { class: "hint", text: "Closing keeps the run and branches but stops task execution. You can reopen to Held later. Give a reason to discard." }));
+    } else if (!reopening) form.append(el("label", { class: "task-discard" }, discard,
       "Discard unfinished work (required if not proven merged); give a reason."));
     form.append(el("div", { class: "stakes-row" }, cancel, confirm));
     box.append(form);
@@ -3221,6 +3231,11 @@ async function doneTask(id, host, button, reopening, reason, discard) {
   } catch (error) {
     setText(button, label);
     button.disabled = false;
+    if (!reopening && !discard && /use --discard to explicitly abandon unfinished work/.test(error.message)) {
+      doneWarnings.set(id, error.message);
+      host.set("doneDiscard", true);
+      return;
+    }
     host.error(`Could not ${reopening ? "reopen" : "mark done"} task ${shortId(id)}: ${error.message}`);
   }
 }
@@ -12451,7 +12466,11 @@ function taskSheetHost(id) {
       if (taskSheet.id !== id) return;
       taskSheet.armed[key] = on;
       if (key === "hold" && !on) taskSheet.reason = "";
-      if (key === "done" && !on) { taskSheet.completionReason = ""; taskSheet.discard = false; }
+      if (key === "done" && !on) {
+        taskSheet.completionReason = ""; taskSheet.discard = false;
+        taskSheet.armed.doneDiscard = false;
+        doneWarnings.delete(id);
+      }
       taskSheet.focus = on;
       renderTaskActions(state.taskDetail.task);
     },
@@ -12605,7 +12624,7 @@ function renderTaskActions(task) {
   }
 
   renderTaskHoldBox(host, task, holdBox);
-  const doneSignature = `${task.id}:${status}:${host.armed("done")}`;
+  const doneSignature = `${task.id}:${status}:${host.armed("done")}:${host.armed("doneDiscard")}`;
   if (doneBox.dataset.signature !== doneSignature) {
     doneBox.dataset.signature = doneSignature;
     renderTaskDoneBox(host, task, doneBox);

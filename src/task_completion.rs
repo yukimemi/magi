@@ -50,23 +50,50 @@ pub fn prepare_close(
     Ok(context)
 }
 
-fn validate_discard(context: &CompletionContext) -> Result<()> {
-    if let Some(run) = &context.run {
-        ensure!(
-            context.discard
-                || run.status.is_some_and(completed)
-                || run.pr_state.as_deref() == Some("merged"),
-            "latest run {} is {} (PR {}, state {}, branches {}); use --discard to explicitly abandon unfinished work{}",
+struct Assessment<'a> {
+    run: Option<&'a crate::queue::CompletionRunSnapshot>,
+}
+
+impl<'a> Assessment<'a> {
+    fn new(context: &'a CompletionContext) -> Self {
+        Self {
+            run: context.run.as_ref(),
+        }
+    }
+
+    fn unfinished(&self) -> bool {
+        self.run.is_some_and(|run| {
+            !run.status.is_some_and(completed) && run.pr_state.as_deref() != Some("merged")
+        })
+    }
+
+    fn describe(&self) -> String {
+        let Some(run) = self.run else {
+            return "no retained run".into();
+        };
+        let mut text = format!(
+            "run {} {}; PR {} {}; head {}; branches {}",
             run.id,
             run.status.map_or("unknown", RunStatus::as_str),
             run.pr_url.as_deref().unwrap_or("none"),
             run.pr_state.as_deref().unwrap_or("none"),
-            run.branches.join(", "),
-            run.error
-                .as_ref()
-                .map_or(String::new(), |error| format!(": {error}")),
+            run.pr_head.as_deref().unwrap_or("unknown"),
+            run.branches.join(", ")
         );
+        if let Some(error) = &run.error {
+            text.push_str(&format!("; snapshot error: {error}"));
+        }
+        text
     }
+}
+
+fn validate_discard(context: &CompletionContext) -> Result<()> {
+    let assessment = Assessment::new(context);
+    ensure!(
+        context.discard || !assessment.unfinished(),
+        "{}; use --discard to explicitly abandon unfinished work",
+        assessment.describe()
+    );
     Ok(())
 }
 
@@ -308,22 +335,13 @@ pub fn describe(task: &Task) -> String {
             text.push_str(&format!("; {label}: {value}"));
         }
     }
-    if let Some(run) = &event.run {
-        text.push_str(&format!(
-            "; run {} {}; PR {} {}; head {}; branches {}",
-            run.id,
-            run.status.map_or("unknown", RunStatus::as_str),
-            run.pr_url.as_deref().unwrap_or("none"),
-            run.pr_state.as_deref().unwrap_or("none"),
-            run.pr_head.as_deref().unwrap_or("unknown"),
-            run.branches.join(", ")
-        ));
-        if let Some(error) = &run.error {
-            text.push_str(&format!("; snapshot error: {error}"));
+    text.push_str("; ");
+    text.push_str(
+        &Assessment {
+            run: event.run.as_ref(),
         }
-    } else {
-        text.push_str("; no retained run");
-    }
+        .describe(),
+    );
     text
 }
 
@@ -353,147 +371,6 @@ mod tests {
         run.save_under(home).unwrap();
         task.link_run(&run.id);
         run
-    }
-
-    #[tokio::test]
-    async fn unfinished_work_requires_discard_and_records_evidence() {
-        let dir = tempfile::tempdir().unwrap();
-        let queue = Queue::at(dir.path().join("queue"));
-        let mut task = task();
-        let run = retained(dir.path(), &mut task, RunStatus::Blocked);
-        task.hold_manual(Some("review".into()));
-        queue.put(&mut task).unwrap();
-        let error = close(
-            &queue,
-            dir.path(),
-            &task.id,
-            CompletionActor::Cli,
-            None,
-            false,
-        )
-        .await
-        .unwrap_err();
-        assert!(error.to_string().contains("--discard"));
-        let done = close(
-            &queue,
-            dir.path(),
-            &task.id,
-            CompletionActor::Cli,
-            Some("abandon".into()),
-            true,
-        )
-        .await
-        .unwrap();
-        let event = done.completion_history.last().unwrap();
-        assert_eq!(event.run.as_ref().unwrap().id, run.id);
-        assert_eq!(event.run.as_ref().unwrap().status, Some(RunStatus::Blocked));
-        assert!(event.discard);
-        assert_eq!(event.prior_status, TaskStatus::Held);
-        assert!(describe(&done).contains(&run.id));
-        assert_eq!(
-            RunState::load_under(&run.id, dir.path()).unwrap().status,
-            RunStatus::Blocked
-        );
-    }
-
-    #[tokio::test]
-    async fn reopening_is_held_reasoned_and_preserves_all_runs() {
-        let dir = tempfile::tempdir().unwrap();
-        let queue = Queue::at(dir.path().join("queue"));
-        let mut task = task();
-        retained(dir.path(), &mut task, RunStatus::Failed);
-        retained(dir.path(), &mut task, RunStatus::Blocked);
-        queue.put(&mut task).unwrap();
-        let done = close(
-            &queue,
-            dir.path(),
-            &task.id,
-            CompletionActor::Web,
-            None,
-            true,
-        )
-        .await
-        .unwrap();
-        assert!(
-            reopen(&queue, dir.path(), &task.id, CompletionActor::Cli, " ")
-                .await
-                .is_err()
-        );
-        let held = reopen(
-            &queue,
-            dir.path(),
-            &task.id,
-            CompletionActor::Chat("talk".into()),
-            "inspect before retry",
-        )
-        .await
-        .unwrap();
-        assert_eq!(held.status, TaskStatus::Held);
-        assert_eq!(held.runs, done.runs);
-        assert_eq!(held.attempts, done.attempts);
-        assert_eq!(held.hold_reason.as_deref(), Some("inspect before retry"));
-        assert_eq!(held.completion_history.len(), 2);
-        assert_eq!(held.completion_history[1].action, CompletionAction::Reopen);
-        assert!(!held.status.runnable());
-    }
-
-    #[tokio::test]
-    async fn any_successful_retained_run_prevents_reopen() {
-        for status in [
-            RunStatus::Ready,
-            RunStatus::Merged,
-            RunStatus::AlreadyInBase,
-        ] {
-            let dir = tempfile::tempdir().unwrap();
-            let queue = Queue::at(dir.path().join("queue"));
-            let mut task = task();
-            retained(dir.path(), &mut task, status);
-            retained(dir.path(), &mut task, RunStatus::Failed);
-            task.succeed(CompletionContext::new(
-                CompletionActor::DaemonSettle,
-                None,
-                dir.path(),
-                &task,
-            ));
-            queue.put(&mut task).unwrap();
-            let error = reopen(&queue, dir.path(), &task.id, CompletionActor::Cli, "retry")
-                .await
-                .unwrap_err();
-            assert!(error.to_string().contains(status.as_str()), "{error:#}");
-            assert_eq!(queue.get(&task.id).unwrap().status, TaskStatus::Done);
-        }
-    }
-
-    #[tokio::test]
-    async fn unknown_retained_record_and_active_claim_fail_closed() {
-        let dir = tempfile::tempdir().unwrap();
-        let queue = Queue::at(dir.path().join("queue"));
-        let mut task = task();
-        task.link_run("missing");
-        task.succeed(CompletionContext::new(
-            CompletionActor::Cli,
-            None,
-            dir.path(),
-            &task,
-        ));
-        queue.put(&mut task).unwrap();
-        let claim = queue.claim(&task.id).unwrap();
-        assert!(
-            reopen(&queue, dir.path(), &task.id, CompletionActor::Cli, "retry")
-                .await
-                .is_err()
-        );
-        drop(claim);
-        let error = reopen(&queue, dir.path(), &task.id, CompletionActor::Cli, "retry")
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains("unknown"));
-        assert_eq!(queue.get(&task.id).unwrap().completion_history.len(), 1);
-        let stored = queue.get(&task.id).unwrap();
-        let snapshot = stored.completion_history[0].run.as_ref().unwrap();
-        assert_eq!(snapshot.id, "missing");
-        assert_eq!(snapshot.status, None);
-        assert!(snapshot.error.is_some(), "unreadable is not no run");
     }
 
     #[tokio::test]

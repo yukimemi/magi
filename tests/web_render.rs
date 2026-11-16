@@ -1366,7 +1366,7 @@ async fn completion_audit_discard_and_reopen_controls_work_at_phone_and_desktop_
           const box = () => document.querySelector('#task-actions-done');
           const buttons = () => [...box().querySelectorAll('button')];
           const input = () => box().querySelector('input[type=text]');
-          const confirm = () => buttons().find(b => /Yes, mark done|^Reopen to Held$/.test(b.textContent));
+          const confirm = () => buttons().find(b => /Yes, mark done|Yes, close and discard|^Reopen to Held$/.test(b.textContent));
           const type = value => { input().value = value; input().dispatchEvent(new Event('input', { bubbles: true })); };
           const fits = node => { const r = node.getBoundingClientRect(); return r.width > 0 && r.left >= 0 && r.right <= innerWidth + 1; };
           document.querySelector('#task-actions-fab').click();
@@ -1374,11 +1374,11 @@ async fn completion_audit_discard_and_reopen_controls_work_at_phone_and_desktop_
           check(fits(input()) && fits(confirm()), 'completion controls fit viewport');
           type('Owner cancelled unfinished work');
           confirm().click();
-          await wait(() => !document.querySelector('#task-actions-error').hidden && !confirm().disabled);
+          await wait(() => box().textContent.includes('Yes, close and discard') && !confirm().disabled);
           check(document.querySelector('#task-status .chip')?.dataset.status !== 'done', 'unmerged closure refused without discard');
-          const discard = box().querySelector('input[type=checkbox]');
-          discard.checked = true;
-          discard.dispatchEvent(new Event('change', { bubbles: true }));
+          check(box().textContent.includes('use --discard'), 'discard confirmation shows retained run evidence');
+          check(input().value === 'Owner cancelled unfinished work', 'reason survives discard confirmation');
+          check(fits(input()) && fits(confirm()), 'discard confirmation fits viewport');
           confirm().click();
           await wait(() => document.querySelector('#task-completions .task-completion-events li') && box().textContent.includes('Reopen to Held'));
           const audit = document.querySelector('#task-completions');

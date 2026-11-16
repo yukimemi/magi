@@ -498,8 +498,10 @@ and pay for a fresh implement wave every time.
 and append an audit event: occurrence ID, actor (CLI, Web, chat, conductor or
 daemon settle), reason, prior task status and the latest run/PR snapshot.
 **Done is not proof of merge.** Closing work without verified merge requires
-`--discard --reason "<text>"` (or the Web discard checkbox and reason); this
-records an intentional closure, not a successful delivery. Every completion
+`--discard --reason "<text>"` (or the Web discard confirmation and reason); this
+records an intentional closure, not a successful delivery. Web **Mark done**
+opens that explicit confirmation when the server refuses unmerged work, showing
+the retained run, status, branches and PR. Every completion
 path records its evidence, including automatic settlement and structured done.
 Task show and the Web task detail expose the append-only completion history;
 legacy tasks may have none.
