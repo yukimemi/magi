@@ -492,6 +492,27 @@ recur on every attempt, and is charged to the task, so the attempt counter
 still bounds it. Refunding *that* would take the bound off the loop entirely
 and pay for a fresh implement wave every time.
 
+### Completion audit and reopening
+
+`magi task done <ID> [--reason "<text>"]` and Web **Mark done** preserve the task
+and append an audit event: occurrence ID, actor (CLI, Web, chat, conductor or
+daemon settle), reason, prior task status and the latest run/PR snapshot.
+**Done is not proof of merge.** Closing work without verified merge requires
+`--discard --reason "<text>"` (or the Web discard checkbox and reason); this
+records an intentional closure, not a successful delivery. Every completion
+path records its evidence, including automatic settlement and structured done.
+Task show and the Web task detail expose the append-only completion history;
+legacy tasks may have none.
+
+Use `magi task reopen <ID> --reason "<text>"` or Web **Reopen to Held** for an
+incorrectly closed, unlanded task. The reason is required. Reopening preserves
+history and leaves the task **Held**; inspect/edit it and explicitly Release
+when ready. It refuses any historical Ready, Merged or AlreadyInBase run, any
+merged PR, and unknown/unreadable run or forge state rather than guessing that
+work is safe to repeat. Chat-filed tasks receive a distinct notice for every
+completion occurrence, so reopening and closing again is not hidden by an
+earlier notice.
+
 ## Working out what to build, with someone
 
 A task file without completion criteria produces a competition whose candidates

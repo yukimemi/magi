@@ -1610,6 +1610,7 @@ impl Ui {
             .route("/api/queue/{id}/attempt-limit", post(queue_attempt_limit))
             .route("/api/queue/{id}/edit", post(queue_edit))
             .route("/api/queue/{id}/done", post(queue_done))
+            .route("/api/queue/{id}/reopen", post(queue_reopen))
             .route("/api/decisions", get(decisions_list))
             .route("/api/decisions/{id}", get(decision_get))
             .route("/api/questions", get(questions_list))
@@ -7618,31 +7619,59 @@ async fn queue_edit(
     .await
 }
 
-/// `POST /api/queue/{id}/done` - close a task as finished without deleting
-/// it, so the phone's other way to clear a task from the backlog does not
-/// have to cost the run history, the attribution, and `created_at` the way
-/// [`queue_delete`] does. Behaves exactly like `magi task done`: any status
-/// can be marked done by hand, because this is for the run the loop never
-/// saw land - a merge done by hand, or a gate that misreported - and that can
-/// happen from any status the task was left in.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct CompleteBody {
+    reason: Option<String>,
+    discard: bool,
+}
+
+/// Close through the same audited merge/discard guard as the CLI.
 async fn queue_done(
     State(ui): State<Arc<Ui>>,
     Path(id): Path<String>,
+    body: std::result::Result<Json<CompleteBody>, JsonRejection>,
 ) -> ApiResult<Json<TaskView>> {
-    let home = ui.home.clone();
-    mutate(ui, id, move |t| {
-        t.succeed();
-        // Same as the loop's own settle path: closing a task by hand is just
-        // as much "this task's story is over" as a daemon-driven `Merged`/
-        // `Ready` is, so any earlier `Blocked`/`Stalled` attempt it leaves
-        // behind must stop looking like it still needs a human. `ui.home`,
-        // not the process-global `run::home()`: they agree in a real
-        // process, but only `ui.home` also agrees with a test fixture's own
-        // directory.
-        crate::daemon::supersede_prior_runs(t, &home);
-        Ok(())
-    })
+    let body = match body {
+        Ok(Json(body)) => body,
+        Err(JsonRejection::MissingJsonContentType(_)) => CompleteBody::default(),
+        Err(e) => return Err(ApiError::bad_request(e.body_text())),
+    };
+    let task = crate::task_completion::close(
+        &ui.queue,
+        &ui.home,
+        &id,
+        crate::queue::CompletionActor::Web,
+        body.reason,
+        body.discard,
+    )
     .await
+    .map_err(ApiError::bad_request_from)?;
+    Ok(Json(TaskView::from(task)))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReopenBody {
+    reason: String,
+}
+
+/// Restore a safely unlanded completion to Held, never straight to execution.
+async fn queue_reopen(
+    State(ui): State<Arc<Ui>>,
+    Path(id): Path<String>,
+    Json(body): Json<ReopenBody>,
+) -> ApiResult<Json<TaskView>> {
+    let task = crate::task_completion::reopen(
+        &ui.queue,
+        &ui.home,
+        &id,
+        crate::queue::CompletionActor::Web,
+        &body.reason,
+    )
+    .await
+    .map_err(ApiError::bad_request_from)?;
+    Ok(Json(TaskView::from(task)))
 }
 
 /// `DELETE /api/queue/{id}`.
@@ -15140,6 +15169,7 @@ mod tests {
             run: Some("run-123"),
             pr: None,
             summary: Some("Merge state unknown"),
+            completion: None,
         });
         talk::record(&mut conversation, &ui.talks, &body, vec![]).unwrap();
         conversation.turns[0].sender = None;
@@ -18615,7 +18645,12 @@ mod tests {
         queue.put(&mut task).expect("file the task");
         let created_at = task.created_at;
 
-        let done = f.post(&format!("/api/queue/{}/done", task.id), None).await;
+        let done = f
+            .post(
+                &format!("/api/queue/{}/done", task.id),
+                Some(r#"{"discard":true,"reason":"owner cancelled retained work"}"#),
+            )
+            .await;
         assert_eq!(done.status, 200, "{}", done.body);
         assert_eq!(done.json()["status_str"], "done");
 
@@ -18632,14 +18667,27 @@ mod tests {
             }
         );
         assert_eq!(reloaded.created_at, created_at);
+        let event = reloaded
+            .completion_history
+            .last()
+            .expect("completion audit");
+        assert_eq!(event.actor, crate::queue::CompletionActor::Web);
+        assert!(event.discard);
+        assert_eq!(
+            event.reason.as_deref(),
+            Some("owner cancelled retained work")
+        );
+        let detail = f.get(&format!("/api/queue/{}", task.id)).await;
+        assert_eq!(
+            detail.json()["completion_history"][0]["occurrence"],
+            event.occurrence
+        );
     }
 
     #[tokio::test]
     async fn closing_a_held_task_as_done_from_the_phone_clears_its_hold_reason() {
-        // `done` is allowed on any status, including `held`, with no release
-        // in between - so a task held for a reason and then closed directly
-        // must not keep reading as "waiting on" it afterwards, on its card or
-        // in `magi task show`.
+        // Explicit discard may close held work without a release; the current
+        // hold clears while the completion audit preserves its prior status.
         let f = Fixture::start().await;
         let queue = f.queue();
         let mut task = Task::new(
@@ -18651,7 +18699,12 @@ mod tests {
         task.hold_manual(Some("waiting on 3ed9".to_owned()));
         queue.put(&mut task).expect("file the held task");
 
-        let done = f.post(&format!("/api/queue/{}/done", task.id), None).await;
+        let done = f
+            .post(
+                &format!("/api/queue/{}/done", task.id),
+                Some(r#"{"discard":true,"reason":"no longer needed"}"#),
+            )
+            .await;
         assert_eq!(done.status, 200, "{}", done.body);
         assert_eq!(done.json()["status_str"], "done");
         assert!(
@@ -18701,10 +18754,8 @@ mod tests {
 
     #[tokio::test]
     async fn done_from_the_phone_does_not_supersede_when_the_last_attempt_never_landed() {
-        // Closing a task by hand is allowed from any status, including one
-        // whose last recorded attempt is itself still `Blocked`/`Failed` - a
-        // manual merge the loop never watched, say. Nothing here is provably
-        // why the task is done, so nothing earlier gets relabelled either.
+        // Intentional discard preserves unsuccessful runs as unsuccessful:
+        // closing the task does not claim they were delivered or superseded.
         let f = Fixture::start().await;
         let queue = f.queue();
         let runs = f.runs();
@@ -18721,7 +18772,12 @@ mod tests {
         task.runs.push("20260101-000000-dob2".to_owned());
         queue.put(&mut task).expect("file the task");
 
-        let done = f.post(&format!("/api/queue/{}/done", task.id), None).await;
+        let done = f
+            .post(
+                &format!("/api/queue/{}/done", task.id),
+                Some(r#"{"discard":true,"reason":"stop this work"}"#),
+            )
+            .await;
         assert_eq!(done.status, 200, "{}", done.body);
 
         let reloaded_run = read_run(&runs, "20260101-000000-dob1")
@@ -18732,6 +18788,47 @@ mod tests {
             "the last recorded attempt never landed, so the earlier one must not be \
              relabelled as superseded by it"
         );
+    }
+
+    #[tokio::test]
+    async fn web_completion_requires_discard_and_reopens_to_held_with_an_audit() {
+        let f = Fixture::start().await;
+        let queue = f.queue();
+        let mut task = Task::new(
+            "unstarted".into(),
+            "keep its history".into(),
+            PathBuf::from("/repo/magi"),
+            Source::Human,
+        );
+        write_run(&f.runs(), "20260101-000000-aud1", RunStatus::Failed);
+        task.runs.push("20260101-000000-aud1".into());
+        queue.put(&mut task).unwrap();
+        let path = format!("/api/queue/{}/done", task.id);
+        let refused = f.post(&path, None).await;
+        assert_eq!(refused.status, 400, "{}", refused.body);
+        assert!(queue.get(&task.id).unwrap().completion_history.is_empty());
+        let closed = f
+            .post(
+                &path,
+                Some(r#"{"discard":true,"reason":"owner stopped work"}"#),
+            )
+            .await;
+        assert_eq!(closed.status, 200, "{}", closed.body);
+        let reopen_path = format!("/api/queue/{}/reopen", task.id);
+        let no_reason = f.post(&reopen_path, Some(r#"{"reason":" "}"#)).await;
+        assert_eq!(no_reason.status, 400, "{}", no_reason.body);
+        let reopened = f
+            .post(&reopen_path, Some(r#"{"reason":"premature closure"}"#))
+            .await;
+        assert_eq!(reopened.status, 200, "{}", reopened.body);
+        let saved = queue.get(&task.id).unwrap();
+        assert_eq!(saved.status, TaskStatus::Held);
+        assert_eq!(saved.completion_history.len(), 2);
+        let event = &saved.completion_history[1];
+        assert_eq!(event.action, crate::queue::CompletionAction::Reopen);
+        assert_eq!(event.actor, crate::queue::CompletionActor::Web);
+        assert_eq!(event.prior_status, TaskStatus::Done);
+        assert_eq!(event.reason.as_deref(), Some("premature closure"));
     }
 
     #[tokio::test]

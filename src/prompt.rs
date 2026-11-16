@@ -1840,6 +1840,8 @@ pub struct ChatTaskNotice<'a> {
     pub pr: Option<&'a str>,
     /// A short summary of the result.
     pub summary: Option<&'a str>,
+    /// The exact audited completion; absent on holds and legacy records.
+    pub completion: Option<&'a crate::queue::CompletionEvent>,
 }
 
 fn clip(text: &str, max: usize) -> String {
@@ -1885,6 +1887,65 @@ fn task_report_with(
     }
     if let Some(m) = n.summary.filter(|m| !m.trim().is_empty()) {
         s.push_str(&format!("- Result: {}\n", clean(m, 600)));
+    }
+    if let Some(event) = n.completion {
+        let actor = match &event.actor {
+            crate::queue::CompletionActor::Cli => "CLI".to_owned(),
+            crate::queue::CompletionActor::Web => "Web".to_owned(),
+            crate::queue::CompletionActor::Chat(talk) => format!("chat {talk}"),
+            crate::queue::CompletionActor::Conductor => "conductor".to_owned(),
+            crate::queue::CompletionActor::DaemonSettle => "daemon settle".to_owned(),
+        };
+        s.push_str(&format!(
+            "- Completion occurrence: `{}`\n- Closed by: {}\n- Prior task status: {}\n- Discard: {}\n",
+            clean(&event.occurrence, 120),
+            clean(&actor, 240),
+            event.prior_status.as_str(),
+            event.discard,
+        ));
+        for (label, value) in [
+            ("Prior hold reason", event.prior_hold_reason.as_deref()),
+            (
+                "Prior dependency reason",
+                event.prior_block_reason.as_deref(),
+            ),
+            ("Prior error", event.prior_error.as_deref()),
+        ] {
+            if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
+                s.push_str(&format!("- {label}: {}\n", clean(value, 600)));
+            }
+        }
+        if let Some(run) = &event.run {
+            s.push_str(&format!(
+                "- Run at closure: `{}`; status {}; PR state {}\n",
+                clean(&run.id, 120),
+                run.status.map_or("unknown", |status| status.as_str()),
+                clean(run.pr_state.as_deref().unwrap_or("unknown"), 120),
+            ));
+            if let Some(url) = &run.pr_url {
+                s.push_str(&format!("- PR at closure: {}\n", clean(url, 2048)));
+            }
+            if let Some(head) = &run.pr_head {
+                s.push_str(&format!(
+                    "- Published head at closure: `{}`\n",
+                    clean(head, 120)
+                ));
+            }
+            if !run.branches.is_empty() {
+                s.push_str(&format!(
+                    "- Retained branches at closure: {}\n",
+                    clean(&run.branches.join(", "), 600)
+                ));
+            }
+            if let Some(error) = &run.error {
+                s.push_str(&format!(
+                    "- Closure snapshot unavailable: {}\n",
+                    clean(error, 600)
+                ));
+            }
+        } else {
+            s.push_str("- Run at closure: none recorded\n");
+        }
     }
     let display = NoticeDisplay {
         inquiry: None,
@@ -1962,6 +2023,7 @@ pub fn legacy_notice_display(body: &str) -> Option<NoticeDisplay> {
             run,
             pr: fields[2],
             summary: fields[3],
+            completion: None,
         };
         // Older task templates bounded prose but did not scrub it. Validate that
         // exact format before applying today's shared sanitization to display.
@@ -4180,6 +4242,7 @@ mod notification_display_tests {
             run: Some("\t"),
             pr: Some("\n"),
             summary: Some(""),
+            completion: None,
         });
         for label in ["- Reason:", "- Run:", "- Pull request:", "- Result:"] {
             assert!(!body.contains(label));
@@ -4198,6 +4261,7 @@ mod notification_display_tests {
             run: None,
             pr: None,
             summary: None,
+            completion: None,
         };
         let (body, display) = chat_task_report(&notice);
         assert!(display.facts.contains("Check ~/project"));
@@ -4217,6 +4281,7 @@ mod notification_display_tests {
             run: Some("abcd"),
             pr: Some("https://example.invalid/pull/1"),
             summary: Some("PR created; merge unknown"),
+            completion: None,
         });
         assert!(body.contains("Tell the operator"));
         assert!(body.contains("not a message from the operator"));

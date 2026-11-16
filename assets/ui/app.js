@@ -48,6 +48,7 @@ const API = {
   priority: (id) => `/api/queue/${encodeURIComponent(id)}/priority`,
   editTask: (id) => `/api/queue/${encodeURIComponent(id)}/edit`,
   doneTask: (id) => `/api/queue/${encodeURIComponent(id)}/done`,
+  reopenTask: (id) => `/api/queue/${encodeURIComponent(id)}/reopen`,
   decisions: "/api/decisions",
   questions: "/api/questions",
   notifications: "/api/notifications",
@@ -3057,6 +3058,7 @@ function cardHost(row, task) {
       row.taskActionFocus = on;
       if (on) row.refs.actionMenu.open = true;
       if (key === "hold" && !on) row.taskHoldReason = "";
+      if (key === "done" && !on) { row.taskCompletionReason = ""; row.taskDiscard = false; }
       const latest = (state.queue || []).find((t) => t.id === task.id) || task;
       updateTaskCard(row, latest);
     },
@@ -3067,6 +3069,10 @@ function cardHost(row, task) {
     },
     reason: () => row.taskHoldReason || "",
     setReason: (reason) => { row.taskHoldReason = reason; },
+    completionReason: () => row.taskCompletionReason || "",
+    setCompletionReason: (reason) => { row.taskCompletionReason = reason; },
+    discard: () => Boolean(row.taskDiscard),
+    setDiscard: (discard) => { row.taskDiscard = discard; },
     refresh: () => refreshTask(task.id),
     error: (msg) => fail(msg),
     deleted: () => loadQueue(),
@@ -3150,61 +3156,72 @@ async function holdTask(id, reason, host, button) {
   }
 }
 
-/* Done and Delete both clear a task off the backlog, and are the two things
-   an operator could tap for "I am finished with this" without reading
-   closely - so the confirm text carries the difference, in the same tone
-   Delete's already does: one keeps the record, one removes it. */
+/* Both completion and reopening preserve the append-only audit trail. */
 function renderTaskDoneBox(host, task, box) {
   const status = String(task.status_str || task.status || "");
+  const reopening = status === "done";
   clear(box);
-  if (status === "done") return;
-
   if (host.armed("done")) {
+    const reason = el("input", {
+      type: "text",
+      placeholder: reopening ? "Why reopen? (required)" : "Completion reason (optional)",
+      "aria-label": reopening ? "Reopen reason" : "Completion reason",
+      value: host.completionReason(),
+    });
+    reason.addEventListener("input", () => host.setCompletionReason(reason.value));
+    const discard = el("input", { type: "checkbox", checked: host.discard() });
+    discard.addEventListener("change", () => host.setDiscard(discard.checked));
     const cancel = el("button", {
-      class: "btn btn-quiet",
-      type: "button",
-      text: "Cancel",
+      class: "btn btn-quiet", type: "button", text: "Cancel",
       onclick: () => host.set("done", false),
     });
     const confirm = el("button", {
-      class: "btn btn-quiet",
-      type: "button",
-      text: "Yes, mark done",
-      onclick: () => doneTask(task.id, host, confirm),
+      class: "btn btn-quiet", type: "button",
+      text: reopening ? "Reopen to Held" : "Yes, mark done",
+      onclick: () => doneTask(task.id, host, confirm, reopening, reason.value, discard.checked),
     });
-    box.append(
-      el("div", { class: "stakes-confirm" },
-        el("p", { class: "hint", text: "Marks the task finished. Its id, who filed it, and its run history are kept — nothing is deleted." }),
-        el("div", { class: "stakes-row" }, cancel, confirm),
-      ),
+    const form = el("div", { class: "stakes-confirm" },
+      el("p", { class: "hint", text: reopening
+        ? "Reopens to Held, not execution. Successful runs or merged PRs cannot be reopened; unknown run or forge state is refused. History is kept."
+        : "Keeps the task and records who closed it, why, and its run state. Done does not mean the PR merged." }),
+      reason,
     );
-    if (host.focus()) requestAnimationFrame(() => cancel.focus({ preventScroll: true }));
+    if (!reopening) form.append(el("label", { class: "task-discard" }, discard,
+      "Discard unfinished work (required if not proven merged); give a reason."));
+    form.append(el("div", { class: "stakes-row" }, cancel, confirm));
+    box.append(form);
+    if (host.focus()) requestAnimationFrame(() => reason.focus({ preventScroll: true }));
   } else {
     const done = el("button", {
-      class: "btn btn-quiet",
-      type: "button",
-      text: "Mark done…",
+      class: "btn btn-quiet", type: "button",
+      text: reopening ? "Reopen to Held…" : "Mark done…",
       onclick: () => host.set("done", true),
     });
-    setAttr(done, "aria-label", `Mark task ${task.title || task.id} done`);
+    setAttr(done, "aria-label", `${reopening ? "Reopen" : "Mark done"} task ${task.title || task.id}`);
     box.append(done);
   }
 }
 
-async function doneTask(id, host, button) {
+async function doneTask(id, host, button, reopening, reason, discard) {
+  reason = reason.trim();
+  if (reopening && !reason) {
+    host.error("Give a reason to reopen this task.");
+    return;
+  }
   const label = button.textContent;
   button.disabled = true;
   setText(button, "…");
   try {
-    await postJson(API.doneTask(id));
+    await postJson(reopening ? API.reopenTask(id) : API.doneTask(id),
+      reopening ? { reason } : { reason: reason || null, discard });
     ok();
-    announce(`Task ${shortId(id)} marked done.`);
+    announce(`Task ${shortId(id)} ${reopening ? "reopened to Held" : "marked done"}.`);
     host.set("done", false);
     await host.refresh(id);
   } catch (error) {
     setText(button, label);
     button.disabled = false;
-    host.error(`Could not mark task ${shortId(id)} done: ${error.message}`);
+    host.error(`Could not ${reopening ? "reopen" : "mark done"} task ${shortId(id)}: ${error.message}`);
   }
 }
 
@@ -12154,6 +12171,7 @@ function renderTask() {
   const { id, task, error } = state.taskDetail;
   setAttr($("view-task"), "data-task-id", task ? task.id : null);
   const head = $("task-status");
+  renderTaskCompletions(task && !task.isShell ? task : null);
   clear(head);
   if (!task || task.isShell) {
     const summary = (state.queue || []).find((t) => t.id === id);
@@ -12280,6 +12298,54 @@ function renderTask() {
   }
 }
 
+function renderTaskCompletions(task) {
+  let section = $("task-completions");
+  if (!section) {
+    section = el("section", { id: "task-completions", class: "task-completions", "aria-label": "Completion audit" });
+    $("task-runs").before(section);
+  }
+  clear(section);
+  show(section, Boolean(task));
+  if (!task) return;
+  section.append(el("h3", { class: "task-runs-h", text: "Completion audit" }));
+  const events = Array.isArray(task.completion_history) ? task.completion_history : [];
+  if (!events.length) {
+    section.append(el("p", { class: "hint", text: "No recorded completion events. Older task records may have no audit history." }));
+    return;
+  }
+  const list = el("ol", { class: "task-completion-events" });
+  for (const event of events) {
+    const actor = event.actor || {};
+    const who = actor.kind === "chat" ? `chat ${actor.talk || "(unknown)"}` : actor.kind || "unknown";
+    const reopening = event.action === "reopen";
+    const item = el("li", {},
+      el("p", { text: `${reopening ? "Reopened to Held" : "Completed"}${event.discard ? " (discard)" : ""} · ${who} · ${event.at || "time unknown"}` }),
+      el("p", { text: `Prior task state: ${event.prior_status || "unknown"}. Reason: ${event.reason || "not recorded"}` }),
+      el("p", { class: "task-completion-id", text: `Occurrence: ${event.occurrence || "unknown"}` }),
+    );
+    for (const [label, value] of [
+      ["Prior hold reason", event.prior_hold_reason],
+      ["Prior dependency reason", event.prior_block_reason],
+      ["Prior error", event.prior_error],
+    ]) {
+      if (value) item.append(el("p", { text: `${label}: ${value}` }));
+    }
+    const run = event.run;
+    if (run) {
+      item.append(el("p", { text: `Run ${run.id}: ${run.status || "unknown"} · PR: ${run.pr_state || "unknown"}${run.pr_head ? ` · head ${run.pr_head}` : ""}` }));
+      if (Array.isArray(run.branches) && run.branches.length) item.append(el("p", { text: `Retained branches: ${run.branches.join(", ")}` }));
+      if (run.pr_url) {
+        const pr = el("p");
+        linkify(pr, run.pr_url);
+        item.append(pr);
+      }
+      if (run.error) item.append(el("p", { class: "hint", text: `Snapshot unavailable: ${run.error}` }));
+    } else item.append(el("p", { class: "hint", text: "No run was recorded at this transition." }));
+    list.append(item);
+  }
+  section.append(list);
+}
+
 /* The chart is drawn from `task.flow` as the server built it (nodes and edges
  * in order); nothing here infers why a run ended. Plain DOM, no SVG: a
  * vertical stack wraps at phone width and follows the theme's variables. */
@@ -12376,7 +12442,7 @@ function closeRunActions() {
  * Queue card offers, through the same renderers and handlers, with a host
  * that keeps its two-step state here and shows a refusal inside the sheet
  * (the banner from fail() would sit behind the open dialog). */
-const taskSheet = { id: null, armed: {}, reason: "", repo: "", focus: false };
+const taskSheet = { id: null, armed: {}, reason: "", completionReason: "", discard: false, repo: "", focus: false };
 
 function taskSheetHost(id) {
   return {
@@ -12385,6 +12451,7 @@ function taskSheetHost(id) {
       if (taskSheet.id !== id) return;
       taskSheet.armed[key] = on;
       if (key === "hold" && !on) taskSheet.reason = "";
+      if (key === "done" && !on) { taskSheet.completionReason = ""; taskSheet.discard = false; }
       taskSheet.focus = on;
       renderTaskActions(state.taskDetail.task);
     },
@@ -12395,6 +12462,10 @@ function taskSheetHost(id) {
     },
     reason: () => taskSheet.reason,
     setReason: (v) => { taskSheet.reason = v; },
+    completionReason: () => taskSheet.completionReason,
+    setCompletionReason: (v) => { taskSheet.completionReason = v; },
+    discard: () => taskSheet.discard,
+    setDiscard: (v) => { taskSheet.discard = v; },
     refresh: (tid) => refreshTask(tid),
     error: (msg) => {
       if (taskSheet.id !== id) return;
@@ -12458,6 +12529,8 @@ function renderTaskActions(task) {
     taskSheet.id = task ? task.id : null;
     taskSheet.armed = {};
     taskSheet.reason = "";
+    taskSheet.completionReason = "";
+    taskSheet.discard = false;
     taskSheet.repo = "";
     taskSheet.focus = false;
     show($("task-actions-error"), false);
@@ -12465,6 +12538,7 @@ function renderTaskActions(task) {
   }
   if (!task) {
     boxes.forEach(clear);
+    boxes.forEach((box) => { delete box.dataset.signature; });
     closeTaskActions();
     return;
   }
@@ -12531,7 +12605,11 @@ function renderTaskActions(task) {
   }
 
   renderTaskHoldBox(host, task, holdBox);
-  renderTaskDoneBox(host, task, doneBox);
+  const doneSignature = `${task.id}:${status}:${host.armed("done")}`;
+  if (doneBox.dataset.signature !== doneSignature) {
+    doneBox.dataset.signature = doneSignature;
+    renderTaskDoneBox(host, task, doneBox);
+  }
   renderTaskDeleteBox(host, task, deleteBox);
   if (running) {
     deleteBox.append(el("p", { class: "hint", text: "A running task cannot be held or deleted until its run ends." }));

@@ -145,7 +145,9 @@ use crate::id_reserve::{IdSource, path_exists};
 /// Older tasks retain shared builds.
 ///
 /// 24: bind automatic recovery-budget holds to their stopped execution.
-pub const SCHEMA: u32 = 24;
+///
+/// 25: append-only completion/reopen audit and occurrence-bound completion notices.
+pub const SCHEMA: u32 = 25;
 
 const RECOVERY_HOLD_SCHEMA: u32 = 24;
 
@@ -347,6 +349,164 @@ pub struct Reassignment {
     pub run_boundary: usize,
 }
 
+/// Origin of a completion or reopen decision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "talk", rename_all = "snake_case")]
+pub enum CompletionActor {
+    /// Terminal operator.
+    Cli,
+    /// Web operator.
+    Web,
+    /// Decision made in the named conversation.
+    Chat(String),
+    /// Conductor decision.
+    Conductor,
+    /// Automatic run settlement.
+    DaemonSettle,
+}
+
+/// A task lifecycle decision, distinct from a run outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompletionAction {
+    /// Task was marked done.
+    Complete,
+    /// Task was reopened into an operator hold.
+    Reopen,
+}
+
+/// Run and publication evidence observed when a task decision was made.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompletionRunSnapshot {
+    /// Retained run identifier.
+    pub id: String,
+    /// Unknown when the retained record could not be read.
+    pub status: Option<crate::run::RunStatus>,
+    /// Recorded public pull request.
+    pub pr_url: Option<String>,
+    /// Recorded or freshly observed public lifecycle.
+    pub pr_state: Option<String>,
+    /// Last published or merged public commit.
+    pub pr_head: Option<String>,
+    /// Retained candidate and public branch names; never deleted by a task decision.
+    #[serde(default)]
+    pub branches: Vec<String>,
+    /// Why a run snapshot was unavailable.
+    pub error: Option<String>,
+}
+
+impl CompletionRunSnapshot {
+    fn from_run(state: &crate::run::RunState) -> Self {
+        let mut branches: Vec<String> = state
+            .candidates
+            .iter()
+            .map(|candidate| candidate.branch.clone())
+            .collect();
+        if let Some(branch) = &state.pr_head
+            && !branches.contains(branch)
+        {
+            branches.push(branch.clone());
+        }
+        Self {
+            id: state.id.clone(),
+            status: Some(state.status),
+            pr_url: state.pr.as_ref().map(|pr| pr.url.clone()),
+            pr_state: state.pr.as_ref().map(|pr| pr.state.clone()),
+            pr_head: state
+                .pr_merged_head
+                .clone()
+                .or_else(|| state.pr_pushed_head.clone()),
+            branches,
+            error: None,
+        }
+    }
+}
+
+/// Mandatory evidence supplied by every path that marks a task done.
+#[derive(Debug, Clone)]
+pub struct CompletionContext {
+    /// Surface or process responsible for the decision.
+    pub actor: CompletionActor,
+    /// Operator explanation or settlement rationale.
+    pub reason: Option<String>,
+    /// Explicit permission to abandon an unfinished latest run.
+    pub discard: bool,
+    /// Latest retained execution snapshot, including unreadable-record evidence.
+    pub run: Option<CompletionRunSnapshot>,
+}
+
+impl CompletionContext {
+    /// Capture the latest retained execution without inventing missing evidence.
+    pub fn new(actor: CompletionActor, reason: Option<String>, home: &Path, task: &Task) -> Self {
+        let run = task
+            .runs
+            .last()
+            .map(|id| match crate::run::RunState::load_under(id, home) {
+                Ok(state) => CompletionRunSnapshot::from_run(&state),
+                Err(error) => CompletionRunSnapshot {
+                    id: id.clone(),
+                    status: None,
+                    pr_url: None,
+                    pr_state: None,
+                    pr_head: None,
+                    branches: Vec::new(),
+                    error: Some(format!("{error:#}")),
+                },
+            });
+        Self {
+            actor,
+            reason,
+            discard: false,
+            run,
+        }
+    }
+
+    /// Use the exact state already loaded by a run settlement.
+    pub fn from_run(
+        actor: CompletionActor,
+        reason: Option<String>,
+        _task: &Task,
+        state: &crate::run::RunState,
+    ) -> Self {
+        Self {
+            actor,
+            reason,
+            discard: false,
+            run: Some(CompletionRunSnapshot::from_run(state)),
+        }
+    }
+}
+
+/// Immutable, occurrence-addressed task completion/reopen audit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompletionEvent {
+    /// Unique decision occurrence, also used to identify its completion notice.
+    pub occurrence: String,
+    /// Kind of transition.
+    pub action: CompletionAction,
+    /// Decision origin.
+    pub actor: CompletionActor,
+    /// Explanation retained verbatim.
+    pub reason: Option<String>,
+    /// Whether unfinished work was explicitly discarded.
+    pub discard: bool,
+    /// Task status before the decision.
+    pub prior_status: TaskStatus,
+    /// Hold explanation before completion cleared active controls.
+    #[serde(default)]
+    pub prior_hold_reason: Option<String>,
+    /// Dependency explanation before completion cleared active controls.
+    #[serde(default)]
+    pub prior_block_reason: Option<String>,
+    /// Last run/task failure evidence before the lifecycle decision.
+    #[serde(default)]
+    pub prior_error: Option<String>,
+    /// Decision time.
+    pub at: Timestamp,
+    /// Run/PR evidence at that time.
+    pub run: Option<CompletionRunSnapshot>,
+}
+
 /// One unit of work.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -389,6 +549,9 @@ pub struct Task {
     pub solo: bool,
     /// Current state.
     pub status: TaskStatus,
+    /// Append-only operator and automatic completion/reopen decisions.
+    #[serde(default)]
+    pub completion_history: Vec<CompletionEvent>,
     /// How many times this task has been claimed.
     #[serde(default)]
     pub attempts: usize,
@@ -1048,6 +1211,7 @@ impl Task {
             priority: 0,
             solo: false,
             status: TaskStatus::Queued,
+            completion_history: Vec::new(),
             attempts: 0,
             attempt_limit: None,
             runs: Vec::new(),
@@ -1197,7 +1361,16 @@ impl Task {
     /// evidence. Dependencies are a set; held causes survive intermediate states.
     pub fn chat_notice_key(&self) -> Option<String> {
         match self.status {
-            TaskStatus::Done => Some("done".to_owned()),
+            TaskStatus::Done => Some(
+                self.completion_history
+                    .iter()
+                    .rev()
+                    .find(|event| event.action == CompletionAction::Complete)
+                    .map_or_else(
+                        || "done".to_owned(),
+                        |event| format!("done:{}", event.occurrence),
+                    ),
+            ),
             TaskStatus::Held => {
                 let cause = self
                     .hold_notice_cause
@@ -1470,7 +1643,11 @@ impl Task {
     /// blocked on a dependency that never actually finished, and then closed
     /// as done without ever being released would still read as waiting on
     /// something in `magi task show` and on its card, after it no longer is.
-    pub fn succeed(&mut self) {
+    pub fn succeed(&mut self, context: CompletionContext) {
+        if self.status == TaskStatus::Done {
+            return;
+        }
+        self.record_completion(CompletionAction::Complete, context);
         self.stamp_schema();
         self.status = TaskStatus::Done;
         self.resume_override = None;
@@ -1495,10 +1672,60 @@ impl Task {
     /// misbehaving, so this is neither [`Task::fail`] nor
     /// [`Task::handed_off`]; and unlike [`Task::succeed`] it does not pretend
     /// the run landed anything.
-    pub fn already_landed(&mut self, note: impl Into<String>) {
-        self.succeed();
+    pub fn already_landed(&mut self, note: impl Into<String>, mut context: CompletionContext) {
+        let note = note.into();
+        if context.reason.is_none() {
+            context.reason = Some(note.clone());
+        }
+        self.succeed(context);
         self.attempts = self.attempts.saturating_sub(1);
-        self.last_error = Some(note.into());
+        self.last_error = Some(note);
+    }
+
+    fn record_completion(&mut self, action: CompletionAction, context: CompletionContext) {
+        self.completion_history.push(CompletionEvent {
+            occurrence: format!(
+                "{}-{:016x}{:016x}",
+                Timestamp::now(),
+                crate::rng::entropy(),
+                crate::rng::entropy()
+            ),
+            action,
+            actor: context.actor,
+            reason: context.reason,
+            discard: context.discard,
+            prior_status: self.status,
+            at: Timestamp::now(),
+            prior_hold_reason: self.hold_reason.clone(),
+            prior_block_reason: self.block_reason.clone(),
+            prior_error: self.last_error.clone(),
+            run: context.run,
+        });
+        self.stamp_schema();
+    }
+
+    /// Reopen a completed task into a hold after transactional admission.
+    /// Release remains a separate operator decision.
+    pub fn reopen(&mut self, context: CompletionContext) -> Result<()> {
+        anyhow::ensure!(
+            self.status == TaskStatus::Done,
+            "only a done task can be reopened"
+        );
+        anyhow::ensure!(
+            context
+                .reason
+                .as_deref()
+                .is_some_and(|reason| !reason.trim().is_empty()),
+            "reopen requires a non-empty reason"
+        );
+        let reason = context.reason.clone();
+        self.record_completion(CompletionAction::Reopen, context);
+        self.hold_manual(reason);
+        self.resume_override = None;
+        self.fresh_start = false;
+        self.last_error = None;
+        self.diagnostic = None;
+        Ok(())
     }
 
     /// Earlier attempts at this task that a later one has since made moot —
@@ -3084,10 +3311,67 @@ impl Queue {
         self.write_record(task)
     }
 
+    /// Commit a validated lifecycle transition only against its admitted snapshot.
+    pub(crate) fn commit_completion(&self, task: &mut Task, expected: &Task) -> Result<()> {
+        let _lock = self.lock_task(&task.id)?;
+        anyhow::ensure!(
+            serde_json::to_value(self.get(&task.id)?)? == serde_json::to_value(expected)?,
+            "task changed during completion decision; reload and inspect it"
+        );
+        self.write_record(task)
+    }
+
     /// Fold the stored record of `task`'s id into `task` (updates only).
     fn merge_stored(&self, task: &mut Task) {
         if let Ok(mut stored) = read_path(&self.path_of(&task.id)) {
             stored.import_chat_notice();
+            // A stale writer may add evidence, but never erase/rewrite an
+            // immutable event or undo the lifecycle decision it did not see.
+            let local_decision = task.completion_history.iter().any(|event| {
+                !stored
+                    .completion_history
+                    .iter()
+                    .any(|saved| saved.occurrence == event.occurrence)
+                    && event.at > stored.updated_at
+            });
+            let unseen_decision = stored.completion_history.iter().any(|event| {
+                !task
+                    .completion_history
+                    .iter()
+                    .any(|mine| mine.occurrence == event.occurrence)
+            });
+            let mut history = std::mem::take(&mut stored.completion_history);
+            for event in std::mem::take(&mut task.completion_history) {
+                if !history
+                    .iter()
+                    .any(|stored| stored.occurrence == event.occurrence)
+                {
+                    history.push(event);
+                }
+            }
+            if unseen_decision {
+                let stale = std::mem::replace(task, stored.clone());
+                for answer in stale.answers {
+                    if !task.answers.contains(&answer) {
+                        task.answers.push(answer);
+                    }
+                }
+                for run in stale.runs {
+                    if !task.runs.contains(&run) {
+                        task.runs.push(run);
+                    }
+                }
+                for failure in stale.startup_failures {
+                    task.record_startup_failure(failure);
+                }
+                for pass in stale.passes {
+                    if !task.passes.iter().any(|stored| {
+                        stored.run == pass.run && stored.pass_index == pass.pass_index
+                    }) {
+                        task.passes.push(pass);
+                    }
+                }
+            }
             if stored.reassignments.len() > task.reassignments.len() {
                 // An older writer may contribute evidence, but cannot restore
                 // old execution selections, status, or runs across the boundary.
@@ -3127,9 +3411,11 @@ impl Queue {
                     .resume_override
                     .as_ref()
                     .is_none_or(|pin| pin.at <= stored.updated_at)
+                && !local_decision
             {
                 *task = stored.clone();
             }
+            task.completion_history = history;
             for key in &stored.base_recovery_requests {
                 if !task.base_recovery_requests.contains(key) {
                     task.base_recovery_requests.push(key.clone());
@@ -4287,7 +4573,7 @@ mod tests {
         let mut t = task("relanded");
         t.attempts = 1;
         t.status = TaskStatus::Running;
-        t.already_landed("already in main as 0e368de");
+        t.already_landed("already in main as 0e368de", completion(&t));
         assert_eq!(t.status, TaskStatus::Done);
         assert_eq!(t.attempts, 0);
         assert!(t.hold_reason.is_none());
@@ -4305,6 +4591,105 @@ mod tests {
     }
 
     use super::*;
+
+    fn completion(task: &Task) -> CompletionContext {
+        CompletionContext::new(CompletionActor::Cli, None, Path::new("."), task)
+    }
+
+    #[test]
+    fn completion_retains_the_hold_dependency_and_failure_it_clears() {
+        let mut held = task("held evidence");
+        held.hold_manual(Some("owner approval required".into()));
+        held.last_error = Some("review budget exhausted".into());
+        held.succeed(completion(&held));
+        let event = held.completion_history.last().unwrap();
+        assert_eq!(event.prior_status, TaskStatus::Held);
+        assert_eq!(
+            event.prior_hold_reason.as_deref(),
+            Some("owner approval required")
+        );
+        assert_eq!(
+            event.prior_error.as_deref(),
+            Some("review budget exhausted")
+        );
+        assert!(held.hold_reason.is_none());
+        assert!(held.last_error.is_none());
+        let mut blocked = task("dependency evidence");
+        blocked.block(
+            vec!["dependency".into()],
+            Some("waiting on migration".into()),
+        );
+        blocked.succeed(completion(&blocked));
+        let event = blocked.completion_history.last().unwrap();
+        assert_eq!(event.prior_status, TaskStatus::Blocked);
+        assert_eq!(
+            event.prior_block_reason.as_deref(),
+            Some("waiting on migration")
+        );
+        assert!(blocked.block_reason.is_none());
+        assert!(blocked.blocked_by.is_empty());
+        let saved = serde_json::to_vec(&held).unwrap();
+        let restored: Task = serde_json::from_slice(&saved).unwrap();
+        assert_eq!(restored.completion_history, held.completion_history);
+    }
+
+    #[test]
+    fn completion_audit_is_append_only_under_stale_puts() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let mut current = task("audited");
+        current.hold_manual(Some("inspect".into()));
+        queue.put(&mut current).unwrap();
+        let mut stale = queue.get(&current.id).unwrap();
+        current.succeed(completion(&current));
+        queue.put(&mut current).unwrap();
+        let original = current.completion_history[0].clone();
+        stale.last_error = Some("stale control state".into());
+        queue.put(&mut stale).unwrap();
+        assert_eq!(stale.status, TaskStatus::Done);
+        assert_eq!(stale.completion_history, vec![original.clone()]);
+        let mut context = completion(&current);
+        context.reason = Some("not actually finished".into());
+        current.reopen(context).unwrap();
+        queue.put(&mut current).unwrap();
+        stale.completion_history[0].actor = CompletionActor::Web;
+        stale.completion_history[0].reason = Some("rewritten evidence".into());
+        queue.put(&mut stale).unwrap();
+        assert_eq!(stale.status, TaskStatus::Held);
+        assert_eq!(stale.hold_reason.as_deref(), Some("not actually finished"));
+        assert_eq!(stale.completion_history[0], original);
+        assert_eq!(stale.completion_history, current.completion_history);
+    }
+
+    #[test]
+    fn repeated_completion_only_notifies_for_new_occurrences() {
+        let mut task = chat_task();
+        task.succeed(completion(&task));
+        let first = task.chat_notice_key().unwrap();
+        task.chat_notices.push(first.clone());
+        task.succeed(completion(&task));
+        assert_eq!(task.completion_history.len(), 1, "idempotent while done");
+        assert_eq!(task.chat_notice_due(), None);
+        let mut context = completion(&task);
+        context.reason = Some("inspect".into());
+        task.reopen(context).unwrap();
+        task.succeed(completion(&task));
+        let second = task.chat_notice_key().unwrap();
+        assert_ne!(first, second);
+        assert_eq!(task.chat_notice_due(), Some(second));
+        assert_eq!(task.completion_history.len(), 3);
+    }
+
+    #[test]
+    fn old_tasks_have_unknown_completion_provenance_not_invented_events() {
+        let mut task = task("legacy");
+        task.status = TaskStatus::Done;
+        let mut value = serde_json::to_value(&task).unwrap();
+        value.as_object_mut().unwrap().remove("completion_history");
+        let task: Task = serde_json::from_value(value).unwrap();
+        assert!(task.completion_history.is_empty());
+        assert_eq!(task.chat_notice_key().as_deref(), Some("done"));
+    }
 
     #[test]
     fn triage_applied_survives_release_and_old_records_read_as_empty() {
@@ -4941,7 +5326,7 @@ mod tests {
         t.hold_manual(Some("waiting on 3ed9".to_owned()));
         assert_eq!(t.hold_reason.as_deref(), Some("waiting on 3ed9"));
 
-        t.succeed();
+        t.succeed(completion(&t));
         assert_eq!(t.status, TaskStatus::Done);
         assert!(
             t.hold_reason.is_none(),
@@ -4977,7 +5362,7 @@ mod tests {
             vec!["20260101-000000-dead".to_owned()],
             Some("waiting on the migration script".to_owned()),
         );
-        done.succeed();
+        done.succeed(completion(&done));
         assert_eq!(done.status, TaskStatus::Done);
         assert!(
             done.blocked_by.is_empty(),
@@ -5391,7 +5776,7 @@ mod tests {
         assert!(err.contains("running"), "{err}");
 
         let mut done = task("finished");
-        done.succeed();
+        done.succeed(completion(&done));
         let err = done
             .edit("x".to_owned(), "y".to_owned())
             .unwrap_err()
@@ -5535,7 +5920,7 @@ mod tests {
         assert!(held.diagnostic.is_none());
 
         held.diagnostic = Some("cargo test failed: ...".to_owned());
-        held.succeed();
+        held.succeed(completion(&held));
         assert!(held.diagnostic.is_none());
     }
 
@@ -6602,13 +6987,17 @@ mod tests {
         assert_eq!(queue.get(&t.id).unwrap().chat_notice_due(), None);
         queue
             .modify(&t.id, |task| {
-                task.succeed();
+                task.succeed(completion(task));
                 true
             })
             .unwrap();
-        assert_eq!(
-            queue.get(&t.id).unwrap().chat_notice_due().as_deref(),
-            Some("done")
+        assert!(
+            queue
+                .get(&t.id)
+                .unwrap()
+                .chat_notice_due()
+                .unwrap()
+                .starts_with("done:")
         );
     }
 
@@ -6716,8 +7105,8 @@ mod tests {
         t.import_chat_notice();
         t.notice_cause("failed", Some("new-run"), Some(0));
         assert!(t.chat_notice_due().is_some(), "new producer evidence");
-        t.succeed();
-        assert_eq!(t.chat_notice_due().as_deref(), Some("done"));
+        t.succeed(completion(&t));
+        assert!(t.chat_notice_due().unwrap().starts_with("done:"));
     }
 
     #[test]
@@ -6746,26 +7135,32 @@ mod tests {
         t.release();
         assert_eq!(t.chat_notice_due(), None, "requeued after a release");
         t.start("r3".to_owned());
-        t.succeed();
+        t.succeed(completion(&t));
         assert!(t.chat_notice_due().is_some(), "done is a new final state");
     }
 
     #[test]
-    fn completed_chat_notices_keep_current_and_legacy_keys_after_requeue() {
+    fn legacy_completion_receipts_do_not_suppress_new_occurrences() {
         for key in ["done", "done#0", "done#1", "done#12"] {
             let mut t = chat_task();
-            t.start("r1".to_owned());
-            t.succeed();
+            t.status = TaskStatus::Done;
             t.chat_notice = Some(ChatNotice {
                 key: key.to_owned(),
                 at: Timestamp::now(),
                 outcome: ChatNoticeOutcome::Posted,
             });
-            t.requeue();
-            t.start("r2".to_owned());
-            t.succeed();
             assert_eq!(t.chat_notice_key().as_deref(), Some("done"));
-            assert_eq!(t.chat_notice_due(), None, "recorded key: {key}");
+            assert_eq!(t.chat_notice_due(), None, "legacy recorded key: {key}");
+            let mut context = completion(&t);
+            context.reason = Some("inspect again".into());
+            t.reopen(context).unwrap();
+            t.start("r2".to_owned());
+            t.succeed(completion(&t));
+            assert!(t.chat_notice_key().unwrap().starts_with("done:"));
+            assert!(
+                t.chat_notice_due().is_some(),
+                "new occurrence, old receipt: {key}"
+            );
         }
     }
 
@@ -6790,12 +7185,12 @@ mod tests {
     #[test]
     fn a_chat_notice_needs_a_chat_source_and_a_current_schema() {
         let mut human = task("h");
-        human.succeed();
+        human.succeed(completion(&human));
         assert_eq!(human.chat_notice_due(), None);
         // A follow-up only inherits the chat; it did not file the task.
         let mut inherited = task("i");
         inherited.origin_chat = Some("20260902-000000-beef".to_owned());
-        inherited.succeed();
+        inherited.succeed(completion(&inherited));
         assert_eq!(inherited.chat_notice_due(), None);
         let mut old = chat_task();
         old.schema = 12;
@@ -6804,7 +7199,7 @@ mod tests {
         let mut live = chat_task();
         live.schema = 12;
         live.start("r1".to_owned());
-        live.succeed();
+        live.succeed(completion(&live));
         assert!(live.chat_notice_due().is_some(), "started by this build");
         let mut held = chat_task();
         held.schema = 12;
@@ -6817,7 +7212,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let q = Queue::at(tmp.path().join("queue"));
         let mut t = chat_task();
-        t.succeed();
+        t.succeed(completion(&t));
         q.put(&mut t).expect("put");
         let mut stale = q.get(&t.id).expect("get");
         let key = t.chat_notice_due().expect("due");
@@ -6872,7 +7267,7 @@ mod tests {
         let q = queue_with_ids(dir.path(), &[TAKEN, TAKEN]);
         let mut first = task("first");
         first.start("run-1".into());
-        first.succeed();
+        first.succeed(completion(&first));
         q.put(&mut first).unwrap();
         assert_eq!(first.id, TAKEN);
         let stored_before = q.get(&first.id).unwrap();

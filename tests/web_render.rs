@@ -1303,6 +1303,140 @@ async fn queue_drag_paints_and_saves_the_insertion_boundary() {
     }
 }
 
+#[tokio::test]
+async fn completion_audit_discard_and_reopen_controls_work_at_phone_and_desktop_widths() {
+    let Some(chrome) = cdp::find_chrome() else {
+        assert!(std::env::var_os("CI").is_none(), "Chrome required in CI");
+        eprintln!("SKIP completion audit controls: no Chrome");
+        return;
+    };
+    let guard = common::home_lock().await;
+    let fx = common::fixture(guard, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("magi-home");
+    let queue = Queue::at(home.join("queue"));
+    let base = serve(
+        &home,
+        queue.clone(),
+        Talks::at(home.join("talks")),
+        home.join("runs"),
+        &fx.repo,
+    )
+    .await;
+    let mut browser = cdp::Browser::launch(&chrome).await.unwrap();
+    for width in [320, 1280] {
+        let mut run = RunState::new(
+            fx.repo.clone(),
+            "main".into(),
+            "abc".into(),
+            "Unfinished work".into(),
+            fx.config.clone(),
+        );
+        run.status = RunStatus::Failed;
+        run.save_under(&home).unwrap();
+        let mut task = Task::new(
+            "Audit completion controls".into(),
+            "Retain the unsuccessful run".into(),
+            fx.repo.clone(),
+            Source::Human,
+        );
+        task.runs.push(run.id.clone());
+        task.hold_manual(Some("Owner review pending".into()));
+        task.last_error = Some("Failed execution retained".into());
+        queue.put(&mut task).unwrap();
+        let page = browser
+            .open_page(
+                &format!("{base}#/tasks/{}", task.id),
+                width,
+                900,
+                width < 400,
+            )
+            .await
+            .unwrap();
+        browser
+            .wait_for(
+                &page,
+                "!!document.querySelector('#task-actions-done button')",
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
+        let result = browser.eval(&page, r##"(async () => {
+          const check = (ok, msg) => { if (!ok) throw new Error(msg); };
+          const wait = async f => { const end = performance.now() + 10000; while (!f()) { if (performance.now() > end) throw new Error('completion control timeout'); await new Promise(r => setTimeout(r, 20)); } };
+          const box = () => document.querySelector('#task-actions-done');
+          const buttons = () => [...box().querySelectorAll('button')];
+          const input = () => box().querySelector('input[type=text]');
+          const confirm = () => buttons().find(b => /Yes, mark done|^Reopen to Held$/.test(b.textContent));
+          const type = value => { input().value = value; input().dispatchEvent(new Event('input', { bubbles: true })); };
+          const fits = node => { const r = node.getBoundingClientRect(); return r.width > 0 && r.left >= 0 && r.right <= innerWidth + 1; };
+          document.querySelector('#task-actions-fab').click();
+          buttons()[0].click();
+          check(fits(input()) && fits(confirm()), 'completion controls fit viewport');
+          type('Owner cancelled unfinished work');
+          confirm().click();
+          await wait(() => !document.querySelector('#task-actions-error').hidden && !confirm().disabled);
+          check(document.querySelector('#task-status .chip')?.dataset.status !== 'done', 'unmerged closure refused without discard');
+          const discard = box().querySelector('input[type=checkbox]');
+          discard.checked = true;
+          discard.dispatchEvent(new Event('change', { bubbles: true }));
+          confirm().click();
+          await wait(() => document.querySelector('#task-completions .task-completion-events li') && box().textContent.includes('Reopen to Held'));
+          const audit = document.querySelector('#task-completions');
+          check(audit.textContent.includes('web'), 'audit actor');
+          check(audit.textContent.includes('Owner cancelled unfinished work'), 'audit reason');
+          check(audit.textContent.includes('Prior task state: held'), 'audit prior state');
+          check(audit.textContent.includes('Prior hold reason: Owner review pending'), 'prior hold survives closure');
+          check(audit.textContent.includes('Prior error: Failed execution retained'), 'prior failure survives closure');
+          check(audit.textContent.includes('failed') && audit.textContent.includes('Occurrence:'), 'audit run state and occurrence');
+          check(audit.textContent.includes('(discard)'), 'audit explicit discard');
+          buttons()[0].click();
+          confirm().click();
+          check(document.querySelector('#task-actions-error').textContent.includes('Give a reason'), 'reopening requires reason');
+          type('Premature completion');
+          check(fits(input()) && fits(confirm()), 'reopen controls fit viewport');
+          confirm().click();
+          await wait(() => document.querySelectorAll('#task-completions .task-completion-events li').length === 2 && document.querySelector('#task-actions-hold').textContent.includes('Release'));
+          check(document.querySelector('#task-status .chip')?.dataset.status === 'held', 'reopened to Held rather than queued');
+          check(audit.textContent.includes('Reopened to Held') && audit.textContent.includes('Premature completion'), 'reopen audit remains visible');
+          document.querySelector('#task-actions-sheet').close();
+          audit.scrollIntoView({ block: 'center' });
+          check(fits(audit), 'audit fits viewport');
+          check(document.documentElement.scrollWidth <= document.documentElement.clientWidth, 'no horizontal spill');
+          return true;
+        })()"##).await.unwrap_or_else(|error| panic!("@{width}px: {error}"));
+        assert_eq!(result, true);
+        let saved = queue.get(&task.id).unwrap();
+        assert_eq!(saved.status, TaskStatus::Held);
+        assert_eq!(saved.completion_history.len(), 2);
+        assert_eq!(
+            saved.completion_history[0].run.as_ref().unwrap().status,
+            Some(RunStatus::Failed)
+        );
+        assert_ne!(
+            saved.completion_history[0].occurrence,
+            saved.completion_history[1].occurrence
+        );
+        let events: Vec<_> = browser
+            .take_events(&page.session)
+            .into_iter()
+            .filter(|event| {
+                !(event["method"] == "Log.entryAdded"
+                    && event["params"]["entry"]["source"] == "network"
+                    && event["params"]["entry"]["url"]
+                        .as_str()
+                        .is_some_and(|url| url.ends_with("/done"))
+                    && event["params"]["entry"]["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("400")))
+            })
+            .collect();
+        for problem in console_problems(&events) {
+            panic!("@{width}px: {problem}");
+        }
+        browser.close_page(&page).await;
+    }
+}
+
 /// `Task::urgent` shows as an URGENT tag on the Queue card and the task page,
 /// whatever the priority or status; a non-urgent task never carries one.
 #[tokio::test]
@@ -5508,7 +5642,12 @@ async fn chat_notification_display_hides_machine_context_on_phone_and_desktop() 
         },
     );
     task.start("example-run".into());
-    task.succeed();
+    task.succeed(magi::queue::CompletionContext::new(
+        magi::queue::CompletionActor::Cli,
+        None,
+        &home,
+        &task,
+    ));
     queue.put(&mut task).unwrap();
     magi::chat_notify::sweep(&queue, &talks, &home);
     talk::drain(&mut conversation, &talks).unwrap();

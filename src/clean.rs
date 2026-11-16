@@ -2338,7 +2338,12 @@ mod tests {
         latest.driver_exited = true;
         latest.save_under(home).unwrap();
         task.start(latest.id.clone());
-        task.succeed();
+        task.succeed(crate::queue::CompletionContext::new(
+            crate::queue::CompletionActor::DaemonSettle,
+            None,
+            home,
+            &task,
+        ));
         queue.put(&mut task).unwrap();
 
         let (folded, unreadable) = fold_due(
@@ -2418,7 +2423,12 @@ mod tests {
         recovered.driver_exited = true;
         recovered.save_under(home).unwrap();
         task.start(recovered.id.clone());
-        task.succeed();
+        task.succeed(crate::queue::CompletionContext::new(
+            crate::queue::CompletionActor::DaemonSettle,
+            None,
+            home,
+            &task,
+        ));
         crate::daemon::supersede_prior_runs(&task, home);
         for (id, _) in &sources {
             assert_eq!(

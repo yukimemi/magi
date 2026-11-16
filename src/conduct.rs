@@ -51,7 +51,7 @@ use crate::agent::{self, Invocation, SeatState};
 use crate::ask::{ChoiceAction, Deputy, Question, Questions};
 use crate::config::Config;
 use crate::prompt;
-use crate::queue::{Queue, Task, TaskStatus};
+use crate::queue::{CompletionActor, CompletionContext, Queue, Task, TaskStatus};
 use crate::run::RunState;
 use crate::verdict;
 
@@ -1025,7 +1025,12 @@ fn apply_one(
                 // would actually start the run.
             }
             Some(Recovery::Done) => {
-                task.succeed();
+                task.succeed(CompletionContext::new(
+                    CompletionActor::Conductor,
+                    d.reason.clone(),
+                    &crate::run::home(),
+                    &task,
+                ));
                 // Same reason `magi task done` and the web UI's equivalent
                 // do this: the conductor closing a task by hand is just as
                 // much a finished story as the loop's own settle path.
@@ -2206,7 +2211,12 @@ mod tests {
             .unwrap()
             .set_times(std::fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH))
             .unwrap();
-        unrelated.succeed();
+        unrelated.succeed(CompletionContext::new(
+            CompletionActor::DaemonSettle,
+            None,
+            dir.path(),
+            &unrelated,
+        ));
         let mut waiting = task("waiting");
         let mut asking = task("needs a product decision");
         let mut holding = task("must stay held");
@@ -2855,6 +2865,13 @@ printf '%s\n' "$MOCK_REPLY"
         assert_eq!(after.status, TaskStatus::Done);
         assert!(after.hold_reason.is_none());
         assert_eq!(after.answers.len(), 1, "the record of why is kept");
+        let completion = after.completion_history.last().unwrap();
+        assert_eq!(completion.actor, CompletionActor::Conductor);
+        assert_eq!(completion.prior_status, TaskStatus::Held);
+        assert_eq!(
+            completion.reason.as_deref(),
+            Some("operator confirmed this already landed")
+        );
     }
 
     #[test]

@@ -2245,6 +2245,13 @@ details.panel > summary + * { margin-top: var(--s2); }
 .task-runs .task-run-top { display: flex; gap: var(--s2); align-items: center; flex-wrap: wrap; }
 .task-runs .task-run-n { font-family: var(--mono); color: var(--ink-3); }
 .task-runs .task-run-desc, .task-runs .task-run-out { font-size: var(--t3); color: var(--ink-2); overflow-wrap: anywhere; }
+.task-completions { margin-bottom: var(--s4); min-width: 0; }
+.task-completion-events { display: flex; flex-direction: column; gap: var(--s3); margin: 0; padding-left: var(--s5); }
+.task-completion-events li { padding: var(--s3); border: 1px solid var(--line); border-radius: var(--radius-sm); overflow-wrap: anywhere; }
+.task-completion-events p { margin: 0 0 var(--s1); font-size: var(--t3); }
+.task-completion-events .task-completion-id { font-family: var(--mono); font-size: var(--t2); color: var(--ink-3); }
+.task-discard { display: flex; align-items: center; gap: var(--s2); min-height: var(--tap); font-size: var(--t3); }
+.task-discard input { flex: none; width: 1.2em; height: 1.2em; }
 .card-title.is-link { cursor: pointer; }
 .back-task { font-size: var(--t3); }
 .run-task-line { margin: var(--s1) 0 0; overflow-wrap: anywhere; display: flex; flex-wrap: wrap; align-items: center; gap: var(--s1); }

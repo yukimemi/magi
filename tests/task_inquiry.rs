@@ -262,7 +262,7 @@ async fn pending_decision_failure_supersession_and_scope_are_durable() {
     assert_eq!(outbox.get(&first.id).unwrap().decision.unwrap().status, Status::Resolved);
     // The operation is accepted, but its precondition fails. Neither restart
     // nor another owner reply counts as successful application.
-    task.succeed();
+    task.succeed(magi::queue::CompletionContext::new(magi::queue::CompletionActor::Cli, None, &home, &task));
     queue.put(&mut task).unwrap();
     let result = chat_control::dispatch(&queue, &home, &talks, &chat.id, Operation::ForDecision {
         inquiry: next.id.clone(), command: Box::new(Operation::Release { task: task.id.clone() }),
@@ -470,7 +470,9 @@ async fn completed_history_migration_is_bounded_passive_and_has_a_durable_bounda
     let home=fx.tmp.path().join("passive-migration"); let queue=Queue::at(home.join("queue")); let talks=Talks::at(home.join("talks"));
     let mut chat=talk::begin(&talks,&fx.config,fx.repo.clone(),Some("alpha")).unwrap(); talk::close(&mut chat,&talks).unwrap();
     let mut task=Task::new("completed".into(),"completed".into(),fx.repo.clone(),Source::Human);
-    task.chat=Some(chat.id.clone()); task.runs.push("run-a".into()); task.succeed(); queue.put(&mut task).unwrap();
+    task.chat=Some(chat.id.clone()); task.runs.push("run-a".into());
+    task.succeed(magi::queue::CompletionContext::new(magi::queue::CompletionActor::Cli, None, &home, &task));
+    queue.put(&mut task).unwrap();
     let questions=Questions::at(home.join("questions"));
     for index in 0..65 {
         let mut q=Question::new("run-a".into(),"implement".into(),"impl-A".into(),format!("Historical discussion {index}"),"Saved history".into(),vec![]);
@@ -554,10 +556,15 @@ async fn task_command_receipts_survive_later_transitions_and_lost_projection_wri
     let queue = Queue::at(home.join("queue"));
     let talks = Talks::at(home.join("talks"));
     let chat = talk::begin(&talks, &fx.config, fx.repo.clone(), Some("alpha")).unwrap();
-    for kind in ["hold", "release", "done", "retry"] {
+    for kind in ["hold", "release", "done", "reopen", "retry"] {
         let mut task = Task::new(kind.into(), "original instruction".into(), fx.repo.clone(), Source::Human);
         task.chat = Some(chat.id.clone());
         task.hold_manual(Some("original hold".into()));
+        if kind == "reopen" {
+            task.succeed(magi::queue::CompletionContext::new(
+                magi::queue::CompletionActor::Cli, None, &home, &task,
+            ));
+        }
         queue.put(&mut task).unwrap();
         let outbox = Outbox::at(&home);
         let record = outbox.file(&task, None, "receipt-test".into(), "Owner decision", kind).unwrap();
@@ -565,7 +572,8 @@ async fn task_command_receipts_survive_later_transitions_and_lost_projection_wri
         let command = match kind {
             "hold" => Operation::Hold { task: task.id.clone(), reason: "new hold".into() },
             "release" => Operation::Release { task: task.id.clone() },
-            "done" => Operation::Done { task: task.id.clone() },
+            "done" => Operation::Done { task: task.id.clone(), reason: Some("owner closed work".into()), discard: true },
+            "reopen" => Operation::Reopen { task: task.id.clone(), reason: "closed by mistake".into() },
             "retry" => Operation::Retry { task: task.id.clone(), title: None, instruction: "revised instruction".into() },
             _ => unreachable!(),
         };
@@ -576,6 +584,20 @@ async fn task_command_receipts_survive_later_transitions_and_lost_projection_wri
         assert_eq!(outbox.get(&record.id).unwrap().decision.unwrap().status, Status::Resolved);
         let committed = queue.get(&task.id).unwrap();
         assert_eq!(committed.decision_effects.get(&record.id), Some(&request));
+        if kind == "done" {
+            let event = committed.completion_history.last().unwrap();
+            assert_eq!(event.actor, magi::queue::CompletionActor::Chat(chat.id.clone()));
+            assert_eq!(event.prior_status, magi::queue::TaskStatus::Held);
+            assert_eq!(event.reason.as_deref(), Some("owner closed work"));
+        }
+        if kind == "reopen" {
+            assert_eq!(committed.status, magi::queue::TaskStatus::Held);
+            let event = committed.completion_history.last().unwrap();
+            assert_eq!(event.actor, magi::queue::CompletionActor::Chat(chat.id.clone()));
+            assert_eq!(event.action, magi::queue::CompletionAction::Reopen);
+            assert_eq!(event.prior_status, magi::queue::TaskStatus::Done);
+            assert_eq!(event.reason.as_deref(), Some("closed by mistake"));
+        }
         // Simulate death after the queue commit and before the final inquiry
         // projection rename. The independently committed receipt is authoritative.
         let path = home.join("notifications/task-inquiries").join(format!("{}.json", record.id));
@@ -586,7 +608,8 @@ async fn task_command_receipts_survive_later_transitions_and_lost_projection_wri
         // A subsequent transition must not erase proof of the earlier effect.
         // This writer still holds a pre-effect snapshot. Queue persistence
         // must merge the receipt even when saving its later transition.
-        task.succeed(); queue.put(&mut task).unwrap();
+        task.succeed(magi::queue::CompletionContext::new(magi::queue::CompletionActor::Cli, None, &home, &task));
+        queue.put(&mut task).unwrap();
         assert_eq!(queue.get(&task.id).unwrap().decision_effects.get(&record.id), Some(&request));
         let before = std::fs::read(queue.path_of(&task.id)).unwrap();
         chat_control::reconcile_decisions(&queue, &home).unwrap();
@@ -608,7 +631,8 @@ async fn failed_task_transition_has_no_effect_receipt_and_stays_actionable_after
     let chat = talk::begin(&talks, &fx.config, fx.repo.clone(), Some("alpha")).unwrap();
     let mut task = Task::new("completed work".into(), "completed work".into(), fx.repo.clone(), Source::Human);
     task.chat = Some(chat.id.clone());
-    task.succeed(); queue.put(&mut task).unwrap();
+    task.succeed(magi::queue::CompletionContext::new(magi::queue::CompletionActor::Cli, None, &home, &task));
+    queue.put(&mut task).unwrap();
     let outbox = Outbox::at(&home);
     let record = outbox.file(&task, None, "receipt-test".into(), "Discuss completed work", "A reply alone does not restart it").unwrap();
     outbox.deliver(&queue, &talks, &record.id).unwrap();
@@ -1215,7 +1239,7 @@ async fn superseded_resume_pins_reconcile_without_starting_or_replaying() {
             assert_eq!(outbox.get(&second.id).unwrap().decision.unwrap().status, Status::Queued);
         } else {
             let operation = if transition == "done" {
-                Operation::Done { task: task.id.clone() }
+                Operation::Done { task: task.id.clone(), reason: None, discard: true }
             } else {
                 Operation::Retry { task: task.id.clone(), title: None, instruction: "New instruction".into() }
             };

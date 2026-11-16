@@ -42,7 +42,7 @@ use crate::config::{BuildCache, Config, MergeMode};
 use crate::graph::Runner;
 use crate::land;
 use crate::notices::{self, Link, Notice};
-use crate::queue::{Queue, Task, TaskStatus};
+use crate::queue::{CompletionActor, CompletionContext, Queue, Task, TaskStatus};
 use crate::run::{Liveness, QuotaLoss, RunState, RunStatus};
 use crate::triage;
 
@@ -1675,7 +1675,17 @@ pub(crate) fn apply_task_choice_actions(queue: &Queue, questions: &Questions, ho
                 task.requeue();
             }
             ActionDecision::Hold => task.hold_manual(Some(q.summary.clone())),
-            ActionDecision::Done => task.succeed(),
+            ActionDecision::Done => task.succeed(CompletionContext::new(
+                CompletionActor::DaemonSettle,
+                Some(format!(
+                    "Question {}: {} — {}",
+                    q.id,
+                    q.summary,
+                    q.resolution().unwrap_or_default()
+                )),
+                home,
+                &task,
+            )),
             ActionDecision::Refuse(why) => {
                 let _ =
                     crate::task_inquiry::Outbox::at(home).update_decision(&q.id, |d| d.fail(&why));
@@ -1876,11 +1886,18 @@ pub struct Verdict {
 /// `left_pr` splits the `Blocked` row, and it is the difference between a run
 /// that failed and a run that finished into a gate. See [`Task::handed_off`].
 pub fn settle(task: &mut Task, verdict: Verdict, detail: &str, max_attempts: usize) {
-    settle_in(task, verdict, detail, max_attempts, &PHRASES_EN)
+    settle_in(task, verdict, detail, max_attempts, &PHRASES_EN, None)
 }
 
 /// [`settle`], with the daemon's own fixed prose in `p`'s language.
-fn settle_in(task: &mut Task, verdict: Verdict, detail: &str, max_attempts: usize, p: &Phrases) {
+fn settle_in(
+    task: &mut Task,
+    verdict: Verdict,
+    detail: &str,
+    max_attempts: usize,
+    p: &Phrases,
+    state: Option<&RunState>,
+) {
     // A parked run is the operator's own doing, and its work is intact on
     // disk. The task goes back in line with its attempt refunded so the next
     // loop resumes the same run - which `one_task` prefers over competing
@@ -1890,6 +1907,20 @@ fn settle_in(task: &mut Task, verdict: Verdict, detail: &str, max_attempts: usiz
         task.park(detail);
         return;
     }
+    let completion = |task: &Task| match state {
+        Some(state) => CompletionContext::from_run(
+            CompletionActor::DaemonSettle,
+            Some(detail.to_owned()),
+            task,
+            state,
+        ),
+        None => CompletionContext::new(
+            CompletionActor::DaemonSettle,
+            Some(detail.to_owned()),
+            &crate::run::home(),
+            task,
+        ),
+    };
     match verdict.status {
         RunStatus::Merged | RunStatus::Ready
             if task.pr_recovery.as_ref().is_some_and(|s| {
@@ -1898,8 +1929,8 @@ fn settle_in(task: &mut Task, verdict: Verdict, detail: &str, max_attempts: usiz
         {
             task.hold_manual(Some("Public delivery is not confirmed. Inspect the selected PR and run, then use recover-pr --disposition land with the intended source and validation configuration.".into()));
         }
-        RunStatus::Merged | RunStatus::Ready => task.succeed(),
-        RunStatus::AlreadyInBase => task.already_landed(detail),
+        RunStatus::Merged | RunStatus::Ready => task.succeed(completion(task)),
+        RunStatus::AlreadyInBase => task.already_landed(detail, completion(task)),
         RunStatus::Stalled if verdict.quota_hit => task.stall(detail),
         RunStatus::Failed if verdict.quota_hit && verdict.no_viable_candidates => {
             task.stall(detail)
@@ -2001,8 +2032,8 @@ pub fn supersede_prior_runs(task: &Task, home: &Path) {
 /// most likely.
 ///
 /// That skip is correct at the time (rewriting under a run something is
-/// still actively saving would just be undone), but a task only ever
-/// reaches `Done` once, so without this nothing would ever look at it
+/// still actively saving would just be undone), but recording a completion
+/// does not schedule another settlement, so without this nothing would look at it
 /// again: if that manual process later ends anywhere other than
 /// `Merged`/`Ready` - abandoned, or landed as another `Blocked` - the
 /// skipped attempt would sit at `Blocked`/`Stalled` forever, exactly the
@@ -2051,7 +2082,12 @@ fn settle_and_diagnose(
             return;
         }
         if (d.choice == md::WITHDRAW && d.closed) || d.choice == md::DISMISS {
-            task.succeed();
+            task.succeed(CompletionContext::from_run(
+                CompletionActor::DaemonSettle,
+                Some(format!("Owner merge decision {}: {}", d.question, d.choice)),
+                task,
+                state,
+            ));
         } else if let Some(agent) = md::selected_agent(&d.choice).filter(|_| d.closed) {
             if state.liveness(false) != Liveness::Dead {
                 task.hold_manual(Some("Previous driver is still live; replacement held until it exits. Release the task after checking the driver.".into()));
@@ -2235,7 +2271,12 @@ fn settle_and_diagnose(
         )
     {
         if state.pr_recovery == task.pr_recovery && state.public_delivery_complete() {
-            task.succeed();
+            task.succeed(CompletionContext::from_run(
+                CompletionActor::DaemonSettle,
+                Some(detail.to_owned()),
+                task,
+                state,
+            ));
         } else {
             task.hold_manual(Some("Selected PR delivery is incomplete: local review or publication is not a confirmed public merge. Inspect the run and PR; use recover-pr --disposition land with --source-head <reviewed-full-SHA> and the required verification configuration. No automatic new attempt will start.".into()));
         }
@@ -2249,7 +2290,7 @@ fn settle_and_diagnose(
     {
         task.hold_unrequested_retry(Some(format!("Selected recovery stopped: {detail}. Inspect the retained source and run; correct the cause before explicitly releasing or selecting again. No automatic replacement will start.")));
     } else {
-        settle_in(task, verdict, detail, max_attempts, p);
+        settle_in(task, verdict, detail, max_attempts, p, Some(state));
     }
     if !verdict.parked
         && !verdict.quota_hit
@@ -9177,6 +9218,7 @@ mod tests {
             "already in main",
             1,
             phrases("en"),
+            None,
         );
         assert_eq!(t.status, TaskStatus::Done);
         assert_eq!(t.attempts, 0);
@@ -9192,6 +9234,7 @@ mod tests {
                 "boom",
                 1,
                 phrases(language),
+                None,
             );
             t.last_error.or(t.hold_reason).unwrap_or_default()
         };
@@ -9333,6 +9376,42 @@ mod tests {
         );
         state.status = status;
         state
+    }
+
+    #[test]
+    fn settlement_audits_the_loaded_run_instead_of_reloading_a_stale_snapshot() {
+        crate::run::pin_test_home();
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = run_state(RunStatus::Blocked);
+        state.id = "20260101-000000-audit".into();
+        state.save_under(dir.path()).unwrap();
+        let mut t = task();
+        t.start(state.id.clone());
+        // The final state is newer than disk, as when a worker settles its
+        // in-memory outcome or recovery is passed an already loaded run.
+        state.status = RunStatus::Ready;
+        settle_and_diagnose(
+            &mut t,
+            unstarted_verdict(RunStatus::Ready),
+            "Verified local delivery",
+            2,
+            &state,
+        );
+        let completion = t.completion_history.last().unwrap();
+        assert_eq!(completion.actor, CompletionActor::DaemonSettle);
+        assert_eq!(completion.prior_status, TaskStatus::Running);
+        assert_eq!(
+            completion.reason.as_deref(),
+            Some("Verified local delivery")
+        );
+        let snapshot = completion.run.as_ref().unwrap();
+        assert_eq!(snapshot.id, state.id);
+        assert_eq!(snapshot.status, Some(RunStatus::Ready));
+        assert_eq!(
+            RunState::load_under(&state.id, dir.path()).unwrap().status,
+            RunStatus::Blocked,
+            "settlement records the actual outcome without rewriting run history"
+        );
     }
 
     fn candidate(label: char, summary: &str, empty: bool, failed: Option<&str>) -> Candidate {
@@ -9850,33 +9929,43 @@ mod tests {
     }
 
     #[test]
-    fn supersede_prior_runs_does_nothing_when_the_last_recorded_attempt_never_landed() {
-        // `magi task done` (or the web/conductor equivalents) can close a
-        // task in any status, including one whose *last* recorded attempt is
-        // itself still `Blocked`/`Failed` - a manual merge magi's own loop
-        // never watched, say. `runs.last()` being `Done`-adjacent is not
-        // proof it actually succeeded, so nothing earlier may be relabelled
-        // on its say-so alone.
-        crate::run::pin_test_home();
-        let mut first = run_state(RunStatus::Blocked);
-        first.id = "20260101-000000-supb".to_owned();
-        first.save().unwrap();
-        let mut second = run_state(RunStatus::Failed);
-        second.id = "20260101-000000-supc".to_owned();
-        second.save().unwrap();
+    fn supersede_prior_runs_preserves_blocked_work_after_an_audited_manual_close() {
+        for status in [RunStatus::Blocked, RunStatus::Stalled, RunStatus::Failed] {
+            let dir = tempfile::tempdir().unwrap();
+            let home = dir.path();
+            let mut first = run_state(RunStatus::Blocked);
+            first.id = "20260101-000000-supb".to_owned();
+            first.save_under(home).unwrap();
+            let mut second = run_state(status);
+            second.id = "20260101-000000-supc".to_owned();
+            second.save_under(home).unwrap();
 
-        let mut t = task();
-        t.runs = vec![first.id.clone(), second.id.clone()];
-        t.status = TaskStatus::Done;
+            let mut t = task();
+            t.runs = vec![first.id.clone(), second.id.clone()];
+            t.hold_manual(Some("Unmerged work remains".into()));
+            let mut context = CompletionContext::new(
+                CompletionActor::Cli,
+                Some("Discard the unmerged attempts".into()),
+                home,
+                &t,
+            );
+            context.discard = true;
+            t.succeed(context);
+            assert_eq!(t.completion_history.len(), 1);
 
-        supersede_prior_runs(&t, &crate::run::home());
+            supersede_prior_runs(&t, home);
 
-        assert_eq!(
-            RunState::load(&first.id).unwrap().status,
-            RunStatus::Blocked,
-            "the task's last attempt never landed, so there is nothing here \
-             actually superseding it"
-        );
+            assert_eq!(
+                RunState::load_under(&first.id, home).unwrap().status,
+                RunStatus::Blocked,
+                "an audited manual close is not proof the earlier work landed"
+            );
+            assert_eq!(
+                RunState::load_under(&second.id, home).unwrap().status,
+                status,
+                "the latest unmerged attempt retains its actual outcome"
+            );
+        }
     }
 
     #[test]
@@ -12295,13 +12384,23 @@ mod tests {
             assert!(questions.list().is_empty());
             // Finishing the transitive prerequisite alone does not satisfy
             // the task's direct dependency.
-            running.succeed();
+            running.succeed(CompletionContext::new(
+                CompletionActor::DaemonSettle,
+                None,
+                dir.path(),
+                &running,
+            ));
             queue.put(&mut running).unwrap();
             resolve_blockers(&queue, &questions);
             assert_eq!(queue.get(&middle.id).unwrap().status, TaskStatus::Queued);
             assert_eq!(queue.get(&waiting.id).unwrap().status, TaskStatus::Blocked);
             middle = queue.get(&middle.id).unwrap();
-            middle.succeed();
+            middle.succeed(CompletionContext::new(
+                CompletionActor::DaemonSettle,
+                None,
+                dir.path(),
+                &middle,
+            ));
             queue.put(&mut middle).unwrap();
             resolve_blockers(&queue, &questions);
             let after = queue.get(&waiting.id).unwrap();
@@ -12350,7 +12449,12 @@ mod tests {
         queue.put(&mut waiting).unwrap();
         let mut done = task();
         done.id = "20261013-193611-ca5b".into();
-        done.succeed();
+        done.succeed(CompletionContext::new(
+            CompletionActor::Cli,
+            None,
+            dir.path(),
+            &done,
+        ));
         queue.put(&mut done).unwrap();
         // An unreadable second match must not disappear from uniqueness
         // checks just because Queue::list skips it.
@@ -12415,7 +12519,12 @@ mod tests {
                             assert!(recorded_reason.contains("waiting for separate consent"));
                         }
                     }
-                    prerequisite.succeed();
+                    prerequisite.succeed(CompletionContext::new(
+                        CompletionActor::DaemonSettle,
+                        None,
+                        dir.path(),
+                        &prerequisite,
+                    ));
                     queue.put(&mut prerequisite).unwrap();
                     resolve_blockers(&queue, &questions);
                     let after = queue.get(&waiting.id).unwrap();
@@ -12443,7 +12552,12 @@ mod tests {
 
         let mut dep = task();
         dep.id = "20260101-000001-dep0".to_owned();
-        dep.succeed();
+        dep.succeed(CompletionContext::new(
+            CompletionActor::DaemonSettle,
+            None,
+            dir.path(),
+            &dep,
+        ));
         queue.put(&mut dep).unwrap();
 
         let mut still_going = task();
@@ -12728,8 +12842,19 @@ mod tests {
                 t.chat_notices.push(key);
             }
         }
-        t.succeed();
-        assert_eq!(t.chat_notice_due().as_deref(), Some("done"));
+        t.succeed(CompletionContext::new(
+            CompletionActor::DaemonSettle,
+            None,
+            dir.path(),
+            &t,
+        ));
+        assert_eq!(
+            t.chat_notice_due(),
+            Some(format!(
+                "done:{}",
+                t.completion_history.last().unwrap().occurrence
+            ))
+        );
     }
 
     #[test]

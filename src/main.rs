@@ -804,6 +804,12 @@ enum ControlCmd {
         #[command(subcommand)]
         command: magi::chat_goal::Command,
     },
+    /// Reopen unfinished, mistakenly completed work on hold without starting it.
+    Reopen {
+        id: String,
+        #[arg(long)]
+        reason: String,
+    },
     /// Reassign an idle task; keep history and start future work in the selected repository.
     Reassign {
         /// Task id or unambiguous prefix.
@@ -1216,6 +1222,12 @@ enum TaskCmd {
     Done {
         /// Task id or unambiguous prefix/suffix.
         id: String,
+        /// Explain why the task is being closed.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Explicitly close unmerged work; preserves runs and branches.
+        #[arg(long)]
+        discard: bool,
     },
     /// Delete a task.
     Rm {
@@ -4091,6 +4103,28 @@ async fn task_cmd_inner(command: TaskCmd, q: Queue) -> Result<()> {
             if !t.runs.is_empty() {
                 println!("runs      {}", t.runs.join(", "));
             }
+            if t.completion_history.is_empty() && t.status == queue::TaskStatus::Done {
+                println!("completion audit: unavailable (legacy task)");
+            }
+            for event in &t.completion_history {
+                println!(
+                    "completion audit: {} {:?} by {:?} from {} ({})",
+                    event.at,
+                    event.action,
+                    event.actor,
+                    event.prior_status.as_str(),
+                    event.occurrence,
+                );
+                if let Some(reason) = &event.reason {
+                    println!("  reason: {reason}");
+                }
+                if let Some(run) = &event.run {
+                    println!(
+                        "  run {}: {:?}, PR {:?} {:?}",
+                        run.id, run.status, run.pr_url, run.pr_state
+                    );
+                }
+            }
             if let Some(e) = &t.last_error {
                 println!("last      {e}");
             }
@@ -4233,6 +4267,26 @@ async fn task_cmd_inner(command: TaskCmd, q: Queue) -> Result<()> {
                 decision.is_none() || standing.standing_task.is_none(),
                 "standing authorization cannot settle an owner decision"
             );
+            // Reopening is also a supported terminal operation. Other controls
+            // retain their existing standing-chat authorization.
+            if let ControlCmd::Reopen { id, reason } = &op
+                && std::env::var("MAGI_NODE").as_deref() != Ok("chat")
+            {
+                ensure!(
+                    decision.is_none() && standing.standing_task.is_none(),
+                    "--decision and standing authorization require a chat"
+                );
+                let task = magi::task_completion::reopen(
+                    &q,
+                    &magi::run::home(),
+                    id,
+                    magi::queue::CompletionActor::Cli,
+                    reason,
+                )
+                .await?;
+                println!("reopened on hold {} {}", task.short(), task.title);
+                return Ok(());
+            }
             let home = magi::run::home();
             let talks = magi::talk::Talks::open();
             let talk = magi::chat_control::authorize(
@@ -4244,6 +4298,7 @@ async fn task_cmd_inner(command: TaskCmd, q: Queue) -> Result<()> {
             use magi::chat_control as cc;
             let operation = match op {
                 ControlCmd::Goal { command } => cc::Operation::Goal { command },
+                ControlCmd::Reopen { id, reason } => cc::Operation::Reopen { task: id, reason },
                 ControlCmd::Reassign { id, repo } => cc::Operation::Reassign { task: id, repo },
                 ControlCmd::ReconcileRepairGrant { request } => {
                     cc::Operation::ReconcileRepairGrant { request }
@@ -4443,16 +4498,25 @@ async fn task_cmd_inner(command: TaskCmd, q: Queue) -> Result<()> {
             Ok(())
         }
 
-        TaskCmd::Done { id } => {
-            if chat_has_control_channel() {
+        TaskCmd::Done {
+            id,
+            reason,
+            discard,
+        } => {
+            if std::env::var("MAGI_NODE").as_deref() == Ok(queue::CHAT_NODE) {
                 println!(
                     "{}",
-                    control_from_chat(magi::chat_control::Operation::Done { task: id }).await?
+                    control_from_chat(magi::chat_control::Operation::Done {
+                        task: id,
+                        reason,
+                        discard
+                    })
+                    .await?
                 );
                 return Ok(());
             }
-            let t = magi::chat_control::done(&q, &magi::run::home(), &id)?;
-            println!("done {} {}", t.short(), t.title);
+            let t = magi::chat_control::done(&q, &magi::run::home(), &id, reason, discard).await?;
+            println!("{}", magi::task_completion::describe(&t));
             Ok(())
         }
 
@@ -6985,6 +7049,52 @@ mod tests {
     }
 
     #[test]
+    fn task_reopen_requires_reason_and_discard_is_explicit() {
+        assert!(Cli::try_parse_from(["magi", "task", "control", "reopen", "abcd"]).is_err());
+        let parsed = Cli::try_parse_from([
+            "magi",
+            "task",
+            "control",
+            "reopen",
+            "abcd",
+            "--reason",
+            "closed by mistake",
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Some(Command::Task {
+                command: TaskCmd::Control {
+                    op: ControlCmd::Reopen { .. },
+                    ..
+                },
+                ..
+            })
+        ));
+        let parsed = Cli::try_parse_from([
+            "magi",
+            "task",
+            "done",
+            "abcd",
+            "--discard",
+            "--reason",
+            "stop work",
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Some(Command::Task {
+                command: TaskCmd::Done {
+                    discard: true,
+                    reason: Some(_),
+                    ..
+                },
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn task_done_is_its_own_verb_and_not_release() {
         // These two are one keystroke apart and do opposite things: `done`
         // finishes a task, `release` puts it back in line and pays for the
@@ -6993,7 +7103,7 @@ mod tests {
         let done = Cli::try_parse_from(["magi", "task", "done", "199c"]).unwrap();
         match done.command {
             Some(Command::Task {
-                command: TaskCmd::Done { id },
+                command: TaskCmd::Done { id, .. },
                 ..
             }) => assert_eq!(id, "199c"),
             other => panic!("expected TaskCmd::Done, got {other:?}"),
@@ -7016,7 +7126,12 @@ mod tests {
             magi::queue::Source::Human,
         );
         t.start("20260903-134458-ec12".to_owned());
-        t.succeed();
+        t.succeed(magi::queue::CompletionContext::new(
+            magi::queue::CompletionActor::Cli,
+            None,
+            &magi::run::home(),
+            &t,
+        ));
         assert_eq!(t.status, magi::queue::TaskStatus::Done);
         assert!(!t.status.runnable(), "a finished task is not offered again");
         t.release();

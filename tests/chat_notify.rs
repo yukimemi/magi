@@ -10,7 +10,10 @@ use std::process::Output;
 
 use magi::chat_notify;
 use magi::config::{AgentKind, AgentSpec, Config};
-use magi::queue::{CHAT_NODE, ChatNoticeOutcome, Queue, Source, Task};
+use magi::queue::{
+    CHAT_NODE, ChatNoticeOutcome, CompletionActor, CompletionContext, Queue, Source, Task,
+    TaskStatus,
+};
 use magi::talk::{self, Talks};
 
 struct World {
@@ -57,7 +60,8 @@ fn finished_task(w: &World, source_talk: &str, run: &str) -> Task {
         },
     );
     t.start(run.to_owned());
-    t.succeed();
+    let context = CompletionContext::new(CompletionActor::DaemonSettle, None, w.tmp.path(), &t);
+    t.succeed(context);
     w.queue.put(&mut t).expect("put task");
     t
 }
@@ -118,13 +122,15 @@ async fn a_crash_between_the_talk_and_the_task_write_does_not_post_twice() {
 }
 
 #[tokio::test]
-async fn completion_stays_once_per_task_after_requeue_and_store_reload() {
+async fn each_completion_occurrence_survives_requeue_and_store_reload() {
     let _home = common::home_lock().await;
     for legacy in [false, true] {
         for held in [false, true] {
             let w = world();
-            let t = finished_task(&w, &w.talk_id, "run-1");
+            let mut t = finished_task(&w, &w.talk_id, "run-1");
             if legacy {
+                t.completion_history.clear();
+                w.queue.put(&mut t).expect("legacy task without audit");
                 // Simulate an older build dying after saving only the talk.
                 let mut talk = w.talks.get(&w.talk_id).expect("talk");
                 talk::queue_once(
@@ -164,17 +170,114 @@ async fn completion_stays_once_per_task_after_requeue_and_store_reload() {
                 .modify(&t.id, |task| {
                     task.requeue();
                     task.start("run-2".to_owned());
-                    task.succeed();
+                    let context = CompletionContext::new(
+                        CompletionActor::DaemonSettle,
+                        None,
+                        w.tmp.path(),
+                        task,
+                    );
+                    task.succeed(context);
                     true
                 })
                 .expect("finish again");
             let queue = Queue::at(w.tmp.path().join("queue"));
             let talks = Talks::at(w.tmp.path().join("talks"));
-            assert!(chat_notify::sweep(&queue, &talks, w.tmp.path()).is_empty());
-            assert_eq!(drafts(&w), before, "completion must not grow the draft");
+            assert_eq!(
+                chat_notify::sweep(&queue, &talks, w.tmp.path()),
+                vec![w.talk_id.clone()]
+            );
+            assert_ne!(drafts(&w), before, "a new occurrence must grow the draft");
             assert_eq!(queue.get(&t.id).expect("task").chat_notice_due(), None);
         }
     }
+}
+
+#[tokio::test]
+async fn audited_reopen_and_reclose_deliver_distinct_notices_with_the_same_reason() {
+    let _home = common::home_lock().await;
+    let w = world();
+    let mut task = Task::new(
+        "cancel unstarted work".into(),
+        "no execution needed".into(),
+        w.tmp.path().into(),
+        Source::Agent {
+            run: w.talk_id.clone(),
+            node: CHAT_NODE.into(),
+        },
+    );
+    task.hold_manual(Some("Owner review pending".into()));
+    task.last_error = Some("Prior failure retained".into());
+    w.queue.put(&mut task).unwrap();
+    let first = magi::task_completion::close(
+        &w.queue,
+        w.tmp.path(),
+        &task.id,
+        CompletionActor::Web,
+        Some("owner cancelled".into()),
+        true,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        chat_notify::sweep(&w.queue, &w.talks, w.tmp.path()),
+        vec![w.talk_id.clone()]
+    );
+    let first_notice = drafts(&w);
+    assert!(first_notice.contains("Closed by: Web"));
+    assert!(first_notice.contains("Reason: owner cancelled"));
+    assert!(first_notice.contains("Prior task status: held"));
+    assert!(first_notice.contains("Prior hold reason: Owner review pending"));
+    assert!(first_notice.contains("Prior error: Prior failure retained"));
+    assert!(first_notice.contains("Run at closure: none recorded"));
+    let reopened = magi::task_completion::reopen(
+        &w.queue,
+        w.tmp.path(),
+        &task.id,
+        CompletionActor::Web,
+        "closure was premature",
+    )
+    .await
+    .unwrap();
+    assert_eq!(reopened.status, TaskStatus::Held);
+    let second = magi::task_completion::close(
+        &w.queue,
+        w.tmp.path(),
+        &task.id,
+        CompletionActor::Web,
+        Some("owner cancelled".into()),
+        true,
+    )
+    .await
+    .unwrap();
+    assert_ne!(
+        first.completion_history[0].occurrence,
+        second.completion_history[2].occurrence
+    );
+    let queue = Queue::at(w.tmp.path().join("queue"));
+    let talks = Talks::at(w.tmp.path().join("talks"));
+    assert_eq!(
+        chat_notify::sweep(&queue, &talks, w.tmp.path()),
+        vec![w.talk_id.clone()]
+    );
+    let talk = talks.get(&w.talk_id).unwrap();
+    assert_eq!(
+        talk.completion_notices.len(),
+        2,
+        "semantic receipts must distinguish occurrences"
+    );
+    assert_ne!(
+        talk.completion_notices[0].notice,
+        talk.completion_notices[1].notice
+    );
+    assert!(
+        talk.pending
+            .contains(&first.completion_history[0].occurrence)
+    );
+    assert!(
+        talk.pending
+            .contains(&second.completion_history[2].occurrence)
+    );
+    assert!(chat_notify::sweep(&queue, &talks, w.tmp.path()).is_empty());
 }
 
 #[tokio::test]
@@ -489,7 +592,10 @@ fn legacy_notice_steps(
         assert_ne!(next.id, first.id, "filing must reserve a distinct task id");
         assert!(next.chat_notice.is_none());
         assert!(next.chat_notices.is_empty());
-        assert_eq!(next.chat_notice_due().as_deref(), Some("done"));
+        assert!(
+            next.chat_notice_due()
+                .is_some_and(|key| key.starts_with("done:"))
+        );
         assert_eq!(
             chat_notify::sweep(&w.queue, &talks, w.tmp.path()),
             vec![w.talk_id.clone()]
@@ -1063,7 +1169,9 @@ async fn unresolved_hold_survives_prose_recovery_restart_and_stale_writes() {
     );
     w.queue
         .modify(&t.id, |task| {
-            task.succeed();
+            let context =
+                CompletionContext::new(CompletionActor::DaemonSettle, None, w.tmp.path(), task);
+            task.succeed(context);
             true
         })
         .unwrap();
