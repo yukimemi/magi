@@ -214,12 +214,9 @@ fn free_bytes_by_os(path: &Path) -> Result<u64> {
         .with_context(|| format!("absolute path for {}", path.display()))?;
     let root = volume_root(&abs)
         .with_context(|| format!("no volume root in {} to measure", abs.display()))?;
-    // volume_root returns exactly three ASCII characters. Keep a fourth, NUL
-    // code unit and avoid allocating another buffer for the native call.
-    let mut wide = [0_u16; 4];
-    for (slot, unit) in wide.iter_mut().zip(root.encode_utf16()) {
-        *slot = unit;
-    }
+    // Encode the complete root and append NUL explicitly, without assuming
+    // a fixed root length when constructing the native API buffer.
+    let wide: Vec<u16> = root.encode_utf16().chain(std::iter::once(0)).collect();
     let mut available = 0_u64;
     // SAFETY: wide is a live NUL-terminated UTF-16 root, available is writable,
     // and the optional totals are null. The API retains none of these pointers.
