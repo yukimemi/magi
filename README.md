@@ -925,6 +925,12 @@ without an owner answer. Manual holds, owner replies or discussion, unrelated
 approvals and ambiguous old records still require explicit resolution; the task
 chat explains these exceptions while eligible tasks continue recovering.
 
+On Windows, live free-space checks use `GetDiskFreeSpaceExW` directly and report
+bytes available to the caller (including quotas), without starting PowerShell
+for each health request. Recursive directory sizes refresh separately; health
+can return unknown sizes while that scan is still running. Drive and verbatim
+drive paths retain their existing support; UNC shares remain unsupported.
+
 Triage displays use saved question status, not migration's execution-only
 unanswered projection. An answered question is history, even while its decision
 still needs application or confirmation in Pending decisions. Applied answers

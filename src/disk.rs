@@ -9,9 +9,10 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result};
 
-use crate::proc::Quiet as _;
+#[cfg(unix)]
+use {crate::proc::Quiet as _, anyhow::bail};
 
 /// Are `free` bytes above the floor for starting a run?
 ///
@@ -167,9 +168,8 @@ pub fn extract_cargo_target_dir(command: &str) -> Option<PathBuf> {
 
 /// Free bytes on the volume containing `path`.
 ///
-/// There is no portable way to ask for this, so each platform runs its own
-/// tiny command, deliberately not a new dependency. The parsing halves are
-/// pure and asserted against fixture text; only the subprocess is live.
+/// Unix parses `df`; Windows asks the volume directly through kernel32, without
+/// starting a subprocess on the synchronous health-request path.
 pub fn free_bytes(path: &Path) -> Result<u64> {
     free_bytes_by_os(path)
 }
@@ -199,39 +199,44 @@ fn free_bytes_by_os(path: &Path) -> Result<u64> {
 /// Free bytes on the volume containing `path`.
 #[cfg(windows)]
 fn free_bytes_by_os(path: &Path) -> Result<u64> {
-    // `fsutil volume diskfree` needs an elevated shell; the .NET DriveInfo in
-    // the Windows PowerShell that ships with the OS does not.
-    //
-    // DriveInfo is handed the **volume root**, never the path itself: its
-    // constructor accepts a drive letter or a root directory and throws on
-    // anything else, including every verbatim path. The queue stores repo
-    // paths as `\\?\C:\...` (that is what `std::path::absolute` yields for a
-    // canonicalised root), so passing the path through closed the disk gate
-    // for every task with `the disk gate refuses to let a run start blind` -
-    // nine tasks were `held` for a disk that had 164 GiB free.
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetDiskFreeSpaceExW(
+            directory: *const u16,
+            available: *mut u64,
+            total: *mut u64,
+            free: *mut u64,
+        ) -> i32;
+    }
+    // Keep the existing drive-root contract, including verbatim drive paths
+    // and refusal of UNC shares; do not depend on the queried directory existing.
     let abs = std::path::absolute(path)
         .with_context(|| format!("absolute path for {}", path.display()))?;
     let root = volume_root(&abs)
         .with_context(|| format!("no volume root in {} to measure", abs.display()))?;
-    let quoted = root.replace('\'', "''");
-    let script = format!("[System.IO.DriveInfo]::new('{quoted}').AvailableFreeSpace");
-    let out = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        // Without this the operator watches a console window blink open for
-        // every measurement - and the health view measures on every tick, so
-        // merely leaving the deck open in a browser flashed one every few
-        // seconds. `Quiet` exists for exactly this and the probe skipped it.
-        .quiet()
-        .output()
-        .with_context(|| format!("run PowerShell for {}", abs.display()))?;
-    if !out.status.success() {
-        bail!(
-            "PowerShell failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
+    // volume_root returns exactly three ASCII characters. Keep a fourth, NUL
+    // code unit and avoid allocating another buffer for the native call.
+    let mut wide = [0_u16; 4];
+    for (slot, unit) in wide.iter_mut().zip(root.encode_utf16()) {
+        *slot = unit;
     }
-    parse_u64(&String::from_utf8_lossy(&out.stdout))
-        .with_context(|| format!("parse PowerShell bytes for {}", abs.display()))
+    let mut available = 0_u64;
+    // SAFETY: wide is a live NUL-terminated UTF-16 root, available is writable,
+    // and the optional totals are null. The API retains none of these pointers.
+    if unsafe {
+        GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut available,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    } == 0
+    {
+        let error = std::io::Error::last_os_error();
+        return Err(error).with_context(|| format!("query free bytes for {}", abs.display()));
+    }
+    // Caller-available bytes, not total free bytes: preserve quota semantics.
+    Ok(available)
 }
 
 /// One `df -k -P` data row: `Filesystem 1024-blocks Used Available …`.
@@ -246,14 +251,13 @@ pub fn parse_df_available(line: &str) -> Option<u64> {
     Some(blocks.saturating_mul(1024))
 }
 
-/// The volume root of an absolute Windows path, as DriveInfo wants it:
+/// The drive root used for querying an absolute Windows path:
 /// `C:\`, never `C:\Users\...` and never a verbatim `\\?\C:\...`.
 ///
 /// Pure and platform-independent so the verbatim form - which is what the
 /// queue stores and what closed the disk gate on every task - is asserted
-/// without a Windows runner. `None` when there is no drive letter to name: a
-/// UNC share has no DriveInfo of its own, and a caller must say it cannot
-/// measure rather than invent a volume.
+/// without a Windows runner. `None` when there is no drive letter to name:
+/// UNC shares remain unsupported, rather than inventing a drive volume.
 pub fn volume_root(path: &Path) -> Option<String> {
     let text = path.to_str()?;
     // Verbatim (`\\?\C:\x`) and verbatim-UNC (`\\?\UNC\server\share`) prefixes.
@@ -267,11 +271,6 @@ pub fn volume_root(path: &Path) -> Option<String> {
         return None;
     }
     Some(format!(r"{letter}:\"))
-}
-
-/// A bare unsigned integer line, which is all PowerShell prints for a long.
-pub fn parse_u64(text: &str) -> Option<u64> {
-    text.trim().parse().ok()
 }
 
 /// Total bytes under `path`, without following symlinks.
@@ -597,13 +596,7 @@ mod tests {
         assert_eq!(parse_df_available("a b c x"), None);
     }
 
-    #[test]
-    fn a_powershell_number_is_one_unsigned_integer() {
-        assert_eq!(parse_u64("     82072211456\r\n"), Some(82_072_211_456));
-        assert_eq!(parse_u64("nah"), None);
-    }
-
-    /// DriveInfo takes a volume, and the queue hands out verbatim paths.
+    /// The volume query takes a drive root; the queue hands out verbatim paths.
     #[test]
     fn the_volume_root_is_a_drive_not_the_path_it_came_from() {
         // The form that closed the gate on every queued task: the queue
@@ -624,8 +617,8 @@ mod tests {
             volume_root(Path::new("C:/Users/yukimemi/src")),
             Some(r"C:\".to_owned())
         );
-        // No drive to name: a share has no DriveInfo, and a POSIX path has no
-        // volume at all. The caller has to report that it cannot measure.
+        // No drive to name: UNC shares are unsupported, and a POSIX path has no
+        // drive volume. The caller has to report that it cannot measure.
         assert_eq!(volume_root(Path::new(r"\\server\share\dir")), None);
         assert_eq!(volume_root(Path::new(r"\\?\UNC\server\share")), None);
         assert_eq!(volume_root(Path::new("/home/yukimemi")), None);
