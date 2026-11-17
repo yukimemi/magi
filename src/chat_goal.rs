@@ -754,7 +754,8 @@ mod authorization_tests {
         let talks = Talks::at(tmp.path().join("talks"));
         let queue = crate::queue::Queue::at(tmp.path().join("queue"));
         let mut talk = crate::talk::seeded_for_test("stale-goals", tmp.path().into());
-        talk.turns.push(input("operator", "Follow this change through"));
+        talk.turns
+            .push(input("operator", "Follow this change through"));
         talks.put(&mut talk).unwrap();
         let mut before_establish = talks.get(&talk.id).unwrap();
         apply(
@@ -798,7 +799,8 @@ mod authorization_tests {
         let talks = Talks::at(tmp.path().join("talks"));
         let queue = crate::queue::Queue::at(tmp.path().join("queue"));
         let mut talk = crate::talk::seeded_for_test("goal-evidence", tmp.path().into());
-        talk.turns.push(input("operator", "Follow this change through"));
+        talk.turns
+            .push(input("operator", "Follow this change through"));
         talks.put(&mut talk).unwrap();
         apply(
             &queue,
