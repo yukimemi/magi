@@ -58,6 +58,9 @@ pub enum State {
 pub struct Goal {
     /// Stable idempotent goal identity.
     pub id: String,
+    /// Monotonic guarded-save revision; stale whole-talk saves cannot replace it.
+    #[serde(default)]
+    pub rev: u64,
     /// Outcome requested by the owner.
     pub purpose: String,
     /// Bounds of work the owner authorized.
@@ -168,6 +171,18 @@ impl Goal {
             "goal automatic turn budget exhausted"
         );
         Ok(())
+    }
+}
+
+/// Preserve missing goals and newer durable revisions during whole-talk saves.
+/// Equal revisions favor disk: only a guarded transition advances authority.
+pub(crate) fn merge_newer(goals: &mut Vec<Goal>, disk: Vec<Goal>) {
+    for saved in disk {
+        match goals.iter_mut().find(|goal| goal.id == saved.id) {
+            Some(incoming) if incoming.rev > saved.rev => {}
+            Some(incoming) => *incoming = saved,
+            None => goals.push(saved),
+        }
     }
 }
 
@@ -436,6 +451,7 @@ pub(crate) fn apply(
                 }
                 talk.goals.push(Goal {
                     id: id.clone(),
+                    rev: 0,
                     purpose,
                     scope,
                     condition: Condition {
@@ -667,6 +683,7 @@ mod tests {
     fn goal() -> Goal {
         Goal {
             id: "g".into(),
+            rev: 0,
             purpose: "ship".into(),
             scope: "this task".into(),
             condition: Condition {
@@ -730,6 +747,88 @@ mod tests {
 #[cfg(test)]
 mod authorization_tests {
     use super::*;
+
+    #[test]
+    fn stale_whole_talk_save_preserves_new_goals_and_owner_stop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let talks = Talks::at(tmp.path().join("talks"));
+        let queue = crate::queue::Queue::at(tmp.path().join("queue"));
+        let mut talk = crate::talk::seeded_for_test("stale-goals", tmp.path().into());
+        talk.turns.push(input("operator", "Follow this change through"));
+        talks.put(&mut talk).unwrap();
+        let mut before_establish = talks.get(&talk.id).unwrap();
+        apply(
+            &queue,
+            tmp.path(),
+            &talks,
+            &talk.id,
+            &Source::Input { turn: 0 },
+            establish(),
+        )
+        .unwrap();
+        let mut before_stop = talks.get(&talk.id).unwrap();
+        talks.put(&mut before_establish).unwrap();
+        assert_eq!(talks.get(&talk.id).unwrap().goals[0].id, "ship");
+        apply(
+            &queue,
+            tmp.path(),
+            &talks,
+            &talk.id,
+            &Source::Input { turn: 0 },
+            Command::Stop {
+                id: "ship".into(),
+                reason: "Owner cancelled".into(),
+            },
+        )
+        .unwrap();
+        let stopped = talks.get(&talk.id).unwrap().goals.remove(0);
+        assert!(stopped.rev > before_stop.goals[0].rev);
+        talks.put(&mut before_stop).unwrap();
+        let saved = talks.get(&talk.id).unwrap();
+        assert_eq!(
+            serde_json::to_value(&saved.goals[0]).unwrap(),
+            serde_json::to_value(stopped).unwrap(),
+        );
+        assert!(!saved.goals[0].active());
+    }
+
+    #[test]
+    fn equal_revision_save_cannot_replace_durable_goal_evidence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let talks = Talks::at(tmp.path().join("talks"));
+        let queue = crate::queue::Queue::at(tmp.path().join("queue"));
+        let mut talk = crate::talk::seeded_for_test("goal-evidence", tmp.path().into());
+        talk.turns.push(input("operator", "Follow this change through"));
+        talks.put(&mut talk).unwrap();
+        apply(
+            &queue,
+            tmp.path(),
+            &talks,
+            &talk.id,
+            &Source::Input { turn: 0 },
+            establish(),
+        )
+        .unwrap();
+        talks
+            .mutate(&talk.id, |talk| {
+                let goal = &mut talk.goals[0];
+                goal.observe("event".into(), "Current retained evidence".into(), false);
+                goal.started = Some(goal.wake);
+                goal.handled = goal.wake - 1;
+                Ok(())
+            })
+            .unwrap();
+        let durable = talks.get(&talk.id).unwrap();
+        let mut stale = talks.get(&talk.id).unwrap();
+        stale.goals[0].evidence.clear();
+        stale.goals[0].started = None;
+        stale.goals[0].fingerprint.clear();
+        talks.put(&mut stale).unwrap();
+        assert_eq!(
+            serde_json::to_value(talks.get(&talk.id).unwrap().goals).unwrap(),
+            serde_json::to_value(durable.goals).unwrap(),
+        );
+    }
 
     fn input(sender: &str, body: &str) -> crate::talk::Turn {
         serde_json::from_value(serde_json::json!({

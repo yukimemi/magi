@@ -689,6 +689,10 @@ automatic reports and external submissions cannot establish or expand a goal.
 Several unfinished requests remain retained; a later status question does not
 replace earlier work.
 
+Guarded goal transitions advance per-goal revisions. Whole-conversation saves
+retain missing goals and prefer durable state at equal or newer revisions, so
+a stale reply cannot erase progress, execution receipts or an owner's stop.
+
 The scheduler reconciles durable evidence in bounded batches. Changed task/run,
 PR/check or supervised-command evidence reserves one finite conversation worker;
 unchanged evidence spends no agent turn. Waiting releases the CLI and turn lease.

@@ -693,6 +693,9 @@ impl Talks {
         let _guard = self.guard()?;
         let mut talk = self.get(id)?;
         let result = change(&mut talk)?;
+        for goal in &mut talk.goals {
+            goal.rev = goal.rev.checked_add(1).context("goal revision exhausted")?;
+        }
         self.put(&mut talk)?;
         Ok(result)
     }
@@ -907,9 +910,12 @@ impl Talks {
     fn put_inner(&self, t: &mut Talk, preserve_title: bool) -> Result<()> {
         std::fs::create_dir_all(&self.root)
             .with_context(|| format!("create {}", self.root.display()))?;
-        if preserve_title && let Ok(old) = self.get(&t.id) {
-            t.title = old.title;
-            t.title_attempted_at = old.title_attempted_at;
+        if let Ok(old) = self.get(&t.id) {
+            crate::chat_goal::merge_newer(&mut t.goals, old.goals);
+            if preserve_title {
+                t.title = old.title;
+                t.title_attempted_at = old.title_attempted_at;
+            }
         }
         t.updated_at = Timestamp::now();
         // Legacy plain messages can still be recovered losslessly from breaks.
