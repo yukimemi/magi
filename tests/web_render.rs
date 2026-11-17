@@ -3908,6 +3908,25 @@ async fn linkify_builds_anchors_and_keeps_markup_as_text() {
         )
         .await
         .unwrap();
+    // A second tab can leave the transcript hidden on Windows. Reference
+    // decoration intentionally waits for visibility; foreground this rendering
+    // fixture explicitly rather than depending on Chrome's tab activation.
+    let background = browser
+        .call(
+            None,
+            "Target.createTarget",
+            serde_json::json!({"url": "about:blank"}),
+        )
+        .await
+        .unwrap();
+    browser
+        .call(
+            None,
+            "Target.activateTarget",
+            serde_json::json!({"targetId": background["targetId"]}),
+        )
+        .await
+        .unwrap();
     browser
         .call(
             Some(&page.session),
@@ -3916,12 +3935,16 @@ async fn linkify_builds_anchors_and_keeps_markup_as_text() {
         )
         .await
         .unwrap();
+    browser
+        .call(Some(&page.session), "Page.bringToFront", serde_json::json!({}))
+        .await
+        .unwrap();
     // Keep secondary responses held until a painted transcript is observable.
     // Save the result so the gate is released even if this assertion fails.
     let transcript = browser
         .wait_for(
             &page,
-            "document.querySelectorAll('#talk-turns > li').length === 85 \
+            "!document.hidden && document.querySelectorAll('#talk-turns > li').length === 85 \
              && document.getElementById('talk-turns').textContent.includes('Synthetic message 84.') \
              && document.querySelector('#talk-turns pre code')?.textContent.trim() === '12ba' \
              && window.delayedChatReads.references > 0 \
