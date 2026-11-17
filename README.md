@@ -696,9 +696,11 @@ a stale reply cannot erase progress, execution receipts or an owner's stop.
 The scheduler reserves an independent finite goal-observation service; slow
 forge and Git reads never run on its task-admission loop. Each service lap
 checks at most eight goals, reading every associated task, run and watch
-without truncating completion evidence. Changed evidence reserves one finite
-conversation worker; unchanged evidence spends no agent turn. Waiting releases
-the CLI and turn lease.
+without truncating completion evidence. Every distinct associated PR is refreshed
+once per lap with a bounded lookup, including PRs beyond the first four; its
+result remains associated with every referring run. Changed evidence reserves
+one finite conversation worker; unchanged evidence spends no agent turn.
+Waiting releases the CLI and turn lease.
 Goal input is separate from drafts and never sends an unsent owner message.
 Fresh, resumed and fallback seats receive the saved goals and current evidence.
 Repairs use existing controls and their effect receipts, not replacement tasks.

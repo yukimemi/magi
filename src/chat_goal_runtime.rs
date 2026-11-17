@@ -26,7 +26,19 @@ fn unavailable(error: &anyhow::Error) -> Value {
     json!({"unavailable": format!("{error:#}")})
 }
 
-/// Local task/run evidence plus a bounded forge lookup per associated PR.
+trait PrObserver: Sync {
+    fn current_pr(&self, repo: &Path, url: &str) -> impl Future<Output = Result<Value>> + Send;
+}
+
+struct CurrentPr;
+
+impl PrObserver for CurrentPr {
+    async fn current_pr(&self, repo: &Path, url: &str) -> Result<Value> {
+        crate::chat_notify::current_pr(repo, url).await
+    }
+}
+
+/// Local task/run evidence plus one timed forge lookup per distinct associated PR.
 /// Timestamps and transcript prose are excluded from the wake fingerprint.
 pub(crate) async fn observe(
     home: &Path,
@@ -34,6 +46,17 @@ pub(crate) async fn observe(
     tasks: &[String],
     runs: &[String],
     watches: &[String],
+) -> Observation {
+    observe_with_pr(home, repo, tasks, runs, watches, &CurrentPr).await
+}
+
+async fn observe_with_pr(
+    home: &Path,
+    repo: &Path,
+    tasks: &[String],
+    runs: &[String],
+    watches: &[String],
+    observer: &impl PrObserver,
 ) -> Observation {
     let mut task_facts = Vec::new();
     let mut run_ids = Vec::new();
@@ -64,7 +87,7 @@ pub(crate) async fn observe(
         }
     }
     let mut run_facts = Vec::new();
-    let mut urls = std::collections::BTreeSet::new();
+    let mut pr_observations = std::collections::BTreeMap::new();
     let mut prs = Vec::new();
     for id in &run_ids {
         if !valid_id(id) {
@@ -96,14 +119,15 @@ pub(crate) async fn observe(
                 } else {
                     None
                 };
-                if let Some(url) = run.pointer("/pr/url").and_then(Value::as_str)
-                    && urls.insert(url.to_owned())
-                    && urls.len() <= 4
-                {
-                    let observed = crate::chat_notify::current_pr(repo, url)
-                        .await
-                        .unwrap_or_else(|error| unavailable(&error));
-                    prs.push(json!({"run":id,"observation":observed}));
+                if let Some(url) = run.pointer("/pr/url").and_then(Value::as_str) {
+                    if !pr_observations.contains_key(url) {
+                        let observed = observer
+                            .current_pr(repo, url)
+                            .await
+                            .unwrap_or_else(|error| unavailable(&error));
+                        pr_observations.insert(url.to_owned(), observed);
+                    }
+                    prs.push(json!({"run":id,"observation":pr_observations[url]}));
                 }
                 run_facts.push(json!({"id":id,"status":run["status"],
                     "pr":run["pr"],"head":run["pr_pushed_head"],"merge":run["merge"],
@@ -457,6 +481,161 @@ mod tests {
             "tasks":[],"runs":["run"],"watches":[],"evidence":"","wake":0,"handled":0,
             "started":null,"wakes":0,"last_checked":null,"fingerprint":""
         })).unwrap()
+    }
+
+    #[derive(Default)]
+    struct FakePrObserver {
+        replies: std::sync::Mutex<std::collections::BTreeMap<String, Value>>,
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl PrObserver for FakePrObserver {
+        async fn current_pr(&self, _: &Path, url: &str) -> Result<Value> {
+            self.calls.lock().unwrap().push(url.to_owned());
+            self.replies
+                .lock()
+                .unwrap()
+                .get(url)
+                .cloned()
+                .with_context(|| format!("fixture PR unavailable: {url}"))
+        }
+    }
+
+    impl FakePrObserver {
+        fn assert_one_lookup_per_pr(&self, urls: &[String]) {
+            let calls = std::mem::take(&mut *self.calls.lock().unwrap());
+            for url in urls {
+                assert_eq!(
+                    calls.iter().filter(|called| *called == url).count(),
+                    1,
+                    "every distinct PR must be refreshed once per observation"
+                );
+            }
+            assert_eq!(
+                calls.len(),
+                urls.len(),
+                "shared run associations must not duplicate forge calls"
+            );
+        }
+    }
+
+    fn pr_goal_fixture(home: &Path) -> (Goal, FakePrObserver, Vec<String>) {
+        let mut goal = goal();
+        goal.runs.clear();
+        let observer = FakePrObserver::default();
+        let urls: Vec<_> = (1..=5)
+            .map(|index| format!("https://example.invalid/pull/{index}"))
+            .collect();
+        for (index, url) in urls.iter().enumerate() {
+            let run = format!("run-{index}");
+            let head = format!("{:040x}", index + 1);
+            let path = home.join("runs").join(&run);
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(
+                path.join("run.json"),
+                json!({"pr":{"url":url},"pr_pushed_head":head}).to_string(),
+            )
+            .unwrap();
+            goal.runs.push(run);
+            observer.replies.lock().unwrap().insert(
+                url.clone(),
+                json!({"state":"MERGED","head":head,"merged_at":"2026-01-01T00:00:00Z"}),
+            );
+        }
+        // A second run sharing the fifth PR still needs a corresponding fact.
+        let alias = home.join("runs").join("run-shared");
+        std::fs::create_dir_all(&alias).unwrap();
+        std::fs::write(
+            alias.join("run.json"),
+            json!({"pr":{"url":urls[4]},"pr_pushed_head":format!("{:040x}",5)}).to_string(),
+        )
+        .unwrap();
+        goal.runs.push("run-shared".into());
+        (goal, observer, urls)
+    }
+
+    #[tokio::test]
+    async fn fifth_pull_request_changes_wake_and_complete_all_related_runs() {
+        let temp = tempfile::tempdir().unwrap();
+        let (mut goal, observer, urls) = pr_goal_fixture(temp.path());
+        let head = format!("{:040x}", 5);
+        observer.replies.lock().unwrap().insert(
+            urls[4].clone(),
+            json!({"state":"OPEN","head":head,"merged_at":null,"checks":[{"verdict":"pending"}]}),
+        );
+        let pending =
+            observe_with_pr(temp.path(), temp.path(), &[], &goal.runs, &[], &observer).await;
+        assert!(!satisfied(&goal, &pending.facts));
+        goal.observe(pending.fingerprint, pending.facts.to_string(), false);
+        observer.assert_one_lookup_per_pr(&urls);
+
+        observer.replies.lock().unwrap().insert(
+            urls[4].clone(),
+            json!({"state":"OPEN","head":head,"merged_at":null,"checks":[{"verdict":"failed"}]}),
+        );
+        let failed =
+            observe_with_pr(temp.path(), temp.path(), &[], &goal.runs, &[], &observer).await;
+        assert_ne!(
+            failed.fingerprint, goal.fingerprint,
+            "CI changes beyond the first four PRs must wake the goal"
+        );
+        assert!(!satisfied(&goal, &failed.facts));
+        goal.observe(failed.fingerprint, failed.facts.to_string(), false);
+        assert_eq!(goal.wake, 2);
+        observer.assert_one_lookup_per_pr(&urls);
+
+        observer.replies.lock().unwrap().insert(urls[4].clone(),
+            json!({"state":"MERGED","head":format!("{:040x}",99),"merged_at":"2026-01-01T00:00:00Z"}));
+        let moved =
+            observe_with_pr(temp.path(), temp.path(), &[], &goal.runs, &[], &observer).await;
+        assert!(
+            !satisfied(&goal, &moved.facts),
+            "the fifth PR must match its saved head too"
+        );
+        observer.assert_one_lookup_per_pr(&urls);
+
+        observer.replies.lock().unwrap().insert(
+            urls[4].clone(),
+            json!({"state":"MERGED","head":head,"merged_at":"2026-01-01T00:00:00Z"}),
+        );
+        let merged =
+            observe_with_pr(temp.path(), temp.path(), &[], &goal.runs, &[], &observer).await;
+        assert!(
+            satisfied(&goal, &merged.facts),
+            "all six run associations must have exact-head merge evidence"
+        );
+        goal.observe(merged.fingerprint, merged.facts.to_string(), true);
+        assert_eq!(goal.state, State::Completed);
+        observer.assert_one_lookup_per_pr(&urls);
+    }
+
+    #[tokio::test]
+    async fn unavailable_pull_request_does_not_hide_later_ci_or_reuse_old_merge_evidence() {
+        let temp = tempfile::tempdir().unwrap();
+        let (goal, observer, urls) = pr_goal_fixture(temp.path());
+        let merged =
+            observe_with_pr(temp.path(), temp.path(), &[], &goal.runs, &[], &observer).await;
+        assert!(satisfied(&goal, &merged.facts));
+        observer.assert_one_lookup_per_pr(&urls);
+        observer.replies.lock().unwrap().remove(&urls[0]);
+        observer.replies.lock().unwrap().insert(urls[4].clone(),
+            json!({"state":"OPEN","head":format!("{:040x}",5),"merged_at":null,"checks":[{"verdict":"failed"}]}));
+        let current =
+            observe_with_pr(temp.path(), temp.path(), &[], &goal.runs, &[], &observer).await;
+        assert!(
+            !satisfied(&goal, &current.facts),
+            "previously merged evidence cannot replace a failed fresh lookup"
+        );
+        assert_ne!(merged.fingerprint, current.fingerprint);
+        let prs = current.facts["prs"].as_array().unwrap();
+        assert!(
+            prs.iter()
+                .any(|pr| pr["run"] == "run-0" && pr["observation"]["unavailable"].is_string())
+        );
+        assert!(prs.iter().any(
+            |pr| pr["run"] == "run-4" && pr["observation"]["checks"][0]["verdict"] == "failed"
+        ));
+        observer.assert_one_lookup_per_pr(&urls);
     }
 
     #[test]

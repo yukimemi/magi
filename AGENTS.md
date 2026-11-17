@@ -3730,8 +3730,10 @@ turn pauses rather than replaying an effect. A separately reserved finite
 admission loop. Reconciliation checks at most eight oldest goals per service
 pass, at least sixty seconds apart per goal, with thirty-two automatic turns
 and 240 evidence probes per accepted authorization. Every associated task/run/watch
-is observed; completion never uses a truncated prefix. Unknown evidence stays
-unknown and owner-wait/stopped goals do not auto-reactivate.
+is observed; completion never uses a truncated prefix. Refresh every distinct
+associated PR once per lap with a timed lookup and associate its result with all
+referring runs, rather than repeatedly querying a fixed prefix. Unknown evidence
+stays unknown and owner-wait/stopped goals do not auto-reactivate.
 
 Completion is machine-observed, never inferred from assistant prose, a task flag
 or PR creation. Landing requires fresh confirmed merge of the recorded head.
