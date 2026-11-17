@@ -3791,6 +3791,7 @@ async fn start_service(
         .and_then(|body| serde_json::from_slice::<Timestamp>(&body).ok());
     let interval = match operation {
         "disk-pressure" => 30,
+        "chat-goals" => 60,
         "cache" => CACHE_CHECK_INTERVAL_SECS,
         "fetch" => cfg.map_or(60, |cfg| cfg.repos.fetch_interval.max(1)),
         _ => opts.poll.as_secs().max(1),
@@ -3855,6 +3856,15 @@ async fn start_service(
         "fetch" => {
             cfg.is_some_and(|cfg| cfg.repos.fetch_interval > 0 && !cfg.repos.roots.is_empty())
         }
+        "chat-goals" => crate::talk::Talks::at(home.join("talks"))
+            .list()
+            .iter()
+            .any(|talk| {
+                talk.status.open()
+                    && talk.pending.is_empty()
+                    && talk.pending_attachments.is_empty()
+                    && talk.goals.iter().any(|goal| goal.active())
+            }),
         _ => false,
     };
     if !eligible {
@@ -3911,6 +3921,10 @@ pub async fn run_service_worker(home: &Path, payload: serde_json::Value) -> Resu
     let queue = Queue::at(request.queue);
     let questions = Questions::at(home.join("questions"));
     match request.operation.as_str() {
+        "chat-goals" => {
+            let talks = crate::talk::Talks::at(home.join("talks"));
+            crate::chat_goal_runtime::sweep(&talks, false).await;
+        }
         "maintenance" => {
             apply_maintenance_choices(&queue, &questions, home).await;
             triage::monitor_disk_waits(
@@ -4190,7 +4204,6 @@ async fn poll(
         if let Err(error) = crate::chat_control::reconcile_decisions(queue, home) {
             tracing::warn!("decision receipt reconciliation remains pending: {error:#}");
         }
-        crate::chat_goal_runtime::sweep(&talks, stop.parking()).await;
         let mut turns = tokio::task::JoinSet::new();
         crate::chat_notify::start_turns(&talks, stop.parking(), &mut turns);
         // start_turns dispatches detached turns; no paid work lives in this set.
@@ -4210,12 +4223,16 @@ async fn poll(
             "disk-pressure",
             "cache",
             "fetch",
+            "chat-goals",
         ] {
             // Once an idle --once drain starts settling services, subsequent
             // scans only consume their effects. An expired cadence receipt
             // must not start another service and keep the drain alive.
             if settling_once_services {
                 break;
+            }
+            if operation == "chat-goals" && stop.parking() {
+                continue;
             }
             start_service(
                 home,
@@ -10885,6 +10902,7 @@ mod tests {
             "disk-pressure",
             "cache",
             "fetch",
+            "chat-goals",
         ] {
             std::fs::write(
                 stamps.join(format!("daemon-{operation}")),
@@ -10990,6 +11008,112 @@ mod tests {
             "no active work; idle housekeeping owns scan"
         );
         assert!(crate::worker::active(&home).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn goal_observation_service_does_not_block_scheduler_decisions() {
+        let dir = tempfile::tempdir().unwrap();
+        let (opts, _, _, home, worktrees) = idle_loop(dir.path());
+        let queue = Queue::at(home.join("queue"));
+        let mut task = task();
+        task.repo = opts.repo.clone();
+        task.chat = Some("decision-chat".into());
+        task.hold_machine(Some("waiting for a decision".into()));
+        queue.put(&mut task).unwrap();
+        let questions = Questions::at(home.join("questions"));
+        let mut question = action_question(&task.id, ask::ChoiceAction::Done);
+        question.node = crate::conduct::NODE.into();
+        question.status = ask::QuestionStatus::Open;
+        question.answer = None;
+        question.answered_at = None;
+        questions.put(&mut question).unwrap();
+        questions
+            .update(&question.id, |q| {
+                q.answer(ask::Answer::Choice("resume で続行する".into()))
+            })
+            .unwrap();
+
+        let talks = crate::talk::Talks::at(home.join("talks"));
+        let mut decision_chat = crate::talk::seeded_for_test("decision-chat", opts.repo.clone());
+        decision_chat.pending = "Keep this unsent status question".into();
+        talks.put(&mut decision_chat).unwrap();
+        let mut talk = crate::talk::seeded_for_test("observing-chat", opts.repo.clone());
+        talk.goals.push(serde_json::from_value(serde_json::json!({
+            "id":"goal","purpose":"follow the retained job","scope":"one task",
+            "condition":{"description":"land the result","kind":"runs_merged"},
+            "state":"runnable","step":"reading the forge","source_turn":0,"owner_input":"land this job",
+            "tasks":[],"runs":[],"watches":[],"evidence":"","wake":1,"handled":0,
+            "started":1,"wakes":1,"last_checked":null,"fingerprint":""
+        })).unwrap());
+        talks.put(&mut talk).unwrap();
+
+        // A retained service lease models an observation still waiting on its
+        // external dependency. Admission must neither await nor repeat it.
+        let directory = home.join("workers/jobs/abcdef");
+        std::fs::create_dir_all(&directory).unwrap();
+        let lease = std::fs::File::create(directory.join("live.lock")).unwrap();
+        crate::pr_head::try_lock_file(&lease).unwrap();
+        let mut job = crate::worker::Job {
+            id: "abcdef".into(),
+            sequence: 1,
+            kind: "daemon-service".into(),
+            key: "service:daemon-chat-goals".into(),
+            payload: serde_json::Value::Null,
+            generation: "fixture".into(),
+            version: None,
+            status: crate::worker::Status::Running,
+            result: None,
+            pid: Some(std::process::id()),
+            created_at: Timestamp::now().as_second() as u64,
+            finished_at: None,
+        };
+        let record = directory.join("job.json");
+        std::fs::write(&record, serde_json::to_vec(&job).unwrap()).unwrap();
+        let status = Arc::new(Mutex::new(Status::new()));
+        let stop = Stop::new();
+        let mut dispatch = Box::pin(poll(
+            &opts,
+            &queue,
+            &status,
+            &home,
+            &worktrees,
+            &stop,
+            DispatchLimits {
+                max_concurrent: 1,
+                pause_for_interrupts: false,
+                recovery_cfg: None,
+            },
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(dispatch.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert!(lock(&status).polls > 0);
+        let saved = queue.get(&task.id).unwrap();
+        assert_eq!(saved.status, TaskStatus::Done);
+        assert!(saved.action_applied(&question.id));
+        assert!(
+            talks
+                .get("decision-chat")
+                .unwrap()
+                .pending
+                .contains("Keep this unsent status question")
+        );
+        let goal = talks.get(&talk.id).unwrap().goals.remove(0);
+        assert_eq!(goal.state, crate::chat_goal::State::Runnable);
+        assert_eq!(
+            goal.started,
+            Some(1),
+            "only the observation worker may reconcile its goal"
+        );
+        assert_eq!(crate::worker::active(&home).unwrap()[0].id, job.id);
+
+        stop.stop();
+        dispatch.await.unwrap();
+        job.status = crate::worker::Status::Finished;
+        std::fs::write(record, serde_json::to_vec(&job).unwrap()).unwrap();
+        drop(lease);
     }
 
     #[test]

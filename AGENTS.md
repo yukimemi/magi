@@ -3725,9 +3725,12 @@ merge head binding and sandbox grants; goals are not another effect executor.
 finite `chat_worker` jobs only for changed evidence. Its independent reserved
 input never drains unsent/recovered drafts. Waiting holds neither a CLI nor the
 turn lease. Persist started generations before invoking; an interrupted uncertain
-turn pauses rather than replaying an effect. Reconciliation checks at most eight
-oldest goals per scheduler pass, at least sixty seconds apart per goal, with
-thirty-two automatic turns and 240 evidence probes per accepted authorization. Unknown evidence stays
+turn pauses rather than replaying an effect. A separately reserved finite
+`daemon-service` (`chat-goals`) performs external observations off the scheduler's
+admission loop. Reconciliation checks at most eight oldest goals per service
+pass, at least sixty seconds apart per goal, with thirty-two automatic turns
+and 240 evidence probes per accepted authorization. Every associated task/run/watch
+is observed; completion never uses a truncated prefix. Unknown evidence stays
 unknown and owner-wait/stopped goals do not auto-reactivate.
 
 Completion is machine-observed, never inferred from assistant prose, a task flag

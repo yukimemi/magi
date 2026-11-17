@@ -39,7 +39,7 @@ pub(crate) async fn observe(
     let mut run_ids = Vec::new();
     let mut historical_runs = std::collections::BTreeSet::new();
     let queue = crate::queue::Queue::at(home.join("queue"));
-    for id in tasks.iter().take(32) {
+    for id in tasks {
         match queue.get(id) {
             Ok(task) => {
                 if task.repo != repo {
@@ -66,8 +66,9 @@ pub(crate) async fn observe(
     let mut run_facts = Vec::new();
     let mut urls = std::collections::BTreeSet::new();
     let mut prs = Vec::new();
-    for id in run_ids.iter().take(32) {
+    for id in &run_ids {
         if !valid_id(id) {
+            run_facts.push(json!({"id":id,"evidence":{"unavailable":"invalid run identity"}}));
             continue;
         }
         match read_json(&home.join("runs").join(id).join("run.json")) {
@@ -115,8 +116,10 @@ pub(crate) async fn observe(
         }
     }
     let mut watch_facts = Vec::new();
-    for id in watches.iter().take(32) {
+    for id in watches {
         if !valid_id(id) {
+            watch_facts
+                .push(json!({"id":id,"observation":{"unavailable":"invalid watch identity"}}));
             continue;
         }
         let value = read_json(&home.join("chat-watches").join(id).join("job.json"))
@@ -520,6 +523,148 @@ mod tests {
         assert_eq!(saved.goals[0].state, State::Stopped);
         assert!(saved.goals[0].started.is_none());
         assert!(saved.turns.is_empty());
+    }
+
+    #[tokio::test]
+    async fn completion_checks_the_entire_task_and_run_scope() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        for args in [
+            vec!["init"],
+            vec![
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "Fixture artifact",
+            ],
+        ] {
+            let result = crate::git::git_raw(&repo, &args).await.unwrap();
+            assert!(result.ok(), "{}", result.stderr);
+        }
+        let head = crate::git::git_raw(&repo, &["rev-parse", "HEAD"])
+            .await
+            .unwrap()
+            .stdout;
+        let queue = crate::queue::Queue::at(home.join("queue"));
+        let mut goal = goal();
+        goal.condition.kind = Completion::TasksDone;
+        goal.tasks.clear();
+        goal.runs.clear();
+        for index in 0..32 {
+            let run = format!("run-{index}");
+            let path = home.join("runs").join(&run);
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(
+                path.join("run.json"),
+                json!({
+                    "gate_ran":true,"gate_head":head,"gate":[{"code":0}],
+                    "tally":{"winner":"A"},"candidates":[{"label":"A","branch":"HEAD"}]
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let mut task = crate::queue::Task::new(
+                "Verified patch".into(),
+                "deliver the patch".into(),
+                repo.clone(),
+                crate::queue::Source::Human,
+            );
+            task.runs.push(run.clone());
+            queue.put(&mut task).unwrap();
+            goal.tasks.push(task.id);
+            goal.runs.push(run);
+        }
+        let mut unstarted = crate::queue::Task::new(
+            "Unstarted patch".into(),
+            "deliver this patch too".into(),
+            repo.clone(),
+            crate::queue::Source::Human,
+        );
+        queue.put(&mut unstarted).unwrap();
+        goal.tasks.push(unstarted.id.clone());
+        goal.runs.push("missing-run".into());
+        let observation = observe(&home, &repo, &goal.tasks, &goal.runs, &[]).await;
+        let mut facts = observation.facts;
+        assert!(
+            !satisfied(&goal, &facts),
+            "unobserved work must never be declared complete"
+        );
+        assert!(
+            facts["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|task| task["id"] == unstarted.id)
+        );
+        assert!(
+            facts["runs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|run| run["id"] == "missing-run")
+        );
+
+        // Each tail independently prevents completion; the fully verified
+        // prefix is a delivered artifact rather than a vacuous failure.
+        facts["runs"].as_array_mut().unwrap().pop();
+        assert!(
+            !satisfied(&goal, &facts),
+            "the thirty-third task is still unstarted"
+        );
+        facts["tasks"].as_array_mut().unwrap().pop();
+        assert!(satisfied(&goal, &facts));
+        facts["runs"].as_array_mut().unwrap().push(json!({
+            "id":"missing-run","evidence":{"unavailable":"not started"}
+        }));
+        assert!(
+            !satisfied(&goal, &facts),
+            "the thirty-third direct run is still unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn watch_completion_requires_the_tail_and_invalid_identities() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut goal = goal();
+        goal.condition.kind = Completion::WatchesSatisfied;
+        goal.watches = (0..33).map(|index| format!("watch-{index}")).collect();
+        for id in &goal.watches[..32] {
+            let path = temp.path().join("chat-watches").join(id);
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(
+                path.join("job.json"),
+                r#"{"result":"exited with status 0"}"#,
+            )
+            .unwrap();
+        }
+        let observation = observe(temp.path(), temp.path(), &[], &[], &goal.watches).await;
+        assert!(
+            !satisfied(&goal, &observation.facts),
+            "the thirty-third watch has no result"
+        );
+        let path = temp.path().join("chat-watches").join(&goal.watches[32]);
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(
+            path.join("job.json"),
+            r#"{"result":"exited with status 0"}"#,
+        )
+        .unwrap();
+        let observation = observe(temp.path(), temp.path(), &[], &[], &goal.watches).await;
+        assert!(satisfied(&goal, &observation.facts));
+        goal.watches.push("../invalid".into());
+        let observation = observe(temp.path(), temp.path(), &[], &[], &goal.watches).await;
+        assert!(
+            !satisfied(&goal, &observation.facts),
+            "invalid identities are unknown, not omitted"
+        );
     }
 }
 

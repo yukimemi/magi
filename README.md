@@ -693,9 +693,12 @@ Guarded goal transitions advance per-goal revisions. Whole-conversation saves
 retain missing goals and prefer durable state at equal or newer revisions, so
 a stale reply cannot erase progress, execution receipts or an owner's stop.
 
-The scheduler reconciles durable evidence in bounded batches. Changed task/run,
-PR/check or supervised-command evidence reserves one finite conversation worker;
-unchanged evidence spends no agent turn. Waiting releases the CLI and turn lease.
+The scheduler reserves an independent finite goal-observation service; slow
+forge and Git reads never run on its task-admission loop. Each service lap
+checks at most eight goals, reading every associated task, run and watch
+without truncating completion evidence. Changed evidence reserves one finite
+conversation worker; unchanged evidence spends no agent turn. Waiting releases
+the CLI and turn lease.
 Goal input is separate from drafts and never sends an unsent owner message.
 Fresh, resumed and fallback seats receive the saved goals and current evidence.
 Repairs use existing controls and their effect receipts, not replacement tasks.
