@@ -5860,6 +5860,7 @@ async fn durable_chat_goals_stay_compact_safe_and_navigable() {
     for (width, height, mobile) in [(1280, 900, false), (390, 844, true)] {
         chat.selected_goal = Some("queued-goal".into());
         chat.goals[1].state = serde_json::from_value(serde_json::json!("waiting")).unwrap();
+        chat.goals[1].rev += 1;
         talks.put(&mut chat).unwrap();
         task.status = TaskStatus::Queued;
         queue.put(&mut task).unwrap();
@@ -5999,6 +6000,14 @@ async fn durable_chat_goals_stay_compact_safe_and_navigable() {
             .eval(&page, &format!("deck.loadTalk({:?})", chat.id))
             .await
             .unwrap();
+        browser
+            .wait_for(
+                &page,
+                "document.getElementById('talk-task-progress-text').textContent.includes('all 1 complete')",
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
         let got = browser.eval(&page, r##"(() => {
           const link = document.getElementById('talk-goal-open');
           return {
@@ -6026,6 +6035,9 @@ async fn durable_chat_goals_stay_compact_safe_and_navigable() {
         chat.selected_goal = Some("run-goal".into());
         chat.goals[1].state = serde_json::from_value(serde_json::json!("completed")).unwrap();
         chat.goals[1].step = "Owner reviewed the result".into();
+        // Fixture transitions must advance the revision, like guarded goal
+        // updates; equal-revision whole-talk saves preserve the disk state.
+        chat.goals[1].rev += 1;
         talks.put(&mut chat).unwrap();
         let page = browser
             .open_page(&format!("{base}#/chat/{}", chat.id), width, height, mobile)
