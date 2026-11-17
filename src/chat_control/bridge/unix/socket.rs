@@ -48,7 +48,12 @@ fn socket_directory(
 }
 
 impl Socket {
-    pub(super) fn start(home: &Path, talk: &str, serial: Serial) -> Result<Self> {
+    pub(super) fn start(
+        home: &Path,
+        talk: &str,
+        serial: Serial,
+        source: crate::chat_goal::Source,
+    ) -> Result<Self> {
         let token = secret()?;
         let directory = socket_directory([std::env::temp_dir(), "/tmp".into()])?;
         let listener = match (|| -> Result<_> {
@@ -83,6 +88,7 @@ impl Socket {
                             let talk = talk.clone();
                             let active = active.clone();
                             let serial = serial.clone();
+                            let source = source.clone();
                             clients.spawn(async move {
                                 let _ = async {
                                     let request = tokio::time::timeout(AUTH_TIMEOUT, async {
@@ -101,8 +107,8 @@ impl Socket {
                                     let _guard = serial.lock().await;
                                     ensure!(active.load(Ordering::Acquire), "control capability revoked");
                                     let talks = crate::talk::Talks::at(home.join("talks"));
-                                    let result = super::super::super::execute(
-                                        &crate::queue::Queue::at(home.join("queue")), &home, &talks, &talk, request.operation,
+                                    let result = super::super::super::execute_authenticated(
+                                        &crate::queue::Queue::at(home.join("queue")), &home, &talks, &talk, source, request.operation,
                                     ).await.map_err(|e| format!("{e:#}"));
                                     // A client that stops reading must not hold the execution lock.
                                     drop(_guard);
@@ -257,8 +263,20 @@ mod tests {
             Source::Human,
         );
         queue.put(&mut task).unwrap();
-        let first = Socket::start(tmp.path(), &conversations[0].id, Serial::default()).unwrap();
-        let second = Socket::start(tmp.path(), &conversations[1].id, Serial::default()).unwrap();
+        let first = Socket::start(
+            tmp.path(),
+            &conversations[0].id,
+            Serial::default(),
+            crate::chat_goal::Source::Automatic,
+        )
+        .unwrap();
+        let second = Socket::start(
+            tmp.path(),
+            &conversations[1].id,
+            Serial::default(),
+            crate::chat_goal::Source::Automatic,
+        )
+        .unwrap();
         let hold = || Operation::Hold {
             task: task.id.clone(),
             reason: "owner request".into(),

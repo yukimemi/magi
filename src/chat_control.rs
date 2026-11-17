@@ -51,6 +51,11 @@ pub(crate) mod bridge;
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "operation", deny_unknown_fields)]
 pub enum Operation {
+    /// Persist owner-authorized follow-through through a turn capability.
+    Goal {
+        /// Typed lifecycle transition; completion is observer-only.
+        command: crate::chat_goal::Command,
+    },
     /// Reassign an idle task to a different repository without migrating runs.
     Reassign {
         /// Task id or unambiguous prefix.
@@ -265,7 +270,7 @@ pub async fn dispatch(
 ) -> Result<String> {
     if matches!(
         &operation,
-        Operation::Reassign { .. } | Operation::RecoverBase { .. }
+        Operation::Reassign { .. } | Operation::RecoverBase { .. } | Operation::Goal { .. }
     ) {
         #[cfg(unix)]
         {
@@ -300,6 +305,18 @@ pub async fn dispatch(
     execute(queue, home, talks, talk, operation).await
 }
 
+/// The transport supplies immutable launcher authority, never the CLI frame.
+async fn execute_authenticated(
+    queue: &Queue,
+    home: &Path,
+    talks: &Talks,
+    talk: &str,
+    source: crate::chat_goal::Source,
+    operation: Operation,
+) -> Result<String> {
+    crate::chat_goal::with_source(source, execute(queue, home, talks, talk, operation)).await
+}
+
 async fn execute(
     queue: &Queue,
     home: &Path,
@@ -308,7 +325,17 @@ async fn execute(
     operation: Operation,
 ) -> Result<String> {
     authorize(talks, talk, crate::queue::CHAT_NODE)?;
+    crate::chat_goal::fence(talks, talk, &crate::chat_goal::current_source())?;
+    admit_goal_operation(queue, home, talks, talk, &operation)?;
     Ok(match operation {
+        Operation::Goal { command } => crate::chat_goal::apply(
+            queue,
+            home,
+            talks,
+            talk,
+            &crate::chat_goal::current_source(),
+            command,
+        )?,
         Operation::Reassign { task, repo } => {
             let cwd = &talks.get(talk)?.repo;
             let task = crate::task_reassign::reassign(
@@ -561,6 +588,111 @@ async fn execute(
     })
 }
 
+/// A goal turn cannot redirect existing effects to unrelated work.
+fn admit_goal_operation(
+    queue: &Queue,
+    home: &Path,
+    talks: &Talks,
+    talk_id: &str,
+    operation: &Operation,
+) -> Result<()> {
+    let crate::chat_goal::Source::Goal { id, .. } = crate::chat_goal::current_source() else {
+        return Ok(());
+    };
+    let talk = talks.get(talk_id)?;
+    let goal = talk
+        .goals
+        .iter()
+        .find(|goal| goal.id == id)
+        .context("unknown goal")?;
+    let task_allowed = |reference: &str| -> Result<()> {
+        let id = queue.resolve_id(reference)?;
+        ensure!(
+            goal.tasks.contains(&id),
+            "effect targets a task outside this goal"
+        );
+        Ok(())
+    };
+    let run_allowed = |run: &str| -> Result<()> {
+        ensure!(
+            goal.runs.iter().any(|id| id == run)
+                || goal.tasks.iter().any(|id| queue
+                    .get(id)
+                    .is_ok_and(|task| task.runs.iter().any(|id| id == run))),
+            "effect targets an execution outside this goal"
+        );
+        Ok(())
+    };
+    match operation {
+        Operation::Goal { .. } => {}
+        Operation::Add { filing } => {
+            ensure!(
+                filing.repo == talk.repo
+                    && matches!(&filing.source, crate::queue::Source::Agent { run, node }
+                    if run == talk_id && node == crate::queue::CHAT_NODE),
+                "goal filing must retain this conversation's repository and provenance"
+            );
+        }
+        Operation::Done { task }
+        | Operation::Priority { task, .. }
+        | Operation::Hold { task, .. }
+        | Operation::Release { task }
+        | Operation::Retry { task, .. }
+        | Operation::ReconcileRetention { task, .. } => task_allowed(task)?,
+        Operation::GrantRepair { request } => {
+            task_allowed(&request.task)?;
+            run_allowed(&request.run)?;
+        }
+        Operation::ReconcileRepairGrant { request } => {
+            task_allowed(&request.task)?;
+            run_allowed(&request.run)?;
+        }
+        Operation::Resume { run }
+        | Operation::RecoverBase { run, .. }
+        | Operation::Abandon { run }
+        | Operation::RerunChecks { run, .. } => run_allowed(run)?,
+        Operation::ForDecision { inquiry, .. }
+        | Operation::ReconcileDecision { inquiry }
+        | Operation::SettleDecision { inquiry, .. } => {
+            task_allowed(&crate::task_inquiry::Outbox::at(home).get(inquiry)?.task)?;
+        }
+        Operation::Decide { question, .. }
+        | Operation::Answer { question, .. }
+        | Operation::ReplyOther { question, .. } => {
+            let questions = crate::ask::Questions::at(home.join("questions"));
+            let question = questions.get_for_effects(&questions.resolve_id(question)?)?;
+            if question.run_names_task() {
+                task_allowed(&question.run)?;
+            } else {
+                run_allowed(&question.run)?;
+            }
+        }
+        Operation::MergePr { repo, number, .. } => {
+            let expected = format!("https://github.com/{repo}/pull/{number}");
+            let mut found = false;
+            let mut inspect = |run: &str| -> Result<()> {
+                let state = crate::run::RunState::load_under(run, home)?;
+                found |= state
+                    .pr
+                    .as_ref()
+                    .is_some_and(|pr| pr.url.eq_ignore_ascii_case(&expected));
+                Ok(())
+            };
+            for run in &goal.runs {
+                inspect(run)?;
+            }
+            for task in &goal.tasks {
+                for run in &queue.get(task)?.runs {
+                    inspect(run)?;
+                }
+            }
+            ensure!(found, "merge targets a pull request outside this goal");
+        }
+        Operation::Reassign { .. } => bail!("automatic goal turns cannot change repository scope"),
+    }
+    Ok(())
+}
+
 /// Run one typed operation on behalf of the owner, retaining failures and
 /// uncertainty. A repeated command never blindly replays a possibly applied
 /// external effect. The underlying operation retains its existing claims and
@@ -757,6 +889,7 @@ async fn execute_decision(
     } else {
         outbox.update_decision(id, |d| d.start())?;
     }
+    crate::chat_goal::fence(talks, chat, &crate::chat_goal::current_source())?;
     let local = apply_local_decision(
         queue,
         home,
@@ -2025,5 +2158,155 @@ mod tests {
         // A recorded run whose driver is not proven dead (here: no state to
         // judge at all) is never abandoned.
         assert!(abandon(&queue, tmp.path(), "20260101-000000-aaaa").is_err());
+    }
+}
+
+#[cfg(test)]
+mod goal_admission_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn goal_effects_require_current_generation_scope_and_no_new_owner_input() {
+        let tmp = tempfile::tempdir().unwrap();
+        let talks = Talks::at(tmp.path().join("talks"));
+        let queue = Queue::at(tmp.path().join("queue"));
+        let mut talk = crate::talk::seeded_for_test("goal-effect", tmp.path().into());
+        talk.turns.push(
+            serde_json::from_value(serde_json::json!({
+                "sender": "operator", "who": "operator", "body": "Follow this task through",
+                "at": jiff::Timestamp::now()
+            }))
+            .unwrap(),
+        );
+        talks.put(&mut talk).unwrap();
+        let mut task = Task::new(
+            "work".into(),
+            "work".into(),
+            talk.repo.clone(),
+            crate::queue::Source::Agent {
+                run: talk.id.clone(),
+                node: crate::queue::CHAT_NODE.into(),
+            },
+        );
+        queue.put(&mut task).unwrap();
+        let mut unrelated = Task::new(
+            "other".into(),
+            "other".into(),
+            talk.repo.clone(),
+            crate::queue::Source::Agent {
+                run: talk.id.clone(),
+                node: crate::queue::CHAT_NODE.into(),
+            },
+        );
+        queue.put(&mut unrelated).unwrap();
+        crate::chat_goal::apply(
+            &queue,
+            tmp.path(),
+            &talks,
+            &talk.id,
+            &crate::chat_goal::Source::Input { turn: 0 },
+            crate::chat_goal::Command::Establish {
+                id: "g".into(),
+                purpose: "Deliver this task".into(),
+                scope: "This task only".into(),
+                condition: "Verified delivery".into(),
+                completion: crate::chat_goal::Completion::TasksDone,
+                tasks: vec![task.id.clone()],
+                runs: vec![],
+                watches: vec![],
+            },
+        )
+        .unwrap();
+        talks
+            .mutate(&talk.id, |talk| {
+                let boundary = talk.turns.len();
+                let goal = &mut talk.goals[0];
+                goal.wake = 1;
+                goal.started = Some(1);
+                goal.launch_turns = Some(boundary);
+                Ok(())
+            })
+            .unwrap();
+        let source = crate::chat_goal::Source::Goal {
+            id: "g".into(),
+            generation: 1,
+        };
+        assert!(
+            execute_authenticated(
+                &queue,
+                tmp.path(),
+                &talks,
+                &talk.id,
+                source.clone(),
+                Operation::Priority {
+                    task: unrelated.id.clone(),
+                    priority: 8
+                }
+            )
+            .await
+            .is_err()
+        );
+        execute_authenticated(
+            &queue,
+            tmp.path(),
+            &talks,
+            &talk.id,
+            source.clone(),
+            Operation::Priority {
+                task: task.id.clone(),
+                priority: 3,
+            },
+        )
+        .await
+        .unwrap();
+        talks
+            .mutate(&talk.id, |talk| {
+                talk.turns.push(serde_json::from_value(serde_json::json!({
+                    "sender": "operator", "who": "operator", "body": "Stop",
+                    "at": jiff::Timestamp::now()
+                }))?);
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            execute_authenticated(
+                &queue,
+                tmp.path(),
+                &talks,
+                &talk.id,
+                source.clone(),
+                Operation::Priority {
+                    task: task.id.clone(),
+                    priority: 9
+                }
+            )
+            .await
+            .is_err()
+        );
+        talks
+            .mutate(&talk.id, |talk| {
+                talk.turns.pop();
+                talk.goals[0].state = crate::chat_goal::State::Stopped;
+                talk.goals[0].wake = 2;
+                talk.goals[0].started = None;
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            execute_authenticated(
+                &queue,
+                tmp.path(),
+                &talks,
+                &talk.id,
+                source,
+                Operation::Priority {
+                    task: task.id.clone(),
+                    priority: 9
+                }
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(queue.get(&task.id).unwrap().priority, 3);
     }
 }

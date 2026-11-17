@@ -209,6 +209,7 @@ enum ClientProbe {
     Run,
     Upgrade,
     TalkScroll,
+    Goals,
 }
 
 // Expose the live module's functions without installing a second client that
@@ -251,6 +252,7 @@ async fn serve_with_client_probe(
             "state, loadRun, observeRunProgress, renderRunProgress, tickActive, applyRevisions_",
         ),
         ClientProbe::TalkScroll => Some("state, renderTalk, applyRoute, scheduleTalkPosition"),
+        ClientProbe::Goals => Some("state, loadTalk, renderTalkTasks"),
         ClientProbe::Upgrade => {
             Some("state, upgrade, renderLoop, renderUpgradeError, loadHealth, ok")
         }
@@ -3906,6 +3908,25 @@ async fn linkify_builds_anchors_and_keeps_markup_as_text() {
         )
         .await
         .unwrap();
+    // A second tab can leave the transcript hidden on Windows. Reference
+    // decoration intentionally waits for visibility; foreground this rendering
+    // fixture explicitly rather than depending on Chrome's tab activation.
+    let background = browser
+        .call(
+            None,
+            "Target.createTarget",
+            serde_json::json!({"url": "about:blank"}),
+        )
+        .await
+        .unwrap();
+    browser
+        .call(
+            None,
+            "Target.activateTarget",
+            serde_json::json!({"targetId": background["targetId"]}),
+        )
+        .await
+        .unwrap();
     browser
         .call(
             Some(&page.session),
@@ -3914,12 +3935,20 @@ async fn linkify_builds_anchors_and_keeps_markup_as_text() {
         )
         .await
         .unwrap();
+    browser
+        .call(
+            Some(&page.session),
+            "Page.bringToFront",
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
     // Keep secondary responses held until a painted transcript is observable.
     // Save the result so the gate is released even if this assertion fails.
     let transcript = browser
         .wait_for(
             &page,
-            "document.querySelectorAll('#talk-turns > li').length === 85 \
+            "!document.hidden && document.querySelectorAll('#talk-turns > li').length === 85 \
              && document.getElementById('talk-turns').textContent.includes('Synthetic message 84.') \
              && document.querySelector('#talk-turns pre code')?.textContent.trim() === '12ba' \
              && window.delayedChatReads.references > 0 \
@@ -5743,6 +5772,309 @@ async fn chat_task_progress_refreshes_and_survives_operation_races() {
         ] {
             assert_eq!(got[key], true, "@{width} {key}: {got}");
         }
+        browser.close_page(&page).await;
+    }
+}
+
+/// Durable goal summaries share the task-progress strip; links are resolved
+/// through owned records rather than model-authored text or guessed ids.
+#[tokio::test]
+async fn durable_chat_goals_stay_compact_safe_and_navigable() {
+    let Some(chrome) = cdp::find_chrome() else {
+        assert!(std::env::var_os("CI").is_none(), "Chrome required in CI");
+        eprintln!("SKIP durable chat goals: no Chrome");
+        return;
+    };
+    let guard = common::home_lock().await;
+    let fx = common::fixture(guard, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("magi-home");
+    let talks = Talks::at(home.join("talks"));
+    let queue = Queue::at(home.join("queue"));
+    let mut chat = talk::begin(&talks, &fx.config, fx.repo.clone(), None).unwrap();
+    let owner_input = "Ship the retry fix, follow its checks, and ask me to review the result.";
+    talk::record(&mut chat, &talks, owner_input, Vec::new()).unwrap();
+    let mut task = Task::new(
+        "Retry fix".into(),
+        owner_input.into(),
+        chat.repo.clone(),
+        Source::Agent {
+            run: chat.id.clone(),
+            node: magi::queue::CHAT_NODE.into(),
+        },
+    );
+    let mut run = RunState::new(
+        chat.repo.clone(),
+        "main".into(),
+        "0000000".into(),
+        owner_input.into(),
+        fx.config.clone(),
+    );
+    run.status = RunStatus::Reviewing;
+    run.save_under(&home).unwrap();
+    queue.put(&mut task).unwrap();
+    // An owner can attach an existing same-repository task even when this
+    // conversation did not file it. It must not inflate "filed from here".
+    let mut execution = Task::new(
+        "Existing review task".into(),
+        owner_input.into(),
+        chat.repo.clone(),
+        Source::Human,
+    );
+    execution.runs.push(run.id.clone());
+    queue.put(&mut execution).unwrap();
+    let mut unrelated = Task::new(
+        "Another chat's work".into(),
+        "Not this goal".into(),
+        fx.repo.join("other-repository"),
+        Source::Agent {
+            run: "another-chat".into(),
+            node: magi::queue::CHAT_NODE.into(),
+        },
+    );
+    unrelated.runs.push(run.id.clone());
+    queue.put(&mut unrelated).unwrap();
+    let purpose = "<img src=x onerror=alert(1)> Ship the retry fix without losing the conversation";
+    let seed_goal = |id: &str, state: &str, step: &str, tasks: Vec<String>, runs: Vec<String>| {
+        serde_json::from_value::<magi::chat_goal::Goal>(serde_json::json!({
+            "id": id, "purpose": purpose, "scope": "retry fix",
+            "condition": {"description": "Owner reviews the result", "kind": "owner_review"},
+            "state": state, "step": step, "source_turn": 0, "owner_input": owner_input,
+            "tasks": tasks, "runs": runs, "watches": [],
+            "evidence": "Seeded durable goal", "wake": 1, "handled": 1,
+            "started": null, "wakes": 0, "last_checked": null, "fingerprint": ""
+        }))
+        .unwrap()
+    };
+    chat.goals = vec![
+        seed_goal(
+            "queued-goal",
+            "runnable",
+            "Wait for a worker",
+            vec![task.id.clone()],
+            vec![],
+        ),
+        seed_goal(
+            "run-goal",
+            "waiting",
+            "Follow the recorded review",
+            vec![execution.id.clone()],
+            vec![run.id.clone()],
+        ),
+        seed_goal(
+            "owner-goal",
+            "owner",
+            "Review the result before closing",
+            vec![
+                unrelated.id.clone(),
+                "../escape".into(),
+                "missing-task".into(),
+            ],
+            vec![run.id.clone(), "../escape".into(), "missing-run".into()],
+        ),
+    ];
+    chat.selected_goal = Some("queued-goal".into());
+    talks.put(&mut chat).unwrap();
+    let base = serve_with_client_probe(
+        &home,
+        queue.clone(),
+        talks.clone(),
+        home.join("runs"),
+        &fx.repo,
+        ClientProbe::Goals,
+    )
+    .await;
+    let mut browser = cdp::Browser::launch(&chrome).await.unwrap();
+    for (width, height, mobile) in [(1280, 900, false), (390, 844, true)] {
+        chat.selected_goal = Some("queued-goal".into());
+        chat.goals[1].state = serde_json::from_value(serde_json::json!("waiting")).unwrap();
+        chat.goals[1].rev += 1;
+        talks.put(&mut chat).unwrap();
+        task.status = TaskStatus::Queued;
+        queue.put(&mut task).unwrap();
+        let page = browser
+            .open_page(&format!("{base}#/chat/{}", chat.id), width, height, mobile)
+            .await
+            .unwrap();
+        browser
+            .wait_for(
+                &page,
+                "!!window.deck && !!deck.state.talkDetail.sections && !document.getElementById('talk-goal-open').hidden",
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
+        let got = browser.eval(&page, &format!(r##"(() => {{
+          const check = (ok, why) => {{ if (!ok) throw new Error(why); }};
+          const goal = document.getElementById('talk-goal');
+          const strip = document.getElementById('talk-task-progress');
+          const link = document.getElementById('talk-goal-open');
+          check(goal.parentElement === strip && !goal.hidden, 'one integrated progress strip');
+          check(document.getElementById('talk-goal-purpose').textContent === 'Goal: ' + {purpose:?}, 'literal purpose');
+          check(!goal.querySelector('img'), 'goal text cannot create HTML');
+          check(document.getElementById('talk-goal-state').textContent === 'Following through', 'selected goal, not latest goal');
+          check(document.getElementById('talk-goal-step').textContent.includes('Wait for a worker'), 'current step');
+          check(link.getAttribute('href') === '#/tasks/' + {task_id:?}, 'owned pre-run task link');
+          check(!document.getElementById('talk-tasks-panel').open, 'task panel stays folded');
+          check(strip.textContent.includes('1 of 1 unfinished'), 'task progress retained');
+          const rect = strip.getBoundingClientRect();
+          check(rect.height < 260, 'compact summary, not a second dashboard');
+          check(rect.left >= 0 && rect.right <= innerWidth && strip.scrollWidth <= strip.clientWidth, 'phone wrapping');
+          const input = document.getElementById('f-talk-say');
+          input.value = 'Keep this unsent draft';
+          input.dispatchEvent(new Event('input', {{ bubbles: true }}));
+          check(document.getElementById('talk-close-go').disabled, 'draft close guard');
+          check(document.getElementById('talk-close-reason').textContent.includes('unsent'), 'guard explanation');
+          return true;
+        }})()"##, purpose = purpose, task_id = task.id)).await.unwrap();
+        assert_eq!(got, true, "initial goal at {width}px");
+        browser
+            .eval(&page, "document.getElementById('talk-goal-open').click()")
+            .await
+            .unwrap();
+        browser
+            .wait_for(
+                &page,
+                "deck.state.route.name === 'task' && !document.getElementById('view-task').hidden",
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
+        browser.eval(&page, "history.back()").await.unwrap();
+        browser
+            .wait_for(
+                &page,
+                "deck.state.route.name === 'talk' && !!deck.state.talkDetail.sections",
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
+
+        // Change the durable selection, not a client-only fixture. Refreshing
+        // must neither overwrite the composer nor expand the task panel.
+        chat.selected_goal = Some("run-goal".into());
+        talks.put(&mut chat).unwrap();
+        browser
+            .eval(&page, &format!("deck.loadTalk({:?})", chat.id))
+            .await
+            .unwrap();
+        let got = browser
+            .eval(
+                &page,
+                &format!(
+                    r##"(() => {{
+          const link = document.getElementById('talk-goal-open');
+          const talk = deck.state.talkDetail.talk;
+          const out = {{
+            waiting: document.getElementById('talk-goal-state').textContent === 'Waiting',
+            run: link.getAttribute('href') === '#/runs/' + {run_id:?},
+            draft: document.getElementById('f-talk-say').value === 'Keep this unsent draft',
+            folded: !document.getElementById('talk-tasks-panel').open,
+            guarded: document.getElementById('talk-close-go').disabled,
+          }};
+          deck.renderTalkTasks({{...talk, updated_at: 'newer-core'}});
+          out.staleHidden = link.hidden && !link.hasAttribute('href');
+          deck.renderTalkTasks(talk);
+          link.click();
+          return out;
+        }})()"##,
+                    run_id = run.id
+                ),
+            )
+            .await
+            .unwrap();
+        for key in [
+            "waiting",
+            "run",
+            "draft",
+            "folded",
+            "guarded",
+            "staleHidden",
+        ] {
+            assert_eq!(got[key], true, "{key} at {width}px: {got}");
+        }
+        browser
+            .wait_for(
+                &page,
+                "deck.state.route.name === 'run' && !document.getElementById('view-run').hidden",
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
+        browser.eval(&page, "history.back()").await.unwrap();
+        browser
+            .wait_for(
+                &page,
+                "deck.state.route.name === 'talk' && !!deck.state.talkDetail.sections",
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            browser
+                .eval(&page, "document.getElementById('f-talk-say').value")
+                .await
+                .unwrap(),
+            "Keep this unsent draft"
+        );
+
+        // All filed tasks finishing is not completion of the selected goal.
+        // An invalid selected id falls back to the latest durable goal.
+        task.status = TaskStatus::Done;
+        queue.put(&mut task).unwrap();
+        chat.selected_goal = Some("removed-goal".into());
+        talks.put(&mut chat).unwrap();
+        browser
+            .eval(&page, &format!("deck.loadTalk({:?})", chat.id))
+            .await
+            .unwrap();
+        browser
+            .wait_for(
+                &page,
+                "document.getElementById('talk-task-progress-text').textContent.includes('all 1 complete')",
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
+        let got = browser.eval(&page, r##"(() => {
+          const link = document.getElementById('talk-goal-open');
+          return {
+            owner: document.getElementById('talk-goal-state').textContent === 'Needs your input',
+            step: document.getElementById('talk-goal-step').textContent.includes('Review the result'),
+            safe: link.hidden && !link.hasAttribute('href'),
+            completeTasks: document.getElementById('talk-task-progress-text').textContent.includes('all 1 complete'),
+            reviewNote: !document.getElementById('talk-task-progress-note').hidden,
+            draft: document.getElementById('f-talk-say').value === 'Keep this unsent draft'
+          };
+        })()"##).await.unwrap();
+        for key in [
+            "owner",
+            "step",
+            "safe",
+            "completeTasks",
+            "reviewNote",
+            "draft",
+        ] {
+            assert_eq!(got[key], true, "{key} at {width}px: {got}");
+        }
+        browser.close_page(&page).await;
+
+        // A fresh browser consumer sees the persisted completed selection.
+        chat.selected_goal = Some("run-goal".into());
+        chat.goals[1].state = serde_json::from_value(serde_json::json!("completed")).unwrap();
+        chat.goals[1].step = "Owner reviewed the result".into();
+        // Fixture transitions must advance the revision, like guarded goal
+        // updates; equal-revision whole-talk saves preserve the disk state.
+        chat.goals[1].rev += 1;
+        talks.put(&mut chat).unwrap();
+        let page = browser
+            .open_page(&format!("{base}#/chat/{}", chat.id), width, height, mobile)
+            .await
+            .unwrap();
+        browser.wait_for(&page, "!!window.deck && !!deck.state.talkDetail.sections && document.getElementById('talk-goal-state').textContent === 'Completed'", Duration::from_secs(30)).await.unwrap();
+        assert_eq!(
+            browser.eval(&page, "deck.state.talkDetail.talk.goals.length === 3 && document.getElementById('talk-goal-step').textContent.includes('Owner reviewed')").await.unwrap(),
+            true
+        );
         browser.close_page(&page).await;
     }
 }

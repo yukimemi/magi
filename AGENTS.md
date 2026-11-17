@@ -3710,3 +3710,32 @@ message URLs carry this fingerprint and the turn timestamp to detect shifted
 transcript indices without putting message bodies in browser history. This is
 navigation evidence, not an authentication or integrity check. Search leaves
 must mirror the UI's message rows (`messages` when present, otherwise the turn).
+
+### Durable chat goals
+
+`chat_goal` retains multiple owner-authorized requests on `Talk`, separate from
+conversation openness, task completion and CLI activity. Only the launcher's
+actual owner input can establish or broaden a goal; automatic reports, external
+submissions and goal wakes are data, not fresh consent. The authenticated control
+bridge captures this source before spawning its server and fences stopped/stale
+goal generations again at effect admission. Keep existing control receipts,
+merge head binding and sandbox grants; goals are not another effect executor.
+
+`chat_goal_runtime` observes task/run/watch and bounded PR evidence, reserving
+finite `chat_worker` jobs only for changed evidence. Its independent reserved
+input never drains unsent/recovered drafts. Waiting holds neither a CLI nor the
+turn lease. Persist started generations before invoking; an interrupted uncertain
+turn pauses rather than replaying an effect. A separately reserved finite
+`daemon-service` (`chat-goals`) performs external observations off the scheduler's
+admission loop. Reconciliation checks at most eight oldest goals per service
+pass, at least sixty seconds apart per goal, with thirty-two automatic turns
+and 240 evidence probes per accepted authorization. Every associated task/run/watch
+is observed; completion never uses a truncated prefix. Refresh every distinct
+associated PR once per lap with a timed lookup and associate its result with all
+referring runs, rather than repeatedly querying a fixed prefix. Unknown evidence
+stays unknown and owner-wait/stopped goals do not auto-reactivate.
+
+Completion is machine-observed, never inferred from assistant prose, a task flag
+or PR creation. Landing requires fresh confirmed merge of the recorded head.
+The existing Chat task-progress strip adds purpose, state and current step/wait,
+with a validated Run or Task link; detailed execution remains on Run.

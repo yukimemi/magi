@@ -679,6 +679,44 @@ Unlike a one-shot interview, Chat does not end when a task is filed: the agent
 runs `magi task add --solo` from inside the conversation, tells you the task
 id, and the conversation stays open for whatever comes up next.
 
+### Durable follow-through
+
+An explicit request for continuing work is saved as a goal, independently of
+the transcript, task status and CLI session. The agent registers its purpose,
+authorized scope, actual owner input, completion condition and related tasks,
+runs or supervised watches through `magi task control goal`. Ordinary questions,
+automatic reports and external submissions cannot establish or expand a goal.
+Several unfinished requests remain retained; a later status question does not
+replace earlier work.
+
+Guarded goal transitions advance per-goal revisions. Whole-conversation saves
+retain missing goals and prefer durable state at equal or newer revisions, so
+a stale reply cannot erase progress, execution receipts or an owner's stop.
+
+The scheduler reserves an independent finite goal-observation service; slow
+forge and Git reads never run on its task-admission loop. Each service lap
+checks at most eight goals, reading every associated task, run and watch
+without truncating completion evidence. Every distinct associated PR is refreshed
+once per lap with a bounded lookup, including PRs beyond the first four; its
+result remains associated with every referring run. Changed evidence reserves
+one finite conversation worker; unchanged evidence spends no agent turn.
+Waiting releases the CLI and turn lease.
+Goal input is separate from drafts and never sends an unsent owner message.
+Fresh, resumed and fallback seats receive the saved goals and current evidence.
+Repairs use existing controls and their effect receipts, not replacement tasks.
+Uncertain interrupted execution pauses for reconciliation instead of replaying it.
+Automatic continuations are capped at 32 and evidence probes at 240 per
+authorization; exhaustion is visible rather than an indefinite polling loop.
+
+The compact Chat progress area shows purpose, state, current step/wait reason and
+the relevant existing Run (or Task before a run exists). Graph stages, reviews,
+verification and logs remain on Run. A completed task or a newly opened PR is not
+goal completion: landing requires a fresh confirmed merge of the recorded head.
+Implementation-only goals retain the distinction between a delivered, verified
+artifact and owner approval to merge. Automatic events never supply that approval.
+Stop/cancel is a goal transition, and stale queued continuations cannot admit
+new typed effects. Closing a chat does not authorize reopening it for a goal.
+
 ### External CLI conversations
 
 An external tool can join an existing standing conversation without the web UI:

@@ -6822,7 +6822,50 @@ function talkTasksSummary(progress) {
 
 const TALK_TASKS_STORAGE_KEY = "magi.talkTasksOpen";
 
+function renderTalkGoal(talk) {
+  const goals = Array.isArray(talk && talk.goals) ? talk.goals : [];
+  const goal = goals.find(goal => goal.id === talk.selected_goal) || goals.at(-1);
+  const link = $("talk-goal-open");
+  show($("talk-goal"), Boolean(goal));
+  show(link, false);
+  setAttr(link, "href", null);
+  if (!goal) return;
+  setText($("talk-goal-purpose"), `Goal: ${goal.purpose}`);
+  const labels = { runnable: "Following through", waiting: "Waiting", owner: "Needs your input",
+    completed: "Completed", paused: "Paused", stopped: "Stopped" };
+  setText($("talk-goal-state"), labels[goal.state] || goal.state);
+  const step = goal.step ? [`Step: ${goal.step}`] : [];
+  if (["runnable", "waiting"].includes(goal.state)) {
+    const checked = Date.parse(goal.last_checked || "");
+    if (!Number.isFinite(checked)) step.push("Evidence not checked yet");
+    else if (Date.now() - checked > 5 * 60 * 1000) step.push("Evidence may be stale");
+    try {
+      const facts = JSON.parse(goal.evidence || "{}");
+      if (["tasks", "runs", "prs", "watches"].some(key => Array.isArray(facts[key])
+          && facts[key].some(item => item.evidence?.unavailable || item.observation?.unavailable))
+          || facts.decisions?.unavailable) step.push("Evidence unavailable");
+    } catch { /* Historical non-JSON evidence is not a fresh observation. */ }
+  }
+  setText($("talk-goal-step"), step.join(" · "));
+  show($("talk-goal-step"), step.length > 0);
+  const target = talk.goal_link;
+  // References arrive separately from the transcript. Never retain a link
+  // from an older selected goal or a stale enrichment response.
+  if (!target || target.goal !== goal.id || talk.goal_link_for !== talk.updated_at
+      || !["run", "task"].includes(target.kind) || typeof target.id !== "string"
+      || !target.id || target.id === "." || target.id === ".." || /[/\\]/.test(target.id)) {
+    step.push((goal.tasks?.length || goal.runs?.length) ? "Run details unavailable" : "No run yet");
+    setText($("talk-goal-step"), step.join(" · "));
+    show($("talk-goal-step"), true);
+    return;
+  }
+  setAttr(link, "href", `#/${target.kind === "run" ? "runs" : "tasks"}/${encodeURIComponent(target.id)}`);
+  setText(link, `${target.kind === "run" ? "Run" : "Task"} ${shortId(target.id)}`);
+  show(link, true);
+}
+
 function renderTalkTasks(talk) {
+  renderTalkGoal(talk);
   const panel = $("talk-tasks-panel");
   const progress = talk && talk.task_progress;
   const tasks = Array.isArray(talk && talk.tasks) ? talk.tasks : [];
@@ -6958,6 +7001,7 @@ function renderTalk() {
     }
     clear($("talk-turns"));
     show($("talk-tasks-panel"), false);
+    renderTalkGoal(null);
     show($("talk-task-progress"), !gone);
     setText($("talk-task-progress-text"), "Tasks filed from this chat: not loaded yet.");
     show($("talk-task-progress-open"), false);

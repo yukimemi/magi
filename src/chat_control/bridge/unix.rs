@@ -39,6 +39,7 @@ impl Bridge {
     pub fn start(home: &Path, talk: &str, artifacts: &Path) -> Result<Self> {
         let talks = crate::talk::Talks::at(home.join("talks"));
         super::super::authorize(&talks, talk, crate::queue::CHAT_NODE)?;
+        let source = crate::chat_goal::current_source();
         // Anonymous pipes need neither a path grant nor network access.
         let (requests, mut incoming) = tokio::net::unix::pipe::pipe()?;
         let (mut outgoing, responses) = tokio::net::unix::pipe::pipe()?;
@@ -52,7 +53,7 @@ impl Bridge {
             .open(&path)?;
         std::fs::remove_file(path)?;
         let serial = socket::Serial::default();
-        let socket = match socket::Socket::start(home, talk, serial.clone()) {
+        let socket = match socket::Socket::start(home, talk, serial.clone(), source.clone()) {
             Ok(socket) => Some(socket),
             Err(error) => {
                 tracing::warn!(%error, "chat control socket unavailable; inherited descriptor transport remains available");
@@ -70,11 +71,12 @@ impl Bridge {
                     incoming.read_exact(&mut body).await?;
                     let Request { id, operation } = serde_json::from_slice(&body)?;
                     let _guard = serial.lock().await;
-                    let result = super::super::execute(
+                    let result = super::super::execute_authenticated(
                         &crate::queue::Queue::at(home.join("queue")),
                         &home,
                         &talks,
                         &talk,
+                        source.clone(),
                         operation,
                     )
                     .await

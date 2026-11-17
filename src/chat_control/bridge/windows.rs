@@ -120,6 +120,7 @@ impl Bridge {
     pub fn start(home: &Path, talk: &str, _artifacts: &Path) -> Result<Self> {
         let talks = crate::talk::Talks::at(home.join("talks"));
         super::super::authorize(&talks, talk, crate::queue::CHAT_NODE)?;
+        let source = crate::chat_goal::current_source();
         let name = format!(r"\\.\pipe\magi-chat-{}", secret()?);
         let token = secret()?;
         let mut incoming = listen(&name, true)?;
@@ -146,6 +147,7 @@ impl Bridge {
                             let talk = talk.clone();
                             let token = token.clone();
                             let active = active.clone();
+                            let source = source.clone();
                             connections.spawn(async move {
                                 let _ = tokio::time::timeout(IO_TIMEOUT, async {
                                     // Authenticate before parsing or executing an operation.
@@ -159,9 +161,9 @@ impl Bridge {
                                     let Request { id, operation } = serde_json::from_slice(&body)?;
                                     ensure!(active.load(Ordering::Acquire), "control capability revoked");
                                     let talks = crate::talk::Talks::at(home.join("talks"));
-                                    let result = super::super::execute(
+                                    let result = super::super::execute_authenticated(
                                         &crate::queue::Queue::at(home.join("queue")),
-                                        &home, &talks, &talk, operation,
+                                        &home, &talks, &talk, source, operation,
                                     ).await.map_err(|e| format!("{e:#}"));
                                     let response = serde_json::to_vec(&Response { id, result })?;
                                     ensure!(response.len() <= MAX_FRAME, "control response too large");
