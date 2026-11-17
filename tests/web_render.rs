@@ -3936,7 +3936,11 @@ async fn linkify_builds_anchors_and_keeps_markup_as_text() {
         .await
         .unwrap();
     browser
-        .call(Some(&page.session), "Page.bringToFront", serde_json::json!({}))
+        .call(
+            Some(&page.session),
+            "Page.bringToFront",
+            serde_json::json!({}),
+        )
         .await
         .unwrap();
     // Keep secondary responses held until a painted transcript is observable.
