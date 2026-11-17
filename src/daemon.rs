@@ -4190,6 +4190,7 @@ async fn poll(
         if let Err(error) = crate::chat_control::reconcile_decisions(queue, home) {
             tracing::warn!("decision receipt reconciliation remains pending: {error:#}");
         }
+        crate::chat_goal_runtime::sweep(&talks, stop.parking()).await;
         let mut turns = tokio::task::JoinSet::new();
         crate::chat_notify::start_turns(&talks, stop.parking(), &mut turns);
         // start_turns dispatches detached turns; no paid work lives in this set.

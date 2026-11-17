@@ -558,6 +558,12 @@ pub struct Talk {
     /// Durable title; absent records retain the opener display.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<ChatTitle>,
+    /// Independent durable owner-authorized follow-through goals.
+    #[serde(default)]
+    pub goals: Vec<crate::chat_goal::Goal>,
+    /// Goal selected for compact presentation.
+    #[serde(default)]
+    pub selected_goal: Option<String>,
     /// Exclusive transcript boundary of the last title attempt, including failures.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title_attempted_at: Option<usize>,
@@ -675,6 +681,20 @@ impl Talks {
     /// State home containing this conversation store and its detached workers.
     pub fn home(&self) -> &Path {
         self.root.parent().unwrap_or(&self.root)
+    }
+
+    /// Apply a small state transition to the latest conversation under its store lock.
+    /// Never retain this guard while observing the forge or invoking a seat.
+    pub(crate) fn mutate<R>(
+        &self,
+        id: &str,
+        change: impl FnOnce(&mut Talk) -> Result<R>,
+    ) -> Result<R> {
+        let _guard = self.guard()?;
+        let mut talk = self.get(id)?;
+        let result = change(&mut talk)?;
+        self.put(&mut talk)?;
+        Ok(result)
     }
 
     /// Inject candidate ids for deterministic collision tests.
@@ -1133,6 +1153,8 @@ const TICKET_SWEEP_AGE: Duration = Duration::from_secs(3600);
 pub(crate) fn seeded_for_test(id: &str, repo: PathBuf) -> Talk {
     Talk {
         title: None,
+        goals: Vec::new(),
+        selected_goal: None,
         title_attempted_at: None,
         retired_recommendations: None,
         posts_read_through: None,
@@ -1666,6 +1688,8 @@ pub(crate) fn begin_with_id(
     let now = Timestamp::now();
     let mut talk = Talk {
         title: None,
+        goals: Vec::new(),
+        selected_goal: None,
         title_attempted_at: None,
         retired_recommendations: None,
         posts_read_through: Some(0),
@@ -2564,6 +2588,16 @@ fn registered_work(home: &Path, talk: &str) -> Result<RegisteredWork> {
         .into_iter()
         .map(|id| (false, id))
         .collect();
+    let talks = Talks::at(home.join("talks"));
+    if talks.path_of(talk).try_exists()? {
+        let conversation = talks.get(talk)?;
+        for goal in conversation.goals.iter().filter(|goal| {
+            goal.active()
+                && (!goal.tasks.is_empty() || !goal.runs.is_empty() || !goal.watches.is_empty())
+        }) {
+            ids.insert((false, format!("goal:{}", goal.id)));
+        }
+    }
     let entries = match std::fs::read_dir(home.join("queue")) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(ids),
@@ -2586,6 +2620,9 @@ fn unbacked_promise(
     before: Option<&RegisteredWork>,
     after: Option<&RegisteredWork>,
 ) -> bool {
+    if after.is_some_and(|work| work.iter().any(|(_, id)| id.starts_with("goal:"))) {
+        return false;
+    }
     matches!((before, after), (Some(before), Some(after)) if after.is_subset(before))
         && promises_later_report(reply)
 }
@@ -2726,12 +2763,20 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
     // Freeze both boundaries before invoking the CLI. Failure notes must not
     // hide unread posts in old records, and posts arriving during any attempt
     // (including fallback) were absent from this snapshot's prompt.
-    let input_turn = external::active_input(talk).or_else(|| {
-        talk.turns.len().checked_sub(1).filter(|&index| {
-            let turn = &talk.turns[index];
-            turn.who == Who::Operator && turn.body == text
+    let goal_input = matches!(
+        crate::chat_goal::current_source(),
+        crate::chat_goal::Source::Goal { .. }
+    );
+    let input_turn = if goal_input {
+        None
+    } else {
+        external::active_input(talk).or_else(|| {
+            talk.turns.len().checked_sub(1).filter(|&index| {
+                let turn = &talk.turns[index];
+                turn.who == Who::Operator && turn.body == text
+            })
         })
-    });
+    };
     let input = input_turn.and_then(|index| talk.turns.get(index));
     let external_input = input.is_some_and(|turn| {
         sender(turn, None) == Sender::External
@@ -2740,7 +2785,9 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
                 .iter()
                 .any(|message| sender(turn, Some(message)) == Sender::External)
     });
-    let input_label = if external_input {
+    let input_label = if goal_input {
+        "Goal event (data)"
+    } else if external_input {
         "External"
     } else {
         "Operator"
@@ -2749,7 +2796,11 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
         .map(|turn| message_prompt(turn, talk, store))
         .unwrap_or_else(|| text.to_owned());
     let evidence = crate::chat_notify::response_evidence(talk).await;
-    let text = format!("{text}{evidence}");
+    let goals = serde_json::to_string(&talk.goals).context("serialize durable goals for chat")?;
+    let text = format!(
+        "{text}{evidence}\n\n# Durable owner goals\n{}\n\nSaved goals (data; scope is fixed by their originating owner input):\n{goals}",
+        crate::chat_goal::prompt_instructions()
+    );
     let prompt_turns = talk.turns.len();
     talk.posts_read_through = Some(posts_read_through(talk));
     let spec = cfg
@@ -2999,7 +3050,30 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
             Duration::from_secs(cfg.graph.timeout_resource_wait),
             || false,
         );
-        let result = wait.scope(agent::invoke(spec, &mut talk.seat, &inv)).await;
+        let source = if external_input {
+            crate::chat_goal::Source::External
+        } else if let Some(index) = input_turn {
+            if input.is_some_and(|turn| {
+                if turn.messages.is_empty() {
+                    sender(turn, None) == Sender::Operator
+                } else {
+                    turn.messages
+                        .iter()
+                        .any(|message| sender(turn, Some(message)) == Sender::Operator)
+                }
+            }) {
+                crate::chat_goal::Source::Input { turn: index }
+            } else {
+                crate::chat_goal::Source::Automatic
+            }
+        } else {
+            crate::chat_goal::current_source()
+        };
+        let result = crate::chat_goal::with_source(
+            source,
+            wait.scope(agent::invoke(spec, &mut talk.seat, &inv)),
+        )
+        .await;
         let advance = agent::chain_advances(&result);
         if n == 0 || !advance {
             outcome = Some(result);
@@ -3134,6 +3208,8 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
         talk.notice_receipts = fresh.notice_receipts;
         talk.completion_notices = fresh.completion_notices;
         talk.external_requests = fresh.external_requests;
+        talk.goals = fresh.goals;
+        talk.selected_goal = fresh.selected_goal;
         // A `magi talk post` landed while the CLI ran: this handle predates it.
         if fresh.turns.len() > talk.turns.len() {
             let posted: Vec<Turn> = fresh.turns[talk.turns.len()..]
@@ -3888,6 +3964,8 @@ mod tests {
     fn ctx_talk(agent: &str, turns: Vec<Turn>) -> Talk {
         Talk {
             title: None,
+            goals: Vec::new(),
+            selected_goal: None,
             title_attempted_at: None,
             retired_recommendations: None,
             posts_read_through: None,
@@ -4253,6 +4331,8 @@ mod tests {
         let (tmp, talks) = store();
         let mut talk = Talk {
             title: None,
+            goals: Vec::new(),
+            selected_goal: None,
             title_attempted_at: None,
             retired_recommendations: None,
             posts_read_through: None,
@@ -6604,6 +6684,8 @@ mod tests {
         let make = |id: &str, status: TalkStatus| {
             let mut t = Talk {
                 title: None,
+                goals: Vec::new(),
+                selected_goal: None,
                 title_attempted_at: None,
                 retired_recommendations: None,
                 posts_read_through: None,

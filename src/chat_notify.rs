@@ -1,12 +1,11 @@
 //! Telling a chat how a task it filed ended.
 //!
-//! A chat is single-turn: it speaks only when the operator writes, so "I will
-//! tell you when it finishes" cannot be kept by the agent. This module keeps
-//! it for the agent. When a task filed by a chat ([`Task::filed_by_chat`])
-//! reaches a final state, a fixed English notice is queued as a draft of the
-//! originating talk, and the talk's own turn machinery (its session, its
-//! lease) runs it. No new seat and no new waiter: the same shape as
-//! [`crate::consult`].
+//! Passive task-outcome reports use the talk's existing draft/turn delivery.
+//! A task filed by a chat ([`Task::filed_by_chat`]) reaching a final state
+//! queues a fixed report in that same conversation and session.
+//! Reports are data, not owner instructions. Separately accepted durable goals
+//! may continue through `chat_goal_runtime`; a report cannot create or expand
+//! that authority. No notice starts a second seat or legacy question waiter.
 //!
 //! - **A reconciler, not a hook.** [`sweep`] looks at the queue on every
 //!   daemon tick, so whoever put the task in its final state (the loop, `magi
@@ -161,7 +160,7 @@ fn open_questions(home: &Path, run: &str) -> Result<Vec<serde_json::Value>> {
 }
 
 /// A bounded read-only observation; dropping a timed-out child kills it.
-async fn current_pr(repo: &Path, url: &str) -> Result<serde_json::Value> {
+pub(crate) async fn current_pr(repo: &Path, url: &str) -> Result<serde_json::Value> {
     use crate::proc::Quiet as _;
     use anyhow::Context;
     let mut command = tokio::process::Command::new("gh");

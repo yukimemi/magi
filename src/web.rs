@@ -9159,6 +9159,8 @@ struct TalkDetailView {
     view: TalkView,
     tasks: Vec<TaskView>,
     task_progress: TalkTaskProgress,
+    goal_link: Option<TalkGoalLink>,
+    goal_link_for: Timestamp,
     /// The agents this talk's repository can switch to; empty when its
     /// configuration cannot be read, which must not fail the whole detail.
     roster: Vec<RosterEntry>,
@@ -9207,6 +9209,52 @@ fn talk_task_progress(tasks: &[Task]) -> TalkTaskProgress {
         counts,
         unfinished_ids,
     }
+}
+
+/// A target must still belong to an explicitly referenced, same-repository
+/// task. Missing/deleted records leave the goal readable.
+#[derive(Debug, Serialize)]
+struct TalkGoalLink {
+    goal: String,
+    kind: &'static str,
+    id: String,
+}
+
+fn talk_goal_link(talk: &Talk, queue: &Queue, runs: &FsPath) -> Option<TalkGoalLink> {
+    let goal = talk
+        .selected_goal
+        .as_ref()
+        .and_then(|id| talk.goals.iter().find(|goal| &goal.id == id))
+        .or_else(|| talk.goals.last())?;
+    for id in goal.tasks.iter().rev() {
+        if !plain_record_id(id) {
+            continue;
+        }
+        let Ok(task) = queue.get(id) else {
+            continue;
+        };
+        if task.id != *id || task.repo != talk.repo {
+            continue;
+        }
+        // Repository reassignments retain historical runs. Only this task's
+        // current execution can be presented as the goal's current Run.
+        if let Some(run) = task.execution_runs().last()
+            && plain_record_id(run)
+            && read_run(runs, run).is_ok_and(|state| state.id == *run && state.repo == talk.repo)
+        {
+            return Some(TalkGoalLink {
+                goal: goal.id.clone(),
+                kind: "run",
+                id: run.clone(),
+            });
+        }
+        return Some(TalkGoalLink {
+            goal: goal.id.clone(),
+            kind: "task",
+            id: task.id,
+        });
+    }
+    None
 }
 
 /// One persona as the talk's persona selector shows it.
@@ -9337,6 +9385,7 @@ async fn talk_sections(
         let talk = ui.talks.get(&id)?;
         let tasks = ui.find_tasks_for_talk(&talk.id)?;
         let task_progress = talk_task_progress(&tasks);
+        let goal_link = talk_goal_link(&talk, &ui.queue, &ui.runs);
         let tasks: Vec<_> = tasks
             .into_iter()
             .map(|task| {
@@ -9377,6 +9426,7 @@ async fn talk_sections(
         let persona_avatar = avatar_url(&ui.home, &talk.id, &active_persona);
         Ok(Json(serde_json::json!({
             "tasks": tasks, "task_progress": task_progress,
+            "goal_link": goal_link, "goal_link_for": talk.updated_at,
             "roster": roster, "personas": personas,
             "context": talk::context_usage(&talk, cfg.as_ref()),
             "context_for": talk.updated_at,
@@ -9399,6 +9449,8 @@ async fn talk_detail(
         let thinking = ui.is_thinking_observed(&talk.id);
         let tasks = ui.find_tasks_for_talk(&talk.id)?;
         let task_progress = talk_task_progress(&tasks);
+        let goal_link = talk_goal_link(&talk, &ui.queue, &ui.runs);
+        let goal_link_for = talk.updated_at;
         let tasks = tasks.into_iter().map(TaskView::from).collect();
         let cfg = Config::discover(&talk.repo, None).ok().map(|(cfg, _)| cfg);
         let roster = cfg
@@ -9430,6 +9482,8 @@ async fn talk_detail(
             view: TalkView::with_config(talk, thinking, cfg.as_ref(), &ui.home, &ui.references),
             tasks,
             task_progress,
+            goal_link,
+            goal_link_for,
             roster,
             personas,
         }))

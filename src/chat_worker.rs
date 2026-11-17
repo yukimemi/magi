@@ -195,6 +195,17 @@ pub async fn run_turn_worker(home: &std::path::Path, payload: serde_json::Value)
         .map(usize::try_from)
         .transpose()?;
     let talks = Talks::at(home.join("talks"));
+    if let Some(wake) = payload.get("goal_wake") {
+        let goal = wake
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .context("goal wake has no goal id")?;
+        let generation = wake
+            .get("generation")
+            .and_then(serde_json::Value::as_u64)
+            .context("goal wake has no generation")?;
+        return crate::chat_goal_runtime::run_wake(&talks, id, goal, generation).await;
+    }
     if let Some(request) = payload
         .get("external_request")
         .and_then(serde_json::Value::as_str)

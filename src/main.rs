@@ -760,6 +760,11 @@ enum TalkCmd {
 /// Direct control of this chat's own tasks and runs (standing chat seat only).
 #[derive(Debug, Subcommand)]
 enum ControlCmd {
+    /// Establish or manage durable owner-authorized follow-through.
+    Goal {
+        #[command(subcommand)]
+        command: magi::chat_goal::Command,
+    },
     /// Reassign an idle task; keep history and start future work in the selected repository.
     Reassign {
         /// Task id or unambiguous prefix.
@@ -4000,6 +4005,7 @@ async fn task_cmd_inner(command: TaskCmd, q: Queue) -> Result<()> {
             let talk_id = talk.id.as_str();
             use magi::chat_control as cc;
             let operation = match op {
+                ControlCmd::Goal { command } => cc::Operation::Goal { command },
                 ControlCmd::Reassign { id, repo } => cc::Operation::Reassign { task: id, repo },
                 ControlCmd::ReconcileRepairGrant { request } => {
                     cc::Operation::ReconcileRepairGrant { request }

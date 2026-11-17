@@ -33,6 +33,8 @@ pub mod blockers;
 pub mod bump;
 pub mod cache;
 pub mod chat_control;
+pub mod chat_goal;
+pub(crate) mod chat_goal_runtime;
 mod chat_merge;
 pub mod chat_notify;
 pub mod chat_watch;

@@ -10,6 +10,8 @@ async fn baseline_talk_detail(
         let thinking = ui.is_thinking(&talk.id);
         let tasks = talk::tasks_of(&ui.queue, &talk.id);
         let task_progress = talk_task_progress(&tasks);
+        let goal_link = talk_goal_link(&talk, &ui.queue, &ui.runs);
+        let goal_link_for = talk.updated_at;
         let tasks = tasks.into_iter().map(TaskView::from).collect();
         let cfg = Config::discover(&talk.repo, None).ok().map(|(cfg, _)| cfg);
         let roster = cfg
@@ -41,6 +43,8 @@ async fn baseline_talk_detail(
             view: TalkView::with_config(talk, thinking, cfg.as_ref(), &ui.home, &ui.references),
             tasks,
             task_progress,
+            goal_link,
+            goal_link_for,
             roster,
             personas,
         }))
