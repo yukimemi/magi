@@ -709,9 +709,11 @@ Automatic continuations are capped at 32 and evidence probes at 240 per
 authorization; exhaustion is visible rather than an indefinite polling loop.
 
 The compact Chat progress area shows purpose, state, current step/wait reason and
-the relevant existing Run (or Task before a run exists). Graph stages, reviews,
-verification and logs remain on Run. A completed task or a newly opened PR is not
-goal completion: landing requires a fresh confirmed merge of the recorded head.
+the relevant existing Run (or Task before a run exists). Referenced tasks take
+precedence; otherwise the newest valid explicitly referenced same-repository Run
+is used. Graph stages, reviews, verification and logs remain on Run. A completed
+task or a newly opened PR is not goal completion: landing requires a fresh
+confirmed merge of the recorded head.
 Implementation-only goals retain the distinction between a delivered, verified
 artifact and owner approval to merge. Automatic events never supply that approval.
 Stop/cancel is a goal transition, and stale queued continuations cannot admit

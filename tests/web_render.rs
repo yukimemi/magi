@@ -5810,7 +5810,30 @@ async fn durable_chat_goals_stay_compact_safe_and_navigable() {
         fx.config.clone(),
     );
     run.status = RunStatus::Reviewing;
-    run.save_under(&home).unwrap();
+    run.reserve_under(&home).unwrap();
+    let reserve_run = |repo| {
+        let mut state = RunState::new(
+            repo,
+            "main".into(),
+            "0000000".into(),
+            owner_input.into(),
+            fx.config.clone(),
+        );
+        state.reserve_under(&home).unwrap();
+        state
+    };
+    let direct_run = reserve_run(chat.repo.clone());
+    let foreign_run = reserve_run(fx.repo.join("foreign-repository"));
+    let corrupt_run = reserve_run(chat.repo.clone());
+    let mismatched_run = reserve_run(chat.repo.clone());
+    let run_file = |id: &str| home.join("runs").join(id).join("run.json");
+    std::fs::write(run_file(&corrupt_run.id), b"not json").unwrap();
+    // A readable record under the wrong reference must not produce a link.
+    std::fs::write(
+        run_file(&mismatched_run.id),
+        serde_json::to_vec(&direct_run).unwrap(),
+    )
+    .unwrap();
     queue.put(&mut task).unwrap();
     // An owner can attach an existing same-repository task even when this
     // conversation did not file it. It must not inflate "filed from here".
@@ -5851,14 +5874,21 @@ async fn durable_chat_goals_stay_compact_safe_and_navigable() {
             "runnable",
             "Wait for a worker",
             vec![task.id.clone()],
-            vec![],
+            vec![direct_run.id.clone()],
         ),
         seed_goal(
             "run-goal",
             "waiting",
             "Follow the recorded review",
             vec![execution.id.clone()],
-            vec![run.id.clone()],
+            vec![direct_run.id.clone()],
+        ),
+        seed_goal(
+            "direct-run-goal",
+            "waiting",
+            "Follow the directly referenced Run",
+            vec![],
+            vec![direct_run.id.clone()],
         ),
         seed_goal(
             "owner-goal",
@@ -5869,7 +5899,11 @@ async fn durable_chat_goals_stay_compact_safe_and_navigable() {
                 "../escape".into(),
                 "missing-task".into(),
             ],
-            vec![run.id.clone(), "../escape".into(), "missing-run".into()],
+            vec![
+                foreign_run.id.clone(),
+                "../escape".into(),
+                "missing-run".into(),
+            ],
         ),
     ];
     chat.selected_goal = Some("queued-goal".into());
@@ -6017,6 +6051,82 @@ async fn durable_chat_goals_stay_compact_safe_and_navigable() {
             "Keep this unsent draft"
         );
 
+        // Only persisted references resolve links. Exercise each unsafe record
+        // alone, then after an earlier valid direct reference.
+        chat.selected_goal = Some("direct-run-goal".into());
+        let invalid_runs = [
+            "../escape".to_string(),
+            "missing-run".to_string(),
+            foreign_run.id.clone(),
+            corrupt_run.id.clone(),
+            mismatched_run.id.clone(),
+        ];
+        let mut cases = vec![
+            (vec![direct_run.id.clone()], Some(&direct_run.id)),
+            (
+                vec![run.id.clone(), direct_run.id.clone()],
+                Some(&direct_run.id),
+            ),
+        ];
+        for invalid in invalid_runs {
+            cases.push((vec![invalid.clone()], None));
+            cases.push((vec![direct_run.id.clone(), invalid], Some(&direct_run.id)));
+        }
+        for (references, expected) in cases {
+            chat.goals[2].runs = references;
+            chat.goals[2].rev += 1;
+            talks.put(&mut chat).unwrap();
+            browser
+                .eval(&page, &format!("deck.loadTalk({:?})", chat.id))
+                .await
+                .unwrap();
+            let expected =
+                serde_json::to_string(&expected.map(|id| format!("#/runs/{id}"))).unwrap();
+            assert_eq!(
+                browser
+                    .eval(
+                        &page,
+                        &format!(
+                            r##"(() => {{
+                              const link = document.getElementById('talk-goal-open');
+                              const expected = {expected};
+                              return expected === null
+                                ? link.hidden && !link.hasAttribute('href')
+                                : !link.hidden && link.getAttribute('href') === expected;
+                            }})()"##
+                        ),
+                    )
+                    .await
+                    .unwrap(),
+                true,
+                "direct Run references at {width}px"
+            );
+        }
+        browser
+            .eval(&page, "document.getElementById('talk-goal-open').click()")
+            .await
+            .unwrap();
+        browser
+            .wait_for(
+                &page,
+                &format!(
+                    "deck.state.route.name === 'run' && deck.state.route.id === {:?} && !document.getElementById('view-run').hidden",
+                    direct_run.id
+                ),
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
+        browser.eval(&page, "history.back()").await.unwrap();
+        browser
+            .wait_for(
+                &page,
+                "deck.state.route.name === 'talk' && !!deck.state.talkDetail.sections",
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
+
         // All filed tasks finishing is not completion of the selected goal.
         // An invalid selected id falls back to the latest durable goal.
         task.status = TaskStatus::Done;
@@ -6072,7 +6182,7 @@ async fn durable_chat_goals_stay_compact_safe_and_navigable() {
             .unwrap();
         browser.wait_for(&page, "!!window.deck && !!deck.state.talkDetail.sections && document.getElementById('talk-goal-state').textContent === 'Completed'", Duration::from_secs(30)).await.unwrap();
         assert_eq!(
-            browser.eval(&page, "deck.state.talkDetail.talk.goals.length === 3 && document.getElementById('talk-goal-step').textContent.includes('Owner reviewed')").await.unwrap(),
+            browser.eval(&page, "deck.state.talkDetail.talk.goals.length === 4 && document.getElementById('talk-goal-step').textContent.includes('Owner reviewed')").await.unwrap(),
             true
         );
         browser.close_page(&page).await;
