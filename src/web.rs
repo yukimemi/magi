@@ -15908,6 +15908,81 @@ mod tests {
     }
 
     #[test]
+    fn goal_link_uses_newest_valid_direct_run_and_prefers_task_targets() {
+        let home = tempfile::tempdir().unwrap();
+        let runs = home.path().join("runs");
+        let queue = Queue::at(home.path().join("queue"));
+        let talks = Talks::at(home.path().join("talks"));
+        let config = stub_config();
+        let repo = PathBuf::from("/repo/magi");
+        let mut talk = talk::begin(&talks, &config, repo.clone(), Some("stub")).unwrap();
+        let reserve_run = |repo| {
+            let mut run = RunState::new(
+                repo,
+                "main".into(),
+                "0000000".into(),
+                "Follow the review".into(),
+                config.clone(),
+            );
+            run.reserve_under(home.path()).unwrap();
+            run
+        };
+        let older = reserve_run(repo.clone());
+        let newer = reserve_run(repo.clone());
+        let foreign = reserve_run(PathBuf::from("/repo/other"));
+        let mismatched = reserve_run(repo.clone());
+        let corrupt = reserve_run(repo.clone());
+        let run_file = |id: &str| runs.join(id).join("run.json");
+        std::fs::write(run_file(&mismatched.id), serde_json::to_vec(&older).unwrap()).unwrap();
+        std::fs::write(run_file(&corrupt.id), b"not json").unwrap();
+        let goal = |tasks: Vec<String>, runs: Vec<String>| {
+            serde_json::from_value::<crate::chat_goal::Goal>(serde_json::json!({
+                "id": "g", "purpose": "Follow the review", "scope": "review",
+                "condition": {"description": "Owner reviews the result", "kind": "owner_review"},
+                "state": "waiting", "step": "Follow the recorded review",
+                "source_turn": 0, "owner_input": "Follow the review",
+                "tasks": tasks, "runs": runs, "watches": [],
+                "evidence": "Seeded durable goal", "wake": 1, "handled": 1,
+                "started": null, "wakes": 0, "last_checked": null, "fingerprint": ""
+            }))
+            .unwrap()
+        };
+        let link = |talk: &Talk| talk_goal_link(talk, &queue, &runs).map(|l| (l.kind, l.id));
+
+        talk.goals = vec![goal(vec![], vec![older.id.clone(), newer.id.clone()])];
+        assert_eq!(link(&talk), Some(("run", newer.id.clone())));
+
+        let unusable = vec![
+            foreign.id.clone(),
+            mismatched.id.clone(),
+            corrupt.id.clone(),
+            "missing".into(),
+            "../escape".into(),
+        ];
+        let mut references = vec![older.id.clone()];
+        references.extend(unusable.clone());
+        talk.goals = vec![goal(vec![], references)];
+        assert_eq!(link(&talk), Some(("run", older.id.clone())));
+
+        talk.goals = vec![goal(vec!["missing-task".into()], unusable)];
+        assert_eq!(link(&talk), None);
+
+        let mut task = Task::new(
+            "Review".into(),
+            "Follow the review".into(),
+            repo,
+            Source::Human,
+        );
+        queue.put(&mut task).unwrap();
+        talk.goals = vec![goal(vec![task.id.clone()], vec![newer.id.clone()])];
+        assert_eq!(link(&talk), Some(("task", task.id.clone())));
+
+        task.runs.push(older.id.clone());
+        queue.put(&mut task).unwrap();
+        assert_eq!(link(&talk), Some(("run", older.id)));
+    }
+
+    #[test]
     fn talk_task_progress_counts_mixed_statuses() {
         let mut tasks: Vec<_> = [
             TaskStatus::Queued,
