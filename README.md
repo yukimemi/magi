@@ -194,6 +194,20 @@ magi repos                    # local checkouts found under [repos] roots
 magi answer                   # what an agent is waiting to hear from you
 ```
 
+Recovery lineage and `retain-recovery-sources` normally prevent folding, even
+after a task finishes. To explicitly release one finished, non-resumable run:
+
+```sh
+magi fold <run-id> --override-recovery-retention --all
+```
+
+The flag requires an explicit run ID; `--all` includes that run's winner, not
+other runs. Live or unknown drivers, dirty sources, ownership/output/execution
+leases, Git checkpoints and evidence failures still refuse deletion. Unincorporated
+tips are archived in `artifacts/fold-evidence` before an operator override event
+is saved and deletion starts. The run record and retention sidecar remain.
+Automatic housekeeping never overrides retention.
+
 `magi run --resume <run-id>` continues only work that was interrupted or
 stopped at a resumable boundary. A completed failed final gate is not retried
 by resume: magi preserves the recorded command output, reports the run as

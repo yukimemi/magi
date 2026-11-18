@@ -181,10 +181,10 @@ the task's history, checking repository identity, cycles and resumability. If th
 authority cannot be validated or no longer matches the task's authorized
 instructions, the task is held rather than starting a replacement competition.
 Explicit fresh competitions and selected public-head recovery retain their normal
-precedence. The ordinary fold path preserves every unmerged source still referenced by an
-unfinished queue task and reports the task and refusal reason; explicit folds
-return an error and automatic folds log the reason. Retirement of a proved-empty
-attempt uses its own proof.
+precedence. The ordinary fold path preserves every unmerged source still referenced
+by a queue task, including completed tasks, and reports the task and refusal reason;
+explicit folds return an error and automatic folds log the reason.
+Retirement of a proved-empty attempt uses its own proof.
 The existing `Superseded` status is not used to retire unfinished work because
 it has separate settlement and publication effects. Historical recovery sources
 retained by an earlier explicit recovery stay retained, even if that means a
@@ -200,28 +200,26 @@ Age alone still cannot revoke a live task writer; unknown process liveness
 retains its lock. Old identified locks require confirmed process death.
 
 Ordinary folding of a confirmed `Merged` run with a successful merge record
-does not wait for an unfinished queue task to settle, but its merge label is only
-admission to proof. Before deleting anything, every targeted candidate branch,
-worktree HEAD, HEAD/branch reflog and ORIG_HEAD must be incorporated in a single
-pinned fetched base. Independent losing candidates and detached reviewers retain
-the entire run. Git operation checkpoints, source changes and unknown ignored
-files also retain it; a target directory needs the existing Cargo residue proof.
-For a squash merge, the recorded winner's complete cumulative binary patch
-(including modes and blob IDs) must exactly match a single-parent commit in
-the pinned fetched history since the run's base commit. Only ancestors of that
-proven winner qualify through this proof; independent losing commits and
-rewritten-away checkpoints still retain the entire run. Later base changes do
-not invalidate a matching historical squash. Missing base information or an
-unproven squash/rebase retains sources for inspection; conflict resolutions or
-base drift that change the patch require manual inspection. Explicit
-recovery-source retention and pending implementation
-preservation still refuse folding. Other terminal labels and successful PR
-publication alone do not establish a confirmed merge.
-Queue completion does not authorize folding historical sources either:
-`Done` tasks retain their historical `Superseded` and `Failed` sources until
-recovery lineage transfers them or a confirmed merge passes the source proof.
-This includes failed candidates with no recorded tally. A newer successful
-attempt alone does not prove that an older independent implementation landed.
+admits source preflight even before its queue task settles. This does not prove
+every source landed: current candidate branches and worktree HEADs are checked
+against a pinned fetched base. Ancestry or an exact historical squash-patch match
+can prove incorporation. Other tips are archived under `artifacts/fold-evidence`
+before any deletion, subject to the existing storage limits. Obsolete reflogs and
+ORIG_HEAD do not establish additional retention obligations. Git operation
+checkpoints, source changes, unknown ignored files and unproved Cargo residue
+still refuse folding.
+
+`magi fold <run-id> --override-recovery-retention` explicitly bypasses only
+queue recovery-lineage retention and `retain-recovery-sources`. It requires a
+readable, finished, non-resumable run and proven driver death; live or unknown
+ownership refuses. `--all` may also drop that run's winner. It cannot be combined
+with merge correction, PR repair or archived-seat inspection/restoration.
+The same source preflight and evidence archive used for confirmed merges must
+succeed first; the flag neither fabricates a merge nor relaxes incorporation
+proof. An operator CLI event records the full run ID, flag and bypassed reason
+before deletion starts. Run records and sidecars remain. Candidate preservation,
+dirty-source, coordination, ownership, execution and output-lease protections
+remain enabled. Automatic housekeeping always uses the ordinary path.
 
 ## Observability and incident evidence
 

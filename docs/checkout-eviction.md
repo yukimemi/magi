@@ -15,6 +15,15 @@ their uncommitted work is never silently discarded. Existing execution,
 coordination and output-lease protections remain in effect. The independent
 inactive-copy eviction policy below remains conservative about dirty files.
 
+Explicit `magi fold <run-id> --override-recovery-retention [--all]` is separate
+from inactive-copy eviction. For a finished, non-resumable run with a proven
+stopped driver it may bypass queue lineage and explicit source-retention markers
+only. All target preflight and unincorporated-tip archiving in
+`artifacts/fold-evidence` finish before a durable operator override event and
+deletion. Dirty sources, leases, Git checkpoints, evidence limits/failures and
+unknown liveness still refuse. Run records and markers remain; housekeeping
+never uses this override.
+
 ## Inactive-copy eviction
 
 Normal retained-output housekeeping also archives and evicts a small set of

@@ -13390,7 +13390,27 @@ async fn remove_read_seat_worktree(state: &mut RunState, path: &Path) -> Result<
 /// directory some other process or test pinned into that `OnceLock` first,
 /// not the one the caller actually resolved its `runs` and `state` from.
 pub async fn fold_run(state: &mut RunState, drop_winner: bool, home: &Path) -> Result<Vec<String>> {
-    if let Some(reason) = crate::pr_recovery::source_retention_reason(home, state) {
+    fold_run_with_policy(state, drop_winner, home, false).await
+}
+
+/// Explicit CLI-only retention override; automatic callers use [`fold_run`].
+pub async fn fold_run_overriding_recovery_retention(
+    state: &mut RunState,
+    drop_winner: bool,
+    home: &Path,
+) -> Result<Vec<String>> {
+    fold_run_with_policy(state, drop_winner, home, true).await
+}
+
+async fn fold_run_with_policy(
+    state: &mut RunState,
+    drop_winner: bool,
+    home: &Path,
+    override_recovery_retention: bool,
+) -> Result<Vec<String>> {
+    if let Some(reason) = crate::pr_recovery::source_retention_reason(home, state)
+        && !override_recovery_retention
+    {
         bail!("refusing fold: {reason}");
     }
     if !state.candidate_preservation.is_empty() || !state.interrupted_implementations.is_empty() {
@@ -13401,6 +13421,29 @@ pub async fn fold_run(state: &mut RunState, drop_winner: bool, home: &Path) -> R
     // around a live output borrower even though target eviction was fenced.
     std::fs::create_dir_all(home.join("runs").join(&state.id))?;
     let _owner = crate::pr_head::owner_lock(home, &state.id)?;
+    // An override must use current durable ownership, not a pre-lock snapshot.
+    if override_recovery_retention {
+        *state = RunState::load_under(&state.id, home)?;
+        anyhow::ensure!(
+            state.status.done() && !state.status.resumable(),
+            "recovery retention override requires a finished, non-resumable run"
+        );
+        let claimed = crate::daemon::is_working_on_other(home, &state.id, Timestamp::now())?;
+        anyhow::ensure!(
+            state.liveness_under(home, claimed) == crate::run::Liveness::Dead,
+            "run is live or its ownership is unknown"
+        );
+        anyhow::ensure!(
+            state.candidate_preservation.is_empty() && state.interrupted_implementations.is_empty(),
+            "candidate preservation incomplete; refusing cleanup"
+        );
+    }
+    let retention_reason = crate::pr_recovery::source_retention_reason(home, state);
+    if let Some(reason) = &retention_reason
+        && !override_recovery_retention
+    {
+        bail!("refusing fold: {reason}");
+    }
     let _driver = crate::driver::maintenance(home, &state.id)?;
     let mut output_guards = Vec::new();
     for entry in std::fs::read_dir(state.worktree_root())
@@ -13425,13 +13468,23 @@ pub async fn fold_run(state: &mut RunState, drop_winner: bool, home: &Path) -> R
     };
     // Confirmed merges dispose of their owned sources after durable evidence
     // capture. Preflight every source before removing anything.
-    let _source_outputs = if state.status == RunStatus::Merged
-        && state.merge.as_ref().is_some_and(|merge| merge.ok)
+    let _source_outputs = if retention_reason.is_some()
+        || (state.status == RunStatus::Merged && state.merge.as_ref().is_some_and(|merge| merge.ok))
     {
         verify_merged_fold_sources(state, drop_winner, home).await?
     } else {
         Vec::new()
     };
+    if let Some(reason) = retention_reason {
+        state.event(
+            "fold",
+            format!(
+                "operator CLI --override-recovery-retention authorized deletion for run {}: bypassed {reason}",
+                state.id
+            ),
+        );
+        state.save_under(home)?;
+    }
     let root = state.worktree_root();
     let winner = state.tally.as_ref().map(|t| t.winner);
     let mut removed = Vec::new();
@@ -16501,6 +16554,217 @@ mod tests {
             assert!(!runner.state.candidates[1].folded);
             assert!(winner.worktree.exists());
             assert!(git::branch_exists(&repo, &winner.branch).await.unwrap());
+        }
+    }
+    #[tokio::test]
+    async fn fold_recovery_override_archives_sources_and_keeps_safety_checks() {
+        for sidecar in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let home = tmp.path().join("home");
+            let repo = tmp.path().join("repo");
+            std::fs::create_dir(&repo).unwrap();
+            init_repo(&repo);
+            let mut state = runner_at(RunStatus::Superseded).state;
+            state.repo = repo.clone();
+            state.base_commit = git::rev_parse(&repo, "HEAD").await.unwrap();
+            state.config.graph.worktree_root = Some(tmp.path().join("wt"));
+            state.driver_exited = true;
+            state.reserve_under(&home).unwrap();
+            git::git(
+                &repo,
+                &["update-ref", "refs/remotes/origin/main", &state.base_commit],
+            )
+            .await
+            .unwrap();
+            let wt = state.worktree_root().join("cand-A");
+            git::worktree_add_branch(&repo, &wt, "candidate", "main")
+                .await
+                .unwrap();
+            std::fs::write(wt.join("independent"), "retained implementation\n").unwrap();
+            git::commit_all(&wt, "fixture: independent source")
+                .await
+                .unwrap();
+            let head = git::rev_parse(&wt, "HEAD").await.unwrap();
+            state.candidates.push(Candidate {
+                index: 0,
+                label: 'A',
+                agent: "fixture".into(),
+                branch: "candidate".into(),
+                worktree: wt.clone(),
+                summary: String::new(),
+                stat: String::new(),
+                files: 0,
+                commits: 0,
+                empty: false,
+                failed: None,
+                verified_noop: None,
+                duration_ms: 0,
+                folded: false,
+            });
+            let mut task = crate::queue::Task::new(
+                "task".into(),
+                "task".into(),
+                repo.clone(),
+                crate::queue::Source::Human,
+            );
+            task.runs.push(state.id.clone());
+            crate::queue::Queue::at(home.join("queue"))
+                .put(&mut task)
+                .unwrap();
+            if sidecar {
+                crate::pr_recovery::retain_sources(&task, &home).unwrap();
+            }
+            state.save_under(&home).unwrap();
+            let reason = crate::pr_recovery::source_retention_reason(&home, &state).unwrap();
+            assert!(
+                fold_run(&mut state, true, &home)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains(&reason)
+            );
+            let mut disk = state.config.disk.clone();
+            disk.fold_grace_secs = 0;
+            assert_eq!(
+                crate::clean::fold_due(
+                    &home.join("runs"),
+                    &home,
+                    &state.worktree_root(),
+                    &disk,
+                    Timestamp::now() + std::time::Duration::from_secs(10),
+                )
+                .await
+                .unwrap(),
+                (0, 0)
+            );
+            assert!(wt.exists());
+            state.status = RunStatus::Blocked;
+            state.save_under(&home).unwrap();
+            assert!(
+                fold_run_overriding_recovery_retention(&mut state, true, &home)
+                    .await
+                    .is_err()
+            );
+            state.status = RunStatus::Superseded;
+            state.driver_exited = false;
+            state.driver_claimed = None;
+            state.save_under(&home).unwrap();
+            assert!(
+                fold_run_overriding_recovery_retention(&mut state, true, &home)
+                    .await
+                    .is_err()
+            );
+            state.driver_pid = Some(std::process::id());
+            state.driver_started_at = crate::proc::process_started_at(std::process::id());
+            state.save_under(&home).unwrap();
+            assert!(
+                fold_run_overriding_recovery_retention(&mut state, true, &home)
+                    .await
+                    .is_err()
+            );
+            state.driver_exited = true;
+            state.driver_pid = None;
+            state.driver_started_at = None;
+            state.save_under(&home).unwrap();
+            let lease = crate::driver::maintenance(&home, &state.id).unwrap();
+            assert!(
+                fold_run_overriding_recovery_retention(&mut state, true, &home)
+                    .await
+                    .is_err()
+            );
+            drop(lease);
+            #[cfg(unix)]
+            {
+                let output = crate::retention::OutputLease::take(&wt, false).unwrap();
+                assert!(
+                    fold_run_overriding_recovery_retention(&mut state, true, &home)
+                        .await
+                        .is_err()
+                );
+                drop(output);
+            }
+            let owner = crate::pr_head::owner_lock(&home, &state.id).unwrap();
+            assert!(
+                fold_run_overriding_recovery_retention(&mut state, true, &home)
+                    .await
+                    .is_err()
+            );
+            drop(owner);
+            let checkpoint = git::git(
+                &wt,
+                &[
+                    "rev-parse",
+                    "--path-format=absolute",
+                    "--git-path",
+                    "CHERRY_PICK_HEAD",
+                ],
+            )
+            .await
+            .unwrap();
+            std::fs::write(&checkpoint, &head).unwrap();
+            assert!(
+                fold_run_overriding_recovery_retention(&mut state, true, &home)
+                    .await
+                    .is_err()
+            );
+            std::fs::remove_file(checkpoint).unwrap();
+            std::fs::write(wt.join("dirty"), "keep").unwrap();
+            assert!(
+                fold_run_overriding_recovery_retention(&mut state, true, &home)
+                    .await
+                    .is_err()
+            );
+            assert!(wt.join("dirty").exists());
+            std::fs::remove_file(wt.join("dirty")).unwrap();
+            let evidence = home
+                .join("runs")
+                .join(&state.id)
+                .join("artifacts/fold-evidence");
+            std::fs::create_dir_all(evidence.parent().unwrap()).unwrap();
+            std::fs::write(&evidence, "blocked archive").unwrap();
+            assert!(
+                fold_run_overriding_recovery_retention(&mut state, true, &home)
+                    .await
+                    .is_err()
+            );
+            assert!(wt.exists());
+            assert!(
+                !RunState::load_under(&state.id, &home)
+                    .unwrap()
+                    .events
+                    .iter()
+                    .any(|event| event.message.contains("--override-recovery-retention"))
+            );
+            std::fs::remove_file(&evidence).unwrap();
+            fold_run_overriding_recovery_retention(&mut state, true, &home)
+                .await
+                .unwrap();
+            assert!(!wt.exists());
+            assert!(!git::branch_exists(&repo, "candidate").await.unwrap());
+            assert!(
+                git::worktree_holding(&repo, "candidate")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                std::fs::read_to_string(evidence.join(format!("{head}.patch")))
+                    .unwrap()
+                    .contains("retained implementation")
+            );
+            assert!(evidence.join(format!("{head}.index")).is_file());
+            let saved = RunState::load_under(&state.id, &home).unwrap();
+            assert_eq!(saved.status, RunStatus::Superseded);
+            assert!(saved.candidates[0].folded);
+            assert!(saved.events.iter().any(|event| {
+                event.message.contains("--override-recovery-retention")
+                    && event.message.contains(&state.id)
+                    && event.message.contains(&reason)
+            }));
+            assert_eq!(
+                crate::pr_recovery::explicit_sources_retained(&home, &state.id),
+                sidecar
+            );
         }
     }
 

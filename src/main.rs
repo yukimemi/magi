@@ -384,15 +384,19 @@ enum Command {
     },
     /// Remove a run's worktrees and branches.
     Fold {
-        /// Run id. Defaults to the most recent run when `--merged` is not
-        /// given; required (and rejected at parse time otherwise) when it
-        /// is, since `--merged` rewrites a run's recorded status rather than
-        /// just cleaning up its worktrees, and guessing "the most recent run
-        /// on this machine" is not an acceptable guess for that.
+        /// Run id. Plain cleanup defaults to the most recent run. An explicit
+        /// id is required for --merged, --override-recovery-retention and
+        /// archived-seat inspection/restoration; these never guess the run.
         id: Option<String>,
         /// Also drop the winner's worktree and branch.
         #[arg(long)]
         all: bool,
+        /// Override only recovery-lineage/source retention for this explicit run.
+        /// Requires a finished, non-resumable run and proven stopped driver.
+        /// Source evidence is archived before deletion; all other safety checks
+        /// remain enabled. --all still selects the winner, not multiple runs.
+        #[arg(long, requires = "id", conflicts_with_all = ["merged", "repair_prs", "show_seats", "restore_seat"])]
+        override_recovery_retention: bool,
         /// Correct a run stuck on a failed automatic merge: the operator (or
         /// an agent on their behalf) created and merged the pull request by
         /// hand, and this is its URL. Requires an explicit run id (no
@@ -1987,7 +1991,11 @@ async fn dispatch(command: Command) -> Result<()> {
         }
 
         Command::Fold {
-            id, all, merged, ..
+            id,
+            all,
+            merged,
+            override_recovery_retention,
+            ..
         } => {
             // clap's own `requires = "id"` on `--merged` rejects this at parse
             // time already; this is the belt to that suspenders for any
@@ -1997,6 +2005,9 @@ async fn dispatch(command: Command) -> Result<()> {
             // plain worktree cleanup, but `--merged` rewrites a run's
             // recorded status - guessing which run that is is exactly how an
             // unrelated, still-`implementing` run gets its status clobbered.
+            if override_recovery_retention && id.is_none() {
+                bail!("`--override-recovery-retention` requires an explicit run id");
+            }
             if merged.is_some() && id.is_none() {
                 bail!(
                     "`--merged` requires an explicit run id; pass the id of the run to correct \
@@ -2039,7 +2050,16 @@ async fn dispatch(command: Command) -> Result<()> {
                             after.as_str()
                         );
                     }
-                    let removed = fold_run(&mut state, all, &magi::run::home()).await?;
+                    let removed = if override_recovery_retention {
+                        magi::graph::fold_run_overriding_recovery_retention(
+                            &mut state,
+                            all,
+                            &magi::run::home(),
+                        )
+                        .await?
+                    } else {
+                        fold_run(&mut state, all, &magi::run::home()).await?
+                    };
                     // Nothing left for `fold_run` to remove is not the same
                     // thing as nothing left to do: a run whose worktrees are
                     // already gone can still be stuck `implementing` (or
@@ -2060,6 +2080,9 @@ async fn dispatch(command: Command) -> Result<()> {
                     removed
                 }
                 Err(e) => {
+                    if override_recovery_retention {
+                        bail!("{id}: state unreadable ({e}); cannot override recovery retention");
+                    }
                     if merged.is_some() {
                         bail!("{id}: state unreadable ({e}); cannot correct its merge record");
                     }
@@ -5863,6 +5886,24 @@ mod tests {
                 assert_eq!(merged.as_deref(), Some("https://github.com/o/r/pull/1"));
             }
             other => panic!("expected Command::Fold, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fold_recovery_override_requires_explicit_exclusive_selection() {
+        let flag = "--override-recovery-retention";
+        let id = "20260901-000000-aaaa";
+        assert!(Cli::try_parse_from(["magi", "fold", flag]).is_err());
+        assert!(Cli::try_parse_from(["magi", "fold", id, flag, "--all"]).is_ok());
+        for args in [
+            vec!["--repair-prs"],
+            vec!["--show-seats"],
+            vec!["--restore-seat", "head", "--dest", "new"],
+            vec!["--merged", "https://github.com/o/r/pull/1"],
+        ] {
+            assert!(
+                Cli::try_parse_from(["magi", "fold", id, flag].into_iter().chain(args)).is_err()
+            );
         }
     }
 
