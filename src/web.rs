@@ -15933,7 +15933,11 @@ mod tests {
         let mismatched = reserve_run(repo.clone());
         let corrupt = reserve_run(repo.clone());
         let run_file = |id: &str| runs.join(id).join("run.json");
-        std::fs::write(run_file(&mismatched.id), serde_json::to_vec(&older).unwrap()).unwrap();
+        std::fs::write(
+            run_file(&mismatched.id),
+            serde_json::to_vec(&older).unwrap(),
+        )
+        .unwrap();
         std::fs::write(run_file(&corrupt.id), b"not json").unwrap();
         let goal = |tasks: Vec<String>, runs: Vec<String>| {
             serde_json::from_value::<crate::chat_goal::Goal>(serde_json::json!({

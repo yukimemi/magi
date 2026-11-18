@@ -6080,7 +6080,8 @@ async fn durable_chat_goals_stay_compact_safe_and_navigable() {
                 .eval(&page, &format!("deck.loadTalk({:?})", chat.id))
                 .await
                 .unwrap();
-            let expected = serde_json::to_string(&expected.map(|id| format!("#/runs/{id}"))).unwrap();
+            let expected =
+                serde_json::to_string(&expected.map(|id| format!("#/runs/{id}"))).unwrap();
             assert_eq!(
                 browser
                     .eval(
