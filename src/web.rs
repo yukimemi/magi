@@ -9211,8 +9211,8 @@ fn talk_task_progress(tasks: &[Task]) -> TalkTaskProgress {
     }
 }
 
-/// A target must still belong to an explicitly referenced, same-repository
-/// task. Missing/deleted records leave the goal readable.
+/// Prefer a referenced task's current Run or Task, then an explicitly
+/// referenced same-repository Run. Missing/deleted records leave the goal readable.
 #[derive(Debug, Serialize)]
 struct TalkGoalLink {
     goal: String,
@@ -9253,6 +9253,17 @@ fn talk_goal_link(talk: &Talk, queue: &Queue, runs: &FsPath) -> Option<TalkGoalL
             kind: "task",
             id: task.id,
         });
+    }
+    for id in goal.runs.iter().rev() {
+        if plain_record_id(id)
+            && read_run(runs, id).is_ok_and(|state| state.id == *id && state.repo == talk.repo)
+        {
+            return Some(TalkGoalLink {
+                goal: goal.id.clone(),
+                kind: "run",
+                id: id.clone(),
+            });
+        }
     }
     None
 }
