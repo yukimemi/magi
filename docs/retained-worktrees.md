@@ -209,6 +209,8 @@ ORIG_HEAD do not establish additional retention obligations. Git operation
 checkpoints, source changes, unknown ignored files and unproved Cargo residue
 still refuse folding.
 
+### Operator override
+
 `magi fold <run-id> --override-recovery-retention` explicitly bypasses only
 queue recovery-lineage retention and `retain-recovery-sources`. It requires a
 readable, finished, non-resumable run and proven driver death; live or unknown
