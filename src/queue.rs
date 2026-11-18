@@ -1650,7 +1650,14 @@ impl Task {
         self.record_completion(CompletionAction::Complete, context);
         self.stamp_schema();
         self.status = TaskStatus::Done;
-        self.resume_override = None;
+        if let Some(pin) = self.resume_override.take()
+            && !pin.question_id.is_empty()
+            && let Some(run) = pin.pinned_run
+        {
+            // Completion cancels a queued request; normal dispatch records its
+            // start separately and must not be mistaken for supersession.
+            self.superseded_resumes.insert(pin.question_id, run);
+        }
         self.sync_only = None;
         self.last_error = None;
         self.park_reason = None;

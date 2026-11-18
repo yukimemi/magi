@@ -1629,9 +1629,31 @@ pub(crate) fn apply_task_choice_actions(queue: &Queue, questions: &Questions, ho
             }
         }
         let language = language_of(&task, Path::new("."));
-        let decision = decide_action(home, &task, &q, phrases(&language), |id| {
+        let mut decision = decide_action(home, &task, &q, phrases(&language), |id| {
             RunState::load_under(id, home)
         });
+        let completion = if matches!(decision, ActionDecision::Done) {
+            match crate::task_completion::prepare_close(
+                &task,
+                home,
+                CompletionActor::DaemonSettle,
+                Some(format!(
+                    "Question {}: {} — {}",
+                    q.id,
+                    q.summary,
+                    q.resolution().unwrap_or_default()
+                )),
+                false,
+            ) {
+                Ok(context) => Some(context),
+                Err(error) => {
+                    decision = ActionDecision::Refuse(error.to_string());
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let ran = matches!(
             decision,
             ActionDecision::Resume(_)
@@ -1675,17 +1697,9 @@ pub(crate) fn apply_task_choice_actions(queue: &Queue, questions: &Questions, ho
                 task.requeue();
             }
             ActionDecision::Hold => task.hold_manual(Some(q.summary.clone())),
-            ActionDecision::Done => task.succeed(CompletionContext::new(
-                CompletionActor::DaemonSettle,
-                Some(format!(
-                    "Question {}: {} — {}",
-                    q.id,
-                    q.summary,
-                    q.resolution().unwrap_or_default()
-                )),
-                home,
-                &task,
-            )),
+            ActionDecision::Done => {
+                task.succeed(completion.expect("done passed completion admission"));
+            }
             ActionDecision::Refuse(why) => {
                 let _ =
                     crate::task_inquiry::Outbox::at(home).update_decision(&q.id, |d| d.fail(&why));
@@ -1703,7 +1717,7 @@ pub(crate) fn apply_task_choice_actions(queue: &Queue, questions: &Questions, ho
                 notices::raise(
                     Notice::warn(
                         &format!("action:{}", q.id),
-                        "An answer asked the daemon to resume a run that cannot be resumed; the task stays held.",
+                        "An answered task action could not be applied; the task stays held.",
                     )
                     .link(Link::Task {
                         id: task.id.clone(),
@@ -1992,6 +2006,13 @@ fn settle_in(
 /// test in the same binary happened to pin into that `OnceLock` first, not
 /// the run this call actually means.
 pub fn supersede_prior_runs(task: &Task, home: &Path) {
+    if task
+        .completion_history
+        .last()
+        .is_some_and(|event| event.discard)
+    {
+        return;
+    }
     let now = Timestamp::now();
     // `Task::superseded_attempts` cannot tell a loop-driven `Done` (always
     // right behind a `Merged`/`Ready` verdict) from one set directly by
@@ -9930,7 +9951,13 @@ mod tests {
 
     #[test]
     fn supersede_prior_runs_preserves_blocked_work_after_an_audited_manual_close() {
-        for status in [RunStatus::Blocked, RunStatus::Stalled, RunStatus::Failed] {
+        for status in [
+            RunStatus::Blocked,
+            RunStatus::Stalled,
+            RunStatus::Failed,
+            RunStatus::Ready,
+            RunStatus::Merged,
+        ] {
             let dir = tempfile::tempdir().unwrap();
             let home = dir.path();
             let mut first = run_state(RunStatus::Blocked);
@@ -9963,7 +9990,7 @@ mod tests {
             assert_eq!(
                 RunState::load_under(&second.id, home).unwrap().status,
                 status,
-                "the latest unmerged attempt retains its actual outcome"
+                "the latest attempt retains its actual outcome"
             );
         }
     }
@@ -14673,6 +14700,33 @@ mod tests {
         queue.put(&mut again).unwrap();
         apply_task_choice_actions(&queue, &questions, &home);
         assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Held);
+    }
+
+    #[test]
+    fn done_choice_cannot_discard_unfinished_work_or_record_success_receipts() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let queue = Queue::at(home.join("queue"));
+        let questions = Questions::at(home.join("questions"));
+        let mut state = run_state(RunStatus::Blocked);
+        state.save_under(home).unwrap();
+        let mut task = held_task_with(&state.id);
+        queue.put(&mut task).unwrap();
+        let mut question = action_question(&state.id, ask::ChoiceAction::Done);
+        questions.put(&mut question).unwrap();
+
+        apply_task_choice_actions(&queue, &questions, home);
+
+        let after = queue.get(&task.id).unwrap();
+        assert_eq!(after.status, TaskStatus::Held);
+        assert!(after.hold_reason.as_deref().unwrap().contains("--discard"));
+        assert_eq!(after.runs, task.runs);
+        assert!(after.completion_history.is_empty());
+        assert!(!after.decision_effects.contains_key(&question.id));
+        assert_eq!(
+            RunState::load_under(&state.id, home).unwrap().status,
+            RunStatus::Blocked
+        );
     }
 
     #[test]

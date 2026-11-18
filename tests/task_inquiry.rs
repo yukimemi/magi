@@ -1321,7 +1321,10 @@ async fn applied_legacy_choice_receipts_survive_later_task_transitions() {
     for action in [ChoiceAction::Requeue, ChoiceAction::Hold, ChoiceAction::Done] {
         let mut run = RunState::new(fx.repo.clone(), "main".into(), "base".into(), "work".into(), fx.config.clone());
         run.reserve_under(&home).unwrap();
-        run.status = RunStatus::Blocked; run.driver_exited = true; run.save_under(&home).unwrap();
+        // A non-discard Done choice needs completed work; the other actions
+        // still operate on an unfinished execution.
+        run.status = if matches!(action, ChoiceAction::Done) { RunStatus::Ready } else { RunStatus::Blocked };
+        run.driver_exited = true; run.save_under(&home).unwrap();
         let mut task = Task::new("work".into(), "work".into(), fx.repo.clone(), Source::Human);
         task.chat = Some(chat.id.clone()); task.runs.push(run.id.clone()); task.hold_manual(Some("Awaiting input".into()));
         queue.put(&mut task).unwrap();

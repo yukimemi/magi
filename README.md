@@ -497,7 +497,7 @@ and pay for a fresh implement wave every time.
 `magi task done <ID> [--reason "<text>"]` and Web **Mark done** preserve the task
 and append an audit event: occurrence ID, actor (CLI, Web, chat, conductor or
 daemon settle), reason, prior task status and the latest run/PR snapshot.
-**Done is not proof of merge.** Closing work without verified merge requires
+**Done is not proof of merge.** Closing an unfinished latest run requires
 `--discard --reason "<text>"` (or the Web discard confirmation and reason); this
 records an intentional closure, not a successful delivery. Web **Mark done**
 opens that explicit confirmation when the server refuses unmerged work, showing
@@ -506,7 +506,7 @@ path records its evidence, including automatic settlement and structured done.
 Task show and the Web task detail expose the append-only completion history;
 legacy tasks may have none.
 
-Use `magi task reopen <ID> --reason "<text>"` or Web **Reopen to Held** for an
+Use `magi task control reopen <ID> --reason "<text>"` or Web **Reopen to Held** for an
 incorrectly closed, unlanded task. The reason is required. Reopening preserves
 history and leaves the task **Held**; inspect/edit it and explicitly Release
 when ready. It refuses any historical Ready, Merged or AlreadyInBase run, any
@@ -514,6 +514,9 @@ merged PR, and unknown/unreadable run or forge state rather than guessing that
 work is safe to repeat. Chat-filed tasks receive a distinct notice for every
 completion occurrence, so reopening and closing again is not hidden by an
 earlier notice.
+Automatic goal turns cannot discard or reopen tasks; those operations require
+an explicit owner turn. Non-discard completion still checks the goal's task scope
+and the shared unfinished-work admission rules.
 
 ## Working out what to build, with someone
 

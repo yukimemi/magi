@@ -2684,6 +2684,88 @@ mod goal_admission_tests {
             queue.put(&mut task).unwrap();
         })
         .await;
+        let error = execute_authenticated(
+            &queue,
+            tmp.path(),
+            &talks,
+            &talk.id,
+            source.clone(),
+            Operation::Done {
+                task: task.id.clone(),
+                reason: Some("discard unfinished work".into()),
+                discard: true,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("explicit owner turn"),
+            "{error:#}"
+        );
+        assert_eq!(queue.get(&task.id).unwrap().status, TaskStatus::Queued);
+        assert!(queue.get(&task.id).unwrap().completion_history.is_empty());
+        assert!(
+            execute_authenticated(
+                &queue,
+                tmp.path(),
+                &talks,
+                &talk.id,
+                source.clone(),
+                Operation::Done {
+                    task: unrelated.id.clone(),
+                    reason: None,
+                    discard: false,
+                },
+            )
+            .await
+            .is_err()
+        );
+        execute_authenticated(
+            &queue,
+            tmp.path(),
+            &talks,
+            &talk.id,
+            source.clone(),
+            Operation::Done {
+                task: task.id.clone(),
+                reason: Some("goal work finished".into()),
+                discard: false,
+            },
+        )
+        .await
+        .unwrap();
+        let error = execute_authenticated(
+            &queue,
+            tmp.path(),
+            &talks,
+            &talk.id,
+            source.clone(),
+            Operation::Reopen {
+                task: task.id.clone(),
+                reason: "recover unfinished work".into(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("explicit owner turn"),
+            "{error:#}"
+        );
+        assert_eq!(queue.get(&task.id).unwrap().status, TaskStatus::Done);
+        execute_authenticated(
+            &queue,
+            tmp.path(),
+            &talks,
+            &talk.id,
+            crate::chat_goal::Source::Input { turn: 0 },
+            Operation::Reopen {
+                task: task.id.clone(),
+                reason: "recover unfinished work".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(queue.get(&task.id).unwrap().status, TaskStatus::Held);
         talks
             .mutate(&talk.id, |talk| {
                 talk.turns.push(serde_json::from_value(serde_json::json!({

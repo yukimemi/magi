@@ -2,8 +2,9 @@
 //!
 //! All operator surfaces share admission checks. Task claims serialize queue
 //! drivers; retained owner/fix/execution locks exclude direct run control until
-//! the admitted task snapshot has been committed. These operations never alter
-//! a run, a public pull request, or the attempt budget.
+//! the admitted task snapshot has been committed. Reopening never alters a run,
+//! public pull request, or attempt budget. Verified completion may supersede
+//! earlier unsuccessful attempts, as automatic settlement does.
 use std::path::Path;
 
 use anyhow::{Context, Result, ensure};
@@ -245,6 +246,9 @@ pub async fn close(
     let (_guards, context) = admit_close(&task, home, actor, reason, discard).await?;
     task.succeed(context);
     queue.commit_completion(&mut task, &expected)?;
+    if !discard {
+        crate::daemon::supersede_prior_runs(&task, home);
+    }
     Ok(task)
 }
 
