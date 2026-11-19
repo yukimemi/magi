@@ -1819,6 +1819,7 @@ mod tests {
             conflict: Some("main moved 2 commit(s) ahead of candidate after 4 rebase(s); rebasing again would only race it".into()),
             already_in: None,
         });
+        state.ensure_base_episode();
         state.record_base_sync_stop(&approved);
         state.authorize_base_sync(&task.id).unwrap();
         state.save_under(dir.path()).unwrap();
@@ -1835,6 +1836,16 @@ mod tests {
         authorization.request = Some(key.into());
         authorization.generation = published.resumption.as_ref().map(|r| r.generation);
         authorization.decision = published.operator_decided_at;
+        let tip = crate::git::rev_parse(&repo, "main").await.unwrap();
+        authorization.scope = Some(crate::base_sync_recovery::Scope {
+            tip: tip.clone(),
+            instruction: task.instruction.clone(),
+            episode: state.base_sync_recovery.episodes.last().unwrap().id,
+        });
+        let tracking = "refs/remotes/origin/main";
+        crate::git::git(&repo, &["update-ref", tracking, &tip])
+            .await
+            .unwrap();
         state.save_under(dir.path()).unwrap();
 
         let verdict = maintenance_resume_verdict(&task, &state);
@@ -1851,6 +1862,62 @@ mod tests {
         queue.put(&mut published).unwrap();
         check_resume_offer(&queue, &published, &state.id, true).unwrap();
 
+        // Move only the observed base, not the retained winner or approval.
+        let tree = format!("{tip}^{{tree}}");
+        let later_tip = crate::git::git(
+            &repo,
+            &["commit-tree", &tree, "-p", &tip, "-m", "Advance upstream"],
+        )
+        .await
+        .unwrap();
+        crate::git::git(&repo, &["update-ref", tracking, &later_tip])
+            .await
+            .unwrap();
+        let facts =
+            crate::repair_budget::legacy::recovery_facts(&queue, dir.path(), &published, &state);
+        assert_eq!(facts["resume"]["status"], "refused");
+        let reason = facts["resume"]["reason"].as_str().unwrap();
+        assert!(reason.contains(&later_tip) && reason.contains(&tip));
+        assert!(reason.contains("not a fresh fetch"));
+        crate::git::git(&repo, &["update-ref", tracking, &tip])
+            .await
+            .unwrap();
+
+        // An already-filed legacy Resume uses the same exact-run pin as
+        // maintenance ResumeRun without spending the approval generation.
+        let mut question = Question::new(
+            task.id.clone(),
+            NODE.into(),
+            SEAT.into(),
+            "Resume?".into(),
+            String::new(),
+            vec!["resume".into()],
+        );
+        question.actions.insert(
+            "resume".into(),
+            ChoiceAction::Resume {
+                run: state.id.clone(),
+            },
+        );
+        questions.put_executable(&mut question).unwrap();
+        published.block(vec![question.id.clone()], None);
+        queue.put(&mut published).unwrap();
+        question
+            .answer(crate::ask::Answer::Choice("resume".into()))
+            .unwrap();
+        questions.put(&mut question).unwrap();
+        crate::daemon::apply_task_choice_actions(&queue, &questions, dir.path());
+        let queued = queue.get(&task.id).unwrap();
+        assert_eq!(queued.status, TaskStatus::Queued);
+        assert_eq!(queued.operator_decided_at, published.operator_decided_at);
+        assert_eq!(
+            queued.resumption.as_ref().unwrap().generation,
+            published.resumption.as_ref().unwrap().generation,
+        );
+        let pin = queued.resume_override.as_ref().unwrap();
+        assert_eq!(pin.pinned_run.as_ref(), Some(&state.id));
+        assert_eq!(pin.question_id, question.id);
+
         crate::git::git(
             &repo,
             &["commit", "--allow-empty", "-m", "Advance kept work"],
@@ -1858,14 +1925,22 @@ mod tests {
         .await
         .unwrap();
         let moved = crate::git::rev_parse(&repo, "HEAD").await.unwrap();
-        let reason = check_resume_offer(&queue, &published, &state.id, true)
+        let reason = check_resume_offer(&queue, &queued, &state.id, true)
             .unwrap_err()
             .to_string();
         assert!(
             reason.contains(&format!("retained HEAD changed from {approved} to {moved}")),
             "{reason}"
         );
-        assert!(queue.get(&task.id).unwrap().resume_override.is_none());
+        assert_eq!(
+            queue
+                .get(&task.id)
+                .unwrap()
+                .resume_override
+                .unwrap()
+                .question_id,
+            question.id
+        );
         assert!(
             RunState::load_under(&state.id, dir.path())
                 .unwrap()
@@ -1943,7 +2018,8 @@ mod tests {
         let mut dependency = task("independent prerequisite");
         queue.put(&mut dependency).unwrap();
 
-        for change in ["none", "dependency", "head"] {
+        use crate::repair_budget::{Applied, Phase};
+        for change in ["none", "dependency", "reviewing", "gating", "head"] {
             let mut task = task("retain conflict repair");
             task.repo = repo.clone();
             let mut state = RunState::new(
@@ -1999,12 +2075,42 @@ mod tests {
                 stop: state.base_sync_recovery.stop.clone(),
                 legacy: None,
             });
+            if matches!(change, "reviewing" | "gating") {
+                let phase = if change == "reviewing" {
+                    Phase::Reviewing
+                } else {
+                    Phase::Gating
+                };
+                state.repair_grants.push(Applied {
+                    receipt: task.repair_grants[0].clone(),
+                    spent: 1,
+                    phase,
+                    review_start: 0,
+                    head: approved.clone(),
+                    succeeded: false,
+                    conflict: None,
+                });
+                state.save_under(dir.path()).unwrap();
+                crate::git::git(
+                    &repo,
+                    &["update-ref", "refs/remotes/origin/main", &approved],
+                )
+                .await
+                .unwrap();
+            }
             queue.put(&mut task).unwrap();
             let verdict = maintenance_resume_verdict(&task, &state);
             if change == "head" {
                 crate::git::git(&repo, &["commit", "--allow-empty", "-m", "Move winner"])
                     .await
                     .unwrap();
+                crate::git::git(&repo, &["update-ref", "refs/remotes/origin/main", &tip])
+                    .await
+                    .unwrap();
+                let before = std::fs::read(queue.path_of(&task.id)).unwrap();
+                let error = crate::resume::pin_queued(&queue, &state.id, None, None).unwrap_err();
+                assert!(error.is::<crate::resume::BeforeQueueWrite>(), "{error:#}");
+                assert_eq!(std::fs::read(queue.path_of(&task.id)).unwrap(), before);
                 apply(&queue, &questions, &verdict).unwrap();
                 assert!(!questions.list().iter().any(|q| q.run == task.id));
                 let facts =
@@ -2017,6 +2123,13 @@ mod tests {
                 continue;
             }
 
+            if change == "none" {
+                let obstruction = queue.path_of(&task.id).with_extension("json.tmp");
+                std::fs::create_dir(&obstruction).unwrap();
+                let error = crate::resume::pin_queued(&queue, &state.id, None, None).unwrap_err();
+                assert!(!error.is::<crate::resume::BeforeQueueWrite>(), "{error:#}");
+                std::fs::remove_dir(obstruction).unwrap();
+            }
             apply(&queue, &questions, &verdict).unwrap();
             let mut question = questions
                 .list()

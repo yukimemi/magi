@@ -1656,6 +1656,16 @@ pub(crate) fn apply_task_choice_actions(queue: &Queue, questions: &Questions, ho
             // carries an action (`waiter::decide_owned`), so it cannot race.
             continue;
         }
+        let decision = if let ActionDecision::Resume(run) = &decision {
+            match RunState::load_under(run, home).and_then(|state| {
+                crate::resume::prepare_pin(queue, home, &mut task, &state, Some(&q.id))
+            }) {
+                Ok(()) => decision,
+                Err(error) => ActionDecision::Refuse(format!("{error:#}")),
+            }
+        } else {
+            decision
+        };
         let done = matches!(decision, ActionDecision::Done);
         // Resume owes an execution pass; only these task-local effects finish
         // in this write. Stale/refused actions never acquire an effect receipt.
@@ -1665,17 +1675,7 @@ pub(crate) fn apply_task_choice_actions(queue: &Queue, questions: &Questions, ho
         );
         match decision {
             ActionDecision::Skip => continue,
-            ActionDecision::Resume(run) => {
-                task.release_operator("choice", Some(&q.id));
-                task.resume_override = Some(crate::queue::OperatorResume {
-                    question_id: q.id.clone(),
-                    at: Timestamp::now(),
-                    conductor_rehold: None,
-                    forced: true,
-                    pinned_run: Some(run),
-                });
-            }
-            ActionDecision::Stale => {}
+            ActionDecision::Resume(_) | ActionDecision::Stale => {}
             ActionDecision::Requeue => {
                 task.release_operator("choice-requeue", Some(&q.id));
                 task.requeue();
@@ -1685,7 +1685,11 @@ pub(crate) fn apply_task_choice_actions(queue: &Queue, questions: &Questions, ho
             ActionDecision::Refuse(why) => {
                 let _ =
                     crate::task_inquiry::Outbox::at(home).update_decision(&q.id, |d| d.fail(&why));
-                if task.operator_held() {
+                if matches!(q.chosen_action(), Some(ask::ChoiceAction::Resume { .. }))
+                    && !task.blocked_by.is_empty()
+                {
+                    // The answer cannot clear independent dependencies.
+                } else if task.operator_held() {
                     // A rejected answer does not release the operator's hold
                     // or reclassify it as recoverable by the conductor.
                     task.hold_reason = Some(match task.hold_reason.take() {
@@ -1696,7 +1700,8 @@ pub(crate) fn apply_task_choice_actions(queue: &Queue, questions: &Questions, ho
                     task.notice_cause(&format!("resume-refused:{}", q.id), None, None);
                     task.hold_machine(Some(why));
                 }
-                notices::raise(
+                notices::raise_in(
+                    home,
                     Notice::warn(
                         &format!("action:{}", q.id),
                         "An answer asked the daemon to resume a run that cannot be resumed; the task stays held.",

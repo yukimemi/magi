@@ -158,12 +158,19 @@ standing-control request, the queue must also record its publication and the
 matching owner generation. If publication was interrupted, repeat the original
 `recover-base` request with the same ID and arguments from its receipt; ordinary
 resume cannot complete publication.
+Both typed resume choices preserve an already-published approval's owner
+generation. A local tracking ref that no longer matches the approval's scope
+blocks the recommendation; only execution fetches and checks the live base.
 
 A pending textual-conflict repair is not offered for resume if its approved
-tip differs from the local tracking ref, or if an unimported grant no longer
-matches the clean retained checkout, branch and approved HEAD. Execution
-revalidates the evidence. Applying a maintenance resume answer can resolve
+tip differs from the local tracking ref before or during repair, or if an
+unimported grant no longer matches the clean retained checkout, branch and
+approved HEAD. Once the repair reaches review or gate, movement of the original
+tip does not block verification of the repaired head. Execution revalidates
+the applicable evidence. Applying a maintenance resume answer can resolve
 its own question blocker, but cannot bypass an independent dependency.
+A native resume decision refused before the queue write can be retried or
+settled; a failed queue write still has an uncertain result.
 Suppressing an unrelated recovery offer keeps existing cache and release holds
 intact and records the refusal separately.
 

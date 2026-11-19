@@ -197,6 +197,19 @@ fn check_pending_movement(
                     .is_some_and(|e| e.id == scope.episode),
             "base recovery task instruction or synchronization interval changed"
         );
+        let tracking = format!(
+            "refs/remotes/{}/{}",
+            state.config.merge.remote, state.base_branch
+        );
+        let tip = crate::graph::Runner::read_base_git(
+            &state.repo,
+            &["rev-parse", "--verify", &tracking],
+        )?;
+        ensure!(
+            scope.tip == tip,
+            "pending base recovery cannot resume: local tracking ref {tracking} is {tip}, not approved tip {}; inspect the changed base before recovery (not a fresh fetch)",
+            scope.tip
+        );
     }
     Ok(authorization.request.is_some() || authorization.generation.is_some())
 }
@@ -233,8 +246,6 @@ pub(crate) fn pin_queued(
         .context("queue has no home")
         .map_err(BeforeQueueWrite)?;
     let state = crate::run::RunState::load_under(run, home).map_err(BeforeQueueWrite)?;
-    let preserve_movement =
-        check_pending_movement(queue, &task, &state).map_err(BeforeQueueWrite)?;
     if applied.is_none()
         && task.status == crate::queue::TaskStatus::Queued
         && task
@@ -242,9 +253,28 @@ pub(crate) fn pin_queued(
             .as_ref()
             .is_some_and(|pin| pin.pinned_run.as_deref() == Some(run))
     {
+        check_pending_movement(queue, &task, &state).map_err(BeforeQueueWrite)?;
         return Ok(true);
     }
-    if !crate::repair_budget::queue_resumption_after_answer(home, &mut task, &state, applied)? {
+    prepare_pin(queue, home, &mut task, &state, applied).map_err(BeforeQueueWrite)?;
+    if let Some(id) = applied {
+        task.mark_action_applied(id);
+    }
+    queue.put(&mut task)?;
+    Ok(true)
+}
+
+/// Prepare the exact-run pin without saving. Callers hold the task claim and
+/// commit their own bookkeeping with the pin in one queue write.
+pub(crate) fn prepare_pin(
+    queue: &crate::queue::Queue,
+    home: &Path,
+    task: &mut crate::queue::Task,
+    state: &crate::run::RunState,
+    applied: Option<&str>,
+) -> Result<()> {
+    let preserve_movement = check_pending_movement(queue, task, state)?;
+    if !crate::repair_budget::queue_resumption_after_answer(home, task, state, applied)? {
         if preserve_movement {
             task.release();
         } else {
@@ -256,11 +286,7 @@ pub(crate) fn pin_queued(
         at: jiff::Timestamp::now(),
         conductor_rehold: None,
         forced: true,
-        pinned_run: Some(run.to_owned()),
+        pinned_run: Some(state.id.clone()),
     });
-    if let Some(id) = applied {
-        task.mark_action_applied(id);
-    }
-    queue.put(&mut task)?;
-    Ok(true)
+    Ok(())
 }

@@ -127,6 +127,12 @@ pub enum Phase {
     Complete,
 }
 
+impl Phase {
+    fn needs_conflict_target(self) -> bool {
+        matches!(self, Self::Pending | Self::Fixing)
+    }
+}
+
 /// Refuse self-grants from implementation/review seats. Chats use their existing bridge.
 pub fn authorize_terminal() -> Result<()> {
     ensure!(
@@ -667,7 +673,7 @@ pub(crate) async fn apply(home: &Path, state: &mut RunState, disk: &RunState) ->
             "repair grant held: task contract or owner decision changed after acceptance"
         );
         let _outputs = output_leases(home, disk)?;
-        if matches!(active.phase, Phase::Pending | Phase::Fixing) {
+        if active.phase.needs_conflict_target() {
             conflict_target(disk, &active.receipt.request, active.receipt.stop.as_ref()).await?;
         }
         if active.phase != Phase::Fixing {
@@ -808,14 +814,16 @@ pub(crate) fn check_queue_resumption(home: &Path, task: &Task, state: &RunState)
         "repair grant held: owner decision or task contract changed after acceptance"
     );
     if receipt.request.kind == Kind::BaseConflict {
-        if !state
+        let imported = state
             .repair_grants
             .iter()
-            .any(|grant| grant.receipt == *receipt)
-        {
+            .find(|grant| grant.receipt == *receipt);
+        if imported.is_none() {
             check_local_head(state, &receipt.request.head)?;
         }
-        conflict_base_tip(state, &receipt.request, receipt.stop.as_ref())?;
+        if imported.is_none_or(|grant| grant.phase.needs_conflict_target()) {
+            conflict_base_tip(state, &receipt.request, receipt.stop.as_ref())?;
+        }
     }
     Ok(true)
 }
