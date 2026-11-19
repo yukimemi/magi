@@ -376,8 +376,25 @@ pub(crate) fn require_repo(kind: &str, id: &str, actual: &Path, expected: &Path)
         path.canonicalize()
             .with_context(|| format!("goal {kind} {id}: resolve repository {}", path.display()))
     };
+    let actual_path = canonical(actual)?;
+    let expected_path = canonical(expected)?;
+    if actual_path == expected_path {
+        return Ok(());
+    }
+    // Task filing can retain a subdirectory, while execution saves the
+    // checkout root. Compare roots, not common Git dirs: linked worktrees
+    // and repositories nested under a checkout still have distinct roots.
+    let root = |path| {
+        crate::git::toplevel_blocking(path).with_context(|| {
+            format!(
+                "goal {kind} {id}: compare repositories ({}; expected {})",
+                actual.display(),
+                expected.display()
+            )
+        })
+    };
     ensure!(
-        canonical(actual)? == canonical(expected)?,
+        root(&actual_path)? == root(&expected_path)?,
         "goal {kind} {id} belongs to another repository ({}; expected {})",
         actual.display(),
         expected.display()
@@ -507,15 +524,18 @@ pub(crate) async fn apply(
             } else {
                 selector
             };
-            let path = crate::repo_selector::resolve_repo_with_clone(
+            let selected = crate::repo_selector::resolve_repo_with_clone(
                 path_selector,
                 &talk.repo,
                 None,
                 false,
             )
-            .await?
-            .canonicalize()
-            .with_context(|| format!("canonicalize goal repository {}", selector.display()))?;
+            .await?;
+            let path = crate::git::toplevel(&selected)
+                .await
+                .with_context(|| format!("locate goal checkout root for {}", selector.display()))?
+                .canonicalize()
+                .with_context(|| format!("canonicalize goal repository {}", selector.display()))?;
             Some((id.clone(), talk.repo, previous, path))
         }
         _ => None,
@@ -1125,6 +1145,8 @@ mod authorization_tests {
             std::fs::create_dir_all(repo).unwrap();
             crate::git::git(repo, &["init", "-q"]).await.unwrap();
         }
+        let subdir = first.join("src");
+        std::fs::create_dir(&subdir).unwrap();
         std::fs::create_dir(&conversation).unwrap();
         let cfg = crate::config::Config {
             repos: crate::config::Repos {
@@ -1144,11 +1166,11 @@ mod authorization_tests {
         talk.turns
             .push(input("operator", "Follow the projects separately"));
         talks.put(&mut talk).unwrap();
-        // On Windows the selector canonicalizes to a verbatim path, unlike this task.
+        // Filing retains the subdirectory; run records store the checkout root.
         let mut task = crate::queue::Task::new(
             "Work".into(),
             "Verify work".into(),
-            first.clone(),
+            subdir.clone(),
             crate::queue::Source::Human,
         );
         queue.put(&mut task).unwrap();
@@ -1180,7 +1202,7 @@ mod authorization_tests {
         )
         .await
         .unwrap();
-        apply(owner.clone(), command("first", Some(&first), true))
+        apply(owner.clone(), command("first", Some(&subdir), true))
             .await
             .unwrap();
         apply(owner.clone(), command("second", Some(&second), false))

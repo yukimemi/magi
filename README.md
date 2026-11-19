@@ -706,9 +706,10 @@ replace earlier work.
 Use `magi task control goal establish … --repo <path-or-name>` to follow
 work outside the conversation's repository. It uses the same local path,
 `owner/repo` and unique short-name selectors as `magi task add`, but never
-clones. Relative paths start at the conversation directory. Without `--repo`,
-the goal uses that directory, including for saved goals created before this
-option existed. Multiple goals in one conversation can target different
+clones. Relative paths start at the conversation directory. A path inside a
+checkout selects its Git root, even if the task retained the subdirectory.
+Without `--repo`, the goal uses the conversation directory, including for older
+saved goals. Multiple goals in one conversation can target different
 checkouts without changing the conversation's directory, agent or permissions.
 Repeat an establishment with the same ID and target only as an idempotent
 request. Use `goal update <id> --repo <path-or-name>` from a new owner request

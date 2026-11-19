@@ -439,11 +439,15 @@ async fn execute(
             serde_json::to_string(&task)?
         }
         Operation::Done { task } => {
-            let t = done(queue, home, &task)?;
+            let t = done_claimed(queue, home, claimed_for_chat(queue, &task, talks, talk)?)?;
             format!("done {} {}", t.short(), t.title)
         }
         Operation::Priority { task, priority } => {
-            let t = set_priority(queue, &task, priority)?;
+            let t = priority_claimed(
+                queue,
+                claimed_for_chat(queue, &task, talks, talk)?,
+                priority,
+            )?;
             format!("{} priority now {} - {}", t.short(), t.priority, t.title)
         }
         Operation::MergePr {
@@ -513,14 +517,25 @@ async fn execute(
                 describe(&t, "resume queued for")
             )
         }
-        Operation::Hold { task, reason } => describe(&hold(queue, &task, &reason)?, "held"),
-        Operation::Release { task } => describe(&release(queue, &task)?, "released"),
+        Operation::Hold { task, reason } => describe(
+            &hold_claimed(queue, claimed_for_chat(queue, &task, talks, talk)?, &reason)?,
+            "held",
+        ),
+        Operation::Release { task } => describe(
+            &release_claimed(queue, claimed_for_chat(queue, &task, talks, talk)?)?,
+            "released",
+        ),
         Operation::Retry {
             task,
             title,
             instruction,
         } => describe(
-            &retry(queue, &task, title, &instruction)?,
+            &retry_claimed(
+                queue,
+                claimed_for_chat(queue, &task, talks, talk)?,
+                title,
+                &instruction,
+            )?,
             "retry queued for",
         ),
         Operation::RerunChecks {
@@ -885,7 +900,10 @@ async fn execute_decision(
         };
         outbox.update_decision(id, |d| d.accept(&request))?;
     }
-    if decision.request.is_some()
+    let late_admission = crate::chat_goal::fence(talks, chat, &crate::chat_goal::current_source())
+        .and_then(|()| admit_goal_operation(queue, home, talks, chat, &command));
+    if late_admission.is_ok()
+        && decision.request.is_some()
         && matches!(decision.status, Status::InProgress | Status::RetryNeeded)
     {
         if decision.retry_safe {
@@ -904,20 +922,33 @@ async fn execute_decision(
         }
         // The shared merge service only checks the forge once this exact
         // request has a receipt; it never issues the merge command twice.
-    } else {
+    } else if late_admission.is_ok() {
         outbox.update_decision(id, |d| d.start())?;
     }
-    crate::chat_goal::fence(talks, chat, &crate::chat_goal::current_source())?;
-    admit_goal_operation(queue, home, talks, chat, &command)?;
-    let local = apply_local_decision(
-        queue,
-        home,
-        id,
-        &request,
-        &inquiry.task,
-        &inquiry.repo,
-        &command,
-    );
+    let local = match late_admission {
+        // A refusal now says nothing about a prior attempt that may have acted.
+        Err(error)
+            if decision.request.is_some()
+                && !decision.retry_safe
+                && (matches!(decision.status, Status::InProgress | Status::RetryNeeded)
+                    || decision
+                        .history
+                        .iter()
+                        .any(|event| event.status == Status::InProgress)) =>
+        {
+            return Err(error);
+        }
+        Err(error) => Err(anyhow::Error::new(BeforeEffect(error))),
+        Ok(()) => apply_local_decision(
+            queue,
+            home,
+            id,
+            &request,
+            &inquiry.task,
+            &inquiry.repo,
+            &command,
+        ),
+    };
     let result = if let Err(error) = local {
         Err(error)
     } else if let Some(message) = local? {
@@ -1643,6 +1674,36 @@ fn claimed(queue: &Queue, reference: &str) -> Result<(crate::queue::Claim, Task)
     Ok((claim, task))
 }
 
+fn claimed_for_chat(
+    queue: &Queue,
+    reference: &str,
+    talks: &Talks,
+    chat: &str,
+) -> Result<(crate::queue::Claim, Task)> {
+    let claimed = claimed(queue, reference)?;
+    if let crate::chat_goal::Source::Goal { id, generation } = crate::chat_goal::current_source() {
+        let talk = talks.get(chat)?;
+        let goal = talk
+            .goals
+            .iter()
+            .find(|goal| goal.id == id)
+            .context("unknown goal")?;
+        goal.admit(generation)?;
+        let task = &claimed.1;
+        ensure!(
+            goal.tasks.contains(&task.id),
+            "effect targets a task outside this goal"
+        );
+        crate::chat_goal::require_repo(
+            "task",
+            &task.id,
+            &task.repo,
+            goal.effective_repo(&talk.repo),
+        )?;
+    }
+    Ok(claimed)
+}
+
 fn check_hold_release(task: &Task, operation: &str) -> Result<()> {
     match task.status {
         TaskStatus::Queued
@@ -1663,7 +1724,14 @@ fn check_hold_release(task: &Task, operation: &str) -> Result<()> {
 
 /// Mark a task complete under its queue claim, as `magi task done` does.
 pub fn done(queue: &Queue, home: &Path, reference: &str) -> Result<Task> {
-    let (_claim, mut task) = claimed(queue, reference)?;
+    done_claimed(queue, home, claimed(queue, reference)?)
+}
+
+fn done_claimed(
+    queue: &Queue,
+    home: &Path,
+    (_claim, mut task): (crate::queue::Claim, Task),
+) -> Result<Task> {
     task.succeed();
     // Manual completion also retires earlier attempts when the latest one landed.
     crate::daemon::supersede_prior_runs(&task, home);
@@ -1673,7 +1741,14 @@ pub fn done(queue: &Queue, home: &Path, reference: &str) -> Result<Task> {
 
 /// Change priority under the same claim and state check as the terminal route.
 pub fn set_priority(queue: &Queue, reference: &str, priority: i32) -> Result<Task> {
-    let (_claim, mut task) = claimed(queue, reference)?;
+    priority_claimed(queue, claimed(queue, reference)?, priority)
+}
+
+fn priority_claimed(
+    queue: &Queue,
+    (_claim, mut task): (crate::queue::Claim, Task),
+    priority: i32,
+) -> Result<Task> {
     task.set_priority(priority)?;
     queue.put(&mut task)?;
     Ok(task)
@@ -1681,7 +1756,14 @@ pub fn set_priority(queue: &Queue, reference: &str, priority: i32) -> Result<Tas
 
 /// Hold a task for the owner.
 pub fn hold(queue: &Queue, reference: &str, reason: &str) -> Result<Task> {
-    let (_claim, mut task) = claimed(queue, reference)?;
+    hold_claimed(queue, claimed(queue, reference)?, reason)
+}
+
+fn hold_claimed(
+    queue: &Queue,
+    (_claim, mut task): (crate::queue::Claim, Task),
+    reason: &str,
+) -> Result<Task> {
     check_hold_release(&task, "hold")?;
     let reason = reason.trim();
     task.hold_manual((!reason.is_empty()).then(|| reason.to_owned()));
@@ -1693,7 +1775,10 @@ pub fn hold(queue: &Queue, reference: &str, reason: &str) -> Result<Task> {
 /// count restarts, the history stays). An operator hold is released too: the
 /// owner asked for it.
 pub fn release(queue: &Queue, reference: &str) -> Result<Task> {
-    let (_claim, mut task) = claimed(queue, reference)?;
+    release_claimed(queue, claimed(queue, reference)?)
+}
+
+fn release_claimed(queue: &Queue, (_claim, mut task): (crate::queue::Claim, Task)) -> Result<Task> {
     check_hold_release(&task, "release")?;
     crate::base_sync_recovery::ensure_generic_release(queue, &task)?;
     let run = task.execution_runs().last().cloned();
@@ -1718,11 +1803,19 @@ pub fn retry(
     title: Option<String>,
     instruction: &str,
 ) -> Result<Task> {
+    retry_claimed(queue, claimed(queue, reference)?, title, instruction)
+}
+
+fn retry_claimed(
+    queue: &Queue,
+    (_claim, mut task): (crate::queue::Claim, Task),
+    title: Option<String>,
+    instruction: &str,
+) -> Result<Task> {
     ensure!(
         !instruction.trim().is_empty(),
         "the new instruction is empty"
     );
-    let (_claim, mut task) = claimed(queue, reference)?;
     if let Some(state) = crate::base_sync_recovery::held_run(queue, &task)
         && state
             .base_sync_recovery
@@ -2283,6 +2376,30 @@ mod goal_admission_tests {
         )
         .await
         .unwrap();
+        let hold = Operation::Hold {
+            task: task.id.clone(),
+            reason: "pause".into(),
+        };
+        crate::chat_goal::with_source(source.clone(), async {
+            // Reassignment publishes under this same claim, between the first
+            // admission and the mutation's claim acquisition.
+            admit_goal_operation(&queue, tmp.path(), &talks, &talk.id, &hold).unwrap();
+            let original = task.repo.clone();
+            {
+                let claim = queue.claim(&task.id).unwrap();
+                task = queue.get(&task.id).unwrap();
+                task.repo = talk.repo.clone();
+                queue.put(&mut task).unwrap();
+                drop(claim);
+            }
+            let result = claimed_for_chat(&queue, &task.id, &talks, &talk.id)
+                .and_then(|claimed| hold_claimed(&queue, claimed, "pause"));
+            assert!(result.unwrap_err().to_string().contains(&task.id));
+            assert_eq!(queue.get(&task.id).unwrap().status, TaskStatus::Queued);
+            task.repo = original;
+            queue.put(&mut task).unwrap();
+        })
+        .await;
         talks
             .mutate(&talk.id, |talk| {
                 talk.turns.push(serde_json::from_value(serde_json::json!({

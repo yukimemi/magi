@@ -694,6 +694,10 @@ mod tests {
         let other = home.join("other");
         std::fs::create_dir(&checkout).unwrap();
         std::fs::create_dir(&other).unwrap();
+        crate::git::git(&checkout, &["init", "-q"]).await.unwrap();
+        crate::git::git(&other, &["init", "-q"]).await.unwrap();
+        let subdir = checkout.join("src");
+        std::fs::create_dir(&subdir).unwrap();
         let queue = crate::queue::Queue::at(home.join("queue"));
         let talks = crate::talk::Talks::at(home.join("talks"));
         let mut talk = crate::talk::seeded_for_test("chat", home.into());
@@ -725,7 +729,7 @@ mod tests {
         let mut task = crate::queue::Task::new(
             "Work".into(),
             "verify".into(),
-            checkout.clone(),
+            subdir.clone(),
             crate::queue::Source::Human,
         );
         task.runs.push(previous.id.clone());
@@ -759,10 +763,19 @@ mod tests {
                 .contains(&foreign.id)
         );
         assert_one_target_lookup(&observer, repo, url);
-        let pending =
-            observe_with_pr(home, repo, &retained.tasks, &retained.runs, &[], &observer).await;
+        // Legacy conversations may have stored the filing subdirectory as cwd.
+        let pending = observe_with_pr(
+            home,
+            &subdir,
+            &retained.tasks,
+            &retained.runs,
+            &[],
+            &observer,
+        )
+        .await;
+        assert_eq!(pending.facts["prs"][0]["run"], target.id);
         assert!(!satisfied(&retained, &pending.facts));
-        assert_one_target_lookup(&observer, repo, url);
+        assert_one_target_lookup(&observer, &subdir, url);
         retained.fingerprint = pending.fingerprint;
         retained.evidence = pending.facts.to_string();
         talk.goals.push(retained);

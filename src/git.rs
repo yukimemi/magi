@@ -190,6 +190,28 @@ pub async fn toplevel(path: &Path) -> Result<PathBuf> {
     Ok(PathBuf::from(out))
 }
 
+/// Canonical checkout root for synchronous record validation.
+pub(crate) fn toplevel_blocking(path: &Path) -> Result<PathBuf> {
+    #[cfg(test)]
+    crate::web::request_cost::git();
+    let out = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(path)
+        .quiet()
+        .stdin(Stdio::null())
+        .output()
+        .with_context(|| format!("read Git checkout root of {}", path.display()))?;
+    ensure!(
+        out.status.success(),
+        "cannot read Git checkout root of {}: {}",
+        path.display(),
+        String::from_utf8_lossy(&out.stderr).trim_end()
+    );
+    Path::new(std::str::from_utf8(&out.stdout)?.trim_end_matches(['\r', '\n']))
+        .canonicalize()
+        .with_context(|| format!("canonicalize Git checkout root of {}", path.display()))
+}
+
 /// Resolve a revision to a full object id.
 pub async fn rev_parse(repo: &Path, rev: &str) -> Result<String> {
     git(repo, &["rev-parse", rev]).await
