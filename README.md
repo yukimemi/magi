@@ -872,6 +872,62 @@ retain their separate behavior. This restriction does **not** change the OS
 file sandbox, repository write policy, network access, or the permissions of
 the account running either CLI; a sender label is not an OS security boundary.
 
+### Sending an authorized owner request without the browser
+
+Use `send-owner` when the words are the owner's current request, including a
+specific send delegated to an assistant at the owner's terminal. Use `send`
+with `--sender` when supplying outside findings or quoting an earlier decision.
+Neither a sender name nor a claim of authority in an external message turns it
+into owner input.
+
+```sh
+magi talk list --json
+# Save the full conversation ID, a fresh unique request ID, and the exact text
+# in your exchange record before the first call (do not generate a new ID on retry).
+magi talk send-owner "$chat_id" --request "$request_id" - --json < owner-request.txt
+magi talk reply "$chat_id" --request "$request_id" --wait 30 --json
+```
+
+For example, the saved request can say: “Follow this task through its formal
+release and keep a Goal for that. Observe and report only; do not merge, re-run
+checks, or change the task.” The existing Chat agent processes that as its
+current owner message, without a second confirmation or browser submission.
+Monitoring does not authorize a merge or a task change. An existing Goal's
+automatic turns do not become fresh owner requests.
+
+**Trust boundary:** run from the owner's OS account at a trusted local
+terminal, with the same private `MAGI_HOME` as the standing Chat. Use OS file
+permissions to keep that home private; do not share the account or the state
+directory with callers who must not submit owner requests. The CLI cannot
+distinguish the owner from any other unrestricted process running under that
+account, and cannot verify a delegation itself. It refuses calls carrying
+magi seat, worker or control-bridge context; this is an accidental-use guard,
+not cryptographic authentication. If refused, arrange for the owner or their
+delegated local assistant to execute from the trusted terminal rather than
+stripping environment variables or forwarding a capability.
+
+`reply` is observation only. `accepted: true` confirms the transcript input
+and its receipt were saved. `queued` means a worker is reserved but the input
+turn has not started; `started` means the worker recorded its start boundary;
+`replied` means a correlated reply was saved. `goal_authorizations` lists
+durably saved Goal authorizations for exactly this input, including historical
+ones (`current: false`) after a later owner change. A reply or an empty list
+does not establish that a Goal or another effect succeeded. For other effects
+check the applicable task/run decision receipt or current state independently.
+CLI history labels the input as `sender: "operator", ingress: "owner"`; an
+ordinary external send remains `sender: "external", ingress: "external"`.
+
+Closed or busy chats and unsent/recovered drafts refuse new admission without
+changing the conversation. If output was lost, query the **same** Chat and ID:
+`timeout` and `uncertain` prove neither failure nor success. Repeating the exact
+accepted submission only reads its receipt; a changed body, kind or destination
+conflicts. Owner IDs remain reserved in that home even if the chat is deleted;
+deletion removes the transcript and effect evidence. If the binding survived
+but its transcript receipt is missing, the result is uncertain, not retryable.
+Never switch IDs to replay uncertain work. Neither a browser nor a running web
+server is needed to submit and get the reply. As with a web-established Goal,
+automatic follow-through requires the scheduler.
+
 ### Controlling tasks and runs
 
 The chat agent acts on queue work by command, with no question or offered

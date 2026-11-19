@@ -1,13 +1,70 @@
-//! Local external-process ingress. Publication, TurnLease and worker ownership
-//! are the same as web Chat; an uncertain submission is never replayed.
+//! Local CLI ingress. Publication, TurnLease and worker ownership are the same
+//! as web Chat; an uncertain submission is never replayed.
 use super::*;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+
+/// Provenance of a CLI admission; old receipts were all external.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestKind {
+    /// Data from an external caller; never grants owner authority.
+    #[default]
+    External,
+    /// An explicit local operator submission.
+    Owner,
+}
+
+// Separate from the transcript so deleting a talk cannot free an owner
+// request ID for use against another destination.
+#[derive(PartialEq, Eq, Serialize, Deserialize)]
+struct OwnerBinding {
+    talk: String,
+    text_sha256: String,
+}
+
+fn digest(text: &str) -> String {
+    use std::fmt::Write as _;
+    let mut encoded = String::with_capacity(64);
+    for byte in Sha256::digest(text.as_bytes()) {
+        write!(encoded, "{byte:02x}").expect("write to String");
+    }
+    encoded
+}
+
+fn binding_path(store: &Talks, request: &str) -> PathBuf {
+    store.root.join("owner-requests").join(digest(request))
+}
+
+fn read_binding(store: &Talks, request: &str) -> Result<Option<OwnerBinding>> {
+    match std::fs::read(binding_path(store, request)) {
+        Ok(bytes) => Ok(Some(
+            serde_json::from_slice(&bytes).context("decode owner request binding")?,
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).context("read owner request binding"),
+    }
+}
+
+fn save_binding(store: &Talks, request: &str, binding: &OwnerBinding) -> Result<()> {
+    let path = binding_path(store, request);
+    std::fs::create_dir_all(path.parent().expect("binding directory"))?;
+    write_atomic(
+        &path.with_extension("tmp"),
+        &path,
+        &serde_json::to_string(binding)?,
+    )
+    .context("persist owner request binding")
+}
 
 /// A durable occurrence, committed atomically with its exact transcript input.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Request {
-    /// Caller-saved occurrence identifier, unique within this conversation.
+    /// Caller-saved occurrence identifier.
     pub request: String,
+    /// Authority comes from the admission path, not the sender label or text.
+    #[serde(default)]
+    pub kind: RequestKind,
     /// Self-reported external display label; never an authority credential.
     pub sender: String,
     /// Exact original input, retained to reject conflicting request replays.
@@ -23,25 +80,6 @@ pub struct Request {
     pub worker: Option<String>,
     /// Startup or response diagnostic, when known.
     pub error: Option<String>,
-}
-
-pub(crate) fn active_input(talk: &Talk) -> Option<usize> {
-    // A historical interrupted request must never hijack a later owner turn.
-    // Bind execution to this worker's immutable payload, not a pending flag.
-    let home = crate::run::try_home()?;
-    let job = crate::worker::current_job(&home).ok()??;
-    if job.payload.get("talk")?.as_str()? != talk.id {
-        return None;
-    }
-    let request = job.payload.get("external_request")?.as_str()?;
-    talk.external_requests
-        .iter()
-        .find(|r| {
-            r.request == request
-                && r.status == "started"
-                && r.worker.as_deref() == Some(job.id.as_str())
-        })
-        .map(|r| r.input_turn)
 }
 
 fn resolve(store: &Talks, selector: &str) -> Result<std::result::Result<Talk, Value>> {
@@ -124,7 +162,9 @@ pub fn history(store: &Talks, selector: &str, after: Option<&str>, limit: usize)
             let turn = &talk.turns[i];
             let message = turn.messages.get(j);
             let body = message.map_or(turn.body.as_str(), |m| m.body.as_str());
-            json!({"id":cursor(&talk,i,j),"sender":sender(turn,message),"body":body,"at":turn.at})
+            let ingress = talk.external_requests.iter().find(|r| r.input_turn == i);
+            json!({"id":cursor(&talk,i,j),"sender":sender(turn,message),"body":body,"at":turn.at,
+                "request":ingress.map(|r| &r.request),"ingress":ingress.map(|r| r.kind)})
         })
         .collect();
     let more = coordinates.next().is_some();
@@ -133,28 +173,50 @@ pub fn history(store: &Talks, selector: &str, after: Option<&str>, limit: usize)
 }
 
 fn view(store: &Talks, talk: &Talk, record: &Request) -> Value {
+    use crate::worker::Status;
     let mut status = record.status.as_str();
+    let owner = record.kind == RequestKind::Owner;
     if matches!(status, "accepted" | "started") {
-        // Absence of completion is not permission to execute again. A worker
-        // result may be pruned; that is unknown, not a fresh request.
-        if let Some(id) = &record.worker {
-            match crate::worker::get(store.home(), id) {
-                Ok(job)
-                    if matches!(
-                        job.status,
-                        crate::worker::Status::Failed | crate::worker::Status::Finished
-                    ) =>
-                {
-                    status = "uncertain"
-                }
-                Err(_) => status = "uncertain",
-                _ => {}
-            }
+        // A missing or ended worker without a settled reply is not permission
+        // to execute again. The owner path also probes the live execution lease.
+        let live = record
+            .worker
+            .as_deref()
+            .and_then(|id| crate::worker::get(store.home(), id).ok())
+            .is_some_and(|job| {
+                matches!(job.status, Status::Starting | Status::Running)
+                    && (!owner
+                        || crate::worker::observe_job_active(store.home(), &job).unwrap_or(false))
+            });
+        status = if !live {
+            "uncertain"
+        } else if owner && status == "accepted" {
+            "queued"
         } else {
-            status = "uncertain";
+            status
+        };
+    }
+    // A saved authorization (even a superseded one) is evidence of the
+    // effect. Persona prose, task status and an unrelated goal are not.
+    let mut goal_authorizations = Vec::new();
+    if owner {
+        for goal in &talk.goals {
+            if goal.source_turn == record.input_turn && goal.owner_input == record.text {
+                goal_authorizations.push(json!({"id":goal.id,"purpose":goal.purpose,
+                    "scope":goal.scope,"condition":goal.condition,"current":true,"state":goal.state}));
+            }
+            for revision in &goal.history {
+                if revision.source_turn == record.input_turn && revision.owner_input == record.text
+                {
+                    goal_authorizations.push(json!({"id":goal.id,"purpose":revision.purpose,
+                        "scope":revision.scope,"condition":revision.condition,
+                        "current":false,"state":revision.state}));
+                }
+            }
         }
     }
-    json!({"talk":talk.id,"request":record.request,"status":status,
+    json!({"talk":talk.id,"request":record.request,"status":status,"accepted":true,
+        "ingress":record.kind,"goal_authorizations":goal_authorizations,
         "input_id":cursor(talk,record.input_turn,0),
         "reply_id":record.reply_turn.map(|i| cursor(talk,i,0)),
         "reply":record.reply_turn.and_then(|i| talk.turns.get(i)).map(|t| &t.body),
@@ -169,6 +231,37 @@ pub async fn send(
     label: &str,
     text: &str,
 ) -> Result<Value> {
+    send_input(store, selector, request, Some(label), text).await
+}
+
+/// Submit an explicit local operator request, independently of external ingress.
+pub async fn send_owner(store: &Talks, id: &str, request: &str, text: &str) -> Result<Value> {
+    let seat_environment = ["MAGI_RUN", "MAGI_NODE", "MAGI_SEAT"];
+    anyhow::ensure!(
+        !seat_environment
+            .iter()
+            .chain(crate::worker::INVOCATION_ENV.iter())
+            .chain(crate::chat_control::bridge::ENVIRONMENT)
+            .any(|key| std::env::var_os(key).is_some()),
+        "send-owner is unavailable inside a magi seat or worker; run it from the owner's trusted local terminal using their private MAGI_HOME"
+    );
+    send_input(store, id, request, None, text).await
+}
+
+async fn send_input(
+    store: &Talks,
+    selector: &str,
+    request: &str,
+    label: Option<&str>,
+    text: &str,
+) -> Result<Value> {
+    let kind = if label.is_some() {
+        RequestKind::External
+    } else {
+        RequestKind::Owner
+    };
+    let label = label.unwrap_or_default();
+    let owner = kind == RequestKind::Owner;
     anyhow::ensure!(
         !request.is_empty()
             && request.len() <= 128
@@ -178,36 +271,72 @@ pub async fn send(
         "request must contain 1..128 ASCII letters, digits, -, _ or ."
     );
     anyhow::ensure!(
-        !label.trim().is_empty() && label.len() <= 128 && !label.chars().any(char::is_control),
+        owner
+            || (!label.trim().is_empty()
+                && label.len() <= 128
+                && !label.chars().any(char::is_control)),
         "sender must be a nonempty single-line label of at most 128 bytes"
     );
     anyhow::ensure!(!text.trim().is_empty(), "nothing to send");
+    let expected_binding = owner.then(|| OwnerBinding {
+        talk: selector.to_owned(),
+        text_sha256: digest(text),
+    });
+    let binding_status = |binding: &OwnerBinding| {
+        let status = if Some(binding) == expected_binding.as_ref() {
+            "uncertain"
+        } else {
+            "conflict"
+        };
+        json!({"talk":selector,"request":request,"status":status})
+    };
     let talk = match resolve(store, selector)? {
         Ok(t) => t,
-        Err(v) => return Ok(v),
+        Err(v) => {
+            return Ok(if owner {
+                read_binding(store, request)?
+                    .as_ref()
+                    .map_or(v, binding_status)
+            } else {
+                v
+            });
+        }
     };
-    if let Some(r) = talk.external_requests.iter().find(|r| r.request == request) {
-        return Ok(if r.text == text && r.sender == label {
-            view(store, &talk, r)
+    anyhow::ensure!(
+        !owner || talk.id == selector,
+        "send-owner requires the full Chat ID from magi talk list"
+    );
+    let replay = |talk: &Talk, r: &Request| {
+        if r.kind == kind && r.text == text && r.sender == label {
+            view(store, talk, r)
         } else {
             json!({"talk":talk.id,"request":request,"status":"conflict"})
-        });
+        }
+    };
+    if let Some(r) = talk.external_requests.iter().find(|r| r.request == request) {
+        return Ok(replay(&talk, r));
+    }
+    if let Some(binding) = read_binding(store, request)? {
+        // Re-read: the binding can become visible just before the atomic
+        // transcript write. Never dispatch again in that interval.
+        let fresh = read_path(&store.path_of(&talk.id))?;
+        return Ok(fresh
+            .external_requests
+            .iter()
+            .find(|r| r.request == request)
+            .map_or_else(|| binding_status(&binding), |r| replay(&fresh, r)));
     }
     let Some(_publication) = crate::chat_worker::try_publication_guard(store, &talk.id)? else {
         return Ok(json!({"talk":talk.id,"request":request,"status":"busy"}));
     };
     // Replays are observational even if the conversation is now busy/closed.
-    let fresh = store.get(&talk.id)?;
+    let fresh = read_path(&store.path_of(&talk.id))?;
     if let Some(r) = fresh
         .external_requests
         .iter()
         .find(|r| r.request == request)
     {
-        return Ok(if r.text == text && r.sender == label {
-            view(store, &fresh, r)
-        } else {
-            json!({"talk":fresh.id,"request":request,"status":"conflict"})
-        });
+        return Ok(replay(&fresh, r));
     }
     if !fresh.status.open() {
         return Ok(json!({"talk":fresh.id,"request":request,"status":"closed"}));
@@ -222,7 +351,10 @@ pub async fn send(
     };
     {
         let _guard = store.guard()?;
-        let mut fresh = store.get(&talk.id)?;
+        let mut fresh = read_path(&store.path_of(&talk.id))?;
+        if let Some(binding) = read_binding(store, request)? {
+            return Ok(binding_status(&binding));
+        }
         if !fresh.status.open() {
             return Ok(json!({"talk":fresh.id,"request":request,"status":"closed"}));
         }
@@ -233,19 +365,25 @@ pub async fn send(
             return Ok(json!({"talk":fresh.id,"request":request,"status":"busy"}));
         }
         let index = fresh.turns.len();
-        fresh.turns.push(Turn {
-            sender: Some(Sender::External),
-            who: Who::Operator,
-            body: format!("External agent [{label}]:\n{text}"),
-            at: Timestamp::now(),
-            attachments: Vec::new(),
-            usage: None,
-            breaks: Some(Vec::new()),
-            messages: Vec::new(),
-            posted_by: None,
-        });
+        if let Some(binding) = &expected_binding {
+            save_binding(store, request, binding)?;
+            fresh.turns.push(operator_turn(text, Vec::new(), None));
+        } else {
+            fresh.turns.push(Turn {
+                sender: Some(Sender::External),
+                who: Who::Operator,
+                body: format!("External agent [{label}]:\n{text}"),
+                at: Timestamp::now(),
+                attachments: Vec::new(),
+                usage: None,
+                breaks: Some(Vec::new()),
+                messages: Vec::new(),
+                posted_by: None,
+            });
+        }
         fresh.external_requests.push(Request {
             request: request.to_owned(),
+            kind,
             sender: label.to_owned(),
             text: text.to_owned(),
             input_turn: index,
@@ -267,12 +405,12 @@ pub async fn send(
     .await;
     {
         let _guard = store.guard()?;
-        let mut fresh = store.get(&talk.id)?;
+        let mut fresh = read_path(&store.path_of(&talk.id))?;
         let r = fresh
             .external_requests
             .iter_mut()
             .find(|r| r.request == request)
-            .context("external request disappeared")?;
+            .context("CLI request disappeared")?;
         match result {
             Ok(job) => {
                 r.worker = Some(job.id);
@@ -291,7 +429,7 @@ pub async fn send(
         }
         store.put(&mut fresh)?;
     }
-    let fresh = store.get(&talk.id)?;
+    let fresh = read_path(&store.path_of(&talk.id))?;
     Ok(view(
         store,
         &fresh,
@@ -299,27 +437,39 @@ pub async fn send(
             .external_requests
             .iter()
             .find(|r| r.request == request)
-            .context("external request disappeared")?,
+            .context("CLI request disappeared")?,
     ))
 }
 
 /// Observation only: timeout neither cancels nor repeats accepted work.
 pub async fn reply(store: &Talks, selector: &str, request: &str, wait: u64) -> Result<Value> {
+    let binding = read_binding(store, request)?;
     let talk = match resolve(store, selector)? {
         Ok(t) => t,
-        Err(v) => return Ok(v),
+        Err(v) => {
+            return Ok(if binding.as_ref().is_some_and(|b| b.talk == selector) {
+                json!({"talk":selector,"request":request,"status":"uncertain"})
+            } else {
+                v
+            });
+        }
     };
     let deadline = tokio::time::Instant::now()
         .checked_add(Duration::from_secs(wait))
         .context("wait duration exceeds the monotonic clock range")?;
     loop {
-        let fresh = store.get(&talk.id)?;
+        let fresh = read_path(&store.path_of(&talk.id))?;
         let Some(record) = fresh
             .external_requests
             .iter()
             .find(|r| r.request == request)
         else {
-            return Ok(json!({"talk":talk.id,"request":request,"status":"not_found"}));
+            let status = match &binding {
+                Some(b) if b.talk == fresh.id => "uncertain",
+                Some(_) => "conflict",
+                None => "not_found",
+            };
+            return Ok(json!({"talk":talk.id,"request":request,"status":status}));
         };
         let mut value = view(store, &fresh, record);
         if wait == 0 || matches!(record.status.as_str(), "replied" | "failed" | "not_started") {
@@ -336,12 +486,19 @@ pub async fn reply(store: &Talks, selector: &str, request: &str, wait: u64) -> R
 
 /// Called only by the ordinary detached chat worker, under its execution lease.
 pub(crate) async fn run_worker(store: &Talks, id: &str, request: &str) -> Result<()> {
+    let job = crate::worker::current_job(store.home())?.context("CLI submission has no worker")?;
+    anyhow::ensure!(
+        job.kind == "chat"
+            && job.payload["talk"].as_str() == Some(id)
+            && job.payload["external_request"].as_str() == Some(request),
+        "CLI submission does not belong to this worker"
+    );
     loop {
         if let Some(lease) = store.claim_turn(id)? {
             let publication = crate::chat_worker::publication_guard(store, id).await?;
-            let mut talk = {
+            let (mut talk, index) = {
                 let _guard = store.guard()?;
-                let mut talk = store.get(id)?;
+                let mut talk = read_path(&store.path_of(id))?;
                 let r = talk
                     .external_requests
                     .iter_mut()
@@ -351,21 +508,58 @@ pub(crate) async fn run_worker(store: &Talks, id: &str, request: &str) -> Result
                 if r.status != "accepted" {
                     return Ok(());
                 }
+                if r.kind == RequestKind::Owner && !talk.status.open() {
+                    r.status = "not_started".into();
+                    r.error = Some("conversation closed before execution".into());
+                    store.put(&mut talk)?;
+                    return Ok(());
+                }
+                anyhow::ensure!(
+                    r.worker.as_deref().is_none_or(|worker| worker == job.id),
+                    "CLI submission belongs to a different worker"
+                );
+                if r.kind == RequestKind::Owner {
+                    let turn = talk
+                        .turns
+                        .get(r.input_turn)
+                        .context("owner input is missing")?;
+                    let binding = OwnerBinding {
+                        talk: id.to_owned(),
+                        text_sha256: digest(&r.text),
+                    };
+                    anyhow::ensure!(
+                        read_binding(store, request)?.as_ref() == Some(&binding)
+                            && turn.who == Who::Operator
+                            && turn.sender == Some(Sender::Operator)
+                            && turn.body == r.text
+                            && turn.messages.iter().all(|message| {
+                                message.sender == Some(Sender::Operator) && message.body == r.text
+                            }),
+                        "saved owner input does not match its admission"
+                    );
+                } else {
+                    anyhow::ensure!(
+                        talk.turns
+                            .get(r.input_turn)
+                            .is_some_and(|turn| turn.sender == Some(Sender::External)),
+                        "saved external input has no external provenance"
+                    );
+                }
                 r.status = "started".into();
-                r.worker = crate::worker::current_job(store.home())?.map(|j| j.id);
+                r.worker = Some(job.id.clone());
+                let index = r.input_turn;
                 store.put(&mut talk)?;
-                talk
+                (talk, index)
             };
-            let index = active_input(&talk).context("external input missing")?;
             let text = talk
                 .turns
                 .get(index)
-                .context("external transcript input missing")?
+                .context("recorded CLI input is missing")?
                 .body
                 .clone();
             drop(publication);
             let (cfg, _) = Config::discover(&talk.repo, None)?;
-            return super::respond(&lease, &mut talk, store, &cfg, &text).await;
+            return super::respond_at(&lease, &mut talk, store, &cfg, &text, Some(index)).await;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }

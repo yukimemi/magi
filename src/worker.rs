@@ -517,32 +517,39 @@ pub fn observe_active(home: &Path) -> Result<Vec<Job>> {
             continue;
         }
         let job = get(home, id)?;
-        match job.status {
-            Status::Starting => active.push(job),
-            Status::Running => {
-                let file = match File::open(entry.path().join("live.lock")) {
-                    Ok(file) => file,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        active.push(job);
-                        continue;
-                    }
-                    Err(error) => return Err(error.into()),
-                };
-                match crate::pr_head::try_lock_file(&file) {
-                    Ok(()) => drop(Lease { _file: file }),
-                    Err(error)
-                        if error.kind() == std::io::ErrorKind::WouldBlock
-                            || cfg!(windows) && error.raw_os_error() == Some(33) =>
-                    {
-                        active.push(job);
-                    }
-                    Err(error) => return Err(error.into()),
-                }
-            }
-            Status::Finished | Status::Failed => {}
+        if observe_job_active(home, &job)? {
+            active.push(job);
         }
     }
     Ok(active)
+}
+
+/// Passive lease observation for a single reservation already read by the caller.
+pub(crate) fn observe_job_active(home: &Path, job: &Job) -> Result<bool> {
+    match job.status {
+        Status::Starting => Ok(true),
+        Status::Running => {
+            let file = match File::open(job_dir(home, &job.id)?.join("live.lock")) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+                Err(error) => return Err(error.into()),
+            };
+            match crate::pr_head::try_lock_file(&file) {
+                Ok(()) => {
+                    drop(Lease { _file: file });
+                    Ok(false)
+                }
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        || cfg!(windows) && error.raw_os_error() == Some(33) =>
+                {
+                    Ok(true)
+                }
+                Err(error) => Err(error.into()),
+            }
+        }
+        Status::Finished | Status::Failed => Ok(false),
+    }
 }
 
 fn control_path(home: &Path, key: &str) -> PathBuf {

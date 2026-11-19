@@ -721,11 +721,28 @@ enum TalkCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Query the exact external request's reply without sending again.
+    /// Submit an owner request from the trusted local terminal, not a magi seat.
+    #[command(
+        long_about = "Submit an actual owner request (including an explicitly delegated send) to an existing chat from the owner's trusted local terminal and private MAGI_HOME. This trusts the OS account, not a sender label. Save the full Chat ID, request ID and exact text before sending; after a lost response, use talk reply --request with that ID. A reply is not proof that a Goal or another effect succeeded."
+    )]
+    SendOwner {
+        /// Full conversation ID from talk list.
+        id: String,
+        /// Stable caller-generated request ID scoped to this MAGI_HOME.
+        #[arg(long)]
+        request: String,
+        /// Owner request text, or - to read all of stdin.
+        #[arg(value_name = "TEXT|-")]
+        text: String,
+        /// Print machine-readable JSON on one line.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Observe an exact CLI submission and any saved Goal authorizations.
     Reply {
         /// Conversation id or unambiguous prefix.
         id: String,
-        /// Request ID originally supplied to send.
+        /// Request ID originally supplied to send or send-owner.
         #[arg(long)]
         request: String,
         /// Maximum seconds to wait; zero queries the current state.
@@ -1389,6 +1406,9 @@ fn spawn_update_check(command: &Command) -> Option<updater::Pending> {
             | Command::Completion { .. }
             | Command::Tui
             | Command::Worker { .. }
+            | Command::Talk {
+                command: TalkCmd::SendOwner { .. },
+            }
     ) {
         return None;
     }
@@ -2229,22 +2249,28 @@ async fn dispatch(command: Command) -> Result<()> {
                 text,
                 json,
             } => {
-                let text = if text == "-" {
-                    use std::io::Read as _;
-                    let mut body = String::new();
-                    std::io::stdin()
-                        .read_to_string(&mut body)
-                        .context("read the external chat message from stdin")?;
-                    body
-                } else {
-                    text
-                };
+                let text = talk_message(text)?;
                 let value = magi::talk::external::send(
                     &magi::talk::Talks::open(),
                     &id,
                     &request,
                     &sender,
                     &text,
+                )
+                .await?;
+                print_external_talk_result(&value, json)
+            }
+            TalkCmd::SendOwner {
+                id,
+                request,
+                text,
+                json,
+            } => {
+                let value = magi::talk::external::send_owner(
+                    &magi::talk::Talks::open(),
+                    &id,
+                    &request,
+                    &talk_message(text)?,
                 )
                 .await?;
                 print_external_talk_result(&value, json)
@@ -2306,6 +2332,19 @@ async fn dispatch(command: Command) -> Result<()> {
     }
 }
 
+fn talk_message(text: String) -> Result<String> {
+    if text == "-" {
+        use std::io::Read as _;
+        let mut body = String::new();
+        std::io::stdin()
+            .read_to_string(&mut body)
+            .context("read the chat message from stdin")?;
+        Ok(body)
+    } else {
+        Ok(text)
+    }
+}
+
 fn print_external_talk_result(value: &serde_json::Value, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string(value)?);
@@ -2324,10 +2363,15 @@ fn print_external_talk_result(value: &serde_json::Value, json: bool) -> Result<(
         }
     } else if let Some(messages) = value["messages"].as_array() {
         for message in messages {
+            let sender = if message["ingress"] == "owner" {
+                "operator (local CLI)"
+            } else {
+                message["sender"].as_str().unwrap_or("")
+            };
             println!(
                 "{}  {}  {}\n{}\n",
                 message["id"].as_str().unwrap_or(""),
-                message["sender"].as_str().unwrap_or(""),
+                sender,
                 message["at"].as_str().unwrap_or(""),
                 message["body"].as_str().unwrap_or("")
             );
@@ -2345,7 +2389,9 @@ fn print_external_talk_result(value: &serde_json::Value, json: bool) -> Result<(
             value["talk"].as_str().unwrap_or(""),
             value["request"].as_str().unwrap_or("")
         );
-        for field in ["state", "input_id", "reply_id", "worker", "error"] {
+        for field in [
+            "state", "ingress", "input_id", "reply_id", "worker", "error",
+        ] {
             if let Some(text) = value[field].as_str() {
                 println!("{field}: {text}");
             }
@@ -2353,6 +2399,11 @@ fn print_external_talk_result(value: &serde_json::Value, json: bool) -> Result<(
         if let Some(candidates) = value["candidates"].as_array() {
             for candidate in candidates.iter().filter_map(serde_json::Value::as_str) {
                 println!("candidate: {candidate}");
+            }
+        }
+        if let Some(goals) = value["goal_authorizations"].as_array() {
+            for goal in goals {
+                println!("goal authorization: {goal}");
             }
         }
         if let Some(reply) = value["reply"].as_str() {
