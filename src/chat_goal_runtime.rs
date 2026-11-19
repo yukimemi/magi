@@ -61,6 +61,7 @@ async fn observe_with_pr(
 ) -> Observation {
     let mut task_facts = Vec::new();
     let mut run_ids = Vec::new();
+    let mut historical_runs = std::collections::BTreeSet::new();
     let queue = crate::queue::Queue::at(home.join("queue"));
     for id in tasks {
         match crate::chat_goal::task_record(&queue, id, repo) {
@@ -72,12 +73,13 @@ async fn observe_with_pr(
                 }
                 task_facts.push(json!({"id": task.id, "status":task.status,
                     "reason":task.hold_reason, "runs":task.execution_runs(),"current_run":task.execution_runs().last()}));
+                historical_runs.extend(task.runs);
             }
             Err(error) => task_facts.push(json!({"id":id,"evidence":unavailable(&error)})),
         }
     }
     for run in runs {
-        if !run_ids.contains(run) {
+        if !historical_runs.contains(run) && !run_ids.contains(run) {
             run_ids.push(run.clone());
         }
     }
@@ -717,6 +719,7 @@ mod tests {
             run.reserve_under(home).unwrap();
             run
         };
+        let previous = make_run(&checkout, 3);
         let target = make_run(&checkout, 1);
         let foreign = make_run(&other, 2);
         let mut task = crate::queue::Task::new(
@@ -725,12 +728,13 @@ mod tests {
             checkout.clone(),
             crate::queue::Source::Human,
         );
+        task.runs.push(previous.id.clone());
         task.runs.push(target.id.clone());
         queue.put(&mut task).unwrap();
         let mut retained = goal();
         retained.repo = Some(checkout.canonicalize().unwrap());
         retained.tasks = vec![task.id];
-        retained.runs.clear();
+        retained.runs = vec![previous.id];
         let observer = FakePrObserver::default();
         let url = &target.pr.as_ref().unwrap().url;
         observer
@@ -743,7 +747,7 @@ mod tests {
             home,
             repo,
             &retained.tasks,
-            std::slice::from_ref(&foreign.id),
+            &[retained.runs[0].clone(), foreign.id.clone()],
             &[],
             &observer,
         )
@@ -755,7 +759,8 @@ mod tests {
                 .contains(&foreign.id)
         );
         assert_one_target_lookup(&observer, repo, url);
-        let pending = observe_with_pr(home, repo, &retained.tasks, &[], &[], &observer).await;
+        let pending =
+            observe_with_pr(home, repo, &retained.tasks, &retained.runs, &[], &observer).await;
         assert!(!satisfied(&retained, &pending.facts));
         assert_one_target_lookup(&observer, repo, url);
         retained.fingerprint = pending.fingerprint;

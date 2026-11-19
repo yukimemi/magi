@@ -722,7 +722,9 @@ a stale reply cannot erase progress, execution receipts or an owner's stop.
 The scheduler reserves an independent finite goal-observation service; slow
 forge and Git reads never run on its task-admission loop. Each service lap
 checks at most eight goals, reading every associated task, run and watch
-without truncating completion evidence. Every distinct associated PR is refreshed
+without truncating completion evidence. A related task contributes only its
+latest execution run; listing an earlier attempt explicitly does not bring it
+back into observation. Every distinct observed PR is refreshed
 once per lap with a bounded lookup, including PRs beyond the first four; its
 result remains associated with every referring run. Changed evidence reserves
 one finite conversation worker; unchanged evidence spends no agent turn.
