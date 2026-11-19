@@ -186,30 +186,75 @@ pub async fn git(cwd: &Path, args: &[&str]) -> Result<String> {
 
 /// Absolute path to the top level of the working tree containing `path`.
 pub async fn toplevel(path: &Path) -> Result<PathBuf> {
-    let out = git(path, &["rev-parse", "--show-toplevel"]).await?;
-    Ok(PathBuf::from(out))
+    let out = Command::from(toplevel_command(path))
+        .kill_on_drop(true)
+        .output()
+        .await;
+    toplevel_output(path, out)
 }
 
 /// Canonical checkout root for synchronous record validation.
 pub(crate) fn toplevel_blocking(path: &Path) -> Result<PathBuf> {
+    toplevel_output(path, toplevel_command(path).output())?
+        .canonicalize()
+        .with_context(|| format!("canonicalize Git checkout root of {}", path.display()))
+}
+
+fn toplevel_command(path: &Path) -> std::process::Command {
     #[cfg(test)]
     crate::web::request_cost::git();
-    let out = std::process::Command::new("git")
+    let mut command = std::process::Command::new("git");
+    command
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(path)
         .quiet()
-        .stdin(Stdio::null())
-        .output()
-        .with_context(|| format!("read Git checkout root of {}", path.display()))?;
+        .stdin(Stdio::null());
+    // Checkout identity comes from cwd, never the invoking Git process.
+    for key in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_IMPLICIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_CONFIG",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+        "GIT_PREFIX",
+    ] {
+        command.env_remove(key);
+    }
+    command
+}
+
+fn toplevel_output(path: &Path, out: std::io::Result<std::process::Output>) -> Result<PathBuf> {
+    let out = out.with_context(|| format!("read Git checkout root of {}", path.display()))?;
     ensure!(
         out.status.success(),
         "cannot read Git checkout root of {}: {}",
         path.display(),
         String::from_utf8_lossy(&out.stderr).trim_end()
     );
-    Path::new(std::str::from_utf8(&out.stdout)?.trim_end_matches(['\r', '\n']))
-        .canonicalize()
-        .with_context(|| format!("canonicalize Git checkout root of {}", path.display()))
+    Ok(PathBuf::from(
+        std::str::from_utf8(&out.stdout)?.trim_end_matches(['\r', '\n']),
+    ))
+}
+
+/// Compare checkout roots, not common Git dirs. Paths already equal (including
+/// canonical aliases) need no Git lookup, preserving non-Git conversation scopes.
+pub(crate) fn same_checkout(left: &Path, right: &Path) -> Result<bool> {
+    if left == right {
+        return Ok(true);
+    }
+    let canonical = |path: &Path| {
+        path.canonicalize()
+            .with_context(|| format!("resolve repository {}", path.display()))
+    };
+    let left = canonical(left)?;
+    let right = canonical(right)?;
+    Ok(left == right || toplevel_blocking(&left)? == toplevel_blocking(&right)?)
 }
 
 /// Resolve a revision to a full object id.
@@ -1560,6 +1605,56 @@ pub async fn rev_exists(repo: &Path, rev: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn checkout_discovery_ignores_inherited_git_target() {
+        const FIXTURE: &str = "MAGI_TEST_CHECKOUT_DISCOVERY_ROOT";
+        if let Some(root) = std::env::var_os(FIXTURE) {
+            let root = std::path::PathBuf::from(root);
+            let first = root.join("first");
+            let second = root.join("second");
+            let plain = root.join("plain");
+            assert_eq!(
+                super::toplevel(&second)
+                    .await
+                    .unwrap()
+                    .canonicalize()
+                    .unwrap(),
+                second.canonicalize().unwrap()
+            );
+            assert!(super::toplevel(&plain).await.is_err());
+            assert!(!super::same_checkout(&first, &second).unwrap());
+            assert!(super::same_checkout(&first, &plain).is_err());
+            assert!(super::same_checkout(&first, &first.join("src")).unwrap());
+            return;
+        }
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        for name in ["first", "second"] {
+            let checkout = root.join(name);
+            std::fs::create_dir_all(checkout.join("src")).unwrap();
+            super::git(&checkout, &["init", "-q"]).await.unwrap();
+        }
+        std::fs::create_dir(root.join("plain")).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "git::tests::checkout_discovery_ignores_inherited_git_target",
+            ])
+            .env(FIXTURE, root)
+            .env("GIT_DIR", root.join("first/.git"))
+            .env("GIT_WORK_TREE", root.join("first"))
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "core.worktree")
+            .env("GIT_CONFIG_VALUE_0", root.join("first"))
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{stdout}"
+        );
+    }
+
     #[test]
     fn git_cli_path_spelling_handles_windows_canonical_prefixes() {
         for (native, expected) in [

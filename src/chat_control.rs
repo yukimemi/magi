@@ -800,13 +800,17 @@ async fn execute_decision(
                 .or_else(|| task.runs.last())
                 .context("task has no execution for this merge")?;
             let state = crate::run::RunState::load_under(run, home)?;
+            ensure!(state.id == *run, "merge run identity changed");
+            ensure!(
+                crate::git::same_checkout(&state.repo, &task.repo)?,
+                "merge targets another repository"
+            );
             let expected = format!("https://github.com/{repo}/pull/{number}");
             ensure!(
-                state.repo == task.repo
-                    && state
-                        .pr
-                        .as_ref()
-                        .is_some_and(|pr| pr.url.eq_ignore_ascii_case(&expected)),
+                state
+                    .pr
+                    .as_ref()
+                    .is_some_and(|pr| pr.url.eq_ignore_ascii_case(&expected)),
                 "merge targets another task or repository"
             );
         }
@@ -1236,7 +1240,11 @@ pub(crate) fn resume_started(home: &Path, task: &Task, inquiry: &str, run: &str)
         "resume run ownership changed"
     );
     let state = crate::run::RunState::load_under(run, home)?;
-    ensure!(state.repo == task.repo, "resume run repository changed");
+    ensure!(state.id == run, "resume run identity changed");
+    ensure!(
+        crate::git::same_checkout(&state.repo, &task.repo)?,
+        "resume run repository changed"
+    );
     if task
         .superseded_resumes
         .get(inquiry)
@@ -1317,7 +1325,11 @@ fn abandonment_receipt(
         "abandon run ownership changed"
     );
     let state = crate::run::RunState::load_under(run, home)?;
-    ensure!(state.repo == task.repo, "abandon run repository changed");
+    ensure!(state.id == run, "abandon run identity changed");
+    ensure!(
+        crate::git::same_checkout(&state.repo, &task.repo)?,
+        "abandon run repository changed"
+    );
     Ok(state
         .abandonment_receipts
         .get(id)
@@ -2087,6 +2099,73 @@ mod tests {
         let recovered = outbox.get(&inquiry.id).unwrap().decision.unwrap();
         assert_eq!(recovered.status, crate::task_decision::Status::RetryNeeded);
         assert!(recovered.retry_safe);
+    }
+
+    #[tokio::test]
+    async fn resume_receipt_matches_checkout_root_not_filing_directory() {
+        use crate::task_decision::Status;
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let repo = home.join("checkout");
+        let subdir = repo.join("src");
+        let foreign = home.join("foreign");
+        std::fs::create_dir_all(&subdir).unwrap();
+        std::fs::create_dir(&foreign).unwrap();
+        for checkout in [&repo, &foreign] {
+            crate::git::git(checkout, &["init", "-q"]).await.unwrap();
+        }
+        let queue = Queue::at(home.join("queue"));
+        let mut task = Task::new("work".into(), "work".into(), subdir, Source::Human);
+        let mut state = crate::run::RunState::new(
+            repo,
+            "main".into(),
+            "base".into(),
+            "work".into(),
+            crate::config::Config::default(),
+        );
+        state.reserve_under(home).unwrap();
+        task.runs.push(state.id.clone());
+        queue.put(&mut task).unwrap();
+        let outbox = crate::task_inquiry::Outbox::at(home);
+        let inquiry = outbox
+            .file(
+                &task,
+                Some(state.id.clone()),
+                "resume".into(),
+                "Resume?",
+                "",
+            )
+            .unwrap();
+        let request = serde_json::to_string(&Operation::Resume {
+            run: state.id.clone(),
+        })
+        .unwrap();
+        outbox
+            .update_decision(&inquiry.id, |d| {
+                d.accept(&request)?;
+                d.start()
+            })
+            .unwrap();
+        task.dispatched_resumes
+            .insert(inquiry.id.clone(), state.id.clone());
+        queue.put(&mut task).unwrap();
+        reconcile_decisions(&queue, home).unwrap();
+        assert_eq!(
+            outbox.get(&inquiry.id).unwrap().decision.unwrap().status,
+            Status::InProgress
+        );
+
+        state.carry_dispatched_resumes(&task);
+        state.begin_pass();
+        state.save_under(home).unwrap();
+        let mut reassigned = task.clone();
+        reassigned.repo = foreign;
+        assert!(resume_started(home, &reassigned, &inquiry.id, &state.id).is_err());
+        reconcile_decisions(&queue, home).unwrap();
+        assert_eq!(
+            outbox.get(&inquiry.id).unwrap().decision.unwrap().status,
+            Status::Resolved
+        );
     }
 
     #[test]

@@ -708,6 +708,9 @@ work outside the conversation's repository. It uses the same local path,
 `owner/repo` and unique short-name selectors as `magi task add`, but never
 clones. Relative paths start at the conversation directory. A path inside a
 checkout selects its Git root, even if the task retained the subdirectory.
+Checkout discovery ignores inherited Git repository overrides. Decision receipt
+matching uses the same checkout identity while still requiring the exact run
+and receipt.
 Without `--repo`, the goal uses the conversation directory, including for older
 saved goals. Multiple goals in one conversation can target different
 checkouts without changing the conversation's directory, agent or permissions.

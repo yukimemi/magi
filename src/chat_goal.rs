@@ -369,32 +369,15 @@ fn text(value: &str, name: &str) -> Result<()> {
 }
 
 pub(crate) fn require_repo(kind: &str, id: &str, actual: &Path, expected: &Path) -> Result<()> {
-    if actual == expected {
-        return Ok(());
-    }
-    let canonical = |path: &Path| {
-        path.canonicalize()
-            .with_context(|| format!("goal {kind} {id}: resolve repository {}", path.display()))
-    };
-    let actual_path = canonical(actual)?;
-    let expected_path = canonical(expected)?;
-    if actual_path == expected_path {
-        return Ok(());
-    }
-    // Task filing can retain a subdirectory, while execution saves the
-    // checkout root. Compare roots, not common Git dirs: linked worktrees
-    // and repositories nested under a checkout still have distinct roots.
-    let root = |path| {
-        crate::git::toplevel_blocking(path).with_context(|| {
-            format!(
-                "goal {kind} {id}: compare repositories ({}; expected {})",
-                actual.display(),
-                expected.display()
-            )
-        })
-    };
+    let same = crate::git::same_checkout(actual, expected).with_context(|| {
+        format!(
+            "goal {kind} {id}: compare repositories ({}; expected {})",
+            actual.display(),
+            expected.display()
+        )
+    })?;
     ensure!(
-        root(&actual_path)? == root(&expected_path)?,
+        same,
         "goal {kind} {id} belongs to another repository ({}; expected {})",
         actual.display(),
         expected.display()
