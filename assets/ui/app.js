@@ -12345,6 +12345,9 @@ function renderTaskCompletions(task) {
     ]) {
       if (value) item.append(el("p", { text: `${label}: ${value}` }));
     }
+    for (const error of event.unavailable_runs || []) {
+      item.append(el("p", { class: "hint", text: `Retained outcome unavailable: ${error}` }));
+    }
     const run = event.run;
     if (run) {
       item.append(el("p", { text: `Run ${run.id}: ${run.status || "unknown"} · PR: ${run.pr_state || "unknown"}${run.pr_head ? ` · head ${run.pr_head}` : ""}` }));

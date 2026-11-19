@@ -4124,6 +4124,9 @@ async fn task_cmd_inner(command: TaskCmd, q: Queue) -> Result<()> {
                         run.id, run.status, run.pr_url, run.pr_state
                     );
                 }
+                for error in &event.unavailable_runs {
+                    println!("  unavailable retained evidence: {error}");
+                }
             }
             if let Some(e) = &t.last_error {
                 println!("last      {e}");

@@ -1915,6 +1915,12 @@ fn task_report_with(
                 s.push_str(&format!("- {label}: {}\n", clean(value, 600)));
             }
         }
+        for error in &event.unavailable_runs {
+            s.push_str(&format!(
+                "- Retained outcome unavailable: {}\n",
+                clean(error, 600)
+            ));
+        }
         if let Some(run) = &event.run {
             s.push_str(&format!(
                 "- Run at closure: `{}`; status {}; PR state {}\n",

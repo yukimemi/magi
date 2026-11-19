@@ -433,6 +433,8 @@ pub struct CompletionContext {
     pub discard: bool,
     /// Latest retained execution snapshot, including unreadable-record evidence.
     pub run: Option<CompletionRunSnapshot>,
+    /// Retained runs whose outcomes could not be read during explicit discard.
+    pub unavailable_runs: Vec<String>,
 }
 
 impl CompletionContext {
@@ -458,6 +460,7 @@ impl CompletionContext {
             reason,
             discard: false,
             run,
+            unavailable_runs: Vec::new(),
         }
     }
 
@@ -473,6 +476,7 @@ impl CompletionContext {
             reason,
             discard: false,
             run: Some(CompletionRunSnapshot::from_run(state)),
+            unavailable_runs: Vec::new(),
         }
     }
 }
@@ -505,6 +509,9 @@ pub struct CompletionEvent {
     pub at: Timestamp,
     /// Run/PR evidence at that time.
     pub run: Option<CompletionRunSnapshot>,
+    /// Unknown historical outcomes retained when the owner explicitly discarded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unavailable_runs: Vec<String>,
 }
 
 /// One unit of work.
@@ -1707,6 +1714,7 @@ impl Task {
             prior_block_reason: self.block_reason.clone(),
             prior_error: self.last_error.clone(),
             run: context.run,
+            unavailable_runs: context.unavailable_runs,
         });
         self.stamp_schema();
     }

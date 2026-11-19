@@ -505,12 +505,15 @@ the retained run, status, branches and PR. Every completion
 path records its evidence, including automatic settlement and structured done.
 Task show and the Web task detail expose the append-only completion history;
 legacy tasks may have none.
+Explicit discard may close work with missing, corrupt or unsupported historical
+run records; their unknown outcomes remain in the audit. It still refuses
+execution/ownership lock contention and does not modify the retained runs.
 
 Use `magi task control reopen <ID> --reason "<text>"` or Web **Reopen to Held** for an
 incorrectly closed, unlanded task. The reason is required. Reopening preserves
 history and leaves the task **Held**; inspect/edit it and explicitly Release
 when ready. It refuses any historical Ready, Merged or AlreadyInBase run, any
-merged PR, and unknown/unreadable run or forge state rather than guessing that
+merged PR (including ambiguous merged-PR matches), and unknown/unreadable run or forge state rather than guessing that
 work is safe to repeat. Chat-filed tasks receive a distinct notice for every
 completion occurrence, so reopening and closing again is not hidden by an
 earlier notice.

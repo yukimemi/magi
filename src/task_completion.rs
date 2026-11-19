@@ -102,23 +102,33 @@ async fn guard_runs(
     task: &Task,
     home: &Path,
     reopening: bool,
-) -> Result<(CompletionGuards, Option<RunState>)> {
+    discard: bool,
+) -> Result<(CompletionGuards, Option<RunState>, Vec<String>)> {
     let mut guards = CompletionGuards {
         _fixes: Vec::new(),
         _owners: Vec::new(),
         _leases: Vec::new(),
     };
     let mut latest = None;
+    let mut unavailable = Vec::new();
     let ids: std::collections::BTreeSet<_> = task
         .runs
         .iter()
         .chain(task.startup_failures.iter().map(|failure| &failure.run))
         .collect();
     for id in ids {
-        // Read before acquiring a fix lock: that lock creates its directory,
-        // which must not make a missing retained run look like valid evidence.
-        RunState::load_under(id, home)
-            .with_context(|| format!("cannot verify retained run {id}; its outcome is unknown"))?;
+        if !discard {
+            RunState::load_under(id, home).with_context(|| {
+                format!(
+                    "cannot verify retained run {id}; its outcome is unknown{}",
+                    if reopening {
+                        ""
+                    } else {
+                        "; use --discard to explicitly abandon unfinished work"
+                    }
+                )
+            })?;
+        }
         guards._fixes.push(
             crate::graph::FixClaim::acquire(&home.join("runs").join(id))
                 .with_context(|| format!("run {id} targeted fix is active or unknown"))?,
@@ -127,8 +137,22 @@ async fn guard_runs(
             crate::pr_head::owner_lock(home, id)
                 .with_context(|| format!("run {id} ownership is busy"))?,
         );
-        let mut state = RunState::load_under(id, home)
-            .with_context(|| format!("cannot verify retained run {id}; its outcome is unknown"))?;
+        let mut state = match RunState::load_under(id, home) {
+            Ok(state) => state,
+            Err(error) if discard => {
+                unavailable.push(format!("run {id}: outcome unknown: {error:#}"));
+                guards._leases.push(
+                    crate::driver::maintenance(home, id)
+                        .with_context(|| format!("run {id} execution is busy or unknown"))?,
+                );
+                continue;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("cannot verify retained run {id}; its outcome is unknown")
+                });
+            }
+        };
         let claims = crate::daemon::is_working_on(home, id, jiff::Timestamp::now());
         ensure!(
             state.liveness_under(home, claims) == Liveness::Dead,
@@ -160,7 +184,9 @@ async fn guard_runs(
                 "cannot reopen: run {id} retains merged public PR evidence"
             );
         }
-        if let Some(pr) = &mut state.pr {
+        if let Some(pr) = &mut state.pr
+            && !discard
+        {
             let lifecycle = crate::land::lifecycle(&state.repo, &pr.url)
                 .await
                 .with_context(|| {
@@ -183,7 +209,7 @@ async fn guard_runs(
                     || (state.pr_head.is_none() && state.pr_pushed_head.is_none()),
                 "cannot reopen: run {id} has public head evidence but its publication outcome is unknown"
             );
-            let merged = crate::land::find_external_merge(&state)
+            let merged = crate::land::find_external_merge_for_reopen(&state)
                 .await
                 .with_context(|| format!("run {id} public merge evidence is unknown"))?;
             ensure!(
@@ -196,7 +222,7 @@ async fn guard_runs(
             latest = Some(state);
         }
     }
-    Ok((guards, latest))
+    Ok((guards, latest, unavailable))
 }
 
 /// Admit a close while the caller holds its task claim.
@@ -214,12 +240,13 @@ pub async fn admit_close(
         "task {} is running; stop its driver before closing it",
         task.id
     );
-    let (guards, latest) = guard_runs(task, home, false).await?;
+    let (guards, latest, unavailable) = guard_runs(task, home, false, discard).await?;
     let mut context = match latest {
         Some(state) => CompletionContext::from_run(actor, reason, task, &state),
         None => CompletionContext::new(actor, reason, home, task),
     };
     context.discard = discard;
+    context.unavailable_runs = unavailable;
     validate_discard(&context)?;
     Ok((guards, context))
 }
@@ -269,7 +296,7 @@ pub async fn admit_reopen(
         "only a done task can be reopened (currently {})",
         task.status.as_str()
     );
-    let (guards, latest) = guard_runs(task, home, true).await?;
+    let (guards, latest, _) = guard_runs(task, home, true, false).await?;
     let reason = Some(reason.to_owned());
     let context = match latest {
         Some(state) => CompletionContext::from_run(actor, reason, task, &state),
@@ -346,6 +373,9 @@ pub fn describe(task: &Task) -> String {
         }
         .describe(),
     );
+    for error in &event.unavailable_runs {
+        text.push_str(&format!("; unavailable retained evidence: {error}"));
+    }
     text
 }
 
@@ -462,6 +492,42 @@ mod tests {
         assert!(crate::pr_head::owner_lock(dir.path(), &run.id).is_err());
         drop(guards);
         drop(claim);
+        assert!(crate::pr_head::owner_lock(dir.path(), &run.id).is_ok());
+        assert!(crate::driver::maintenance(dir.path(), &run.id).is_ok());
+    }
+
+    #[tokio::test]
+    async fn discard_retains_locks_even_when_run_evidence_is_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut task = task();
+        let run = retained(dir.path(), &mut task, RunStatus::Blocked);
+        std::fs::write(dir.path().join("runs").join(&run.id).join("run.json"), "{").unwrap();
+        let owner = crate::pr_head::owner_lock(dir.path(), &run.id).unwrap();
+        assert!(
+            admit_close(&task, dir.path(), CompletionActor::Cli, None, true)
+                .await
+                .is_err()
+        );
+        drop(owner);
+        let execution = crate::driver::maintenance(dir.path(), &run.id).unwrap();
+        assert!(
+            admit_close(&task, dir.path(), CompletionActor::Cli, None, true)
+                .await
+                .is_err()
+        );
+        drop(execution);
+        let (guards, context) = admit_close(&task, dir.path(), CompletionActor::Cli, None, true)
+            .await
+            .unwrap();
+        assert!(
+            context
+                .unavailable_runs
+                .iter()
+                .any(|error| error.contains(&run.id))
+        );
+        assert!(crate::pr_head::owner_lock(dir.path(), &run.id).is_err());
+        assert!(crate::driver::maintenance(dir.path(), &run.id).is_err());
+        drop(guards);
         assert!(crate::pr_head::owner_lock(dir.path(), &run.id).is_ok());
         assert!(crate::driver::maintenance(dir.path(), &run.id).is_ok());
     }

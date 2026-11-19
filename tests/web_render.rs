@@ -1437,6 +1437,76 @@ async fn completion_audit_discard_and_reopen_controls_work_at_phone_and_desktop_
     }
 }
 
+#[tokio::test]
+async fn completion_discard_displays_unknown_historical_outcomes() {
+    let Some(chrome) = cdp::find_chrome() else {
+        assert!(std::env::var_os("CI").is_none(), "Chrome required in CI");
+        eprintln!("SKIP unknown completion evidence: no Chrome");
+        return;
+    };
+    let fx = common::fixture(common::home_lock().await, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("magi-home");
+    let queue = Queue::at(home.join("queue"));
+    let base = serve(
+        &home,
+        queue.clone(),
+        Talks::at(home.join("talks")),
+        home.join("runs"),
+        &fx.repo,
+    )
+    .await;
+    let mut browser = cdp::Browser::launch(&chrome).await.unwrap();
+    for width in [320, 1280] {
+        let mut task = Task::new(
+            "Discard with unknown history".into(),
+            "Retain unknown evidence".into(),
+            fx.repo.clone(),
+            Source::Human,
+        );
+        task.runs.push("missing-history".into());
+        task.hold_manual(Some("History unavailable".into()));
+        queue.put(&mut task).unwrap();
+        let page = browser
+            .open_page(
+                &format!("{base}#/tasks/{}", task.id),
+                width,
+                900,
+                width < 400,
+            )
+            .await
+            .unwrap();
+        browser
+            .wait_for(
+                &page,
+                "!!document.querySelector('#task-actions-done button')",
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
+        browser.eval(&page, r##"(async () => {
+          const wait = async f => { const end = performance.now() + 10000; while (!f()) { if (performance.now() > end) throw new Error('discard timeout'); await new Promise(r => setTimeout(r, 20)); } };
+          const box = document.querySelector('#task-actions-done');
+          const confirm = () => [...box.querySelectorAll('button')].find(b => /Yes, mark done|Yes, close and discard/.test(b.textContent));
+          document.querySelector('#task-actions-fab').click();
+          box.querySelector('button').click();
+          const input = box.querySelector('input[type=text]');
+          input.value = 'Discard despite unknown history';
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+          confirm().click();
+          await wait(() => box.textContent.includes('Yes, close and discard') && !confirm().disabled);
+          confirm().click();
+          await wait(() => document.querySelector('#task-status .chip')?.dataset.status === 'done');
+          const audit = document.querySelector('#task-completions');
+          if (!audit.textContent.includes('Retained outcome unavailable: run missing-history: outcome unknown')) throw new Error('unknown evidence absent');
+          if (document.documentElement.scrollWidth > document.documentElement.clientWidth) throw new Error('audit overflow');
+          return true;
+        })()"##).await.unwrap();
+        let saved = queue.get(&task.id).unwrap();
+        assert!(saved.completion_history[0].unavailable_runs[0].contains("missing-history"));
+        browser.close_page(&page).await;
+    }
+}
+
 /// `Task::urgent` shows as an URGENT tag on the Queue card and the task page,
 /// whatever the priority or status; a non-urgent task never carries one.
 #[tokio::test]

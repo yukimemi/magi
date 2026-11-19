@@ -219,3 +219,74 @@ async fn legacy_done_without_audit_reopens_without_inventing_a_closer() {
     assert_eq!(event.reason.as_deref(), Some("recover legacy close"));
     assert_eq!(std::fs::read(&run_path).unwrap(), before);
 }
+
+#[tokio::test]
+async fn explicit_discard_audits_unreadable_runs_without_losing_current_evidence() {
+    for broken in ["missing", "corrupt", "schema"] {
+        for break_latest in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let home = dir.path();
+            let queue = Queue::at(home.join("queue"));
+            let mut task = task();
+            let old = retained(home, &mut task, RunStatus::Failed);
+            let latest = retained(home, &mut task, RunStatus::Blocked);
+            let unknown = if break_latest { &latest } else { &old };
+            let path = home.join("runs").join(&unknown.id).join("run.json");
+            match broken {
+                "missing" => std::fs::remove_file(&path).unwrap(),
+                "corrupt" => std::fs::write(&path, "{").unwrap(),
+                "schema" => {
+                    let mut raw = serde_json::to_value(unknown).unwrap();
+                    raw["schema"] = serde_json::json!(0);
+                    std::fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let before = std::fs::read(&path).ok();
+            task.hold_manual(Some("Inspect unfinished work".into()));
+            queue.put(&mut task).unwrap();
+            assert!(
+                close(&queue, home, &task.id, CompletionActor::Cli, None, false)
+                    .await
+                    .is_err()
+            );
+            assert!(queue.get(&task.id).unwrap().completion_history.is_empty());
+
+            let done = close(
+                &queue,
+                home,
+                &task.id,
+                CompletionActor::Cli,
+                Some("Discard despite missing history".into()),
+                true,
+            )
+            .await
+            .unwrap();
+            let event = done.completion_history.last().unwrap();
+            assert_eq!(done.status, TaskStatus::Done);
+            assert_eq!(done.runs, task.runs);
+            assert_eq!(event.prior_status, TaskStatus::Held);
+            assert!(event.discard);
+            assert!(
+                event
+                    .unavailable_runs
+                    .iter()
+                    .any(|error| error.contains(&unknown.id))
+            );
+            assert!(describe(&done).contains("outcome unknown"));
+            let snapshot = event.run.as_ref().unwrap();
+            assert_eq!(snapshot.id, latest.id);
+            assert_eq!(
+                snapshot.status,
+                (!break_latest).then_some(RunStatus::Blocked)
+            );
+            assert_eq!(std::fs::read(&path).ok(), before);
+            assert!(
+                reopen(&queue, home, &task.id, CompletionActor::Cli, "recover")
+                    .await
+                    .is_err()
+            );
+            assert_eq!(queue.get(&task.id).unwrap().status, TaskStatus::Done);
+        }
+    }
+}
