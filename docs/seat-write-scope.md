@@ -77,8 +77,10 @@ when the current magi home differs. An unavailable directory, a different
 reported ID, or a successful exit without ID confirmation fails rather than
 replacing the stored session. A timeout or failed exit without an ID keeps
 the saved pair and follows normal agent failure handling. Saved IDs without a
-directory still use the old invocation and lookup; those transcripts are
-not moved or copied and remain visible in the operator's normal history.
+directory still use the old invocation and lookup. If omp reports a new
+continuation ID for a legacy session, magi follows it without adding a
+directory binding. Those transcripts are not moved or copied and remain
+visible in the operator's normal history.
 
 Use a build that supports `--session-dir` (verified with omp 18.22.2).
 For new and managed sessions, remove any session storage, resume/import

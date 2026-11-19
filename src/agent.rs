@@ -833,6 +833,7 @@ impl OmpSession {
                 "--session-dir"
                     | "--no-session"
                     | "--resume"
+                    | "--session"
                     | "--restore"
                     | "--continue"
                     | "--from-claude"
@@ -881,6 +882,12 @@ impl OmpSession {
     fn record(self, seat: &mut SeatState, reported: Option<String>, success: bool) -> Result<()> {
         let reported = reported.filter(|id| !id.is_empty());
         match self {
+            Self::Resume if seat.omp_session_dir.is_none() => {
+                // Legacy lookup can resolve a continuation with a new ID.
+                if let Some(id) = reported {
+                    seat.captured_session = Some(id);
+                }
+            }
             Self::Resume => {
                 if let Some(id) = reported {
                     anyhow::ensure!(
@@ -2963,10 +2970,16 @@ mod tests {
         assert!(!args.contains(&OsStr::new("--session-dir")));
         assert!(args.windows(2).any(|w| w == ["--resume", "legacy-id"]));
         resume
-            .record(&mut seat, Some("legacy-id".into()), true)
+            .record(&mut seat, Some("continuation-id".into()), true)
             .unwrap();
         assert!(seat.omp_session_dir.is_none());
-        assert_eq!(seat.captured_session.as_deref(), Some("legacy-id"));
+        assert_eq!(seat.captured_session.as_deref(), Some("continuation-id"));
+        let plan = plan_for(AgentKind::Omp, &seat, false);
+        assert!(
+            plan.args(None)
+                .zip(plan.args(None).skip(1))
+                .any(|(flag, id)| flag == "--resume" && id == "continuation-id")
+        );
     }
 
     #[test]
@@ -2979,6 +2992,8 @@ mod tests {
             "--no-session",
             "--continue",
             "--resume=other",
+            "--session",
+            "--session=operator.jsonl",
             "--restore",
             "--from-claude",
             "--from-codex",
