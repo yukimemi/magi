@@ -1030,6 +1030,26 @@ fn apply_one(
                     if task.status == TaskStatus::Blocked || task.has_disk_capacity_cause() {
                         return Ok(());
                     }
+                    if task
+                        .hold_reason
+                        .as_deref()
+                        .is_some_and(|reason| reason.starts_with(crate::cache::RESOURCE_HOLD))
+                    {
+                        // Triage uses the original hold reason to recognize
+                        // cache contention. Report the unrelated refusal separately.
+                        if let Some(home) = queue.root().parent() {
+                            use crate::notices::{Link, Notice};
+                            crate::notices::raise_in(
+                                home,
+                                Notice::warn(&format!("task:{}:recovery-offer", task.id), q.detail)
+                                    .link(Link::Task {
+                                        id: task.id.clone(),
+                                    })
+                                    .since(task.held_at),
+                            );
+                        }
+                        return Ok(());
+                    }
                     if task.status != TaskStatus::Held
                         || task.hold_reason.as_deref() != Some(&q.detail)
                     {

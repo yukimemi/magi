@@ -156,6 +156,7 @@ pub(crate) fn inspect_queued(
         state.check_base_recovery_head(&head)?;
     }
     crate::repair_budget::check_queue_resumption(home, task, state)?;
+    crate::repair_budget::check_pending_conflict_tip(task, state)?;
     Ok(())
 }
 

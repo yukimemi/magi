@@ -299,7 +299,13 @@ async fn conflict_execution_rechecks_tip_checkout_owner_and_head_before_consumpt
     let (fx, mut task, runner, request) = stopped().await;
     grant(&request).await;
     let original_tip = request.tip.as_ref().unwrap();
+    let before_move = inspect(&request).await;
+    assert_eq!(before_move["recovery"]["resume"]["status"], "locally_eligible", "{before_move}");
     git_ok(&fx.repo, &["update-ref", "refs/remotes/origin/main", &request.head]).await;
+    let moved = inspect(&request).await;
+    assert_eq!(moved["recovery"]["resume"]["status"], "refused", "{moved}");
+    let reason = moved["recovery"]["resume"]["reason"].as_str().unwrap();
+    assert!(reason.contains("base tip moved") && reason.contains("--replace-request"), "{reason}");
     let mut resumed = Runner::resume(&request.run).unwrap();
     assert!(resumed.execute().await.unwrap_err().to_string().contains("base tip moved"));
     assert!(RunState::load(&request.run).unwrap().repair_grants.is_empty());

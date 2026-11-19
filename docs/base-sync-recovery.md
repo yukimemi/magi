@@ -154,6 +154,11 @@ the reason instead of requesting a choice. A previously offered operation can
 still be refused if its target changes before application.
 A pending movement authorization does not make resume eligible if its saved
 head no longer matches the clean retained checkout and winner branch.
+A pending textual-conflict repair is not offered for resume if its approved
+tip differs from the local tracking ref. Inspect the changed tip before
+replacing an unimported approval; execution still revalidates the target.
+Suppressing an unrelated recovery offer leaves a cache wait intact and reports
+the refusal separately.
 
 Chat refreshes current run evidence for task notices and decision messages.
 The latest review's recorded E2E commands and failure tails are reported with

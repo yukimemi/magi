@@ -1491,7 +1491,7 @@ impl Runner {
         .context("cannot resolve the retained branch; locate the owned ref without resetting it")
     }
 
-    fn read_base_git(repo: &Path, args: &[&str]) -> Result<String> {
+    pub(crate) fn read_base_git(repo: &Path, args: &[&str]) -> Result<String> {
         use crate::proc::Quiet as _;
         let output = std::process::Command::new("git")
             .arg("--no-optional-locks")

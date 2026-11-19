@@ -788,6 +788,14 @@ pub(crate) fn check_queue_resumption(home: &Path, task: &Task, state: &RunState)
     Ok(true)
 }
 
+pub(crate) fn check_pending_conflict_tip(task: &Task, state: &RunState) -> Result<()> {
+    if conflict_pending(task, state) {
+        let receipt = task.repair_grants.last().expect("pending conflict receipt");
+        conflict_base_tip(state, &receipt.request, receipt.stop.as_ref())?;
+    }
+    Ok(())
+}
+
 /// Recheck the recorded target without fetching or renewing a synchronization interval.
 async fn conflict_target(
     state: &RunState,
@@ -815,11 +823,22 @@ async fn conflict_target(
             "base-conflict repair held: stopped synchronization changed"
         );
     }
+    let live = conflict_base_tip(state, request, stop)?;
+    ensure!(
+        git::is_ancestor(&state.repo, &derived.tip, &live).await,
+        "base-conflict repair refused: current base {live} does not descend from recorded stop tip {}; reconcile the rewritten base explicitly before granting repair",
+        derived.tip
+    );
+    Ok(())
+}
+
+fn conflict_base_tip(state: &RunState, request: &Request, stop: Option<&Stop>) -> Result<String> {
     let tracking = format!(
         "refs/remotes/{}/{}",
         state.config.merge.remote, state.base_branch
     );
-    let live = git::rev_parse(&state.repo, &tracking).await?;
+    let live =
+        crate::graph::Runner::read_base_git(&state.repo, &["rev-parse", "--verify", &tracking])?;
     if request.tip.as_ref() != Some(&live) {
         let imported = state
             .repair_grants
@@ -851,13 +870,7 @@ async fn conflict_target(
             request.request
         );
     }
-    let (stopped, _) = legacy::textual_stop(state, &request.head, &live)?;
-    ensure!(
-        git::is_ancestor(&state.repo, &stopped.tip, &live).await,
-        "base-conflict repair refused: current base {live} does not descend from recorded stop tip {}; reconcile the rewritten base explicitly before granting repair",
-        stopped.tip
-    );
-    Ok(())
+    Ok(live)
 }
 
 /// Only a typed exact-run grant can pass the textual-stop admission fence.

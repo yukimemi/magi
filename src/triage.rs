@@ -2796,6 +2796,28 @@ mod tests {
             limit_secs: 10,
         };
         state.save_under(dir.path()).unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let questions = Questions::at(dir.path().join("questions"));
+        queue.put(&mut task).unwrap();
+        let hold_reason = task.hold_reason.clone();
+        let hold_at = task.held_at;
+        let other_run = "20260101-000000-aaaa";
+        let verdict = serde_json::from_value(serde_json::json!({"decisions":[{
+            "id":task.id, "question":"Resume another run?",
+            "choices":["resume","hold"], "actions":{
+                "resume":{"do":"resumerun","run":other_run}, "hold":{"do":"hold"}
+            }
+        }]}))
+        .unwrap();
+        crate::conduct::apply(&queue, &questions, &verdict).unwrap();
+        task = queue.get(&task.id).unwrap();
+        assert_eq!(task.hold_reason, hold_reason);
+        assert_eq!(task.held_at, hold_at);
+        assert!(questions.list().is_empty());
+        let notices = crate::notices::Notices::at(dir.path().join("notifications")).list();
+        assert!(notices.iter().any(|notice| {
+            notice.message.contains(other_run) && notice.message.contains("unreadable")
+        }));
         assert_eq!(
             machine_cause_resolved_under(&task, &cfg, dir.path()),
             Some(true)
