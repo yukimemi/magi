@@ -1713,7 +1713,7 @@ fn merge_consent_superseded(state: &RunState, question: &ask::Question) -> Resul
         .get(task_id)
         .context("cannot verify operator decisions for the merge approval")?;
     Ok(task
-        .operator_decided_at
+        .latest_operator_decision_at()
         .is_some_and(|at| at > question.answered_at.unwrap_or(question.asked_at)))
 }
 
@@ -3653,11 +3653,11 @@ async fn owner_stop<F: Forge>(state: &mut RunState, pr: &mut PrState, forge: &F)
         if !owner.is_some_and(|task| {
             task.execution_runs().last() == Some(&state.id)
                 && (!task
-                    .operator_decided_at
+                    .latest_operator_decision_at()
                     .is_some_and(|at| at > q.answered_at.unwrap_or(q.asked_at))
                     || task.resumption.as_ref().is_some_and(|release| {
                         release.question_id.as_deref() == Some(q.id.as_str())
-                            && task.operator_decided_at == Some(release.at)
+                            && task.latest_operator_decision_at() == Some(release.at)
                     }))
         }) {
             stop(state, &repo, pr, "replacement requires the current original queue task owner and an unsuperseded answer; PR left open").await?;

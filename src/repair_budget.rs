@@ -307,6 +307,18 @@ fn check_local_head(state: &RunState, head: &str) -> Result<()> {
     Ok(())
 }
 
+fn check_interrupted_fixer_branch(state: &RunState) -> Result<()> {
+    let winner = state.winner().context("repair winner missing")?;
+    let read_git = crate::graph::Runner::read_base_git;
+    ensure!(
+        read_git(&winner.worktree, &["branch", "--show-current"])? == winner.branch
+            && read_git(&winner.worktree, &["rev-parse", "--verify", "HEAD"])?
+                == crate::graph::Runner::retained_branch_head(state)?,
+        "repair grant held: interrupted fixer branch ownership changed"
+    );
+    Ok(())
+}
+
 async fn public_lease(state: &RunState) -> Result<()> {
     let winner = state.winner().context("repair winner missing")?;
     if let Some(pr) = &state.pr {
@@ -679,14 +691,7 @@ pub(crate) async fn apply(home: &Path, state: &mut RunState, disk: &RunState) ->
         if active.phase != Phase::Fixing {
             head_and_public(disk, &active.head).await?;
         } else {
-            let winner = disk.winner().context("repair winner missing")?;
-            ensure!(
-                git::current_branch(&winner.worktree).await?.as_deref()
-                    == Some(winner.branch.as_str())
-                    && git::rev_parse(&winner.worktree, "HEAD").await?
-                        == git::rev_parse(&disk.repo, &winner.branch).await?,
-                "repair grant held: interrupted fixer branch ownership changed"
-            );
+            check_interrupted_fixer_branch(disk)?;
             public_lease(disk).await?;
         }
     }
@@ -820,8 +825,8 @@ pub(crate) fn check_queue_resumption(home: &Path, task: &Task, state: &RunState)
             .find(|grant| grant.receipt == *receipt);
         match imported {
             None => check_local_head(state, &receipt.request.head)?,
-            Some(grant) if grant.phase != Phase::Fixing => check_local_head(state, &grant.head)?,
-            Some(_) => {}
+            Some(grant) if grant.phase == Phase::Fixing => check_interrupted_fixer_branch(state)?,
+            Some(grant) => check_local_head(state, &grant.head)?,
         }
         if imported.is_none_or(|grant| grant.phase.needs_conflict_target()) {
             conflict_base_tip(state, &receipt.request, receipt.stop.as_ref())?;

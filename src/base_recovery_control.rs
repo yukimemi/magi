@@ -161,7 +161,7 @@ impl Transaction {
             ensure!(
                 owner == &task.id
                     && task
-                        .operator_decided_at
+                        .latest_operator_decision_at()
                         .is_none_or(|decision| decision <= *at),
                 "recovery decision has stale task ownership or was superseded"
             );

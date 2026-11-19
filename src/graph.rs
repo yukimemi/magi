@@ -1385,6 +1385,7 @@ impl Runner {
         Self::check_standing_base_recovery(state, task, &head)?;
         let stop = state.check_movement_stop(&head, &task.id)?;
         state.check_new_base_authorization(&stop)?;
+        crate::daemon::check_resume_implementers(task, state)?;
         Ok(head)
     }
 
@@ -1538,6 +1539,7 @@ impl Runner {
         state.ensure_base_episode();
         state.record_base_sync_stop(&head);
         state.check_movement_stop(&head, task)?;
+        crate::daemon::check_resume_implementers(&queued, &state)?;
         let fetched =
             git::fetch(&state.repo, &state.config.merge.remote, &state.base_branch).await?;
         anyhow::ensure!(
@@ -18056,6 +18058,7 @@ esac
         let home = crate::run::home();
         let queue = crate::queue::Queue::open();
         runner.state.task_instruction = Some(queue.get(&task).unwrap().instruction);
+        runner.state.config.graph.implementers = 2;
         runner.state.save().unwrap();
         let request = crate::base_recovery_control::Request {
             run: runner.state.id.clone(),
@@ -18065,6 +18068,26 @@ esac
             decision: None,
             expected_stop: None,
         };
+        let mut mismatched = queue.get(&task).unwrap();
+        mismatched.solo = true;
+        queue.put(&mut mismatched).unwrap();
+        let error = Runner::inspect_base_recovery(&home, &runner.state, &mismatched).unwrap_err();
+        assert!(error.to_string().contains("saved count: 2"), "{error:#}");
+        let error = crate::base_recovery_control::recover(&queue, &home, request.clone())
+            .await
+            .err()
+            .expect("mismatched implementers must refuse authorization");
+        assert!(error.to_string().contains("saved count: 2"), "{error:#}");
+        assert!(
+            RunState::load(&runner.state.id)
+                .unwrap()
+                .base_sync_recovery
+                .authorizations
+                .is_empty()
+        );
+        mismatched.solo = false;
+        queue.put(&mut mismatched).unwrap();
+        Runner::inspect_base_recovery(&home, &runner.state, &mismatched).unwrap();
         crate::base_recovery_control::recover(&queue, &home, request.clone())
             .await
             .unwrap();

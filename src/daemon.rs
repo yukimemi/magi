@@ -974,7 +974,10 @@ where
     // placed before it (even after the question was asked) was seen and
     // overruled by it, while a hold or release after it supersedes it.
     let decision_at = q.answered_at.unwrap_or(q.asked_at);
-    if task.operator_decided_at.is_some_and(|at| at > decision_at) {
+    if task
+        .latest_operator_decision_at()
+        .is_some_and(|at| at > decision_at)
+    {
         return if repair || stopping {
             ActionDecision::Refuse(format!(
                 "{} answer {} was superseded by a later operator decision; the task stays held. Inspect `magi show {}`; if this action is still wanted, explicitly release the existing owner with `magi task release {}`",
@@ -1403,7 +1406,7 @@ async fn apply_maintenance_choices(queue: &Queue, questions: &Questions, home: &
                                 && task.held_at == Some(*held_at)
                                 && task.hold_reason.as_deref() == reason.as_deref()
                                 && task
-                                    .operator_decided_at
+                                    .latest_operator_decision_at()
                                     .is_none_or(|at| at <= q.answered_at.unwrap_or(q.asked_at)),
                             "task no longer has the hold this question names"
                         );
@@ -1452,7 +1455,9 @@ async fn apply_maintenance_choices(queue: &Queue, questions: &Questions, home: &
             && let Ok(mut origin) = queue.get(&listed.id)
         {
             if !origin.operator_held()
-                && origin.operator_decided_at.is_none_or(|at| at <= q.asked_at)
+                && origin
+                    .latest_operator_decision_at()
+                    .is_none_or(|at| at <= q.asked_at)
                 && !matches!(origin.status, TaskStatus::Running | TaskStatus::Done)
             {
                 if matches!(action, ask::ChoiceAction::ResumeRun { .. })

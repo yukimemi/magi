@@ -111,8 +111,10 @@ pub(crate) fn check_queue_owner(
         "run queue owner changed, is running, or is done"
     );
     ensure!(
-        decided_before
-            .is_none_or(|answered| task.operator_decided_at.is_none_or(|at| at <= answered)),
+        decided_before.is_none_or(|answered| {
+            task.latest_operator_decision_at()
+                .is_none_or(|at| at <= answered)
+        }),
         "resume was superseded by a newer operator decision"
     );
     Ok(())
@@ -252,7 +254,12 @@ pub(crate) fn pin_queued(
             .as_ref()
             .is_some_and(|pin| pin.pinned_run.as_deref() == Some(run))
     {
-        check_pending_movement(queue, &task, &state, false).map_err(BeforeQueueWrite)?;
+        if check_pending_movement(queue, &task, &state, false).map_err(BeforeQueueWrite)? {
+            // A new explicit request supersedes earlier answers even when
+            // the exact-run pin is already queued.
+            task.base_recovery_resume_at = Some(jiff::Timestamp::now());
+            queue.put(&mut task)?;
+        }
         return Ok(true);
     }
     let source = if decided_before.is_some() {
@@ -298,9 +305,11 @@ pub(crate) fn prepare_pin(
 ) -> Result<()> {
     let preserve_movement =
         check_pending_movement(queue, task, state, matches!(source, PinSource::Choice))?;
+    let at = jiff::Timestamp::now();
     if !crate::repair_budget::queue_resumption_after_answer(home, task, state, applied)? {
         if preserve_movement {
             task.release();
+            task.base_recovery_resume_at = Some(at);
         } else {
             let label = match source {
                 PinSource::Cli => "cli-run-resume",
@@ -313,7 +322,7 @@ pub(crate) fn prepare_pin(
     }
     task.resume_override = Some(crate::queue::OperatorResume {
         question_id: applied.unwrap_or_default().to_owned(),
-        at: jiff::Timestamp::now(),
+        at,
         conductor_rehold: None,
         forced: true,
         pinned_run: Some(state.id.clone()),

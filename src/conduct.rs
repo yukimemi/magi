@@ -372,7 +372,9 @@ fn new_blocking_evidence(
                             && dep.status != TaskStatus::Done
                             && (dep.created_at > r.at
                                 || dep.held_at.is_some_and(|at| at > r.at)
-                                || dep.operator_decided_at.is_some_and(|at| at > r.at)
+                                || dep
+                                    .latest_operator_decision_at()
+                                    .is_some_and(|at| at > r.at)
                                 || dep.passes.iter().any(|p| p.settled_at > r.at)
                                 || (dep.status == TaskStatus::Blocked
                                     && dep.blocked_at.is_some_and(|at| at > r.at)))
@@ -1829,6 +1831,9 @@ mod tests {
         check_resume_offer(&queue, &task, &state.id, true).unwrap();
         let mut published = task.clone();
         published.release_operator("base-recovery", None);
+        let decision = "2026-01-01T00:00:00Z".parse().unwrap();
+        published.operator_decided_at = Some(decision);
+        published.resumption.as_mut().unwrap().at = decision;
         let key = "owner-chat/interrupted";
         published.base_recovery_requests.push(key.into());
         published.hold_machine(Some("retained work".into()));
@@ -1907,9 +1912,29 @@ mod tests {
         assert!(reason.contains("not a fresh fetch"));
         let run_path = dir.path().join("runs").join(&state.id).join("run.json");
         let approval_before = std::fs::read(&run_path).unwrap();
+        let mut delayed_hold = Question::new(
+            task.id.clone(),
+            NODE.into(),
+            SEAT.into(),
+            "Hold?".into(),
+            String::new(),
+            vec!["hold".into()],
+        );
+        delayed_hold
+            .actions
+            .insert("hold".into(), ChoiceAction::Hold);
+        delayed_hold
+            .answer(crate::ask::Answer::Choice("hold".into()))
+            .unwrap();
+        delayed_hold.answered_at = Some("2026-01-01T00:00:01Z".parse().unwrap());
+        delayed_hold.asked_at = delayed_hold.answered_at.unwrap();
+        delayed_hold.accepted_answer_at = delayed_hold.answered_at;
+        questions.put(&mut delayed_hold).unwrap();
         assert!(crate::resume::pin_queued(&queue, &state.id, None, None).unwrap());
+        crate::daemon::apply_task_choice_actions(&queue, &questions, dir.path());
         published = queue.get(&task.id).unwrap();
         assert_eq!(published.status, TaskStatus::Queued);
+        assert!(published.action_applied(&delayed_hold.id));
         assert_eq!(
             crate::base_recovery_control::queue_binding_refusal(authorization, &published),
             None
@@ -2105,6 +2130,8 @@ mod tests {
             "dependency",
             "reviewing",
             "gating",
+            "fixing-dirty",
+            "fixing-detached",
             "head",
             "repaired-head",
         ] {
@@ -2168,12 +2195,13 @@ mod tests {
                 stop: state.base_sync_recovery.stop.clone(),
                 legacy: None,
             });
-            if matches!(change, "reviewing" | "gating" | "repaired-head") {
-                let phase = if matches!(change, "reviewing" | "repaired-head") {
-                    Phase::Reviewing
-                } else {
-                    Phase::Gating
-                };
+            let phase = match change {
+                "reviewing" | "repaired-head" => Some(Phase::Reviewing),
+                "gating" => Some(Phase::Gating),
+                "fixing-dirty" | "fixing-detached" => Some(Phase::Fixing),
+                _ => None,
+            };
+            if let Some(phase) = phase {
                 state.repair_grants.push(Applied {
                     receipt: task.repair_grants[0].clone(),
                     spent: 1,
@@ -2191,9 +2219,14 @@ mod tests {
                     conflict: None,
                 });
                 state.save_under(dir.path()).unwrap();
+                let tracking_tip = if phase == Phase::Fixing {
+                    &tip
+                } else {
+                    &approved
+                };
                 crate::git::git(
                     &repo,
-                    &["update-ref", "refs/remotes/origin/main", &approved],
+                    &["update-ref", "refs/remotes/origin/main", tracking_tip],
                 )
                 .await
                 .unwrap();
@@ -2202,6 +2235,34 @@ mod tests {
             let verdict = maintenance_resume_verdict(&task, &state);
             if change == "repaired-head" {
                 check_resume_offer(&queue, &task, &state.id, true).unwrap();
+            }
+            if change == "fixing-dirty" {
+                std::fs::write(repo.join("change.txt"), "interrupted edits\n").unwrap();
+                check_resume_offer(&queue, &task, &state.id, true).unwrap();
+                assert!(crate::resume::pin_queued(&queue, &state.id, None, None).unwrap());
+                assert_eq!(queue.get(&task.id).unwrap().status, TaskStatus::Queued);
+                std::fs::write(repo.join("change.txt"), "x\n").unwrap();
+                continue;
+            }
+            if change == "fixing-detached" {
+                check_resume_offer(&queue, &task, &state.id, true).unwrap();
+                crate::git::git(&repo, &["checkout", "--detach", &approved])
+                    .await
+                    .unwrap();
+                let before = std::fs::read(queue.path_of(&task.id)).unwrap();
+                let error = crate::resume::pin_queued(&queue, &state.id, None, None).unwrap_err();
+                assert!(error.is::<crate::resume::BeforeQueueWrite>(), "{error:#}");
+                assert_eq!(std::fs::read(queue.path_of(&task.id)).unwrap(), before);
+                apply(&queue, &questions, &verdict).unwrap();
+                assert!(!questions.list().iter().any(|q| q.run == task.id));
+                assert!(
+                    recovery_offer_notice(dir.path(), &task.id)
+                        .contains("interrupted fixer branch ownership changed")
+                );
+                crate::git::git(&repo, &["checkout", "candidate"])
+                    .await
+                    .unwrap();
+                continue;
             }
             if matches!(change, "head" | "repaired-head") {
                 crate::git::git(&repo, &["commit", "--allow-empty", "-m", "Move winner"])
