@@ -20866,6 +20866,278 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_report_json_route_preserves_recovery_repair_release_and_final_review_facts() {
+        crate::run::pin_test_home();
+        let f = Fixture::start().await;
+        let id = "20260902-140505-facts";
+        write_run(&f.runs(), id, RunStatus::Stalled);
+        let path = f.runs().join(id).join("run.json");
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        v["candidates"] = serde_json::json!([{
+            "index": 0, "label": "A", "agent": "a", "branch": "a", "worktree": "/a",
+            "empty": true, "folded": true, "summary": "Already covered.\nNo patch needed."
+        }]);
+        v["tally"] = serde_json::json!({
+            "first_choice": {"A": 1}, "borda": {"A": 2}, "winner": "A",
+            "unanimous_initial": true, "deliberated": false, "changed_votes": 0,
+            "unanimous_final": true, "judges": 3, "present": 1, "quorum": 2,
+            "met_quorum": false, "rankings": 1
+        });
+        v["quota"] = serde_json::json!([
+            {
+                "seat": "judge-1", "node": "judge", "at": "2026-09-02T14:05:01Z",
+                "agent": "signed-out", "cause": "authentication"
+            },
+            {"seat": "judge-2", "node": "judge", "at": "2026-09-02T14:05:01Z"}
+        ]);
+        v["startup"] = serde_json::json!({
+            "kind": "review", "branch": "topic", "stage": "fetch", "complete": false,
+            "failure": "fetch refused\ncredentials expired"
+        });
+        v["recovery"] = serde_json::json!({
+            "from_run": "20260902-140501-a1b2", "generation": 1, "mode": "full-review",
+            "reasons": ["head moved\nreview the new diff"], "criteria_inherited": true,
+            "repair": {"started": {"before": "abcdef012345"}}
+        });
+        v["reviews"] = serde_json::json!([{
+            "round": 1, "head": "abcdef012345", "answered": 1, "expected": 2,
+            "verified_head": "fedcba9876543210", "verified_at": "2026-09-02T14:05:01Z",
+            "vote_split": true, "verdict": "approve_with_findings",
+            "e2e": [{
+                "command": "cargo test", "code": 0, "duration_ms": 12, "output_tail": "ok"
+            }],
+            "reviews": [
+                {"reviewer": 1, "agent": "reviewer", "vote": "reject",
+                 "summary": "Initial **concern**.\n\nPlease inspect.",
+                 "findings": [{"id": "R1-1-1", "severity": "minor", "title": "Check edge case"}]},
+                {"reviewer": 2, "agent": "missing", "failed": "connection lost"}
+            ],
+            "reconsideration": [{
+                "reviewer": 1, "agent": "reviewer", "vote": "approve_with_findings",
+                "reason": "The blocker is resolved.\nOne minor issue remains."
+            }]
+        }]);
+        v["merge_repairs"] = serde_json::json!([{
+            "question": "question-42", "head": "abcdef012345",
+            "pr": "https://example.test/pull/42", "reviews": v["reviews"].clone(),
+            "gate": [], "phase": "Failed",
+            "failure": "owner decision required\ninspect updated results"
+        }]);
+        v["bump_decision_attempts"] = serde_json::json!([
+            {"agent": "first", "outcome": "unavailable"},
+            {"agent": "second", "outcome": "patch\naccepted"}
+        ]);
+        v["release_bump"] = serde_json::json!({
+            "version": "1.2.3", "local": true,
+            "problem": "publish failed\nregistry refused",
+            "release": {
+                "version": "1.2.3", "commit": "fedcba9876543210", "tag_done": true, "done": 1,
+                "failed": "registry refused\nawait owner approval",
+                "log": [{
+                    "name": "cargo publish", "code": 1,
+                    "tail": "first output line\nsecond output line", "output": "/logs/publish.log"
+                }]
+            }
+        });
+        std::fs::write(&path, v.to_string()).unwrap();
+
+        let res = f.get(&format!("/api/runs/{id}/report.json")).await;
+        assert_eq!(res.status, 200, "{}", res.body);
+        let j = res.json();
+        assert_eq!(j["schema"], 1);
+        assert_eq!(j["header"]["tone"], "warn");
+        assert_eq!(
+            j["header"]["startup"],
+            "review branch=topic stage=fetch complete=false"
+        );
+        assert_eq!(
+            j["header"]["startup_failure"],
+            "fetch refused\ncredentials expired"
+        );
+        assert_eq!(j["sections"][0]["items"][0]["state"], "no_change");
+        assert_eq!(
+            j["sections"][0]["items"][0]["detail"],
+            "Already covered.\nNo patch needed."
+        );
+        assert_eq!(
+            j["sections"][1]["tally"]["rate_limited"],
+            serde_json::json!(["judge-1", "judge-2"])
+        );
+        let sections = j["sections"].as_array().unwrap();
+        let labels: Vec<_> = sections
+            .iter()
+            .map(|section| {
+                section["key"]
+                    .as_str()
+                    .or_else(|| section["kind"].as_str())
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "candidates",
+                "tally",
+                "quota_details",
+                "recovery",
+                "review",
+                "merge_repairs",
+                "release_decision_attempts",
+                "release_bump",
+                "release_execution"
+            ]
+        );
+        let note = |key: &str| {
+            sections
+                .iter()
+                .find(|section| section["kind"] == "notes" && section["key"] == key)
+                .unwrap()
+        };
+        let unavailable = note("quota_details");
+        assert_eq!(unavailable["tone"], "warn");
+        assert_eq!(
+            unavailable["lines"],
+            serde_json::json!([
+                "judge-1 (signed-out: re-authenticate)",
+                "judge-2 (usage limit)"
+            ])
+        );
+        let recovery = note("recovery");
+        assert_eq!(recovery["tone"], "warn");
+        assert!(
+            recovery["lines"][0]
+                .as_str()
+                .unwrap()
+                .contains("head moved\nreview the new diff")
+        );
+        assert_eq!(
+            recovery["lines"][1],
+            "the task's own completion criteria were kept"
+        );
+        assert_eq!(recovery["lines"][2], "repair: unfinished");
+        let review = sections
+            .iter()
+            .find(|section| section["kind"] == "review")
+            .unwrap();
+        assert_eq!(review["tone"], "warn", "missing input cannot look settled");
+        let round = &review["rounds"][0];
+        assert_eq!(round["verified_head"], "fedcba9");
+        assert_eq!(round["verified_at"], "2026-09-02T14:05:01Z");
+        assert_eq!(round["status"], "incomplete");
+        assert_eq!(round["e2e"]["state"], "pass");
+        assert_eq!(round["reviewers"][0]["vote"], "reject");
+        assert_eq!(round["reviewers"][0]["final_vote"], "approve_with_findings");
+        assert_eq!(
+            round["reviewers"][0]["reason"],
+            "Initial **concern**.\n\nPlease inspect."
+        );
+        assert!(
+            !round["reviewers"][0]["reason_md"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(round["reviewers"][1]["final_vote"].is_null());
+        assert_eq!(round["reviewers"][1]["failed"], "connection lost");
+        assert_eq!(
+            round["reconsideration"][0]["reason"],
+            "The blocker is resolved.\nOne minor issue remains."
+        );
+        assert!(
+            !round["reconsideration"][0]["reason_md"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let repairs = note("merge_repairs");
+        assert_eq!(repairs["tone"], "warn");
+        assert_eq!(
+            repairs["lines"][0],
+            "question question-42  head abcdef012345  Failed\nhttps://example.test/pull/42"
+        );
+        assert_eq!(
+            repairs["lines"][1],
+            "held: owner decision required\ninspect updated results"
+        );
+        assert_eq!(
+            repairs["lines"][2],
+            "original [R1-1-1] Minor: Check edge case"
+        );
+        assert_eq!(
+            repairs["lines"][3],
+            "original reviewer #1: ApproveWithFindings"
+        );
+        assert_eq!(
+            repairs["lines"][4],
+            "Repair never approves a merge; updated results require a fresh owner decision."
+        );
+        let attempts = note("release_decision_attempts");
+        assert_eq!(attempts["tone"], "neutral");
+        assert_eq!(
+            attempts["lines"],
+            serde_json::json!(["1. first: unavailable", "2. second: patch\naccepted"])
+        );
+        let bump = sections
+            .iter()
+            .find(|section| section["kind"] == "release_bump")
+            .unwrap();
+        assert_eq!(bump["bump"]["automerge"], "local");
+        assert_eq!(bump["bump"]["problem"], "publish failed\nregistry refused");
+        assert_eq!(bump["tone"], "warn");
+        let execution = note("release_execution");
+        assert_eq!(execution["tone"], "warn");
+        assert_eq!(
+            execution["lines"][0],
+            "release v1.2.3 at fedcba9876543210: registry refused\nawait owner approval"
+        );
+        assert_eq!(
+            execution["lines"][1],
+            "tag on remote: true; 1 command(s) completed"
+        );
+        assert_eq!(
+            execution["lines"][2],
+            "cargo publish (exit 1) output /logs/publish.log\nfirst output line\nsecond output line"
+        );
+
+        // The original endpoint remains terminal text, including these same facts.
+        let raw = f.get(&format!("/api/runs/{id}/report")).await;
+        assert_eq!(raw.status, 200);
+        assert!(
+            raw.headers
+                .contains("content-type: text/plain; charset=utf-8")
+        );
+        assert!(raw.body.contains("fetch refused\ncredentials expired"));
+        assert!(raw.body.contains("Already covered."));
+        assert!(raw.body.contains("judge-1 (signed-out: re-authenticate)"));
+        assert!(raw.body.contains("judge-2 (usage limit)"));
+        assert!(
+            raw.body
+                .contains("owner decision required\ninspect updated results")
+        );
+        assert!(raw.body.contains("2. second: patch\naccepted"));
+        assert!(raw.body.contains(
+            "release v1.2.3 at fedcba9876543210: registry refused\nawait owner approval"
+        ));
+
+        // Historical records do not acquire invented startup or verification facts.
+        let legacy_id = "20260902-140506-old";
+        write_run(&f.runs(), legacy_id, RunStatus::Stalled);
+        let legacy = f.get(&format!("/api/runs/{legacy_id}/report.json")).await;
+        assert_eq!(legacy.status, 200, "{}", legacy.body);
+        let legacy = legacy.json();
+        assert!(legacy["header"]["startup"].is_null());
+        assert!(legacy["header"]["startup_failure"].is_null());
+        assert!(
+            legacy["sections"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|section| section["kind"] != "notes")
+        );
+    }
+
+    #[tokio::test]
     async fn the_report_json_route_serves_deliberation_turns_with_markdown_bodies() {
         crate::run::pin_test_home();
         let f = Fixture::start().await;
@@ -21940,14 +22212,15 @@ mod tests {
 
     #[tokio::test]
     async fn a_new_turn_on_a_talk_moves_the_change_stream_revision() {
-        let f = Fixture::start().await;
-        let before = f.get("/api/health").await.json()["talks_rev"]
-            .as_u64()
-            .expect("talks_rev");
-
-        let talk = seed_talk(&f, "20260904-014455-ab12", "open");
-        std::thread::sleep(Duration::from_millis(10));
-        let mut on_disk = f.talks().get(&talk).expect("get seeded talk");
+        let home = TempDir::new().expect("temp home");
+        let ui = delta_test_ui(home.path());
+        let talk = seed_talk_at(&ui.talks, "20260904-014455-ab12", "open");
+        // Establish the existing conversation's baseline before appending.
+        // Wait on the stream's shared notification rather than repeatedly
+        // rebuilding health (config, process and disk observations included).
+        let before = ui.monitor.revisions(&ui).await.expect("initial scan").3;
+        let mut changes = ui.monitor.broadcaster.subscribe();
+        let mut on_disk = ui.talks.get(&talk).expect("get seeded talk");
         on_disk.turns.push(crate::talk::Turn {
             sender: None,
             breaks: Some(Vec::new()),
@@ -21959,17 +22232,19 @@ mod tests {
             attachments: Vec::new(),
             usage: None,
         });
-        f.talks().put(&mut on_disk).expect("record a turn");
+        ui.talks.put(&mut on_disk).expect("record a turn");
 
         let after = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                let revision = f.get("/api/health").await.json()["talks_rev"]
-                    .as_u64()
-                    .unwrap();
+                let change = changes.recv().await.expect("monitor notification");
+                let revision = change.payload["talks_rev"].as_u64().expect("talks_rev");
                 if revision != before {
+                    assert_eq!(
+                        change.payload["talks_delta"]["changed"],
+                        serde_json::json!([talk])
+                    );
                     break revision;
                 }
-                tokio::time::sleep(Duration::from_millis(50)).await;
             }
         })
         .await
@@ -21977,6 +22252,11 @@ mod tests {
         assert_ne!(
             before, after,
             "a phone must be able to notice a talk's reply without polling every store"
+        );
+        let Json(observed) = health(State(ui)).await.expect("health");
+        assert_eq!(
+            observed.talks_rev, after,
+            "health exposes the same revision"
         );
     }
 

@@ -8067,7 +8067,7 @@ function rcommands(list) {
 }
 
 function rlines(lines) {
-  return el("ul", { class: "rlist" }, (lines || []).map((l) => el("li", { class: "rrow", text: l })));
+  return el("ul", { class: "rlist" }, (lines || []).map((l) => el("li", { class: "rrow rnote", text: l })));
 }
 
 const GRAFT_STATE = {
@@ -8160,6 +8160,10 @@ function renderFinding(f) {
     f.declined_why ? el("div", { class: "rfinding-why", text: `Declined: ${f.declined_why}` }) : null);
 }
 
+function reviewVoteBadge(vote) {
+  return vote ? voteTag(vote) : rtag("no vote", "warn");
+}
+
 function renderRound(runId, r) {
   const e2eTone = { pass: "ok", fail: r.e2e && r.e2e.build_failed ? "warn" : "fail", blocked: "warn", deferred: "warn", not_configured: "neutral" };
   const e2eText = { pass: "e2e pass", fail: "e2e FAIL", blocked: "e2e blocked", deferred: "e2e deferred", not_configured: "no e2e" };
@@ -8181,6 +8185,7 @@ function renderRound(runId, r) {
     if (fix.continuation) fixLine += ` [${fix.continuation}]`;
   }
   const meta = `${r.raised} finding(s), ${r.blocking} blocking · @ ${r.head}${r.verified_head ? ` (verified @ ${r.verified_head})` : ""}`
+    + (r.verified_at ? ` · verified ${r.verified_at}` : "")
     + (e2e.retried ? " · e2e retried once" : "");
   return rcard(runId, `review:${r.round}`, `Round ${r.round}`, r.tone, r.default_open, badges,
     el("p", { class: "rmeta", text: meta }),
@@ -8191,12 +8196,20 @@ function renderRound(runId, r) {
       ? el("ul", { class: "rfindings" }, r.findings.map(renderFinding))
       : el("p", { class: "rmeta", text: "No findings." }),
     (r.reviewers || []).length
-      ? rlines(r.reviewers.map((x) => `review-${x.reviewer} (${x.agent}) ${x.failed ? `failed: ${x.failed}` : x.vote ? x.vote.replace(/_/g, " ") : "no vote"}`))
+      ? el("ul", { class: "rlist" }, r.reviewers.map((x) => el("li", { class: "rrow" },
+        el("strong", { text: `review-${x.reviewer} (${x.agent})` }),
+        reviewVoteBadge(x.final_vote || x.vote),
+        x.failed ? el("span", { class: "rwide", text: `failed: ${x.failed}` }) : null,
+        x.final_vote && x.final_vote !== x.vote
+          ? el("span", { class: "rmeta", text: `initial: ${(x.vote || "no vote").replace(/_/g, " ")}` }) : null,
+        x.reason_md ? mdBlock("rturn-body rwide", x.reason_md) : null)))
       : null,
     (r.reconsideration || []).length
       ? el("div", null, el("p", { class: "rmeta", text: "reconsideration" }),
-        el("ul", { class: "rlist" }, r.reconsideration.map((x) => linkify(el("li", { class: "rrow" }),
-          `review-${x.reviewer} → ${x.vote ? x.vote.replace(/_/g, " ") : ""} ${x.reason || ""}`.trim()))))
+        el("ul", { class: "rlist" }, r.reconsideration.map((x) => el("li", { class: "rrow" },
+          el("strong", { text: `review-${x.reviewer}` }), reviewVoteBadge(x.vote),
+          x.reason_md ? mdBlock("rturn-body rwide", x.reason_md)
+            : x.reason ? el("div", { class: "rwide rnote", text: x.reason }) : null))))
       : null);
 }
 
@@ -8213,7 +8226,7 @@ function renderSection(runId, s) {
           c.winner ? rtag("winner", "ok") : null,
           c.provisional_winner ? rtag("provisional", "warn", "Leads, but the panel did not reach quorum") : null,
           el("span", { class: "rmeta", text: `${c.files} files, ${c.commits} commits, ${c.duration_secs}s` }),
-          c.detail ? el("div", { class: "rwide", text: c.detail }) : null))));
+          c.detail ? el("div", { class: "rwide rnote", text: c.detail }) : null))));
     case "judging": {
       const rounds = s.rounds || [];
       const deliberationRounds = rounds.length ? rounds.map((r) => el("div", { class: "rblock" },
@@ -8226,10 +8239,20 @@ function renderSection(runId, s) {
           return rcard(runId, `deliberation:${r.round}:${t.judge}:${idx}`, `judge ${t.judge} (${t.agent})`, "neutral", false, [tentativeBadge], bodyEl);
         }))) : null;
       return card([],
-        rlines((s.judges || []).map((j) => `judge ${j.judge} (${j.agent}) ${j.failed ? `no ranking: ${j.failed}` : `${j.ranking}${j.confidence != null ? ` confidence ${j.confidence}` : ""}`}`)),
+        el("ul", { class: "rlist" }, (s.judges || []).map((j) => el("li", { class: "rrow" },
+          el("strong", { text: `judge ${j.judge} (${j.agent})` }),
+          rtag(j.failed || !j.ranking ? "no ranking" : `ranking ${j.ranking}`, j.failed || !j.ranking ? "warn" : "neutral"),
+          j.confidence != null ? el("span", { class: "rmeta", text: `confidence ${j.confidence}` }) : null,
+          j.failed ? el("div", { class: "rwide", text: j.failed }) : null,
+          Object.entries(j.reasons_md || {}).map(([candidate, nodes]) =>
+            el("details", { class: "rout" }, el("summary", { text: `candidate ${candidate}: reasoning` }),
+              mdBlock("rturn-body", nodes)))))),
         (s.deliberation || []).length ? rlines(s.deliberation) : null,
         deliberationRounds,
-        (s.votes || []).length ? rlines(s.votes.map((v) => `final vote: judge ${v.judge} (${v.agent}) ${v.vote}${v.changed ? " (changed after deliberation)" : ""}`)) : null);
+        (s.votes || []).length ? el("ul", { class: "rlist" }, s.votes.map((v) => el("li", { class: "rrow" },
+          el("strong", { text: `judge ${v.judge} (${v.agent})` }),
+          rtag(`final choice ${v.vote}`, v.vote === "?" ? "warn" : "neutral"),
+          v.changed ? el("span", { class: "rmeta", text: "changed after deliberation" }) : null))) : null);
     }
     case "tally": {
       const t = s.tally;
@@ -8310,6 +8333,7 @@ function renderSection(runId, s) {
             rtag(j.status, j.status === "completed" ? "ok" : j.status === "failed" ? "fail" : "warn"),
             j.exit_code != null ? el("span", { class: "rmeta", text: `exit ${j.exit_code}` }) : null,
             j.round != null ? el("span", { class: "rmeta", text: `round ${j.round}` }) : null,
+            j.checked_at ? el("span", { class: "rmeta", text: `checked ${j.checked_at}` }) : null,
             el("code", { class: "rmono", text: j.description }),
             routput(j.result_summary)))))),
         el("p", { class: "rmeta", text: s.coverage }));
@@ -8396,9 +8420,13 @@ function renderReportCards() {
       h.needs_attention ? rtag("needs a human", "warn") : null,
       el("span", { class: "rmeta", text: `${h.repo || ""} (${h.base_branch || ""} @ ${h.base_commit || ""}) · created ${h.created || ""}` }),
       h.task ? el("div", { class: "rwide", text: h.task }) : null,
+      h.startup ? el("div", { class: "rwide rnote", text: h.startup }) : null,
+      h.startup_failure ? el("div", { class: "rwide rnote rwarn", text: `startup failure: ${h.startup_failure}` }) : null,
+      h.state_dir ? el("div", { class: "rwide rmono", text: `state ${h.state_dir}` }) : null,
       h.origin ? el("div", { class: "rmeta", text: h.origin }) : null),
     view.active_seats ? el("details", { class: "rout" }, el("summary", { text: "active seats" }), el("pre", { class: "rpre", text: view.active_seats })) : null,
-    view.sections.map((s) => renderSection(runId, s)),
+    view.sections.filter((s) => s.kind === "tally").map((s) => renderSection(runId, s)),
+    view.sections.filter((s) => s.kind !== "tally").map((s) => renderSection(runId, s)),
     archivedSeatEvidence(runId),
   ]);
 }
