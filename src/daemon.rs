@@ -1056,12 +1056,12 @@ where
                 Ok(s) if s.liveness_under(home, false) == Liveness::Live => {
                     ActionDecision::Refuse("run already has a live driver".into())
                 }
-                Ok(s) => match crate::handover::resume_refusal_under(&s, Some(home)) {
-                    None => ActionDecision::Resume(run.clone()),
-                    Some(reason) => ActionDecision::Refuse((p.resume_cannot_progress)(
+                Ok(s) => match crate::resume::check_checkpoint(home, &s) {
+                    Ok(()) => ActionDecision::Resume(run.clone()),
+                    Err(reason) => ActionDecision::Refuse((p.resume_cannot_progress)(
                         q.short(),
                         ask::short_id(run),
-                        &reason.diagnostic(&s),
+                        &reason.to_string(),
                     )),
                 },
                 Err(e) => ActionDecision::Refuse((p.resume_unreadable)(

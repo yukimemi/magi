@@ -458,7 +458,7 @@ impl ResumeRefusal {
 
     pub(crate) fn diagnostic(&self, state: &RunState) -> String {
         let reason = match self {
-            Self::BaseSyncStop => "base synchronization is stopped; inspect the retained work. For movement exhaustion only, use `magi run --resume <run> --recover-base` (standing chat: `magi task control recover-base <run> --request <id> --head <retained-sha>`, full SHA or 7+ hex digits) to authorize a new bounded synchronization interval and fresh verification".into(),
+            Self::BaseSyncStop => "base synchronization is stopped and has no eligible resume checkpoint".into(),
             Self::Status(status) => format!("status `{}` is final; there is nothing left to resume", status.as_str()),
             Self::Released(_) => "execution was released".into(),
             Self::Retired(_) => "execution was retired".into(),
@@ -498,7 +498,10 @@ impl ResumeRefusal {
             state.id
         ));
         if matches!(self, Self::BaseSyncStop) {
-            detail.push_str(&format!(" {}", state.base_sync_next_action()));
+            detail.push_str(&format!(
+                " Synchronization budget: {}/{} in the current interval. Use `magi task inspect-base-stop <task> --run {}` to identify the stop and its missing prerequisites.",
+                state.base_episode_used(), crate::graph::BASE_SYNC_ROUNDS, state.id
+            ));
         }
         if matches!(self, Self::ReviewBudget { .. } | Self::ReviewDisabled) {
             detail.push_str(" To continue the retained implementation, first confirm its saved candidate branch and owning task with `magi task show <task-id>`. When the task is eligible and no driver is live, explicitly use `magi review <saved-branch> --task <task-id> --merge none --review-rounds <positive-rounds>`. This creates a review-only successor with a new review budget; it does not resume this run or start a new implementation competition. Existing ownership and checkpoint checks still apply.");

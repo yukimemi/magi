@@ -908,7 +908,7 @@ enum TaskCmd {
         #[command(flatten)]
         request: magi::repair_budget::reconcile::Request,
     },
-    /// Inspect stopped base evidence and current retained Git state without mutation.
+    /// Inspect retained HEAD, recovery eligibility and latest verification without mutation.
     InspectBaseStop {
         /// Owning task id or unambiguous prefix.
         task: String,

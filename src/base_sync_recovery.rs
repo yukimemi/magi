@@ -200,10 +200,11 @@ impl RunState {
         {
             return format!("Approval invalidated: {reason}");
         }
-        if self.resource_block.is_some() {
+        if !self.base_sync_blocked() && self.resource_block.is_some() {
             return "Restore the required resource, then explicitly resume the retained run; automatic retries retain the synchronization budget".into();
         }
-        if self.base_sync_recovery.stop.is_none()
+        if !self.base_sync_blocked()
+            && self.base_sync_recovery.stop.is_none()
             && let Some(op) = self
                 .base_sync_recovery
                 .operations
@@ -234,26 +235,56 @@ impl RunState {
         }
         match self.base_sync_recovery.stop.as_ref().map(|s| &s.kind) {
             Some(StopKind::Exhausted) => {
-                let why = if self.base_sync_recovery.stop.as_ref().is_some_and(|s| s.unverified_sync) {
+                let why = if self
+                    .base_sync_recovery
+                    .stop
+                    .as_ref()
+                    .is_some_and(|s| s.unverified_sync)
+                {
                     "The synchronized HEAD never reached its gate before the base moved again. "
                 } else {
                     ""
                 };
                 if self.base_recovery_pending() {
-                    format!("{why}Approval recorded; resume the retained run to open the approved bounded synchronization interval")
+                    format!(
+                        "{why}Approval recorded; resume the retained run to open the approved bounded synchronization interval"
+                    )
                 } else {
-                    format!("{why}Authorize a new bounded synchronization interval with `magi run --resume {} --recover-base`, or, from a standing chat, `magi task control recover-base {} --request <unique-id> --head {}`", self.id, self.id, self.base_sync_recovery.stop.as_ref().unwrap().head)
+                    format!(
+                        "{why}Movement budget exhausted; inspect the retained HEAD and recovery eligibility with `magi task inspect-base-stop <task> --run {}` before authorizing a new interval",
+                        self.id
+                    )
                 }
-            },
+            }
             Some(StopKind::Conflict) => {
                 let stop = self.base_sync_recovery.stop.as_ref().unwrap();
-                let task = self.origin.as_ref().and_then(|origin| origin.task.as_deref()).unwrap_or("<task>");
-                format!("Authorize a narrow history-preserving repair with `magi task grant-repair {task} --run {} --kind base-conflict --rounds 1 --head {} --tip {} --expect-pass {} --request <unique-id> --reason <reason> --instruction <approved-resolution>`; retain the original review criteria. Base-budget recovery cannot resolve a textual conflict", self.id, stop.head, stop.tip, self.passes.last().map_or(0, |p| p.index))
-            },
-            Some(StopKind::Divergence) => "Reconcile foreign remote branch commits before resuming; do not overwrite them".into(),
-            Some(StopKind::Publication) => "Inspect the retained publication failure and remote lease before resuming".into(),
-            Some(StopKind::ClosingIntegratedPr) => "Resume to retry closing the already integrated pull request".into(),
-            Some(StopKind::Unknown) => "Inspect the retained synchronization state before resuming; unknown evidence grants no new budget".into(),
+                let task = self
+                    .origin
+                    .as_ref()
+                    .and_then(|origin| origin.task.as_deref())
+                    .unwrap_or("<task>");
+                format!(
+                    "Authorize a narrow history-preserving repair with `magi task grant-repair {task} --run {} --kind base-conflict --rounds 1 --head {} --tip {} --expect-pass {} --request <unique-id> --reason <reason> --instruction <approved-resolution>`; retain the original review criteria. Base-budget recovery cannot resolve a textual conflict",
+                    self.id,
+                    stop.head,
+                    stop.tip,
+                    self.passes.last().map_or(0, |p| p.index)
+                )
+            }
+            Some(StopKind::Divergence) => {
+                "Reconcile foreign remote branch commits before resuming; do not overwrite them"
+                    .into()
+            }
+            Some(StopKind::Publication) => {
+                "Inspect the retained publication failure and remote lease before resuming".into()
+            }
+            Some(StopKind::ClosingIntegratedPr) => {
+                "Resume to retry closing the already integrated pull request".into()
+            }
+            Some(StopKind::Unknown) => format!(
+                "Unknown synchronization stop; no new interval is available. Inspect retained Git state and missing evidence with `magi task inspect-base-stop <task> --run {}`",
+                self.id
+            ),
             None => "Continue verification on the current synchronized HEAD".into(),
         }
     }
@@ -448,26 +479,31 @@ impl RunState {
     /// Legacy exhaustion is recognized only by the exact message and budget.
     /// Once recorded, its identity remains stable across no-progress passes.
     pub(crate) fn record_base_sync_stop(&mut self, head: &str) {
-        let Some(sync) = self.base_sync.as_ref() else {
-            return;
-        };
-        let Some(detail) = sync.conflict.clone() else {
-            return;
-        };
-        if self
+        if let Some(stop) = self.observed_base_stop(head) {
+            if self.base_sync_recovery.stop.as_ref() != Some(&stop) {
+                self.base_sync_recovery.stops.push(stop.clone());
+                self.base_sync_recovery.stop = Some(stop);
+            }
+            self.status = RunStatus::Blocked;
+        }
+    }
+
+    pub(crate) fn observed_base_stop(&self, head: &str) -> Option<Stop> {
+        let sync = self.base_sync.as_ref()?;
+        let detail = sync.conflict.as_ref()?;
+        if let Some(stop) = self
             .base_sync_recovery
             .stop
             .as_ref()
-            .is_some_and(|s| s.head == head && s.tip == sync.tip && s.detail == detail)
+            .filter(|s| s.head == head && s.tip == sync.tip && &s.detail == detail)
         {
-            self.status = RunStatus::Blocked;
-            return;
+            return Some(stop.clone());
         }
         let exhausted = self.winner().is_some_and(|w| {
             [
                 ("rebase(s)", "rebasing"),
                 ("synchronization(s)", "synchronizing"),
-            ].iter().any(|(noun, verb)| detail == format!(
+            ].iter().any(|(noun, verb)| *detail == format!(
                 "{} moved {} commit(s) ahead of {} after {} {}; {} again would only race it",
                 self.base_branch, sync.behind, w.branch, crate::graph::BASE_SYNC_ROUNDS, noun, verb
             ))
@@ -492,7 +528,7 @@ impl RunState {
             .events
             .iter()
             .rev()
-            .find(|event| event.node == "land" && event.message == detail)
+            .find(|event| event.node == "land" && &event.message == detail)
             .map_or(self.updated_at, |event| event.at);
         let unverified_sync = sync.behind > 0
             && self
@@ -501,18 +537,25 @@ impl RunState {
                 .last()
                 .is_some_and(|e| e.last_sync_head.as_deref() == Some(head))
             && !(self.gate_ran && self.gate_head.as_deref() == Some(head));
-        let stop = Stop {
+        Some(Stop {
             unverified_sync,
             kind,
             head: head.to_owned(),
             tip: sync.tip.clone(),
             attempts: sync.attempts,
-            detail,
+            detail: detail.clone(),
             at,
-        };
-        self.base_sync_recovery.stops.push(stop.clone());
-        self.base_sync_recovery.stop = Some(stop);
-        self.status = RunStatus::Blocked;
+        })
+    }
+
+    pub(crate) fn check_movement_stop(&self, head: &str, task: &str) -> Result<Stop> {
+        let stop = self.observed_base_stop(head);
+        ensure!(
+            stop.as_ref().is_some_and(|s| s.kind == StopKind::Exhausted),
+            "base recovery refused: missing eligible movement-exhaustion evidence; inspect with `magi task inspect-base-stop {task} --run {}`. Textual stops require an evidence-bound base-conflict grant",
+            self.id
+        );
+        Ok(stop.expect("checked exhaustion"))
     }
 
     pub(crate) fn base_recovery_pending(&self) -> bool {
@@ -537,14 +580,7 @@ impl RunState {
             stop.kind == StopKind::Exhausted,
             "only exhausted base movement permits recovery"
         );
-        ensure!(
-            !self
-                .base_sync_recovery
-                .authorizations
-                .last()
-                .is_some_and(|a| !a.consumed && a.stop == stop),
-            "this stop already has a pending authorization; resume the existing request"
-        );
+        self.check_new_base_authorization(&stop)?;
         self.base_sync_recovery.authorizations.push(Authorization {
             scope: None,
             request: None,
@@ -563,6 +599,18 @@ impl RunState {
             gate_head: None,
             gate_ran: false,
         });
+        Ok(())
+    }
+
+    pub(crate) fn check_new_base_authorization(&self, stop: &Stop) -> Result<()> {
+        ensure!(
+            !self
+                .base_sync_recovery
+                .authorizations
+                .last()
+                .is_some_and(|a| !a.consumed && &a.stop == stop),
+            "this stop already has a pending authorization; resume the existing request"
+        );
         Ok(())
     }
 

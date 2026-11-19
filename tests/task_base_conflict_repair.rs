@@ -915,7 +915,7 @@ async fn legacy_scratch_descendant_and_owner_hold_refuse_without_losing_dirty_co
 
 common::e2e! {
 async fn legacy_movement_diagnostics_use_recover_base_without_mutation() {
-    let (_fx, task, mut runner, request) = stopped().await;
+    let (_fx, mut task, mut runner, request) = stopped().await;
     legacy_stop(&mut runner, &request.head, false);
     let branch = runner.state.winner().unwrap().branch.clone();
     for (noun, verb) in [("rebase(s)", "rebasing"), ("synchronization(s)", "synchronizing")] {
@@ -930,8 +930,22 @@ async fn legacy_movement_diagnostics_use_recover_base_without_mutation() {
         let assessment = magi::repair_budget::legacy::classify(&runner.state, &request.head, request.tip.as_deref().unwrap());
         assert_eq!(assessment.class, magi::repair_budget::legacy::Class::MovementExhausted);
         let report = inspect(&request).await;
+        if task.review_branch.is_some() {
+            assert_eq!(report["classification"], "movement-exhaustion");
+            assert_eq!(report["recovery"]["recover_base"]["status"], "refused");
+            assert_eq!(report["admission_blocker"], "run task ownership changed");
+            assert_eq!(std::fs::read(&run_path).unwrap(), before);
+            assert_eq!(std::fs::read(Queue::open().path_of(&task.id)).unwrap(), owner_before);
+            // The textual-repair fixture carries a separate review selection.
+            // Remove only that fixture checkpoint to inspect movement recovery.
+            task.review_branch = None;
+            Queue::open().put(&mut task).unwrap();
+        }
+        let owner_before = std::fs::read(Queue::open().path_of(&task.id)).unwrap();
+        let report = inspect(&request).await;
         assert_eq!(report["classification"], "movement-exhaustion");
-        assert!(report["next_step"].as_str().unwrap().contains("recover-base"));
+        assert_eq!(report["recovery"]["recover_base"]["status"], "locally_eligible", "{report}");
+        assert!(report["next_step"].as_str().unwrap().contains("recover-base"), "{report}");
         let refused = grant_output(&request);
         assert!(!refused.status.success());
         assert!(String::from_utf8_lossy(&refused.stderr).contains("recover-base"));

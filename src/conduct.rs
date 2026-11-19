@@ -710,6 +710,83 @@ fn repo_for(task: &Task, fallback: &Path) -> PathBuf {
     }
 }
 
+fn check_resume_offer(queue: &Queue, task: &Task, run: &str, maintenance: bool) -> Result<()> {
+    anyhow::ensure!(crate::run::is_run_id(run), "resume needs an exact run ID");
+    let home = queue.root().parent().context("queue home is unknown")?;
+    let state = RunState::load_under(run, home).context("run state is unreadable")?;
+    if maintenance && !task.execution_runs().last().is_some_and(|id| id == run) {
+        let mut owners = queue
+            .list()
+            .into_iter()
+            .filter(|t| t.execution_runs().last().is_some_and(|id| id == run));
+        let owner = owners
+            .next()
+            .context("no verified queue owner for this maintenance resume")?;
+        anyhow::ensure!(owners.next().is_none(), "ambiguous run queue ownership");
+        crate::resume::inspect_queued(home, queue, &owner, &state)?;
+    } else {
+        crate::resume::inspect_queued(home, queue, task, &state)?;
+    }
+    Ok(())
+}
+
+fn recovery_refusal(queue: &Queue, task: &Task, action: &ChoiceAction) -> Option<anyhow::Error> {
+    let result = match action {
+        ChoiceAction::Resume { run } => check_resume_offer(queue, task, run, false),
+        ChoiceAction::ResumeRun { run } => check_resume_offer(queue, task, run, true),
+        ChoiceAction::RecoverBase { run, stop, episode } => (|| {
+            anyhow::ensure!(crate::run::is_run_id(run), "recovery needs an exact run ID");
+            let home = queue.root().parent().context("queue home is unknown")?;
+            let state = RunState::load_under(run, home).context("run state is unreadable")?;
+            crate::graph::Runner::inspect_base_recovery(home, &state, task)?;
+            crate::base_recovery_control::check_stop_binding(&state, stop, *episode)
+        })(),
+        ChoiceAction::Requeue if crate::base_sync_recovery::held_task(queue, task) => {
+            let run = task.execution_runs().last().expect("held run");
+            check_resume_offer(queue, task, run, false)
+        }
+        _ => return None,
+    };
+    result.err()
+}
+
+fn guard_recovery_offers(queue: &Queue, task: &Task, q: &mut Question, d: &Decision) -> bool {
+    let mut rejected = Vec::new();
+    q.choices.retain(|label| {
+        let Some(error) = q
+            .actions
+            .get(label)
+            .and_then(|a| recovery_refusal(queue, task, a))
+        else {
+            return true;
+        };
+        rejected.push(format!("- {}: {error:#}", q.actions[label].describe()));
+        false
+    });
+    q.actions.retain(|label, _| q.choices.contains(label));
+    if q.actions.values().all(|a| matches!(a, ChoiceAction::Hold))
+        && let Some(QuestionDecision {
+            operation: QuestionOperation::Resume,
+            target: QuestionTarget::Run { id },
+        }) = &d.question_decision
+        && let Err(error) = check_resume_offer(queue, task, id, false)
+    {
+        rejected.push(format!("- Resume: {error:#}"));
+    }
+    if rejected.is_empty() {
+        return false;
+    }
+
+    q.summary = "実行できない復旧操作を除外しました".into();
+    q.detail = rejected.join("\n");
+    let only_hold = q.actions.values().all(|a| matches!(a, ChoiceAction::Hold));
+    if only_hold {
+        q.detail
+            .push_str("\n利用可能な復旧操作は確認できません。再選択は不要です。");
+    }
+    only_hold
+}
+
 /// Apply one decision to the queue and the question store.
 ///
 /// Takes the task's own claim before touching it: a model call spans a whole
@@ -781,13 +858,8 @@ fn apply_one(
     }
 
     if crate::base_sync_recovery::held_task(queue, &task)
-        && (d.recovery == Some(Recovery::Requeue)
-            || d.question_decision
-                .as_ref()
-                .is_some_and(|q| q.operation == QuestionOperation::Resume)
-            || d.actions
-                .values()
-                .any(|a| matches!(a, ChoiceAction::Resume { .. })))
+        && d.recovery == Some(Recovery::Requeue)
+        && d.question.is_none()
     {
         // Additional base rebases require their own explicit authorization.
         return Ok(());
@@ -924,12 +996,12 @@ fn apply_one(
         // `Question::run` is a task id for conductor questions, but ordinary
         // graph questions use it as a run id. A coincidental equality must
         // not block this task on an answer meant for another node.
-        let question_id = match questions
+        let (question_id, detail) = match questions
             .list_for_effects()
             .into_iter()
             .find(|q| q.status.open() && q.node == NODE && q.run == task.id)
         {
-            Some(existing) => existing.id,
+            Some(existing) => (existing.id, existing.detail),
             None => {
                 let mut q = Question::new(
                     task.id.clone(),
@@ -941,25 +1013,45 @@ fn apply_one(
                 );
                 q.actions = d.actions.clone();
                 crate::choice_effect::executable_conductor(&mut q);
+                if guard_recovery_offers(queue, &task, &mut q, d) {
+                    // An omitted recovery offer must not clear an independent
+                    // dependency, approval, or typed resource wait.
+                    if task.status == TaskStatus::Blocked || task.has_disk_capacity_cause() {
+                        return Ok(());
+                    }
+                    if task.status != TaskStatus::Held
+                        || task.hold_reason.as_deref() != Some(&q.detail)
+                    {
+                        if task.status == TaskStatus::Held {
+                            task.hold_reason = Some(q.detail);
+                        } else {
+                            task.hold_machine(Some(q.detail));
+                        }
+                        queue.put(&mut task)?;
+                        if let (Some(home), Some(notice)) =
+                            (queue.root().parent(), crate::notices::task_held(&task))
+                        {
+                            crate::notices::raise_in(home, notice);
+                        }
+                    }
+                    return Ok(());
+                }
                 q.decision_context = Some(context);
                 // The wait is handed to a deputy (`crate::deputy`), so a
                 // free-text reply reaches an agent that knows why this was
                 // asked. The conductor still never blocks: this only records
                 // what the deputy will be told, and `serve` starts it.
                 q.deputy = Some(Deputy::new(crate::deputy::brief(
-                    &task.id,
-                    d.reason.as_deref().unwrap_or_default(),
-                    &q.choices,
-                    &q.actions,
+                    &task.id, &q.detail, &q.choices, &q.actions,
                 )));
                 if task.repo.is_dir() && task.repo != Path::new(".") {
                     q.cwd = Some(task.repo.to_string_lossy().into_owned());
                 }
                 questions.put_executable(&mut q)?;
-                q.id
+                (q.id, q.detail)
             }
         };
-        task.block(vec![question_id], d.reason.clone());
+        task.block(vec![question_id], Some(detail).filter(|s| !s.is_empty()));
         return queue.put(&mut task);
     }
 
@@ -1452,6 +1544,132 @@ mod tests {
             std::path::PathBuf::from("."),
             Source::Human,
         )
+    }
+
+    #[tokio::test]
+    async fn recovery_offer_filters_stops_and_rechecks_at_application() {
+        use crate::ask::Answer;
+        use crate::run::{BaseSync, Origin, RunStatus};
+        let dir = tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let questions = Questions::at(dir.path().join("questions"));
+        for (initial_stop, stop_after_offer) in [(true, false), (false, false), (false, true)] {
+            let mut task = task("retain implementation");
+            let mut state = RunState::new(
+                dir.path().into(),
+                "main".into(),
+                "base".into(),
+                task.instruction.clone(),
+                Config::default(),
+            );
+            state.origin = Some(Origin::queue(&task.id));
+            state.status = RunStatus::Blocked;
+            state.driver_exited = true;
+            task.link_run(&state.id);
+            task.hold_machine(Some("retained work".into()));
+            queue.put(&mut task).unwrap();
+            let stop = |state: &mut RunState| {
+                state.base_sync = Some(BaseSync {
+                    tip: "base-tip".into(),
+                    behind: 2,
+                    attempts: 1,
+                    conflict: Some("rebase preparation: os error 267".into()),
+                    already_in: None,
+                });
+                state.record_base_sync_stop("candidate-head");
+            };
+            if initial_stop {
+                stop(&mut state);
+            }
+            state.save_under(dir.path()).unwrap();
+            let mut actions = serde_json::json!({"resume": {"do":"resumerun","run":state.id}});
+            let mut choices = vec!["resume", "hold"];
+            actions["hold"] = serde_json::json!({"do":"hold"});
+            if initial_stop {
+                actions["recover"] = serde_json::json!({"do":"recoverbase","run":state.id,
+                    "stop":state.base_sync_recovery.stop,"episode":0});
+                choices.push("recover");
+            }
+            let reply = serde_json::json!({"decisions":[{
+                "id":task.id,"question":"How should the retained run continue?",
+                "choices":choices,"actions":actions,
+            }]})
+            .to_string();
+            let cfg = config(mock_agent(dir.path(), REPLY, env(&reply)));
+            Conductor::new()
+                .run_once(
+                    &cfg,
+                    dir.path(),
+                    &queue,
+                    &questions,
+                    dir.path(),
+                    &[],
+                    &[],
+                    std::slice::from_ref(&task),
+                    1,
+                )
+                .await
+                .unwrap();
+            let filed = questions.list().into_iter().find(|q| q.run == task.id);
+            if initial_stop {
+                assert!(filed.is_none(), "no decision can advance this stop");
+                let held = queue.get(&task.id).unwrap();
+                let reason = held.hold_reason.unwrap();
+                assert!(
+                    reason.contains("1/4") && reason.contains("movement-exhaustion evidence"),
+                    "{reason}"
+                );
+                assert!(held.resume_override.is_none());
+                continue;
+            }
+            let mut question = filed.expect("healthy resume offer");
+            assert_eq!(
+                question.actions["resume"],
+                ChoiceAction::ResumeRun {
+                    run: state.id.clone()
+                }
+            );
+            if stop_after_offer {
+                stop(&mut state);
+                state.save_under(dir.path()).unwrap();
+            }
+            question.answer(Answer::Choice("resume".into())).unwrap();
+            questions.put(&mut question).unwrap();
+            crate::daemon::apply_choice_actions(&queue, &questions, dir.path()).await;
+            let settled = queue.get(&task.id).unwrap();
+            let receipt: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(
+                    dir.path()
+                        .join("choice-actions")
+                        .join(format!("{}.json", question.id)),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            if stop_after_offer {
+                assert_eq!(settled.status, TaskStatus::Held);
+                assert!(settled.resume_override.is_none());
+                assert!(
+                    receipt["status"]
+                        .as_str()
+                        .unwrap()
+                        .contains("no eligible resume checkpoint")
+                );
+            } else {
+                assert_eq!(settled.status, TaskStatus::Queued);
+                assert_eq!(
+                    settled.resume_override.unwrap().pinned_run,
+                    Some(state.id.clone())
+                );
+                assert_eq!(receipt["status"], "applied");
+            }
+            assert!(
+                RunState::load_under(&state.id, dir.path())
+                    .unwrap()
+                    .passes
+                    .is_empty()
+            );
+        }
     }
 
     #[test]

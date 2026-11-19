@@ -134,6 +134,26 @@ repository, branch, original HEAD, current HEAD, clean tree and recorded picks
 must match the reserved operation. Validation is saved before cleanup; refused
 or incomplete evidence stays intact for inspection and grants no new attempt.
 
+## Read-only recommendations
+
+`magi task inspect-base-stop <task> --run <full-run>` reports the current owner,
+retained branch head, stop classification, interval budget, scratch presence
+and recovery eligibility without fetching or writing records. A local tracking
+ref is not fresh remote evidence. `recover-base` is locally eligible only for
+proven movement exhaustion with a matching clean retained checkout; execution
+still fetches and revalidates under its leases. An unknown stop with unused
+budget and no recovery checkpoint does not admit ordinary resume or a new
+interval. Keep the retained work and diagnose the missing Git or execution
+evidence; do not reset the budget or pick a different spelling of resume.
+
+The conductor removes unavailable typed resume/recovery choices before saving
+new questions. If only a hold remains, it records the reason instead of
+requesting a choice. A previously offered operation can still be refused if
+its target changes before application. Chat refreshes current run evidence for
+task notices and decision messages. Latest-round E2E is reported for its
+exact reviewed and verified head; absent or mismatched results stay unknown,
+and the gate is reported separately against its own head.
+
 ## Verification
 
 Run `RUSTUP_TOOLCHAIN=stable cargo test --locked --test chat_base_recovery` for

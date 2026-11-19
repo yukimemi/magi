@@ -9,15 +9,29 @@ pub(crate) fn validate(home: &Path, id: &str) -> Result<crate::run::RunState> {
     crate::task_reassign::ensure_current(&crate::queue::Queue::at(home.join("queue")), id)?;
     let _owner = crate::pr_head::owner_lock(home, id)?;
     let state = crate::run::RunState::load_under(id, home)?;
-    if let Some(reason) = crate::handover::resume_refusal_under(&state, Some(home)) {
-        anyhow::bail!(reason.diagnostic(&state));
-    }
-    let claims = crate::daemon::is_working_on(home, id, jiff::Timestamp::now());
+    check_run(
+        home,
+        &state,
+        crate::daemon::is_working_on(home, id, jiff::Timestamp::now()),
+    )?;
+    Ok(state)
+}
+
+/// Read-only part of resume admission. The caller must not treat this
+/// observation as a replacement for acquiring the execution and owner locks.
+pub(crate) fn check_run(home: &Path, state: &crate::run::RunState, claimed: bool) -> Result<()> {
     ensure!(
-        state.liveness_under(home, claims) != crate::run::Liveness::Live,
+        state.liveness_under(home, claimed) != crate::run::Liveness::Live,
         "run already has a live driver"
     );
-    Ok(state)
+    check_checkpoint(home, state)
+}
+
+pub(crate) fn check_checkpoint(home: &Path, state: &crate::run::RunState) -> Result<()> {
+    if let Some(reason) = crate::handover::resume_refusal_under(state, Some(home)) {
+        anyhow::bail!(reason.diagnostic(state));
+    }
+    Ok(())
 }
 
 /// Resumes outside the queue must not bypass the daemon's execution limits.
@@ -93,6 +107,54 @@ pub(crate) async fn start(home: &Path, id: String) -> Result<()> {
 #[error("resume did not reach its queue write: {0:#}")]
 pub(crate) struct BeforeQueueWrite(pub anyhow::Error);
 
+pub(crate) fn check_queue_owner(
+    task: &crate::queue::Task,
+    run: &str,
+    decided_before: Option<jiff::Timestamp>,
+) -> Result<()> {
+    use crate::queue::TaskStatus;
+    ensure!(
+        task.execution_runs().last().map(String::as_str) == Some(run)
+            && !matches!(task.status, TaskStatus::Running | TaskStatus::Done),
+        "run queue owner changed, is running, or is done"
+    );
+    ensure!(
+        decided_before
+            .is_none_or(|answered| task.operator_decided_at.is_none_or(|at| at <= answered)),
+        "resume was superseded by a newer operator decision"
+    );
+    Ok(())
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct Unconfirmed(pub String);
+
+/// Observe the queued maintenance path without creating locks or receipts.
+pub(crate) fn inspect_queued(
+    home: &Path,
+    queue: &crate::queue::Queue,
+    task: &crate::queue::Task,
+    state: &crate::run::RunState,
+) -> Result<()> {
+    crate::task_reassign::ensure_current(queue, &state.id)?;
+    check_queue_owner(task, &state.id, None)?;
+    check_run(
+        home,
+        state,
+        crate::daemon::is_working_on(home, &state.id, jiff::Timestamp::now()),
+    )?;
+    if state.liveness_under(home, false) == crate::run::Liveness::Unknown {
+        return Err(Unconfirmed(
+            "driver liveness is unknown; inspect the retained execution lease and driver identity"
+                .into(),
+        )
+        .into());
+    }
+    crate::repair_budget::check_queue_resumption(home, task, state)?;
+    Ok(())
+}
+
 /// Hand a resumable run back to the queue task that owns it, pinned to that
 /// exact run, so the loop's ordinary start logic resumes it under the graph's
 /// execution lease. Never starts a driver itself. `Ok(false)` means no task
@@ -108,7 +170,6 @@ pub(crate) fn pin_queued(
     decided_before: Option<jiff::Timestamp>,
     applied: Option<&str>,
 ) -> Result<bool> {
-    use crate::queue::TaskStatus;
     crate::task_reassign::ensure_current(queue, run).map_err(BeforeQueueWrite)?;
     let Some(listed) = queue
         .list()
@@ -119,24 +180,9 @@ pub(crate) fn pin_queued(
     };
     let _claim = queue.claim(&listed.id).map_err(BeforeQueueWrite)?;
     let mut task = queue.get(&listed.id).map_err(BeforeQueueWrite)?;
-    let preflight = || -> Result<()> {
-        ensure!(
-            task.execution_runs().last().map(String::as_str) == Some(run)
-                && !matches!(task.status, TaskStatus::Running | TaskStatus::Done),
-            "run queue owner changed"
-        );
-        ensure!(
-            match decided_before {
-                Some(answered) => task.operator_decided_at.is_none_or(|at| at <= answered),
-                None => true,
-            },
-            "resume was superseded by a newer operator decision"
-        );
-        Ok(())
-    };
-    preflight().map_err(BeforeQueueWrite)?;
+    check_queue_owner(&task, run, decided_before).map_err(BeforeQueueWrite)?;
     if applied.is_none()
-        && task.status == TaskStatus::Queued
+        && task.status == crate::queue::TaskStatus::Queued
         && task
             .resume_override
             .as_ref()

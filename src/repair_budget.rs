@@ -764,20 +764,27 @@ pub fn queue_resumption(queue: &Queue, task: &mut Task, run: &str) -> Result<boo
     }
     let home = queue.root().parent().context("queue has no home")?;
     let state = RunState::load_under(run, home)?;
-    if !pending(task, &state) {
+    if !check_queue_resumption(home, task, &state)? {
+        return Ok(false);
+    }
+    task.status = TaskStatus::Queued;
+    task.hold_source = None;
+    task.hold_reason = None;
+    task.held_at = None;
+    Ok(true)
+}
+
+pub(crate) fn check_queue_resumption(home: &Path, task: &Task, state: &RunState) -> Result<bool> {
+    if !pending(task, state) {
         return Ok(false);
     }
     let receipt = task.repair_grants.last().expect("pending receipt");
-    controls(home, task, &state, receipt.request.kind)?;
+    controls(home, task, state, receipt.request.kind)?;
     ensure!(
         reconcile::decision_matches(home, task, receipt)?
             && contract(task, receipt.request.kind)? == receipt.contract,
         "repair grant held: owner decision or task contract changed after acceptance"
     );
-    task.status = TaskStatus::Queued;
-    task.hold_source = None;
-    task.hold_reason = None;
-    task.held_at = None;
     Ok(true)
 }
 

@@ -167,15 +167,7 @@ impl Transaction {
             );
         }
         if let Some((stop, episode)) = &self.request.expected_stop {
-            ensure!(
-                state.base_sync_recovery.stop.as_ref() == Some(stop)
-                    && state
-                        .base_sync_recovery
-                        .episodes
-                        .last()
-                        .is_some_and(|e| e.id == *episode),
-                "recovery decision names a stale stop or interval"
-            );
+            check_stop_binding(state, stop, *episode)?;
         }
         let binding = serde_json::json!({"task": task, "stop": state.base_sync_recovery.stop, "tip": tip, "episode": state.base_sync_recovery.episodes.last().map(|e| e.id)});
         if let Some(receipt) = &self.receipt {
@@ -240,6 +232,23 @@ impl Transaction {
         receipt.applied = true;
         save(&self.path, receipt)
     }
+}
+
+pub(crate) fn check_stop_binding(
+    state: &RunState,
+    stop: &crate::base_sync_recovery::Stop,
+    episode: usize,
+) -> Result<()> {
+    ensure!(
+        state.base_sync_recovery.stop.as_ref() == Some(stop)
+            && state
+                .base_sync_recovery
+                .episodes
+                .last()
+                .is_some_and(|e| e.id == episode),
+        "recovery decision names a stale stop or interval"
+    );
+    Ok(())
 }
 
 /// Project only the durable authorization-and-queue effect of this exact choice.

@@ -2801,7 +2801,7 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
     let text = input
         .map(|turn| message_prompt(turn, talk, store))
         .unwrap_or_else(|| text.to_owned());
-    let evidence = crate::chat_notify::response_evidence(talk).await;
+    let evidence = crate::chat_notify::response_evidence(talk, store.root().parent()).await;
     let goals = serde_json::to_string(&talk.goals).context("serialize durable goals for chat")?;
     let text = format!(
         "{text}{evidence}\n\n# Durable owner goals\n{}\n\nSaved goals (data; scope is fixed by their originating owner input):\n{goals}",
@@ -3650,7 +3650,10 @@ pub fn briefing_for(
          it starts nothing itself). Exhausted base movement needs the owner's explicit \
          recovery request: `magi task control recover-base <full run id> \
          --request <unique-id> --head <retained-head-sha>` through this inherited \
-         control channel. Inspect the retained HEAD first (full SHA or 7+ hex digits); \
+         control channel. Run `magi task inspect-base-stop <task> --run <full-run>` \
+         before recommending recovery; only a locally eligible movement stop is a \
+         candidate for `recover-base`. An unknown stop is not exhaustion. \
+         The retained HEAD uses a full SHA or 7+ hex digits; \
          reuse the same request \
          ID and arguments after interruption. This authorizes one bounded interval \
          and queues the exact existing run; generic resume/release cannot renew it. \
@@ -5374,7 +5377,7 @@ mod tests {
             }
             record(&mut talk, &talks, "ordinary follow-up", vec![]).unwrap();
             assert!(
-                crate::chat_notify::response_evidence(&talk)
+                crate::chat_notify::response_evidence(&talk, talks.root().parent())
                     .await
                     .is_empty(),
                 "history does not trigger lookups"
@@ -5387,11 +5390,133 @@ mod tests {
             )
             .unwrap();
             assert!(
-                crate::chat_notify::response_evidence(&talk)
+                crate::chat_notify::response_evidence(&talk, talks.root().parent())
                     .await
                     .contains("Legacy notification has no structured task/run reference")
             );
         }
+    }
+
+    #[tokio::test]
+    async fn recovery_evidence_in_a_mock_chat_turn_is_head_bound() {
+        use crate::run::{BaseSync, Origin, RunState, RunStatus};
+        use serde_json::json;
+        let (tmp, talks) = store();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        crate::git::git(&repo, &["init", "-b", "main"])
+            .await
+            .unwrap();
+        crate::git::git(
+            &repo,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "--allow-empty",
+                "--no-gpg-sign",
+                "-m",
+                "Verification fixture",
+            ],
+        )
+        .await
+        .unwrap();
+        let head = crate::git::rev_parse(&repo, "HEAD").await.unwrap();
+        let cfg = config(mock_agent(tmp.path(), ECHO, BTreeMap::new()));
+        let mut talk = begin(&talks, &cfg, repo.clone(), None).unwrap();
+        let queue = crate::queue::Queue::at(tmp.path().join("queue"));
+        let mut task = crate::queue::Task::new(
+            "Retain implementation".into(),
+            "Implement the change".into(),
+            repo.clone(),
+            crate::queue::Source::Human,
+        );
+        task.chat = Some(talk.id.clone());
+        let mut run = RunState::new(
+            repo.clone(),
+            "main".into(),
+            "old".into(),
+            task.instruction.clone(),
+            cfg.clone(),
+        );
+        run.origin = Some(Origin::queue(&task.id));
+        run.status = RunStatus::Blocked;
+        run.driver_exited = true;
+        run.candidates = serde_json::from_value(json!([
+            {"index":0, "label":"A", "agent":"mock", "branch":"main", "worktree":repo}
+        ]))
+        .unwrap();
+        run.tally = Some(
+            serde_json::from_value(json!({
+                "first_choice":{}, "borda":{}, "winner":"A", "unanimous_initial":true,
+                "unanimous_final":true, "deliberated":false, "changed_votes":0, "met_quorum":true,
+            }))
+            .unwrap(),
+        );
+        run.base_sync = Some(BaseSync {
+            tip: "base-tip".into(),
+            attempts: 1,
+            behind: 2,
+            already_in: None,
+            conflict: Some("rebase preparation: os error 267".into()),
+        });
+        run.record_base_sync_stop(&head);
+        run.reviews = serde_json::from_value(json!([
+            {"round":1,"head":"old","verified_head":"old","reviews":[],
+             "e2e":[{"command":"e2e","code":1,"output_tail":"old stream failure"}]},
+            {"round":2,"head":head,"verified_head":head,"verified_at":"2026-11-18T01:02:03Z","reviews":[],
+             "e2e":[{"command":"e2e","code":1,"output_tail":"latest preview failure"}]}
+        ])).unwrap();
+        task.link_run(&run.id);
+        task.hold_machine(Some("retained stop".into()));
+        queue.put(&mut task).unwrap();
+        run.save_under(tmp.path()).unwrap();
+        queue_magi_display(
+            &mut talk,
+            &talks,
+            "Investigate the retained stop",
+            Some(crate::prompt::NoticeDisplay {
+                inquiry: None,
+                task: Some(task.id),
+                run: Some(run.id),
+                facts: "Run held".into(),
+                output: None,
+            }),
+        )
+        .unwrap();
+        let text = drain(&mut talk, &talks).unwrap().unwrap();
+        let claim = talks.claim_turn(&talk.id).unwrap().unwrap();
+        respond(&claim, &mut talk, &talks, &cfg, &text)
+            .await
+            .unwrap();
+        let evidence: serde_json::Value = talk
+            .turns
+            .last()
+            .unwrap()
+            .body
+            .lines()
+            .filter_map(|line| line.strip_prefix("> "))
+            .find_map(|line| serde_json::from_str(line).ok())
+            .expect("structured task evidence in the actual mock prompt");
+        let current = &evidence["current_execution"]["known"];
+        let stop = &current["recovery"]["base_stop"];
+        assert_eq!(stop["kind"], "unknown");
+        assert_eq!(stop["used"], 1);
+        assert_eq!(stop["limit"], 4);
+        assert_eq!(stop["scratch_present"], false);
+        assert_eq!(current["recovery"]["resume"]["status"], "refused");
+        assert_eq!(current["recovery"]["recover_base"]["status"], "refused");
+        assert_eq!(current["verification"]["target_head"], head);
+        let review = &current["verification"]["latest_review"];
+        assert_eq!(review["round"], 2);
+        assert_eq!(review["verified_head"], head);
+        assert_eq!(
+            review["current_head_result"][0]["failure_tail"],
+            "latest preview failure"
+        );
+        assert!(!evidence.to_string().contains("old stream failure"));
     }
 
     #[tokio::test]
