@@ -410,7 +410,6 @@ mod tests {
             talk.turns[0].messages.clear();
             talk.external_requests.push(talk::external::Request {
                 request: "external-first".to_owned(),
-                kind: talk::external::RequestKind::External,
                 sender: "external-fixture".to_owned(),
                 text: "external input".to_owned(),
                 input_turn: 0,

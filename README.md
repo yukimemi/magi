@@ -908,7 +908,9 @@ stripping environment variables or forwarding a capability.
 
 `reply` is observation only. `accepted: true` confirms the transcript input
 and its receipt were saved. `queued` means a worker is reserved but the input
-turn has not started; `started` means the worker recorded its start boundary;
+turn has not started, even if startup acknowledgement timed out. That worker
+can still start; do not send another request. `started` means the worker
+recorded its start boundary;
 `replied` means a correlated reply was saved. `goal_authorizations` lists
 durably saved Goal authorizations for exactly this input, including historical
 ones (`current: false`) after a later owner change. A reply or an empty list
@@ -924,8 +926,10 @@ accepted submission only reads its receipt. Within a chat, reusing an ID with
 a different body, sender or submission kind conflicts. Owner submissions also
 bind the destination: their IDs remain reserved for owner use in that home
 even if the chat is deleted. An external send in a different chat may use the
-same ID. Deleting a chat removes its transcript and effect evidence. If the binding survived
-but its transcript receipt is missing, the result is uncertain, not retryable.
+same ID. The separate owner binding also survives older schedulers rewriting
+the Chat. Deleting a chat removes its transcript and effect evidence. If the
+binding survived but its transcript receipt is missing, the result is
+uncertain, not retryable.
 Never switch IDs to replay uncertain work. Neither a browser nor a running web
 server is needed to submit and get the reply. As with a web-established Goal,
 automatic follow-through requires the scheduler.

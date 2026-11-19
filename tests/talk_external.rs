@@ -416,6 +416,24 @@ printf 'fixture response\n'
     std::fs::write(f.repo().join("release"), "").unwrap();
     let reply = f.query("follow-release", "20");
     assert_eq!(reply["status"], "replied", "{reply}");
+    // Model an older whole-record writer dropping fields unknown to its
+    // receipt schema. Goal evidence and replay must still recognize owner input.
+    let path = f.talks.path_of(&f.id);
+    let mut disk: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    for receipt in disk["external_requests"].as_array_mut().unwrap() {
+        receipt.as_object_mut().unwrap().remove("kind");
+    }
+    // Let the actual worker settle before replacing the fixture record.
+    let until = std::time::Instant::now() + Duration::from_secs(15);
+    while magi::chat_worker::turn_worker_active(&f.talks, &f.id) {
+        assert!(std::time::Instant::now() < until, "worker did not settle");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    std::fs::write(path, serde_json::to_vec(&disk).unwrap()).unwrap();
+    assert_eq!(
+        f.query("follow-release", "0")["goal_authorizations"][0]["id"],
+        "follow"
+    );
     assert_eq!(
         f.send_owner("follow-release", owner)["reply_id"],
         reply["reply_id"]
@@ -514,7 +532,10 @@ printf 'fixture response\n'
     assert_eq!(other_reply["status"], "replied", "{other_reply}");
     assert_eq!(other_reply["input_id"], reused["input_id"]);
     assert_eq!(other_reply["goal_authorizations"], json!([]));
-    assert_eq!(f.query("follow-release", "0")["reply_id"], reply["reply_id"]);
+    assert_eq!(
+        f.query("follow-release", "0")["reply_id"],
+        reply["reply_id"]
+    );
 
     assert_eq!(queue.get(&task.id).unwrap().status, task.status);
     assert!(questions.get(&approval.id).unwrap().answer.is_none());
@@ -551,7 +572,6 @@ async fn external_admission_preserves_drafts_and_uncertain_occurrences() {
     t.turns[0].messages.clear();
     t.external_requests.push(talk::external::Request {
         request: "lost".into(),
-        kind: talk::external::RequestKind::External,
         sender: "fixture-agent".into(),
         text: "message".into(),
         input_turn: 0,

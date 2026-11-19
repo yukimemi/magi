@@ -85,6 +85,15 @@ pub fn not_started(error: &anyhow::Error) -> bool {
     error.downcast_ref::<NotStarted>().is_some()
 }
 
+/// The wait timed out, but this reservation is still eligible to start.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "worker {id} startup is unacknowledged; its reservation remains occupied; inspect or retry the same operation key"
+)]
+pub(crate) struct StartupUnacknowledged {
+    pub(crate) id: String,
+}
+
 /// A durable operation record. Its payload belongs to the started generation.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Job {
@@ -1057,10 +1066,7 @@ pub async fn spawn(home: &Path, kind: &str, key: &str, payload: serde_json::Valu
             Status::Starting => {}
         }
         if tokio::time::Instant::now() >= deadline {
-            bail!(
-                "worker {} startup is unacknowledged; its reservation remains occupied; inspect or retry the same operation key",
-                job.id
-            );
+            return Err(StartupUnacknowledged { id: job.id }.into());
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
