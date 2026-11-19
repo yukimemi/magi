@@ -158,21 +158,29 @@ standing-control request, the queue must also record its publication and the
 matching owner generation. If publication was interrupted, repeat the original
 `recover-base` request with the same ID and arguments from its receipt; ordinary
 resume cannot complete publication.
-Both typed resume choices preserve an already-published approval's owner
-generation. A local tracking ref that no longer matches the approval's scope
-blocks the recommendation; only execution fetches and checks the live base.
+CLI, Web, and chat resumes (including typed choices) preserve an already
+published approval's owner generation and decision timestamp. A local tracking
+ref that no longer matches the approval's scope blocks the recommendation.
+An explicit CLI, Web, or chat resume can still queue the existing run: the
+driver fetches and can invalidate the stale approval without spending a new
+synchronization slot. If invalidated, authorize recovery with a new request.
+An unpublished authorization or changed owner binding still refuses resume.
 
 A pending textual-conflict repair is not offered for resume if its approved
 tip differs from the local tracking ref before or during repair, or if an
 unimported grant no longer matches the clean retained checkout, branch and
-approved HEAD. Once the repair reaches review or gate, movement of the original
-tip does not block verification of the repaired head. Execution revalidates
-the applicable evidence. Applying a maintenance resume answer can resolve
-its own question blocker, but cannot bypass an independent dependency.
+approved HEAD. Once the repair reaches review or gate, the original conflict
+tip no longer blocks continuation, but the retained checkout must match the
+saved repaired HEAD. Execution revalidates the applicable evidence. A
+maintenance resume answer can resolve its own question blocker, but cannot
+bypass an independent dependency.
 A native resume decision refused before the queue write can be retried or
 settled; a failed queue write still has an uncertain result.
 Suppressing an unrelated recovery offer keeps existing cache and release holds
 intact and records the refusal separately.
+Ordinary resume offers also use the dispatcher's saved implementer check;
+restore a mismatched seat selection before requesting that resume. Diagnostic
+reads do not upgrade saved approval cards.
 
 Chat refreshes current run evidence for task notices and decision messages.
 The latest review's recorded E2E commands and failure tails are reported with

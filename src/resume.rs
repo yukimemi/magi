@@ -77,16 +77,8 @@ pub(crate) async fn spawn_detached(home: &Path, id: &str) -> Result<crate::worke
     // and execution lease. Preflight checked run liveness, and the task claim
     // acquired above excludes a concurrent queue driver; no scheduler reclaim
     // is required before this explicit resume.
-    if !crate::repair_budget::queue_resumption(&queue, &mut task, id)? {
-        task.release_operator("resume", None);
-    }
-    task.resume_override = Some(crate::queue::OperatorResume {
-        question_id: String::new(),
-        at: jiff::Timestamp::now(),
-        conductor_rehold: None,
-        forced: true,
-        pinned_run: Some(id.to_owned()),
-    });
+    let state = crate::run::RunState::load_under(id, home)?;
+    prepare_pin(&queue, home, &mut task, &state, None, PinSource::Web)?;
     queue.put(&mut task)?;
     let opts = crate::daemon::Opts {
         repo: task.repo.clone(),
@@ -151,17 +143,22 @@ pub(crate) fn inspect_queued(
         )
         .into());
     }
-    check_pending_movement(queue, task, state)?;
-    crate::repair_budget::check_queue_resumption(home, task, state)?;
+    check_pending_movement(queue, task, state, true)?;
+    if !crate::repair_budget::check_queue_resumption(home, task, state)? {
+        crate::daemon::check_resume_implementers(task, state)?;
+    }
     Ok(())
 }
 
 /// A request-backed approval must be published before ordinary resume can
 /// use it. `true` means queueing must preserve the existing owner generation.
+/// Explicit resume leaves base-tip validation to the live driver: it can
+/// invalidate a stale published approval without spending its budget.
 fn check_pending_movement(
     queue: &crate::queue::Queue,
     task: &crate::queue::Task,
     state: &crate::run::RunState,
+    inspect_tracking: bool,
 ) -> Result<bool> {
     if !state.base_sync_blocked() || !state.base_recovery_pending() {
         return Ok(false);
@@ -197,6 +194,8 @@ fn check_pending_movement(
                     .is_some_and(|e| e.id == scope.episode),
             "base recovery task instruction or synchronization interval changed"
         );
+    }
+    if inspect_tracking && let Some(scope) = &authorization.scope {
         let tracking = format!(
             "refs/remotes/{}/{}",
             state.config.merge.remote, state.base_branch
@@ -253,15 +252,38 @@ pub(crate) fn pin_queued(
             .as_ref()
             .is_some_and(|pin| pin.pinned_run.as_deref() == Some(run))
     {
-        check_pending_movement(queue, &task, &state).map_err(BeforeQueueWrite)?;
+        check_pending_movement(queue, &task, &state, false).map_err(BeforeQueueWrite)?;
         return Ok(true);
     }
-    prepare_pin(queue, home, &mut task, &state, applied).map_err(BeforeQueueWrite)?;
+    let source = if decided_before.is_some() {
+        PinSource::Choice
+    } else {
+        PinSource::Chat
+    };
+    prepare_pin(queue, home, &mut task, &state, applied, source).map_err(BeforeQueueWrite)?;
     if let Some(id) = applied {
         task.mark_action_applied(id);
     }
     queue.put(&mut task)?;
     Ok(true)
+}
+
+/// Prepare a terminal resume under the caller's task claim without saving.
+pub fn prepare_cli_pin(
+    queue: &crate::queue::Queue,
+    task: &mut crate::queue::Task,
+    run: &str,
+) -> Result<()> {
+    let home = queue.root().parent().context("queue has no home")?;
+    let state = crate::run::RunState::load_under(run, home)?;
+    prepare_pin(queue, home, task, &state, None, PinSource::Cli)
+}
+
+pub(crate) enum PinSource {
+    Cli,
+    Web,
+    Chat,
+    Choice,
 }
 
 /// Prepare the exact-run pin without saving. Callers hold the task claim and
@@ -272,13 +294,21 @@ pub(crate) fn prepare_pin(
     task: &mut crate::queue::Task,
     state: &crate::run::RunState,
     applied: Option<&str>,
+    source: PinSource,
 ) -> Result<()> {
-    let preserve_movement = check_pending_movement(queue, task, state)?;
+    let preserve_movement =
+        check_pending_movement(queue, task, state, matches!(source, PinSource::Choice))?;
     if !crate::repair_budget::queue_resumption_after_answer(home, task, state, applied)? {
         if preserve_movement {
             task.release();
         } else {
-            task.release_operator(if applied.is_some() { "choice" } else { "chat" }, applied);
+            let label = match source {
+                PinSource::Cli => "cli-run-resume",
+                PinSource::Web => "resume",
+                PinSource::Chat => "chat",
+                PinSource::Choice => "choice",
+            };
+            task.release_operator(label, applied);
         }
     }
     task.resume_override = Some(crate::queue::OperatorResume {

@@ -120,6 +120,7 @@ pub mod worktree_setup;
 
 pub mod choice_effect;
 mod resume;
+pub use resume::prepare_cli_pin;
 
 // Run environment-sensitive unit fixtures as ordinary standalone invocations,
 // without mutating the concurrent test harness or inheriting worker ownership.

@@ -1658,7 +1658,14 @@ pub(crate) fn apply_task_choice_actions(queue: &Queue, questions: &Questions, ho
         }
         let decision = if let ActionDecision::Resume(run) = &decision {
             match RunState::load_under(run, home).and_then(|state| {
-                crate::resume::prepare_pin(queue, home, &mut task, &state, Some(&q.id))
+                crate::resume::prepare_pin(
+                    queue,
+                    home,
+                    &mut task,
+                    &state,
+                    Some(&q.id),
+                    crate::resume::PinSource::Choice,
+                )
             }) {
                 Ok(()) => decision,
                 Err(error) => ActionDecision::Refuse(format!("{error:#}")),
@@ -4892,14 +4899,10 @@ async fn attempt(
         branch_exists,
         unfinished.as_deref(),
     );
-    let retry_selected = task.replacement.is_some()
-        && task.resumption.is_some()
-        && !task.fresh_start
-        && previous.as_ref().is_some_and(|run| {
-            run.replaces.is_some()
-                && ((run.status == RunStatus::Failed && run.viable().is_empty())
-                    || (run.status == RunStatus::Blocked && run.tally.is_none()))
-        });
+    let retry_selected = task.resumption.is_some()
+        && previous
+            .as_ref()
+            .is_some_and(|run| retry_selected_resume(task, run));
     let stop_pin = task
         .resume_override
         .as_ref()
@@ -5610,6 +5613,38 @@ fn implementers_match(task: &Task, state: &RunState) -> bool {
                 && state.config.graph.implementers == 1
         },
     )
+}
+
+fn retry_selected_resume(task: &Task, run: &RunState) -> bool {
+    task.replacement.is_some()
+        && !task.fresh_start
+        && run.replaces.is_some()
+        && ((run.status == RunStatus::Failed && run.viable().is_empty())
+            || (run.status == RunStatus::Blocked && run.tally.is_none()))
+}
+
+/// Ordinary dispatch applies the saved-seat check only when a higher-priority
+/// continuation does not already select the run. Repair grants are checked by
+/// the caller; the stop-only landing action has its own admission.
+pub(crate) fn check_resume_implementers(task: &Task, state: &RunState) -> Result<()> {
+    let selected = task.pr_recovery.as_ref().is_some_and(|selection| {
+        selection
+            .check_task_assignment(&task.id, &task.instruction, task.reassignments.len())
+            .is_ok()
+            && selected_starter(selection, Some(state), Some(&state.id))
+                == Starter::Resume(state.id.clone())
+    });
+    anyhow::ensure!(
+        implementers_match(task, state)
+            || crate::handover::landing_checkpoint(state)
+            || crate::merge_decision::resumable_hold(state)
+            || retry_selected_resume(task, state)
+            || selected,
+        "saved run implementer assignment differs from the current task (saved count: {}, requested count: {:?}); restore the saved seat assignment before resuming",
+        state.config.graph.implementers,
+        task.implementers()
+    );
+    Ok(())
 }
 
 /// Never resume or take over candidate work built for a different seat count.
@@ -13248,6 +13283,26 @@ mod tests {
         state.config.graph.review_rounds = 1;
         state.reviews = vec![review_round(1)];
         assert!(crate::handover::resume_refusal_under(&state, Some(home.path())).is_some());
+        let questions = Questions::at(home.path().join("questions"));
+        let mut other = run_state(RunStatus::Landing);
+        let mut legacy = ask::Question::new(
+            other.id.clone(),
+            land::APPROVAL_NODE.into(),
+            "land".into(),
+            "merge?".into(),
+            String::new(),
+            vec!["merge".into(), land::HOLD.into()],
+        );
+        other.land_approval = Some(crate::run::LandApproval {
+            question: legacy.id.clone(),
+            head: "legacy-head".into(),
+        });
+        other.save_under(home.path()).unwrap();
+        questions.put(&mut legacy).unwrap();
+        let path = questions.path_of(&legacy.id);
+        let before = std::fs::read(&path).unwrap();
+        assert!(crate::handover::resume_refusal_under(&state, Some(home.path())).is_some());
+        assert_eq!(std::fs::read(path).unwrap(), before);
         for checkpoint in ["publication", "approval", "armed", "landing", "question"] {
             let mut saved = state.clone();
             match checkpoint {

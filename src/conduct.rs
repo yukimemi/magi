@@ -1847,6 +1847,7 @@ mod tests {
             .await
             .unwrap();
         state.save_under(dir.path()).unwrap();
+        let authorization = state.base_sync_recovery.authorizations.last().unwrap();
 
         let verdict = maintenance_resume_verdict(&task, &state);
         apply(&queue, &questions, &verdict).unwrap();
@@ -1861,6 +1862,31 @@ mod tests {
 
         queue.put(&mut published).unwrap();
         check_resume_offer(&queue, &published, &state.id, true).unwrap();
+        for web in [false, true] {
+            let mut manual = published.clone();
+            if web {
+                crate::resume::prepare_pin(
+                    &queue,
+                    dir.path(),
+                    &mut manual,
+                    &state,
+                    None,
+                    crate::resume::PinSource::Web,
+                )
+                .unwrap();
+            } else {
+                crate::prepare_cli_pin(&queue, &mut manual, &state.id).unwrap();
+            }
+            assert_eq!(manual.status, TaskStatus::Queued);
+            assert_eq!(
+                manual.resume_override.as_ref().unwrap().pinned_run.as_ref(),
+                Some(&state.id)
+            );
+            assert_eq!(
+                crate::base_recovery_control::queue_binding_refusal(authorization, &manual),
+                None
+            );
+        }
 
         // Move only the observed base, not the retained winner or approval.
         let tree = format!("{tip}^{{tree}}");
@@ -1879,6 +1905,20 @@ mod tests {
         let reason = facts["resume"]["reason"].as_str().unwrap();
         assert!(reason.contains(&later_tip) && reason.contains(&tip));
         assert!(reason.contains("not a fresh fetch"));
+        let run_path = dir.path().join("runs").join(&state.id).join("run.json");
+        let approval_before = std::fs::read(&run_path).unwrap();
+        assert!(crate::resume::pin_queued(&queue, &state.id, None, None).unwrap());
+        published = queue.get(&task.id).unwrap();
+        assert_eq!(published.status, TaskStatus::Queued);
+        assert_eq!(
+            crate::base_recovery_control::queue_binding_refusal(authorization, &published),
+            None
+        );
+        assert_eq!(
+            std::fs::read(&run_path).unwrap(),
+            approval_before,
+            "the live driver, not queue admission, disposes of a stale approval"
+        );
         crate::git::git(&repo, &["update-ref", tracking, &tip])
             .await
             .unwrap();
@@ -1948,6 +1988,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn recovery_offer_requires_the_saved_implementer_count_for_ordinary_resume() {
+        use crate::run::{Origin, RunStatus};
+        let home = tempdir().unwrap();
+        let queue = Queue::at(home.path().join("queue"));
+        let questions = Questions::at(home.path().join("questions"));
+        let mut task = task("retain implementation");
+        let mut state = RunState::new(
+            task.repo.clone(),
+            "main".into(),
+            "base".into(),
+            task.instruction.clone(),
+            Config::default(),
+        );
+        state.origin = Some(Origin::queue(&task.id));
+        state.status = RunStatus::Blocked;
+        state.driver_exited = true;
+        state.config.graph.implementers = 2;
+        state.save_under(home.path()).unwrap();
+        task.link_run(&state.id);
+        task.hold_machine(Some("retained work".into()));
+        queue.put(&mut task).unwrap();
+        check_resume_offer(&queue, &task, &state.id, true).unwrap();
+
+        task.solo = true;
+        queue.put(&mut task).unwrap();
+        apply(
+            &queue,
+            &questions,
+            &maintenance_resume_verdict(&task, &state),
+        )
+        .unwrap();
+        assert!(questions.list().is_empty());
+        let reason = recovery_offer_notice(home.path(), &task.id);
+        assert!(
+            reason.contains("saved count: 2") && reason.contains("requested count: Some(1)"),
+            "{reason}"
+        );
+        assert_eq!(queue.get(&task.id).unwrap().status, TaskStatus::Held);
+    }
+
     fn recovery_offer_notice(home: &Path, task: &str) -> String {
         crate::notices::Notices::at(home.join("notifications"))
             .list()
@@ -2012,14 +2093,26 @@ mod tests {
         crate::git::git(&repo, &["update-ref", "refs/remotes/origin/main", &tip])
             .await
             .unwrap();
-        let approved = crate::git::rev_parse(&repo, "HEAD").await.unwrap();
+        let original = crate::git::rev_parse(&repo, "HEAD").await.unwrap();
         let queue = Queue::at(dir.path().join("queue"));
         let questions = Questions::at(dir.path().join("questions"));
         let mut dependency = task("independent prerequisite");
         queue.put(&mut dependency).unwrap();
 
         use crate::repair_budget::{Applied, Phase};
-        for change in ["none", "dependency", "reviewing", "gating", "head"] {
+        for change in [
+            "none",
+            "dependency",
+            "reviewing",
+            "gating",
+            "head",
+            "repaired-head",
+        ] {
+            let approved = if change == "repaired-head" {
+                crate::git::rev_parse(&repo, "HEAD").await.unwrap()
+            } else {
+                original.clone()
+            };
             let mut task = task("retain conflict repair");
             task.repo = repo.clone();
             let mut state = RunState::new(
@@ -2075,8 +2168,8 @@ mod tests {
                 stop: state.base_sync_recovery.stop.clone(),
                 legacy: None,
             });
-            if matches!(change, "reviewing" | "gating") {
-                let phase = if change == "reviewing" {
+            if matches!(change, "reviewing" | "gating" | "repaired-head") {
+                let phase = if matches!(change, "reviewing" | "repaired-head") {
                     Phase::Reviewing
                 } else {
                     Phase::Gating
@@ -2086,7 +2179,14 @@ mod tests {
                     spent: 1,
                     phase,
                     review_start: 0,
-                    head: approved.clone(),
+                    head: if change == "repaired-head" {
+                        crate::git::git(&repo, &["commit", "--allow-empty", "-m", "Repair result"])
+                            .await
+                            .unwrap();
+                        crate::git::rev_parse(&repo, "HEAD").await.unwrap()
+                    } else {
+                        approved.clone()
+                    },
                     succeeded: false,
                     conflict: None,
                 });
@@ -2100,7 +2200,10 @@ mod tests {
             }
             queue.put(&mut task).unwrap();
             let verdict = maintenance_resume_verdict(&task, &state);
-            if change == "head" {
+            if change == "repaired-head" {
+                check_resume_offer(&queue, &task, &state.id, true).unwrap();
+            }
+            if matches!(change, "head" | "repaired-head") {
                 crate::git::git(&repo, &["commit", "--allow-empty", "-m", "Move winner"])
                     .await
                     .unwrap();

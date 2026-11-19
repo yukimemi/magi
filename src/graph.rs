@@ -17784,7 +17784,6 @@ esac
         assert_eq!(runner.state.base_sync.as_ref().unwrap().attempts, 5);
     }
 
-    #[cfg(unix)]
     async fn advance_base_fixture(runner: &Runner) {
         let repo = &runner.state.repo;
         for args in [
@@ -18050,17 +18049,35 @@ esac
         assert_eq!(runner.state.base_sync.as_ref().unwrap().attempts, 4);
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn base_recovery_stale_fetched_base_invalidates_approval() {
         let (_tmp, mut runner, head, task) = exhausted_base_fixture().await;
         runner.state.driver_exited = true;
+        let home = crate::run::home();
+        let queue = crate::queue::Queue::open();
+        runner.state.task_instruction = Some(queue.get(&task).unwrap().instruction);
         runner.state.save().unwrap();
-        Runner::authorize_base_recovery(&crate::run::home(), &runner.state.id, &task)
+        let request = crate::base_recovery_control::Request {
+            run: runner.state.id.clone(),
+            head: head.clone(),
+            actor: "test-chat".into(),
+            request: "initial".into(),
+            decision: None,
+            expected_stop: None,
+        };
+        crate::base_recovery_control::recover(&queue, &home, request.clone())
             .await
             .unwrap();
         runner.state = RunState::load(&runner.state.id).unwrap();
         advance_base_fixture(&runner).await;
+        let mut held = queue.get(&task).unwrap();
+        held.hold_machine(Some("base synchronization stopped".into()));
+        queue.put(&mut held).unwrap();
+        let reason = crate::resume::inspect_queued(&home, &queue, &held, &runner.state)
+            .unwrap_err()
+            .to_string();
+        assert!(reason.contains("local tracking ref"), "{reason}");
+        assert!(crate::resume::pin_queued(&queue, &runner.state.id, None, None).unwrap());
         runner.sync_to_base().await.unwrap();
         let a = runner
             .state
@@ -18080,9 +18097,16 @@ esac
             git::rev_parse(&runner.state.repo, "HEAD").await.unwrap(),
             head
         );
-        Runner::authorize_base_recovery(&crate::run::home(), &runner.state.id, &task)
-            .await
-            .unwrap();
+        crate::base_recovery_control::recover(
+            &queue,
+            &home,
+            crate::base_recovery_control::Request {
+                request: "renewed".into(),
+                ..request
+            },
+        )
+        .await
+        .unwrap();
         runner.state = RunState::load(&runner.state.id).unwrap();
         runner.sync_to_base().await.unwrap();
         assert!(!runner.state.base_sync_blocked());

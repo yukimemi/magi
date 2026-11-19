@@ -818,8 +818,10 @@ pub(crate) fn check_queue_resumption(home: &Path, task: &Task, state: &RunState)
             .repair_grants
             .iter()
             .find(|grant| grant.receipt == *receipt);
-        if imported.is_none() {
-            check_local_head(state, &receipt.request.head)?;
+        match imported {
+            None => check_local_head(state, &receipt.request.head)?,
+            Some(grant) if grant.phase != Phase::Fixing => check_local_head(state, &grant.head)?,
+            Some(_) => {}
         }
         if imported.is_none_or(|grant| grant.phase.needs_conflict_target()) {
             conflict_base_tip(state, &receipt.request, receipt.stop.as_ref())?;

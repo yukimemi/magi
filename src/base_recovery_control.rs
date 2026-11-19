@@ -344,7 +344,7 @@ pub(crate) fn decision_current(
     let Some(home) = queue.root().parent() else {
         return false;
     };
-    let Ok(q) = crate::ask::Questions::at(home.join("questions")).get_for_effects(question) else {
+    let Ok(q) = crate::ask::Questions::at(home.join("questions")).read_for_effects(question) else {
         return false;
     };
     let tasks = queue.list();

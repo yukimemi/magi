@@ -607,10 +607,7 @@ fn resume_checkpoint(state: &RunState) -> bool {
 pub(crate) fn has_resume_checkpoint(state: &RunState, home: &Path) -> bool {
     state.status.resumable()
         && (resume_checkpoint(state)
-            || crate::ask::Questions::at(home.join("questions"))
-                .list_for_effects()
-                .iter()
-                .any(|q| q.run == state.id && q.status.open()))
+            || crate::ask::Questions::at(home.join("questions")).has_open_for_effects(&state.id))
 }
 
 /// The scan only finds a possible holder. Driver claims share this lock, so

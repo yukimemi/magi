@@ -5017,16 +5017,7 @@ async fn resume_run(id: &str, dry_run: bool, recover_base: bool) -> Result<()> {
         task.short(),
         task.short()
     );
-    if !magi::repair_budget::queue_resumption(&queue, &mut task, &run_id)? {
-        task.release_operator("cli-run-resume", None);
-    }
-    task.resume_override = Some(queue::OperatorResume {
-        question_id: String::new(),
-        at: jiff::Timestamp::now(),
-        conductor_rehold: None,
-        forced: true,
-        pinned_run: Some(run_id.clone()),
-    });
+    magi::prepare_cli_pin(&queue, &mut task, &run_id)?;
     if hand_to_loop {
         // The loop resumes it: an attempt at a task whose newest run is
         // unfinished resumes that run (`Runner::resume`), never competes again.
