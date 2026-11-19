@@ -147,12 +147,18 @@ interval. Keep the retained work and diagnose the missing Git or execution
 evidence; do not reset the budget or pick a different spelling of resume.
 
 The conductor removes unavailable typed resume/recovery choices before saving
-new questions. If only a hold remains, it records the reason instead of
-requesting a choice. A previously offered operation can still be refused if
-its target changes before application. Chat refreshes current run evidence for
-task notices and decision messages. Latest-round E2E is reported for its
-exact reviewed and verified head; absent or mismatched results stay unknown,
-and the gate is reported separately against its own head.
+new questions. The question detail and deputy brief share the refusal reasons
+and missing prerequisites. An unreadable run record leaves eligibility unknown
+until a valid record can be read. If only a hold remains, the conductor records
+the reason instead of requesting a choice. A previously offered operation can
+still be refused if its target changes before application.
+
+Chat refreshes current run evidence for task notices and decision messages.
+The latest review's recorded E2E commands and failure tails are reported with
+both the reviewed and verified heads, even when they do not apply to the target
+head. `applies_to_target` is true only when both heads match the target and E2E
+was recorded without deferral. Neither an older round nor a gate on another
+head stands in for a missing current result.
 
 ## Verification
 

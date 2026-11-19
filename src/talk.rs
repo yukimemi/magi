@@ -5463,10 +5463,11 @@ mod tests {
             conflict: Some("rebase preparation: os error 267".into()),
         });
         run.record_base_sync_stop(&head);
+        let verified_head = "2".repeat(40);
         run.reviews = serde_json::from_value(json!([
             {"round":1,"head":"old","verified_head":"old","reviews":[],
              "e2e":[{"command":"e2e","code":1,"output_tail":"old stream failure"}]},
-            {"round":2,"head":head,"verified_head":head,"verified_at":"2026-11-18T01:02:03Z","reviews":[],
+            {"round":2,"head":head,"verified_head":verified_head,"verified_at":"2026-11-18T01:02:03Z","reviews":[],
              "e2e":[{"command":"e2e","code":1,"output_tail":"latest preview failure"}]}
         ])).unwrap();
         task.link_run(&run.id);
@@ -5511,9 +5512,11 @@ mod tests {
         assert_eq!(current["verification"]["target_head"], head);
         let review = &current["verification"]["latest_review"];
         assert_eq!(review["round"], 2);
-        assert_eq!(review["verified_head"], head);
+        assert_eq!(review["head"], head);
+        assert_eq!(review["verified_head"], verified_head);
+        assert_eq!(review["applies_to_target"], false);
         assert_eq!(
-            review["current_head_result"][0]["failure_tail"],
+            review["recorded_e2e"][0]["failure_tail"],
             "latest preview failure"
         );
         assert!(!evidence.to_string().contains("old stream failure"));

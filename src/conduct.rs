@@ -710,10 +710,18 @@ fn repo_for(task: &Task, fallback: &Path) -> PathBuf {
     }
 }
 
+fn load_recovery_run(run: &str, home: &Path) -> Result<RunState> {
+    RunState::load_under(run, home).with_context(|| {
+        format!(
+            "unknown: run {run} state is unreadable; restore read access to a valid run record before rechecking eligibility"
+        )
+    })
+}
+
 fn check_resume_offer(queue: &Queue, task: &Task, run: &str, maintenance: bool) -> Result<()> {
     anyhow::ensure!(crate::run::is_run_id(run), "resume needs an exact run ID");
     let home = queue.root().parent().context("queue home is unknown")?;
-    let state = RunState::load_under(run, home).context("run state is unreadable")?;
+    let state = load_recovery_run(run, home)?;
     if maintenance && !task.execution_runs().last().is_some_and(|id| id == run) {
         let mut owners = queue
             .list()
@@ -737,7 +745,7 @@ fn recovery_refusal(queue: &Queue, task: &Task, action: &ChoiceAction) -> Option
         ChoiceAction::RecoverBase { run, stop, episode } => (|| {
             anyhow::ensure!(crate::run::is_run_id(run), "recovery needs an exact run ID");
             let home = queue.root().parent().context("queue home is unknown")?;
-            let state = RunState::load_under(run, home).context("run state is unreadable")?;
+            let state = load_recovery_run(run, home)?;
             crate::graph::Runner::inspect_base_recovery(home, &state, task)?;
             crate::base_recovery_control::check_stop_binding(&state, stop, *episode)
         })(),
@@ -778,7 +786,10 @@ fn guard_recovery_offers(queue: &Queue, task: &Task, q: &mut Question, d: &Decis
     }
 
     q.summary = "実行できない復旧操作を除外しました".into();
-    q.detail = rejected.join("\n");
+    q.detail = format!(
+        "提示しなかった操作と、再確認に必要な情報:\n{}",
+        rejected.join("\n")
+    );
     let only_hold = q.actions.values().all(|a| matches!(a, ChoiceAction::Hold));
     if only_hold {
         q.detail
@@ -1553,6 +1564,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let queue = Queue::at(dir.path().join("queue"));
         let questions = Questions::at(dir.path().join("questions"));
+        let unreadable = "20260101-000000-aaaa";
+        let unreadable_dir = dir.path().join("runs").join(unreadable);
+        std::fs::create_dir_all(&unreadable_dir).unwrap();
+        std::fs::write(unreadable_dir.join("run.json"), "{").unwrap();
         for (initial_stop, stop_after_offer) in [(true, false), (false, false), (false, true)] {
             let mut task = task("retain implementation");
             let mut state = RunState::new(
@@ -1582,8 +1597,11 @@ mod tests {
                 stop(&mut state);
             }
             state.save_under(dir.path()).unwrap();
-            let mut actions = serde_json::json!({"resume": {"do":"resumerun","run":state.id}});
-            let mut choices = vec!["resume", "hold"];
+            let mut actions = serde_json::json!({
+                "resume": {"do":"resumerun","run":state.id},
+                "damaged": {"do":"resumerun","run":unreadable}
+            });
+            let mut choices = vec!["resume", "damaged", "hold"];
             actions["hold"] = serde_json::json!({"do":"hold"});
             if initial_stop {
                 actions["recover"] = serde_json::json!({"do":"recoverbase","run":state.id,
@@ -1623,6 +1641,25 @@ mod tests {
                 continue;
             }
             let mut question = filed.expect("healthy resume offer");
+            assert!(!question.choices.iter().any(|choice| choice == "damaged"));
+            assert!(!question.actions.contains_key("damaged"));
+            assert!(
+                question
+                    .detail
+                    .contains(&format!("unknown: run {unreadable} state is unreadable"))
+                    && question.detail.contains("restore read access"),
+                "{}",
+                question.detail
+            );
+            assert!(
+                question
+                    .deputy
+                    .as_ref()
+                    .unwrap()
+                    .brief
+                    .contains(&question.detail),
+                "the deputy must receive the same refusal and repair information"
+            );
             assert_eq!(
                 question.actions["resume"],
                 ChoiceAction::ResumeRun {
