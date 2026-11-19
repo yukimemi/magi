@@ -328,14 +328,17 @@ async fn execute(
     crate::chat_goal::fence(talks, talk, &crate::chat_goal::current_source())?;
     admit_goal_operation(queue, home, talks, talk, &operation)?;
     Ok(match operation {
-        Operation::Goal { command } => crate::chat_goal::apply(
-            queue,
-            home,
-            talks,
-            talk,
-            &crate::chat_goal::current_source(),
-            command,
-        )?,
+        Operation::Goal { command } => {
+            crate::chat_goal::apply(
+                queue,
+                home,
+                talks,
+                talk,
+                &crate::chat_goal::current_source(),
+                command,
+            )
+            .await?
+        }
         Operation::Reassign { task, repo } => {
             let cwd = &talks.get(talk)?.repo;
             let task = crate::task_reassign::reassign(
@@ -596,7 +599,8 @@ fn admit_goal_operation(
     talk_id: &str,
     operation: &Operation,
 ) -> Result<()> {
-    let crate::chat_goal::Source::Goal { id, .. } = crate::chat_goal::current_source() else {
+    let crate::chat_goal::Source::Goal { id, generation } = crate::chat_goal::current_source()
+    else {
         return Ok(());
     };
     let talk = talks.get(talk_id)?;
@@ -605,32 +609,38 @@ fn admit_goal_operation(
         .iter()
         .find(|goal| goal.id == id)
         .context("unknown goal")?;
+    goal.admit(generation)?;
+    let repo = goal.effective_repo(&talk.repo);
     let task_allowed = |reference: &str| -> Result<()> {
         let id = queue.resolve_id(reference)?;
         ensure!(
             goal.tasks.contains(&id),
             "effect targets a task outside this goal"
         );
+        crate::chat_goal::task_record(queue, &id, repo)?;
         Ok(())
     };
     let run_allowed = |run: &str| -> Result<()> {
         ensure!(
             goal.runs.iter().any(|id| id == run)
-                || goal.tasks.iter().any(|id| queue
-                    .get(id)
-                    .is_ok_and(|task| task.runs.iter().any(|id| id == run))),
+                || goal
+                    .tasks
+                    .iter()
+                    .any(|id| crate::chat_goal::task_record(queue, id, repo)
+                        .is_ok_and(|task| task.execution_runs().iter().any(|id| id == run))),
             "effect targets an execution outside this goal"
         );
+        crate::chat_goal::run_record(home, run, repo)?;
         Ok(())
     };
     match operation {
         Operation::Goal { .. } => {}
         Operation::Add { filing } => {
+            crate::chat_goal::require_repo("filing", talk_id, &filing.repo, repo)?;
             ensure!(
-                filing.repo == talk.repo
-                    && matches!(&filing.source, crate::queue::Source::Agent { run, node }
+                matches!(&filing.source, crate::queue::Source::Agent { run, node }
                     if run == talk_id && node == crate::queue::CHAT_NODE),
-                "goal filing must retain this conversation's repository and provenance"
+                "goal filing must retain this conversation's provenance"
             );
         }
         Operation::Done { task }
@@ -654,7 +664,12 @@ fn admit_goal_operation(
         Operation::ForDecision { inquiry, .. }
         | Operation::ReconcileDecision { inquiry }
         | Operation::SettleDecision { inquiry, .. } => {
-            task_allowed(&crate::task_inquiry::Outbox::at(home).get(inquiry)?.task)?;
+            let record = crate::task_inquiry::Outbox::at(home).get(inquiry)?;
+            crate::chat_goal::require_repo("inquiry", inquiry, &record.repo, repo)?;
+            task_allowed(&record.task)?;
+            if let Some(run) = record.run {
+                run_allowed(&run)?;
+            }
         }
         Operation::Decide { question, .. }
         | Operation::Answer { question, .. }
@@ -667,11 +682,13 @@ fn admit_goal_operation(
                 run_allowed(&question.run)?;
             }
         }
-        Operation::MergePr { repo, number, .. } => {
-            let expected = format!("https://github.com/{repo}/pull/{number}");
+        Operation::MergePr {
+            repo: slug, number, ..
+        } => {
+            let expected = format!("https://github.com/{slug}/pull/{number}");
             let mut found = false;
             let mut inspect = |run: &str| -> Result<()> {
-                let state = crate::run::RunState::load_under(run, home)?;
+                let state = crate::chat_goal::run_record(home, run, repo)?;
                 found |= state
                     .pr
                     .as_ref()
@@ -682,7 +699,7 @@ fn admit_goal_operation(
                 inspect(run)?;
             }
             for task in &goal.tasks {
-                for run in &queue.get(task)?.runs {
+                for run in crate::chat_goal::task_record(queue, task, repo)?.execution_runs() {
                     inspect(run)?;
                 }
             }
@@ -706,6 +723,7 @@ async fn execute_decision(
     command: Operation,
 ) -> Result<String> {
     use crate::task_decision::Status;
+    admit_goal_operation(queue, home, talks, chat, &command)?;
     let outbox = crate::task_inquiry::Outbox::at(home);
     let _execution = outbox.execution_claim(id)?;
     let inquiry = outbox.get(id)?;
@@ -890,6 +908,7 @@ async fn execute_decision(
         outbox.update_decision(id, |d| d.start())?;
     }
     crate::chat_goal::fence(talks, chat, &crate::chat_goal::current_source())?;
+    admit_goal_operation(queue, home, talks, chat, &command)?;
     let local = apply_local_decision(
         queue,
         home,
@@ -2170,6 +2189,9 @@ mod goal_admission_tests {
         let tmp = tempfile::tempdir().unwrap();
         let talks = Talks::at(tmp.path().join("talks"));
         let queue = Queue::at(tmp.path().join("queue"));
+        let target = tmp.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        crate::git::git(&target, &["init", "-q"]).await.unwrap();
         let mut talk = crate::talk::seeded_for_test("goal-effect", tmp.path().into());
         talk.turns.push(
             serde_json::from_value(serde_json::json!({
@@ -2182,7 +2204,7 @@ mod goal_admission_tests {
         let mut task = Task::new(
             "work".into(),
             "work".into(),
-            talk.repo.clone(),
+            target.clone(),
             crate::queue::Source::Agent {
                 run: talk.id.clone(),
                 node: crate::queue::CHAT_NODE.into(),
@@ -2192,7 +2214,7 @@ mod goal_admission_tests {
         let mut unrelated = Task::new(
             "other".into(),
             "other".into(),
-            talk.repo.clone(),
+            target.clone(),
             crate::queue::Source::Agent {
                 run: talk.id.clone(),
                 node: crate::queue::CHAT_NODE.into(),
@@ -2211,11 +2233,13 @@ mod goal_admission_tests {
                 scope: "This task only".into(),
                 condition: "Verified delivery".into(),
                 completion: crate::chat_goal::Completion::TasksDone,
+                repo: Some(target),
                 tasks: vec![task.id.clone()],
                 runs: vec![],
                 watches: vec![],
             },
         )
+        .await
         .unwrap();
         talks
             .mutate(&talk.id, |talk| {

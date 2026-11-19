@@ -703,6 +703,18 @@ automatic reports and external submissions cannot establish or expand a goal.
 Several unfinished requests remain retained; a later status question does not
 replace earlier work.
 
+Use `magi task control goal establish … --repo <path-or-name>` to follow
+work outside the conversation's repository. It uses the same local path,
+`owner/repo` and unique short-name selectors as `magi task add`, but never
+clones. Relative paths start at the conversation directory. Without `--repo`,
+the goal uses that directory, including for saved goals created before this
+option existed. Multiple goals in one conversation can target different
+checkouts without changing the conversation's directory, agent or permissions.
+Repeat an establishment with the same ID and target only as an idempotent
+request. Use `goal update <id> --repo <path-or-name>` from a new owner request
+to change the target. If any retained task or run belongs elsewhere, the whole
+update is refused; create a separate goal instead of silently dropping links.
+
 Guarded goal transitions advance per-goal revisions. Whole-conversation saves
 retain missing goals and prefer durable state at equal or newer revisions, so
 a stale reply cannot erase progress, execution receipts or an owner's stop.
@@ -722,12 +734,12 @@ Uncertain interrupted execution pauses for reconciliation instead of replaying i
 Automatic continuations are capped at 32 and evidence probes at 240 per
 authorization; exhaustion is visible rather than an indefinite polling loop.
 
-The compact Chat progress area shows purpose, state, current step/wait reason and
-the relevant existing Run (or Task before a run exists). Referenced tasks take
-precedence; otherwise the newest valid explicitly referenced same-repository Run
-is used. Graph stages, reviews, verification and logs remain on Run. A completed
-task or a newly opened PR is not goal completion: landing requires a fresh
-confirmed merge of the recorded head.
+The compact Chat progress area shows purpose, state, target repository, current
+step/wait reason and the relevant existing Run (or Task before a run exists).
+Referenced tasks take precedence; otherwise the newest valid explicitly
+referenced same-repository Run is used. Graph stages, reviews, verification and
+logs remain on Run. A completed task or a newly opened PR is not goal
+completion: landing requires a fresh confirmed merge of the recorded head.
 Implementation-only goals retain the distinction between a delivered, verified
 artifact and owner approval to merge. Automatic events never supply that approval.
 Stop/cancel is a goal transition, and stale queued continuations cannot admit
