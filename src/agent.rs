@@ -834,6 +834,7 @@ impl OmpSession {
                     | "--no-session"
                     | "--resume"
                     | "--session"
+                    | "--fork"
                     | "--restore"
                     | "--continue"
                     | "--from-claude"
@@ -890,10 +891,15 @@ impl OmpSession {
             }
             Self::Resume => {
                 if let Some(id) = reported {
-                    anyhow::ensure!(
-                        seat.captured_session.as_deref() == Some(id.as_str()),
-                        "omp resumed a different session than requested"
-                    );
+                    let previous = seat.captured_session.as_deref().expect("managed resume");
+                    let dir = seat.omp_session_dir.as_deref().expect("managed resume");
+                    if previous != id {
+                        anyhow::ensure!(
+                            omp_continues(dir, previous, &id)?,
+                            "omp resumed a different session than requested"
+                        );
+                        seat.captured_session = Some(id);
+                    }
                 } else if success {
                     // An unsuccessful turn may exit before reporting an ID.
                     // Keep the saved pair and let the caller classify the output.
@@ -911,6 +917,52 @@ impl OmpSession {
         }
         Ok(())
     }
+}
+
+/// A resume may move to a successor when omp cannot append to the old file.
+/// Only accept lineage recorded by session headers in this seat's directory.
+fn omp_continues(dir: &Path, previous: &str, reported: &str) -> Result<bool> {
+    use std::io::{BufRead as _, BufReader, Read as _};
+
+    let mut parents = BTreeMap::new();
+    let mut line = Vec::new();
+    for entry in std::fs::read_dir(dir).context("read omp continuation directory")? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension() != Some(OsStr::new("jsonl")) || !entry.file_type()?.is_file() {
+            continue;
+        }
+        line.clear();
+        // The rest of the transcript is unrelated and can be arbitrarily large.
+        BufReader::new(std::fs::File::open(path)?)
+            .take(64 * 1024)
+            .read_until(b'\n', &mut line)?;
+        if !line.ends_with(b"\n") {
+            continue;
+        }
+        let Ok(header) = serde_json::from_slice::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if header["type"].as_str() != Some("session") {
+            continue;
+        }
+        if let Some(id) = header["id"].as_str() {
+            let parent = header["continuationOf"].as_str().map(str::to_owned);
+            if parents.insert(id.to_owned(), parent).is_some() {
+                return Ok(false);
+            }
+        }
+    }
+
+    let mut current = reported.to_owned();
+    // Removing each visited ID also rejects cycles.
+    while let Some(Some(parent)) = parents.remove(&current) {
+        if parent == previous {
+            return Ok(true);
+        }
+        current = parent;
+    }
+    Ok(false)
 }
 
 /// The argv plus optional stdin body for one invocation.
@@ -2983,6 +3035,43 @@ mod tests {
     }
 
     #[test]
+    fn omp_managed_resume_tracks_only_local_continuation_lineage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let managed = tmp.path().join("managed");
+        std::fs::create_dir(&managed).unwrap();
+        let mut seat = SeatState::new("review-1", "a", 7);
+        seat.turns = 1;
+        seat.captured_session = Some("original".into());
+        seat.omp_session_dir = Some(managed.clone());
+
+        let write_header = |dir: &Path, id: &str, parent: &str| {
+            let header = serde_json::json!({
+                "type": "session", "version": 3, "id": id, "continuationOf": parent,
+            });
+            std::fs::write(dir.join(format!("{id}.jsonl")), format!("{header}\n")).unwrap();
+        };
+        write_header(tmp.path(), "outside", "original");
+        write_header(&managed, "unrelated", "other-seat");
+        write_header(&managed, "middle", "original");
+        write_header(&managed, "latest", "middle");
+        for id in ["outside", "unrelated"] {
+            assert!(
+                OmpSession::Resume
+                    .record(&mut seat, Some(id.into()), true)
+                    .is_err()
+            );
+            assert_eq!(seat.captured_session.as_deref(), Some("original"));
+        }
+
+        OmpSession::Resume
+            .record(&mut seat, Some("latest".into()), true)
+            .unwrap();
+        assert_eq!(seat.omp_session_dir.as_deref(), Some(managed.as_path()));
+        let plan = plan_for(AgentKind::Omp, &seat, false);
+        assert!(plan.argv.windows(2).any(|w| w == ["--resume", "latest"]));
+    }
+
+    #[test]
     fn omp_managed_session_rejects_extra_args_that_override_history() {
         let mut spec = spec(AgentKind::Omp, None);
         let mut seat = SeatState::new("review-1", "a", 7);
@@ -2994,6 +3083,8 @@ mod tests {
             "--resume=other",
             "--session",
             "--session=operator.jsonl",
+            "--fork",
+            "--fork=operator.jsonl",
             "--restore",
             "--from-claude",
             "--from-codex",

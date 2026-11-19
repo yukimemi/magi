@@ -73,9 +73,11 @@ provider/model configuration, extensions or tools.
 
 The saved seat pairs the absolute directory with the CLI-reported session
 ID. A managed resume uses that exact directory and `--resume <id>`, even
-when the current magi home differs. An unavailable directory, a different
-reported ID, or a successful exit without ID confirmation fails rather than
-replacing the stored session. A timeout or failed exit without an ID keeps
+when the current magi home differs. If omp reports a different ID, magi
+accepts it only when JSONL session headers in that directory link it back to
+the saved ID through `continuationOf`. An unavailable directory, an unproven
+ID, or a successful exit without ID confirmation fails without replacing the
+stored session. A timeout or failed exit without an ID keeps
 the saved pair and follows normal agent failure handling. Saved IDs without a
 directory still use the old invocation and lookup. If omp reports a new
 continuation ID for a legacy session, magi follows it without adding a
