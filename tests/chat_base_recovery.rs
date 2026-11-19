@@ -321,7 +321,17 @@ fn standing_base_recovery_queues_once_and_repeated_delivery_never_releases_a_new
             let mut f = Fixture::new(false);
             let response = f.control(vec!["resume".into(), f.run.id.clone()]).await;
             assert_eq!(response["ok"], false, "{response}");
-            assert!(response["err"].as_str().unwrap().contains("recover-base"));
+            let refusal = response["err"].as_str().unwrap();
+            assert!(
+                refusal.contains(
+                    "base synchronization is stopped and has no eligible resume checkpoint"
+                ) && refusal.contains("magi task inspect-base-stop"),
+                "{response}"
+            );
+            let held = f.queue.get(&f.task.id).unwrap();
+            assert_eq!(held.status, TaskStatus::Held);
+            assert!(held.resume_override.is_none());
+            assert!(f.state().base_sync_recovery.authorizations.is_empty());
             let response = f.recover("once").await;
             assert_eq!(response["ok"], true, "{response}");
             let state = f.state();
