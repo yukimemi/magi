@@ -1550,7 +1550,10 @@ async fn maintenance_named_resume_never_replaces_an_exhausted_run() {
             assert!(stored.resume_override.is_none());
             assert_eq!(stored.runs, vec![run.id.clone()]);
             assert_eq!(stored.attempts, 0);
-            assert!(stored.hold_reason.unwrap().contains("review budget exhausted (1/1 rounds used)"));
+            assert_eq!(stored.hold_reason.as_deref(), Some("waiting for resume"));
+            assert!(magi::notices::Notices::at(s.home.join("notifications")).list().iter()
+                .any(|notice| notice.key == format!("task:{}:recovery-offer", task.id)
+                    && notice.message.contains("review budget exhausted (1/1 rounds used)")));
             continue;
         }
         let mut q = offer.expect("resume is eligible while review budget remains");

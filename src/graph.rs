@@ -5763,12 +5763,10 @@ impl Runner {
             });
             let invalidation = if !owner_valid {
                 Some("latest task ownership changed")
-            } else if !owner.as_ref().is_ok_and(|t| {
-                authorization
-                    .generation
-                    .is_none_or(|g| t.resumption.as_ref().is_some_and(|r| r.generation == g))
+            } else if let Some(reason) = owner.as_ref().ok().and_then(|task| {
+                crate::base_recovery_control::queue_binding_refusal(authorization, task)
             }) {
-                Some("owner approval generation changed")
+                Some(reason)
             } else if authorization.question.as_ref().is_some_and(|question| {
                 !crate::base_recovery_control::decision_current(
                     &crate::queue::Queue::at(crate::run::home().join("queue")),
@@ -5778,12 +5776,6 @@ impl Runner {
                 )
             }) {
                 Some("recovery decision ownership, routing or stop evidence changed")
-            } else if authorization.request.is_some()
-                && !owner
-                    .as_ref()
-                    .is_ok_and(|t| t.operator_decided_at == authorization.decision)
-            {
-                Some("owner decision changed")
             } else if let Some(scope) = &authorization.scope {
                 if scope.tip != tip {
                     Some("fetched base changed")

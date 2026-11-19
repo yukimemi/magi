@@ -234,6 +234,29 @@ impl Transaction {
     }
 }
 
+/// Queue publication and the owner decision are separate from the run save.
+/// Both a read-only recommendation and consumption require this binding.
+pub(crate) fn queue_binding_refusal(
+    authorization: &crate::base_sync_recovery::Authorization,
+    task: &Task,
+) -> Option<&'static str> {
+    if let Some(key) = &authorization.request
+        && !task.base_recovery_requests.contains(key)
+    {
+        return Some("recovery authorization has not been published to the queue");
+    }
+    if authorization
+        .generation
+        .is_some_and(|g| task.resumption.as_ref().is_none_or(|r| r.generation != g))
+    {
+        return Some("owner approval generation changed");
+    }
+    if authorization.request.is_some() && task.operator_decided_at != authorization.decision {
+        return Some("owner decision changed");
+    }
+    None
+}
+
 pub(crate) fn check_stop_binding(
     state: &RunState,
     stop: &crate::base_sync_recovery::Stop,

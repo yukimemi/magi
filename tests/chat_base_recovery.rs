@@ -379,6 +379,29 @@ fn standing_base_recovery_restarts_between_authorization_and_queue_publication()
             assert_eq!(f.state().base_sync_recovery.authorizations.len(), 1);
             assert_eq!(f.queue.get(&f.task.id).unwrap().status, TaskStatus::Held);
             std::fs::remove_dir(obstruction).unwrap();
+            let inspection =
+                magi::repair_budget::legacy::inspect(&f.queue, f.tmp.path(), &f.task.id, &f.run.id)
+                    .await
+                    .unwrap();
+            let resume = &inspection["recovery"]["resume"];
+            assert_eq!(resume["status"], "refused", "{inspection}");
+            let reason = resume["reason"].as_str().unwrap();
+            assert!(
+                reason.contains("has not been published to the queue"),
+                "{reason}"
+            );
+            assert!(reason.contains("/interrupted.json"), "{reason}");
+            let task_path = f.queue.path_of(&f.task.id);
+            let before = std::fs::read(&task_path).unwrap();
+            let response = f.control(vec!["resume".into(), f.run.id.clone()]).await;
+            assert_eq!(response["ok"], false, "{response}");
+            assert!(
+                response["err"]
+                    .as_str()
+                    .unwrap()
+                    .contains("/interrupted.json")
+            );
+            assert_eq!(std::fs::read(&task_path).unwrap(), before);
             let response = f.recover("interrupted").await;
             assert_eq!(response["ok"], true, "{response}");
             assert_eq!(f.state().base_sync_recovery.authorizations.len(), 1);

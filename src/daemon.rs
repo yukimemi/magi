@@ -1455,7 +1455,13 @@ async fn apply_maintenance_choices(queue: &Queue, questions: &Questions, home: &
                 && origin.operator_decided_at.is_none_or(|at| at <= q.asked_at)
                 && !matches!(origin.status, TaskStatus::Running | TaskStatus::Done)
             {
-                if result.is_err() || matches!(action, ask::ChoiceAction::ResumeRun { .. }) {
+                if matches!(action, ask::ChoiceAction::ResumeRun { .. })
+                    && origin.blocked_by.iter().any(|id| id != &q.id)
+                {
+                    // Settle only this question, not an independent dependency
+                    // that appeared after it was filed.
+                    origin.unblock(&q.id);
+                } else if result.is_err() || matches!(action, ask::ChoiceAction::ResumeRun { .. }) {
                     origin.hold_machine(Some(format!(
                         "Maintenance choice {} settled; inspect its target before releasing this task",
                         q.id

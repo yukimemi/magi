@@ -153,12 +153,19 @@ until a valid record can be read. If only a hold remains, the conductor records
 the reason instead of requesting a choice. A previously offered operation can
 still be refused if its target changes before application.
 A pending movement authorization does not make resume eligible if its saved
-head no longer matches the clean retained checkout and winner branch.
+head no longer matches the clean retained checkout and winner branch. For a
+standing-control request, the queue must also record its publication and the
+matching owner generation. If publication was interrupted, repeat the original
+`recover-base` request with the same ID and arguments from its receipt; ordinary
+resume cannot complete publication.
+
 A pending textual-conflict repair is not offered for resume if its approved
-tip differs from the local tracking ref. Inspect the changed tip before
-replacing an unimported approval; execution still revalidates the target.
-Suppressing an unrelated recovery offer leaves a cache wait intact and reports
-the refusal separately.
+tip differs from the local tracking ref, or if an unimported grant no longer
+matches the clean retained checkout, branch and approved HEAD. Execution
+revalidates the evidence. Applying a maintenance resume answer can resolve
+its own question blocker, but cannot bypass an independent dependency.
+Suppressing an unrelated recovery offer keeps existing cache and release holds
+intact and records the refusal separately.
 
 Chat refreshes current run evidence for task notices and decision messages.
 The latest review's recorded E2E commands and failure tails are reported with

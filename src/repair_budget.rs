@@ -276,23 +276,29 @@ async fn head_and_public(state: &RunState, head: &str) -> Result<()> {
     if let Some(checkout) = &state.foreign_checkout {
         checkout.validate(&state.repo).await?;
     }
+    check_local_head(state, head)?;
+    public_lease(state).await
+}
+
+fn check_local_head(state: &RunState, head: &str) -> Result<()> {
+    let read_git = crate::graph::Runner::read_base_git;
     let winner = state
         .winner()
         .context("repair grant refused: no retained winner")?;
     ensure!(
-        git::is_clean(&winner.worktree).await?,
+        read_git(&winner.worktree, &["status", "--porcelain"])?.is_empty(),
         "repair grant refused: uncommitted work retained; commit it before requesting repair"
     );
     ensure!(
-        git::current_branch(&winner.worktree).await?.as_deref() == Some(winner.branch.as_str()),
+        read_git(&winner.worktree, &["branch", "--show-current"])? == winner.branch,
         "repair grant refused: retained worktree branch changed"
     );
     ensure!(
-        git::rev_parse(&winner.worktree, "HEAD").await? == head
-            && git::rev_parse(&state.repo, &format!("refs/heads/{}", winner.branch)).await? == head,
+        read_git(&winner.worktree, &["rev-parse", "--verify", "HEAD"])? == head
+            && crate::graph::Runner::retained_branch_head(state)? == head,
         "repair grant refused: winner branch/head changed"
     );
-    public_lease(state).await
+    Ok(())
 }
 
 async fn public_lease(state: &RunState) -> Result<()> {
@@ -764,7 +770,23 @@ pub fn queue_resumption(queue: &Queue, task: &mut Task, run: &str) -> Result<boo
     }
     let home = queue.root().parent().context("queue has no home")?;
     let state = RunState::load_under(run, home)?;
-    if !check_queue_resumption(home, task, &state)? {
+    queue_resumption_after_answer(home, task, &state, None)
+}
+
+pub(crate) fn queue_resumption_after_answer(
+    home: &Path,
+    task: &mut Task,
+    state: &RunState,
+    answered: Option<&str>,
+) -> Result<bool> {
+    if let Some(id) = answered
+        && pending(task, state)
+    {
+        // The caller holds the task claim. Only this answered maintenance
+        // question can be resolved here; independent blockers still refuse.
+        task.unblock(id);
+    }
+    if !check_queue_resumption(home, task, state)? {
         return Ok(false);
     }
     task.status = TaskStatus::Queued;
@@ -785,15 +807,17 @@ pub(crate) fn check_queue_resumption(home: &Path, task: &Task, state: &RunState)
             && contract(task, receipt.request.kind)? == receipt.contract,
         "repair grant held: owner decision or task contract changed after acceptance"
     );
-    Ok(true)
-}
-
-pub(crate) fn check_pending_conflict_tip(task: &Task, state: &RunState) -> Result<()> {
-    if conflict_pending(task, state) {
-        let receipt = task.repair_grants.last().expect("pending conflict receipt");
+    if receipt.request.kind == Kind::BaseConflict {
+        if !state
+            .repair_grants
+            .iter()
+            .any(|grant| grant.receipt == *receipt)
+        {
+            check_local_head(state, &receipt.request.head)?;
+        }
         conflict_base_tip(state, &receipt.request, receipt.stop.as_ref())?;
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Recheck the recorded target without fetching or renewing a synchronization interval.

@@ -151,13 +151,54 @@ pub(crate) fn inspect_queued(
         )
         .into());
     }
-    if state.base_sync_blocked() && state.base_recovery_pending() {
-        let head = crate::graph::Runner::base_recovery_head(state)?;
-        state.check_base_recovery_head(&head)?;
-    }
+    check_pending_movement(queue, task, state)?;
     crate::repair_budget::check_queue_resumption(home, task, state)?;
-    crate::repair_budget::check_pending_conflict_tip(task, state)?;
     Ok(())
+}
+
+/// A request-backed approval must be published before ordinary resume can
+/// use it. `true` means queueing must preserve the existing owner generation.
+fn check_pending_movement(
+    queue: &crate::queue::Queue,
+    task: &crate::queue::Task,
+    state: &crate::run::RunState,
+) -> Result<bool> {
+    if !state.base_sync_blocked() || !state.base_recovery_pending() {
+        return Ok(false);
+    }
+    let head = crate::graph::Runner::base_recovery_head(state)?;
+    state.check_base_recovery_head(&head)?;
+    let authorization = state.base_sync_recovery.authorizations.last().unwrap();
+    ensure!(
+        authorization.task == task.id && !task.fresh_start && task.review_branch.is_none(),
+        "base recovery task ownership or continuation changed"
+    );
+    if let Some(reason) = crate::base_recovery_control::queue_binding_refusal(authorization, task) {
+        if let Some(key) = &authorization.request {
+            anyhow::bail!(
+                "pending base recovery cannot resume: {reason}; if queue publication was interrupted, complete the existing recover-base request {key} with the same ID and original arguments from base-recovery-controls/{key}.json, not ordinary resume"
+            );
+        }
+        anyhow::bail!("pending base recovery cannot resume: {reason}");
+    }
+    if let Some(question) = &authorization.question {
+        ensure!(
+            crate::base_recovery_control::decision_current(queue, state, &task.id, question),
+            "recovery decision ownership, routing or stop evidence changed"
+        );
+    }
+    if let Some(scope) = &authorization.scope {
+        ensure!(
+            task.instruction == scope.instruction
+                && state
+                    .base_sync_recovery
+                    .episodes
+                    .last()
+                    .is_some_and(|e| e.id == scope.episode),
+            "base recovery task instruction or synchronization interval changed"
+        );
+    }
+    Ok(authorization.request.is_some() || authorization.generation.is_some())
 }
 
 /// Hand a resumable run back to the queue task that owns it, pinned to that
@@ -186,6 +227,14 @@ pub(crate) fn pin_queued(
     let _claim = queue.claim(&listed.id).map_err(BeforeQueueWrite)?;
     let mut task = queue.get(&listed.id).map_err(BeforeQueueWrite)?;
     check_queue_owner(&task, run, decided_before).map_err(BeforeQueueWrite)?;
+    let home = queue
+        .root()
+        .parent()
+        .context("queue has no home")
+        .map_err(BeforeQueueWrite)?;
+    let state = crate::run::RunState::load_under(run, home).map_err(BeforeQueueWrite)?;
+    let preserve_movement =
+        check_pending_movement(queue, &task, &state).map_err(BeforeQueueWrite)?;
     if applied.is_none()
         && task.status == crate::queue::TaskStatus::Queued
         && task
@@ -195,8 +244,12 @@ pub(crate) fn pin_queued(
     {
         return Ok(true);
     }
-    if !crate::repair_budget::queue_resumption(queue, &mut task, run)? {
-        task.release_operator(if applied.is_some() { "choice" } else { "chat" }, applied);
+    if !crate::repair_budget::queue_resumption_after_answer(home, &mut task, &state, applied)? {
+        if preserve_movement {
+            task.release();
+        } else {
+            task.release_operator(if applied.is_some() { "choice" } else { "chat" }, applied);
+        }
     }
     task.resume_override = Some(crate::queue::OperatorResume {
         question_id: applied.unwrap_or_default().to_owned(),
