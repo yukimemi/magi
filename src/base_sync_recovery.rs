@@ -647,19 +647,34 @@ impl RunState {
         Ok(())
     }
 
+    pub(crate) fn check_base_recovery_head(&self, head: &str) -> Result<()> {
+        if self.base_recovery_pending() {
+            let approved = &self
+                .base_sync_recovery
+                .authorizations
+                .last()
+                .unwrap()
+                .stop
+                .head;
+            ensure!(
+                approved == head,
+                "retained HEAD changed from {approved} to {head}; inspect the retained stop and authorization"
+            );
+        }
+        Ok(())
+    }
+
     /// Open the approved bounded interval and detach old gate evidence atomically
     /// with consumption. The caller must save before reserving Git work.
     pub(crate) fn consume_base_recovery(&mut self, head: &str) -> bool {
         if !self.base_recovery_pending() {
             return false;
         }
+        let head_check = self.check_base_recovery_head(head);
         let a = self.base_sync_recovery.authorizations.last_mut().unwrap();
         a.consumed = true;
-        if a.stop.head != head {
-            a.refuse(format!(
-                "retained HEAD changed from {} to {head}; inspect it and authorize again with --recover-base",
-                a.stop.head
-            ));
+        if let Err(error) = head_check {
+            a.refuse(error.to_string());
             return false;
         }
         a.reviews = self.reviews.clone();

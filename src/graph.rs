@@ -1464,7 +1464,7 @@ impl Runner {
         Ok(())
     }
 
-    fn base_recovery_head(state: &RunState) -> Result<String> {
+    pub(crate) fn base_recovery_head(state: &RunState) -> Result<String> {
         let winner = state.winner().context("run has no retained winner")?;
         anyhow::ensure!(
             Self::read_base_git(&winner.worktree, &["status", "--porcelain"])?.is_empty(),

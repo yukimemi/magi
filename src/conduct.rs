@@ -1769,6 +1769,83 @@ mod tests {
         run(&["commit", "-m", "candidate work"]);
     }
 
+    #[tokio::test]
+    async fn recovery_offer_requires_the_pending_base_authorizations_head() {
+        use crate::run::{BaseSync, Origin, RunStatus};
+        use serde_json::json;
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo_with_branch(&repo, "candidate");
+        let approved = crate::git::rev_parse(&repo, "HEAD").await.unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let questions = Questions::at(dir.path().join("questions"));
+        let mut task = task("resume approved movement recovery");
+        task.repo = repo.clone();
+        let mut state = RunState::new(
+            repo.clone(),
+            "main".into(),
+            "base".into(),
+            task.instruction.clone(),
+            Config::default(),
+        );
+        state.driver_exited = true;
+        state.status = RunStatus::Blocked;
+        state.origin = Some(Origin::queue(&task.id));
+        state.candidates = serde_json::from_value(json!([
+            {"index":0,"label":"A","agent":"fixture","branch":"candidate","worktree":repo}
+        ]))
+        .unwrap();
+        state.tally = Some(
+            serde_json::from_value(json!({
+                "first_choice":{},"borda":{},"winner":"A","unanimous_initial":true,
+                "unanimous_final":true,"deliberated":false,"changed_votes":0,"met_quorum":true,
+            }))
+            .unwrap(),
+        );
+        state.base_sync = Some(BaseSync {
+            tip: "base-tip".into(),
+            behind: 2,
+            attempts: 4,
+            conflict: Some("main moved 2 commit(s) ahead of candidate after 4 rebase(s); rebasing again would only race it".into()),
+            already_in: None,
+        });
+        state.record_base_sync_stop(&approved);
+        state.authorize_base_sync(&task.id).unwrap();
+        state.save_under(dir.path()).unwrap();
+        task.link_run(&state.id);
+        task.hold_machine(Some("retained work".into()));
+        queue.put(&mut task).unwrap();
+        check_resume_offer(&queue, &task, &state.id, true).unwrap();
+
+        crate::git::git(
+            &repo,
+            &["commit", "--allow-empty", "-m", "Advance kept work"],
+        )
+        .await
+        .unwrap();
+        let moved = crate::git::rev_parse(&repo, "HEAD").await.unwrap();
+        let verdict = serde_json::from_value(json!({"decisions":[{
+            "id":task.id,"question":"Resume?",
+            "choices":["resume"],"actions":{"resume":{"do":"resumerun","run":state.id}},
+        }]}))
+        .unwrap();
+        apply(&queue, &questions, &verdict).unwrap();
+        assert!(questions.list().is_empty());
+        let held = queue.get(&task.id).unwrap();
+        let reason = held.hold_reason.as_deref().unwrap();
+        assert!(
+            reason.contains(&format!("retained HEAD changed from {approved} to {moved}")),
+            "{reason}"
+        );
+        assert!(held.resume_override.is_none());
+        assert!(
+            RunState::load_under(&state.id, dir.path())
+                .unwrap()
+                .base_recovery_pending()
+        );
+    }
+
     fn review_round_with_finding(
         round: usize,
         finding_id: &str,

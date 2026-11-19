@@ -152,13 +152,17 @@ and missing prerequisites. An unreadable run record leaves eligibility unknown
 until a valid record can be read. If only a hold remains, the conductor records
 the reason instead of requesting a choice. A previously offered operation can
 still be refused if its target changes before application.
+A pending movement authorization does not make resume eligible if its saved
+head no longer matches the clean retained checkout and winner branch.
 
 Chat refreshes current run evidence for task notices and decision messages.
 The latest review's recorded E2E commands and failure tails are reported with
 both the reviewed and verified heads, even when they do not apply to the target
 head. `applies_to_target` is true only when both heads match the target and E2E
-was recorded without deferral. Neither an older round nor a gate on another
-head stands in for a missing current result.
+was recorded without deferral. The `head_e2e` and `gate_repair_e2e` records
+carry their own target SHA and results separately from the review and final
+gate. Neither an older round nor a gate on another head stands in for a
+missing current result.
 
 ## Verification
 

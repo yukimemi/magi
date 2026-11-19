@@ -151,6 +151,10 @@ pub(crate) fn inspect_queued(
         )
         .into());
     }
+    if state.base_sync_blocked() && state.base_recovery_pending() {
+        let head = crate::graph::Runner::base_recovery_head(state)?;
+        state.check_base_recovery_head(&head)?;
+    }
     crate::repair_budget::check_queue_resumption(home, task, state)?;
     Ok(())
 }

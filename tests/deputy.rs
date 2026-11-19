@@ -1391,7 +1391,7 @@ fn conductor_maintenance_question(
     queue: &magi::queue::Queue,
     task: &magi::queue::Task,
     action: magi::ask::ChoiceAction,
-) -> Question {
+) -> Option<Question> {
     magi::conduct::apply(
         queue,
         &s.store,
@@ -1410,7 +1410,6 @@ fn conductor_maintenance_question(
         .list()
         .into_iter()
         .find(|q| q.run == task.id && q.node == magi::conduct::NODE)
-        .unwrap()
 }
 
 common::e2e! {
@@ -1424,7 +1423,7 @@ async fn maintenance_conductor_release_restores_its_original_hold_once() {
     queue.put(&mut task).unwrap();
     let action = ChoiceAction::ReleaseTask { task: task.id.clone(),
         held_at: task.held_at.unwrap(), reason: task.hold_reason.clone() };
-    let mut q = conductor_maintenance_question(&s, &queue, &task, action);
+    let mut q = conductor_maintenance_question(&s, &queue, &task, action).unwrap();
     let blocked = queue.get(&task.id).unwrap();
     assert_eq!(blocked.status, TaskStatus::Blocked);
     assert_eq!(blocked.blocked_from, Some(TaskStatus::Held));
@@ -1474,7 +1473,7 @@ async fn maintenance_resume_preserves_later_operator_decisions_after_chat_accept
         task.hold_machine(Some("waiting for resume".into()));
         queue.put(&mut task).unwrap();
         let q = conductor_maintenance_question(&s, &queue, &task,
-            ChoiceAction::ResumeRun { run: run.id.clone() });
+            ChoiceAction::ResumeRun { run: run.id.clone() }).unwrap();
         magi::task_chat::sweep(&queue, &talks, &s.store, &s.home);
         assert_eq!(s.store.get(&q.id).unwrap().routed_chat.as_deref(), Some(chat.id.as_str()));
         magi::chat_control::decide(&talks, &s.home, &chat.id, &q.id, "daemon: execute").unwrap();
@@ -1524,7 +1523,7 @@ async fn maintenance_named_resume_never_replaces_an_exhausted_run() {
     std::fs::write(&config_path, toml::to_string(&config).unwrap()).unwrap();
     let opts = magi::daemon::Opts { repo: s.fx.repo.clone(), config: Some(config_path),
         worktrees_root: Some(s.fx.tmp.path().join("worktrees")), ..Default::default() };
-    for exhausted_before_answer in [true, false] {
+    for exhausted_at in ["offer", "answer", "dispatch"] {
         let mut task = Task::new("resume existing work".into(), "work".into(), s.fx.repo.clone(), Source::Human);
         let mut run = RunState::new(s.fx.repo.clone(), "main".into(), "base".into(),
             task.instruction.clone(), config.clone());
@@ -1536,14 +1535,29 @@ async fn maintenance_named_resume_never_replaces_an_exhausted_run() {
             e2e_deferred: false, e2e_defer_reason: None, fix: None, blocking: 0,
             answered: 1, expected: 1, clean: false, progressed: true, vote_split: false,
             reconsideration: Vec::new(), verdict: None };
-        if exhausted_before_answer { run.reviews.push(round.clone()); }
+        if exhausted_at == "offer" { run.reviews.push(round.clone()); }
         run.save_under(&s.home).unwrap();
         task.runs.push(run.id.clone());
         task.hold_machine(Some("waiting for resume".into()));
         queue.put(&mut task).unwrap();
         assert!(task.review_of.is_none() && task.replacement.is_none() && task.pr_recovery.is_none());
-        let mut q = conductor_maintenance_question(&s, &queue, &task,
+        let offer = conductor_maintenance_question(&s, &queue, &task,
             ChoiceAction::ResumeRun { run: run.id.clone() });
+        if exhausted_at == "offer" {
+            assert!(offer.is_none(), "an exhausted run must not create a decision");
+            let stored = queue.get(&task.id).unwrap();
+            assert_eq!(stored.status, TaskStatus::Held);
+            assert!(stored.resume_override.is_none());
+            assert_eq!(stored.runs, vec![run.id.clone()]);
+            assert_eq!(stored.attempts, 0);
+            assert!(stored.hold_reason.unwrap().contains("review budget exhausted (1/1 rounds used)"));
+            continue;
+        }
+        let mut q = offer.expect("resume is eligible while review budget remains");
+        if exhausted_at == "answer" {
+            run.reviews.push(round.clone());
+            run.save_under(&s.home).unwrap();
+        }
         q.answer(Answer::Choice(q.choices[0].clone())).unwrap();
         s.store.put(&mut q).unwrap();
         let path = s.home.join("runs").join(&run.id).join("run.json");
@@ -1552,7 +1566,7 @@ async fn maintenance_named_resume_never_replaces_an_exhausted_run() {
             .map(|entry| entry.unwrap().file_name()).collect::<std::collections::BTreeSet<_>>();
         magi::daemon::apply_choice_actions(&queue, &s.store, &s.home).await;
         task = queue.get(&task.id).unwrap();
-        if exhausted_before_answer {
+        if exhausted_at == "answer" {
             // Admission refuses exhausted work before a queue pin is written.
             assert_eq!(task.status, TaskStatus::Held);
             assert!(task.resume_override.is_none());
