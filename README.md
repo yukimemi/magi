@@ -920,9 +920,11 @@ ordinary external send remains `sender: "external", ingress: "external"`.
 Closed or busy chats and unsent/recovered drafts refuse new admission without
 changing the conversation. If output was lost, query the **same** Chat and ID:
 `timeout` and `uncertain` prove neither failure nor success. Repeating the exact
-accepted submission only reads its receipt; a changed body, kind or destination
-conflicts. Owner IDs remain reserved in that home even if the chat is deleted;
-deletion removes the transcript and effect evidence. If the binding survived
+accepted submission only reads its receipt. Within a chat, reusing an ID with
+a different body, sender or submission kind conflicts. Owner submissions also
+bind the destination: their IDs remain reserved for owner use in that home
+even if the chat is deleted. An external send in a different chat may use the
+same ID. Deleting a chat removes its transcript and effect evidence. If the binding survived
 but its transcript receipt is missing, the result is uncertain, not retryable.
 Never switch IDs to replay uncertain work. Neither a browser nor a running web
 server is needed to submit and get the reply. As with a web-established Goal,

@@ -484,6 +484,38 @@ printf 'fixture response\n'
     let external = f.query("pretend", "20");
     assert_eq!(external["status"], "replied", "{external}");
     assert_eq!(external["goal_authorizations"], json!([]));
+
+    let reused = f.cli(
+        &[
+            "send",
+            &other.id,
+            "--request",
+            "follow-release",
+            "--sender",
+            "Operator",
+            "--json",
+            "-",
+        ],
+        Some(&quoted),
+    );
+    assert_eq!(reused["accepted"], true, "{reused}");
+    let other_reply = f.cli(
+        &[
+            "reply",
+            &other.id,
+            "--request",
+            "follow-release",
+            "--wait",
+            "20",
+            "--json",
+        ],
+        None,
+    );
+    assert_eq!(other_reply["status"], "replied", "{other_reply}");
+    assert_eq!(other_reply["input_id"], reused["input_id"]);
+    assert_eq!(other_reply["goal_authorizations"], json!([]));
+    assert_eq!(f.query("follow-release", "0")["reply_id"], reply["reply_id"]);
+
     assert_eq!(queue.get(&task.id).unwrap().status, task.status);
     assert!(questions.get(&approval.id).unwrap().answer.is_none());
     assert_eq!(f.talks.get(&f.id).unwrap().goals.len(), 1);

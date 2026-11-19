@@ -223,6 +223,11 @@ fn view(store: &Talks, talk: &Talk, record: &Request) -> Value {
         "worker":record.worker,"error":record.error})
 }
 
+enum InputKind<'a> {
+    External(&'a str),
+    Owner,
+}
+
 /// Accept once, or return the saved occurrence. Duplicate calls never dispatch.
 pub async fn send(
     store: &Talks,
@@ -231,7 +236,7 @@ pub async fn send(
     label: &str,
     text: &str,
 ) -> Result<Value> {
-    send_input(store, selector, request, Some(label), text).await
+    submit(store, selector, request, InputKind::External(label), text).await
 }
 
 /// Submit an explicit local operator request, independently of external ingress.
@@ -245,22 +250,20 @@ pub async fn send_owner(store: &Talks, id: &str, request: &str, text: &str) -> R
             .any(|key| std::env::var_os(key).is_some()),
         "send-owner is unavailable inside a magi seat or worker; run it from the owner's trusted local terminal using their private MAGI_HOME"
     );
-    send_input(store, id, request, None, text).await
+    submit(store, id, request, InputKind::Owner, text).await
 }
 
-async fn send_input(
+async fn submit(
     store: &Talks,
     selector: &str,
     request: &str,
-    label: Option<&str>,
+    input: InputKind<'_>,
     text: &str,
 ) -> Result<Value> {
-    let kind = if label.is_some() {
-        RequestKind::External
-    } else {
-        RequestKind::Owner
+    let (kind, label) = match input {
+        InputKind::External(label) => (RequestKind::External, label),
+        InputKind::Owner => (RequestKind::Owner, ""),
     };
-    let label = label.unwrap_or_default();
     let owner = kind == RequestKind::Owner;
     anyhow::ensure!(
         !request.is_empty()
@@ -270,13 +273,12 @@ async fn send_input(
                 .all(|c| c.is_ascii_alphanumeric() || b"-_.".contains(&c)),
         "request must contain 1..128 ASCII letters, digits, -, _ or ."
     );
-    anyhow::ensure!(
-        owner
-            || (!label.trim().is_empty()
-                && label.len() <= 128
-                && !label.chars().any(char::is_control)),
-        "sender must be a nonempty single-line label of at most 128 bytes"
-    );
+    if let InputKind::External(label) = input {
+        anyhow::ensure!(
+            !label.trim().is_empty() && label.len() <= 128 && !label.chars().any(char::is_control),
+            "sender must be a nonempty single-line label of at most 128 bytes"
+        );
+    }
     anyhow::ensure!(!text.trim().is_empty(), "nothing to send");
     let expected_binding = owner.then(|| OwnerBinding {
         talk: selector.to_owned(),
@@ -306,6 +308,11 @@ async fn send_input(
         !owner || talk.id == selector,
         "send-owner requires the full Chat ID from magi talk list"
     );
+    // Owner bindings are home-wide for owner submissions only. Within the
+    // bound conversation, an incomplete owner receipt still fences both kinds.
+    let scoped_binding = || -> Result<Option<OwnerBinding>> {
+        Ok(read_binding(store, request)?.filter(|binding| owner || binding.talk == talk.id))
+    };
     let replay = |talk: &Talk, r: &Request| {
         if r.kind == kind && r.text == text && r.sender == label {
             view(store, talk, r)
@@ -316,7 +323,7 @@ async fn send_input(
     if let Some(r) = talk.external_requests.iter().find(|r| r.request == request) {
         return Ok(replay(&talk, r));
     }
-    if let Some(binding) = read_binding(store, request)? {
+    if let Some(binding) = scoped_binding()? {
         // Re-read: the binding can become visible just before the atomic
         // transcript write. Never dispatch again in that interval.
         let fresh = read_path(&store.path_of(&talk.id))?;
@@ -352,7 +359,7 @@ async fn send_input(
     {
         let _guard = store.guard()?;
         let mut fresh = read_path(&store.path_of(&talk.id))?;
-        if let Some(binding) = read_binding(store, request)? {
+        if let Some(binding) = scoped_binding()? {
             return Ok(binding_status(&binding));
         }
         if !fresh.status.open() {
@@ -367,9 +374,10 @@ async fn send_input(
         let index = fresh.turns.len();
         if let Some(binding) = &expected_binding {
             save_binding(store, request, binding)?;
-            fresh.turns.push(operator_turn(text, Vec::new(), None));
-        } else {
-            fresh.turns.push(Turn {
+        }
+        fresh.turns.push(match input {
+            InputKind::Owner => operator_turn(text, Vec::new(), None),
+            InputKind::External(label) => Turn {
                 sender: Some(Sender::External),
                 who: Who::Operator,
                 body: format!("External agent [{label}]:\n{text}"),
@@ -379,8 +387,8 @@ async fn send_input(
                 breaks: Some(Vec::new()),
                 messages: Vec::new(),
                 posted_by: None,
-            });
-        }
+            },
+        });
         fresh.external_requests.push(Request {
             request: request.to_owned(),
             kind,
