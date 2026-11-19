@@ -887,7 +887,9 @@ impl OmpSession {
                         seat.captured_session.as_deref() == Some(id.as_str()),
                         "omp resumed a different session than requested"
                     );
-                } else if success || seat.omp_session_dir.is_some() {
+                } else if success {
+                    // An unsuccessful turn may exit before reporting an ID.
+                    // Keep the saved pair and let the caller classify the output.
                     bail!("omp did not confirm the requested session; see the seat output");
                 }
             }
@@ -2915,7 +2917,10 @@ mod tests {
                 .record(&mut seat, Some("other-id".into()), true)
                 .is_err()
         );
-        assert!(OmpSession::Resume.record(&mut seat, None, false).is_err());
+        assert!(OmpSession::Resume.record(&mut seat, None, true).is_err());
+        assert_eq!(seat, before);
+        // Timeout and nonzero exit both reach record with success == false.
+        OmpSession::Resume.record(&mut seat, None, false).unwrap();
         assert_eq!(seat, before);
 
         let fallback = SeatState::new("review-1", "b", 7);

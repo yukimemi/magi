@@ -73,8 +73,10 @@ provider/model configuration, extensions or tools.
 
 The saved seat pairs the absolute directory with the CLI-reported session
 ID. A managed resume uses that exact directory and `--resume <id>`, even
-when the current magi home differs. An unavailable directory or unconfirmed
-resume fails rather than replacing the stored session. Saved IDs without a
+when the current magi home differs. An unavailable directory, a different
+reported ID, or a successful exit without ID confirmation fails rather than
+replacing the stored session. A timeout or failed exit without an ID keeps
+the saved pair and follows normal agent failure handling. Saved IDs without a
 directory still use the old invocation and lookup; those transcripts are
 not moved or copied and remain visible in the operator's normal history.
 
