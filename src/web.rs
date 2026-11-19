@@ -9221,26 +9221,23 @@ struct TalkGoalLink {
 }
 
 fn talk_goal_link(talk: &Talk, queue: &Queue, runs: &FsPath) -> Option<TalkGoalLink> {
-    let goal = talk
-        .selected_goal
-        .as_ref()
-        .and_then(|id| talk.goals.iter().find(|goal| &goal.id == id))
-        .or_else(|| talk.goals.last())?;
+    let goal = crate::chat_goal::Goal::selected(talk)?;
+    let repo = goal.effective_repo(&talk.repo);
+    let valid_run = |id: &str| {
+        plain_record_id(id)
+            && read_run(runs, id).is_ok_and(|state| {
+                state.id == id
+                    && crate::chat_goal::require_repo("run", id, &state.repo, repo).is_ok()
+            })
+    };
     for id in goal.tasks.iter().rev() {
-        if !plain_record_id(id) {
-            continue;
-        }
-        let Ok(task) = queue.get(id) else {
+        let Ok(task) = crate::chat_goal::task_record(queue, id, repo) else {
             continue;
         };
-        if task.id != *id || task.repo != talk.repo {
-            continue;
-        }
         // Repository reassignments retain historical runs. Only this task's
         // current execution can be presented as the goal's current Run.
         if let Some(run) = task.execution_runs().last()
-            && plain_record_id(run)
-            && read_run(runs, run).is_ok_and(|state| state.id == *run && state.repo == talk.repo)
+            && valid_run(run)
         {
             return Some(TalkGoalLink {
                 goal: goal.id.clone(),
@@ -9255,9 +9252,7 @@ fn talk_goal_link(talk: &Talk, queue: &Queue, runs: &FsPath) -> Option<TalkGoalL
         });
     }
     for id in goal.runs.iter().rev() {
-        if plain_record_id(id)
-            && read_run(runs, id).is_ok_and(|state| state.id == *id && state.repo == talk.repo)
-        {
+        if valid_run(id) {
             return Some(TalkGoalLink {
                 goal: goal.id.clone(),
                 kind: "run",

@@ -6834,7 +6834,11 @@ function renderTalkGoal(talk) {
   const labels = { runnable: "Following through", waiting: "Waiting", owner: "Needs your input",
     completed: "Completed", paused: "Paused", stopped: "Stopped" };
   setText($("talk-goal-state"), labels[goal.state] || goal.state);
-  const step = goal.step ? [`Step: ${goal.step}`] : [];
+  const repo = goal.repo ?? talk.repo;
+  const repoName = typeof repo === "string" ? repo.split(/[\\/]/).filter(Boolean).slice(-2).join("/") : "";
+  setAttr($("talk-goal-step"), "title", repoName ? repo : null);
+  const step = repoName ? [`Repo: ${repoName}`] : [];
+  if (goal.step) step.push(`Step: ${goal.step}`);
   if (["runnable", "waiting"].includes(goal.state)) {
     const checked = Date.parse(goal.last_checked || "");
     if (!Number.isFinite(checked)) step.push("Evidence not checked yet");

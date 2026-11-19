@@ -5776,9 +5776,9 @@ async fn chat_task_progress_refreshes_and_survives_operation_races() {
     }
 }
 
-/// Durable goal summaries share the task-progress strip; links are resolved
-/// through owned records rather than model-authored text or guessed ids.
-#[tokio::test]
+// Durable goal summaries share the task-progress strip; links are resolved
+// through owned records rather than model-authored text or guessed ids.
+common::e2e! {
 async fn durable_chat_goals_stay_compact_safe_and_navigable() {
     let Some(chrome) = cdp::find_chrome() else {
         assert!(std::env::var_os("CI").is_none(), "Chrome required in CI");
@@ -5790,20 +5790,35 @@ async fn durable_chat_goals_stay_compact_safe_and_navigable() {
     let home = fx.tmp.path().join("magi-home");
     let talks = Talks::at(home.join("talks"));
     let queue = Queue::at(home.join("queue"));
-    let mut chat = talk::begin(&talks, &fx.config, fx.repo.clone(), None).unwrap();
-    let owner_input = "Ship the retry fix, follow its checks, and ask me to review the result.";
-    talk::record(&mut chat, &talks, owner_input, Vec::new()).unwrap();
+    let conversation = fx.tmp.path().join("conversation-home");
+    std::fs::create_dir(&conversation).unwrap();
+    let owner_input = "Follow the retry fix in the other repository and ask me to review the result.";
+    let mut config = fx.config.clone();
+    config.agents.truncate(1);
+    let script = fx.tmp.path().join("goal-agent.sh");
+    std::fs::write(&script, r#"#!/bin/sh
+set -eu
+cat >/dev/null
+"$GOAL_MAGI" task control goal establish --id queued-goal \
+  --repo "$GOAL_REPO" --task "$GOAL_TASK" --purpose "$GOAL_PURPOSE" \
+  --scope "retry fix" --condition "Owner reviews the result" --completion owner-review
+"$GOAL_MAGI" task control goal update queued-goal --step "Wait for a worker"
+printf 'Registered the cross-repository goal.\n'
+"#).unwrap();
+    config.agents[0].command = vec!["sh".into(), script.display().to_string()];
+    config.agents[0].env.extend(common::magi_cli_env(&home, "GOAL_MAGI"));
+    let mut chat = talk::begin(&talks, &config, conversation.clone(), None).unwrap();
     let mut task = Task::new(
         "Retry fix".into(),
         owner_input.into(),
-        chat.repo.clone(),
+        fx.repo.clone(),
         Source::Agent {
             run: chat.id.clone(),
             node: magi::queue::CHAT_NODE.into(),
         },
     );
     let mut run = RunState::new(
-        chat.repo.clone(),
+        fx.repo.clone(),
         "main".into(),
         "0000000".into(),
         owner_input.into(),
@@ -5822,10 +5837,10 @@ async fn durable_chat_goals_stay_compact_safe_and_navigable() {
         state.reserve_under(&home).unwrap();
         state
     };
-    let direct_run = reserve_run(chat.repo.clone());
-    let foreign_run = reserve_run(fx.repo.join("foreign-repository"));
-    let corrupt_run = reserve_run(chat.repo.clone());
-    let mismatched_run = reserve_run(chat.repo.clone());
+    let direct_run = reserve_run(fx.repo.clone());
+    let foreign_run = reserve_run(chat.repo.clone());
+    let corrupt_run = reserve_run(fx.repo.clone());
+    let mismatched_run = reserve_run(fx.repo.clone());
     let run_file = |id: &str| home.join("runs").join(id).join("run.json");
     std::fs::write(run_file(&corrupt_run.id), b"not json").unwrap();
     // A readable record under the wrong reference must not produce a link.
@@ -5840,7 +5855,7 @@ async fn durable_chat_goals_stay_compact_safe_and_navigable() {
     let mut execution = Task::new(
         "Existing review task".into(),
         owner_input.into(),
-        chat.repo.clone(),
+        fx.repo.clone(),
         Source::Human,
     );
     execution.runs.push(run.id.clone());
@@ -5857,9 +5872,34 @@ async fn durable_chat_goals_stay_compact_safe_and_navigable() {
     unrelated.runs.push(run.id.clone());
     queue.put(&mut unrelated).unwrap();
     let purpose = "<img src=x onerror=alert(1)> Ship the retry fix without losing the conversation";
+    config.agents[0].env.extend([
+        ("GOAL_REPO".into(), fx.repo.display().to_string()),
+        ("GOAL_TASK".into(), task.id.clone()),
+        ("GOAL_PURPOSE".into(), purpose.into()),
+    ]);
+    std::fs::write(conversation.join("magi.toml"), toml::to_string(&config).unwrap()).unwrap();
+    let base = serve_with_client_probe(
+        &home, queue.clone(), talks.clone(), home.join("runs"), &fx.repo, ClientProbe::Goals,
+    ).await;
+    let mut browser = cdp::Browser::launch(&chrome).await.unwrap();
+    let page = browser.open_page(&format!("{base}#/chat/{}", chat.id), 1280, 900, false).await.unwrap();
+    browser.wait_for(&page, "!!window.deck && !!deck.state.talkDetail?.talk && document.getElementById('view-talk')?.hidden === false", Duration::from_secs(30)).await.unwrap();
+    browser.eval(&page, &format!(
+        "(() => {{ const input = document.getElementById('f-talk-say'); input.value = {owner_input:?}; input.dispatchEvent(new Event('input', {{bubbles:true}})); document.getElementById('talk-send').click(); return true; }})()"
+    )).await.unwrap();
+    let page_result = browser.wait_for(&page,
+        "document.getElementById('talk-turns')?.textContent.includes('Registered the cross-repository goal.')",
+        Duration::from_secs(60)).await;
+    chat = Talks::at(home.join("talks")).get(&chat.id).unwrap();
+    assert!(page_result.is_ok(), "goal registration failed: {:?}", chat.turns.iter().map(|t| &t.body).collect::<Vec<_>>());
+    assert_eq!(chat.repo, conversation.canonicalize().unwrap());
+    assert_eq!(chat.goals[0].repo, Some(fx.repo.canonicalize().unwrap()));
+    assert_eq!(chat.goals[0].tasks, vec![task.id.clone()]);
+    browser.close_page(&page).await;
     let seed_goal = |id: &str, state: &str, step: &str, tasks: Vec<String>, runs: Vec<String>| {
         serde_json::from_value::<magi::chat_goal::Goal>(serde_json::json!({
             "id": id, "purpose": purpose, "scope": "retry fix",
+            "repo": fx.repo.canonicalize().unwrap(),
             "condition": {"description": "Owner reviews the result", "kind": "owner_review"},
             "state": state, "step": step, "source_turn": 0, "owner_input": owner_input,
             "tasks": tasks, "runs": runs, "watches": [],
@@ -5868,14 +5908,7 @@ async fn durable_chat_goals_stay_compact_safe_and_navigable() {
         }))
         .unwrap()
     };
-    chat.goals = vec![
-        seed_goal(
-            "queued-goal",
-            "runnable",
-            "Wait for a worker",
-            vec![task.id.clone()],
-            vec![direct_run.id.clone()],
-        ),
+    chat.goals.extend([
         seed_goal(
             "run-goal",
             "waiting",
@@ -5905,19 +5938,9 @@ async fn durable_chat_goals_stay_compact_safe_and_navigable() {
                 "missing-run".into(),
             ],
         ),
-    ];
+    ]);
     chat.selected_goal = Some("queued-goal".into());
     talks.put(&mut chat).unwrap();
-    let base = serve_with_client_probe(
-        &home,
-        queue.clone(),
-        talks.clone(),
-        home.join("runs"),
-        &fx.repo,
-        ClientProbe::Goals,
-    )
-    .await;
-    let mut browser = cdp::Browser::launch(&chrome).await.unwrap();
     for (width, height, mobile) in [(1280, 900, false), (390, 844, true)] {
         chat.selected_goal = Some("queued-goal".into());
         chat.goals[1].state = serde_json::from_value(serde_json::json!("waiting")).unwrap();
@@ -5947,11 +5970,13 @@ async fn durable_chat_goals_stay_compact_safe_and_navigable() {
           check(!goal.querySelector('img'), 'goal text cannot create HTML');
           check(document.getElementById('talk-goal-state').textContent === 'Following through', 'selected goal, not latest goal');
           check(document.getElementById('talk-goal-step').textContent.includes('Wait for a worker'), 'current step');
+          const step = document.getElementById('talk-goal-step');
+          check(step.title === {repo_path:?} && step.textContent.includes('Repo: '), 'target checkout, not chat directory');
           check(link.getAttribute('href') === '#/tasks/' + {task_id:?}, 'owned pre-run task link');
           check(!document.getElementById('talk-tasks-panel').open, 'task panel stays folded');
           check(strip.textContent.includes('1 of 1 unfinished'), 'task progress retained');
           const rect = strip.getBoundingClientRect();
-          check(rect.height < 260, 'compact summary, not a second dashboard');
+          check(rect.height < 260, `compact summary, not a second dashboard (${{innerWidth}}px: ${{rect.height}}px)`);
           check(rect.left >= 0 && rect.right <= innerWidth && strip.scrollWidth <= strip.clientWidth, 'phone wrapping');
           const input = document.getElementById('f-talk-say');
           input.value = 'Keep this unsent draft';
@@ -5959,7 +5984,7 @@ async fn durable_chat_goals_stay_compact_safe_and_navigable() {
           check(document.getElementById('talk-close-go').disabled, 'draft close guard');
           check(document.getElementById('talk-close-reason').textContent.includes('unsent'), 'guard explanation');
           return true;
-        }})()"##, purpose = purpose, task_id = task.id)).await.unwrap();
+        }})()"##, purpose = purpose, task_id = task.id, repo_path = fx.repo.canonicalize().unwrap().display().to_string())).await.unwrap();
         assert_eq!(got, true, "initial goal at {width}px");
         browser
             .eval(&page, "document.getElementById('talk-goal-open').click()")
@@ -5989,6 +6014,17 @@ async fn durable_chat_goals_stay_compact_safe_and_navigable() {
         talks.put(&mut chat).unwrap();
         browser
             .eval(&page, &format!("deck.loadTalk({:?})", chat.id))
+            .await
+            .unwrap();
+        browser
+            .wait_for(
+                &page,
+                &format!(
+                    "document.getElementById('talk-goal-open').getAttribute('href') === {:?}",
+                    format!("#/runs/{}", run.id)
+                ),
+                Duration::from_secs(30),
+            )
             .await
             .unwrap();
         let got = browser
@@ -6078,6 +6114,19 @@ async fn durable_chat_goals_stay_compact_safe_and_navigable() {
             talks.put(&mut chat).unwrap();
             browser
                 .eval(&page, &format!("deck.loadTalk({:?})", chat.id))
+                .await
+                .unwrap();
+            // Core and sections are fetched independently. Inspect the link
+            // only when both describe this exact saved reference list.
+            browser
+                .wait_for(
+                    &page,
+                    &format!(
+                        "(() => {{ const talk = deck.state.talkDetail.talk; return talk?.updated_at === {:?} && talk.goal_link_for === talk.updated_at; }})()",
+                        chat.updated_at.to_string()
+                    ),
+                    Duration::from_secs(30),
+                )
                 .await
                 .unwrap();
             let expected =
@@ -6187,6 +6236,7 @@ async fn durable_chat_goals_stay_compact_safe_and_navigable() {
         );
         browser.close_page(&page).await;
     }
+}
 }
 
 #[tokio::test]

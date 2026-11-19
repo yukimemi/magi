@@ -328,14 +328,17 @@ async fn execute(
     crate::chat_goal::fence(talks, talk, &crate::chat_goal::current_source())?;
     admit_goal_operation(queue, home, talks, talk, &operation)?;
     Ok(match operation {
-        Operation::Goal { command } => crate::chat_goal::apply(
-            queue,
-            home,
-            talks,
-            talk,
-            &crate::chat_goal::current_source(),
-            command,
-        )?,
+        Operation::Goal { command } => {
+            crate::chat_goal::apply(
+                queue,
+                home,
+                talks,
+                talk,
+                &crate::chat_goal::current_source(),
+                command,
+            )
+            .await?
+        }
         Operation::Reassign { task, repo } => {
             let cwd = &talks.get(talk)?.repo;
             let task = crate::task_reassign::reassign(
@@ -436,11 +439,15 @@ async fn execute(
             serde_json::to_string(&task)?
         }
         Operation::Done { task } => {
-            let t = done(queue, home, &task)?;
+            let t = done_claimed(queue, home, claimed_for_chat(queue, &task, talks, talk)?)?;
             format!("done {} {}", t.short(), t.title)
         }
         Operation::Priority { task, priority } => {
-            let t = set_priority(queue, &task, priority)?;
+            let t = priority_claimed(
+                queue,
+                claimed_for_chat(queue, &task, talks, talk)?,
+                priority,
+            )?;
             format!("{} priority now {} - {}", t.short(), t.priority, t.title)
         }
         Operation::MergePr {
@@ -510,14 +517,25 @@ async fn execute(
                 describe(&t, "resume queued for")
             )
         }
-        Operation::Hold { task, reason } => describe(&hold(queue, &task, &reason)?, "held"),
-        Operation::Release { task } => describe(&release(queue, &task)?, "released"),
+        Operation::Hold { task, reason } => describe(
+            &hold_claimed(queue, claimed_for_chat(queue, &task, talks, talk)?, &reason)?,
+            "held",
+        ),
+        Operation::Release { task } => describe(
+            &release_claimed(queue, claimed_for_chat(queue, &task, talks, talk)?)?,
+            "released",
+        ),
         Operation::Retry {
             task,
             title,
             instruction,
         } => describe(
-            &retry(queue, &task, title, &instruction)?,
+            &retry_claimed(
+                queue,
+                claimed_for_chat(queue, &task, talks, talk)?,
+                title,
+                &instruction,
+            )?,
             "retry queued for",
         ),
         Operation::RerunChecks {
@@ -596,7 +614,8 @@ fn admit_goal_operation(
     talk_id: &str,
     operation: &Operation,
 ) -> Result<()> {
-    let crate::chat_goal::Source::Goal { id, .. } = crate::chat_goal::current_source() else {
+    let crate::chat_goal::Source::Goal { id, generation } = crate::chat_goal::current_source()
+    else {
         return Ok(());
     };
     let talk = talks.get(talk_id)?;
@@ -605,32 +624,38 @@ fn admit_goal_operation(
         .iter()
         .find(|goal| goal.id == id)
         .context("unknown goal")?;
+    goal.admit(generation)?;
+    let repo = goal.effective_repo(&talk.repo);
     let task_allowed = |reference: &str| -> Result<()> {
         let id = queue.resolve_id(reference)?;
         ensure!(
             goal.tasks.contains(&id),
             "effect targets a task outside this goal"
         );
+        crate::chat_goal::task_record(queue, &id, repo)?;
         Ok(())
     };
     let run_allowed = |run: &str| -> Result<()> {
         ensure!(
             goal.runs.iter().any(|id| id == run)
-                || goal.tasks.iter().any(|id| queue
-                    .get(id)
-                    .is_ok_and(|task| task.runs.iter().any(|id| id == run))),
+                || goal
+                    .tasks
+                    .iter()
+                    .any(|id| crate::chat_goal::task_record(queue, id, repo)
+                        .is_ok_and(|task| task.execution_runs().iter().any(|id| id == run))),
             "effect targets an execution outside this goal"
         );
+        crate::chat_goal::run_record(home, run, repo)?;
         Ok(())
     };
     match operation {
         Operation::Goal { .. } => {}
         Operation::Add { filing } => {
+            crate::chat_goal::require_repo("filing", talk_id, &filing.repo, repo)?;
             ensure!(
-                filing.repo == talk.repo
-                    && matches!(&filing.source, crate::queue::Source::Agent { run, node }
+                matches!(&filing.source, crate::queue::Source::Agent { run, node }
                     if run == talk_id && node == crate::queue::CHAT_NODE),
-                "goal filing must retain this conversation's repository and provenance"
+                "goal filing must retain this conversation's provenance"
             );
         }
         Operation::Done { task }
@@ -654,7 +679,12 @@ fn admit_goal_operation(
         Operation::ForDecision { inquiry, .. }
         | Operation::ReconcileDecision { inquiry }
         | Operation::SettleDecision { inquiry, .. } => {
-            task_allowed(&crate::task_inquiry::Outbox::at(home).get(inquiry)?.task)?;
+            let record = crate::task_inquiry::Outbox::at(home).get(inquiry)?;
+            crate::chat_goal::require_repo("inquiry", inquiry, &record.repo, repo)?;
+            task_allowed(&record.task)?;
+            if let Some(run) = record.run {
+                run_allowed(&run)?;
+            }
         }
         Operation::Decide { question, .. }
         | Operation::Answer { question, .. }
@@ -667,11 +697,13 @@ fn admit_goal_operation(
                 run_allowed(&question.run)?;
             }
         }
-        Operation::MergePr { repo, number, .. } => {
-            let expected = format!("https://github.com/{repo}/pull/{number}");
+        Operation::MergePr {
+            repo: slug, number, ..
+        } => {
+            let expected = format!("https://github.com/{slug}/pull/{number}");
             let mut found = false;
             let mut inspect = |run: &str| -> Result<()> {
-                let state = crate::run::RunState::load_under(run, home)?;
+                let state = crate::chat_goal::run_record(home, run, repo)?;
                 found |= state
                     .pr
                     .as_ref()
@@ -682,7 +714,7 @@ fn admit_goal_operation(
                 inspect(run)?;
             }
             for task in &goal.tasks {
-                for run in &queue.get(task)?.runs {
+                for run in crate::chat_goal::task_record(queue, task, repo)?.execution_runs() {
                     inspect(run)?;
                 }
             }
@@ -706,6 +738,7 @@ async fn execute_decision(
     command: Operation,
 ) -> Result<String> {
     use crate::task_decision::Status;
+    admit_goal_operation(queue, home, talks, chat, &command)?;
     let outbox = crate::task_inquiry::Outbox::at(home);
     let _execution = outbox.execution_claim(id)?;
     let inquiry = outbox.get(id)?;
@@ -767,13 +800,17 @@ async fn execute_decision(
                 .or_else(|| task.runs.last())
                 .context("task has no execution for this merge")?;
             let state = crate::run::RunState::load_under(run, home)?;
+            ensure!(state.id == *run, "merge run identity changed");
+            ensure!(
+                crate::git::same_checkout(&state.repo, &task.repo)?,
+                "merge targets another repository"
+            );
             let expected = format!("https://github.com/{repo}/pull/{number}");
             ensure!(
-                state.repo == task.repo
-                    && state
-                        .pr
-                        .as_ref()
-                        .is_some_and(|pr| pr.url.eq_ignore_ascii_case(&expected)),
+                state
+                    .pr
+                    .as_ref()
+                    .is_some_and(|pr| pr.url.eq_ignore_ascii_case(&expected)),
                 "merge targets another task or repository"
             );
         }
@@ -867,7 +904,10 @@ async fn execute_decision(
         };
         outbox.update_decision(id, |d| d.accept(&request))?;
     }
-    if decision.request.is_some()
+    let late_admission = crate::chat_goal::fence(talks, chat, &crate::chat_goal::current_source())
+        .and_then(|()| admit_goal_operation(queue, home, talks, chat, &command));
+    if late_admission.is_ok()
+        && decision.request.is_some()
         && matches!(decision.status, Status::InProgress | Status::RetryNeeded)
     {
         if decision.retry_safe {
@@ -886,19 +926,33 @@ async fn execute_decision(
         }
         // The shared merge service only checks the forge once this exact
         // request has a receipt; it never issues the merge command twice.
-    } else {
+    } else if late_admission.is_ok() {
         outbox.update_decision(id, |d| d.start())?;
     }
-    crate::chat_goal::fence(talks, chat, &crate::chat_goal::current_source())?;
-    let local = apply_local_decision(
-        queue,
-        home,
-        id,
-        &request,
-        &inquiry.task,
-        &inquiry.repo,
-        &command,
-    );
+    let local = match late_admission {
+        // A refusal now says nothing about a prior attempt that may have acted.
+        Err(error)
+            if decision.request.is_some()
+                && !decision.retry_safe
+                && (matches!(decision.status, Status::InProgress | Status::RetryNeeded)
+                    || decision
+                        .history
+                        .iter()
+                        .any(|event| event.status == Status::InProgress)) =>
+        {
+            return Err(error);
+        }
+        Err(error) => Err(anyhow::Error::new(BeforeEffect(error))),
+        Ok(()) => apply_local_decision(
+            queue,
+            home,
+            id,
+            &request,
+            &inquiry.task,
+            &inquiry.repo,
+            &command,
+        ),
+    };
     let result = if let Err(error) = local {
         Err(error)
     } else if let Some(message) = local? {
@@ -1186,7 +1240,11 @@ pub(crate) fn resume_started(home: &Path, task: &Task, inquiry: &str, run: &str)
         "resume run ownership changed"
     );
     let state = crate::run::RunState::load_under(run, home)?;
-    ensure!(state.repo == task.repo, "resume run repository changed");
+    ensure!(state.id == run, "resume run identity changed");
+    ensure!(
+        crate::git::same_checkout(&state.repo, &task.repo)?,
+        "resume run repository changed"
+    );
     if task
         .superseded_resumes
         .get(inquiry)
@@ -1267,7 +1325,11 @@ fn abandonment_receipt(
         "abandon run ownership changed"
     );
     let state = crate::run::RunState::load_under(run, home)?;
-    ensure!(state.repo == task.repo, "abandon run repository changed");
+    ensure!(state.id == run, "abandon run identity changed");
+    ensure!(
+        crate::git::same_checkout(&state.repo, &task.repo)?,
+        "abandon run repository changed"
+    );
     Ok(state
         .abandonment_receipts
         .get(id)
@@ -1624,6 +1686,36 @@ fn claimed(queue: &Queue, reference: &str) -> Result<(crate::queue::Claim, Task)
     Ok((claim, task))
 }
 
+fn claimed_for_chat(
+    queue: &Queue,
+    reference: &str,
+    talks: &Talks,
+    chat: &str,
+) -> Result<(crate::queue::Claim, Task)> {
+    let claimed = claimed(queue, reference)?;
+    if let crate::chat_goal::Source::Goal { id, generation } = crate::chat_goal::current_source() {
+        let talk = talks.get(chat)?;
+        let goal = talk
+            .goals
+            .iter()
+            .find(|goal| goal.id == id)
+            .context("unknown goal")?;
+        goal.admit(generation)?;
+        let task = &claimed.1;
+        ensure!(
+            goal.tasks.contains(&task.id),
+            "effect targets a task outside this goal"
+        );
+        crate::chat_goal::require_repo(
+            "task",
+            &task.id,
+            &task.repo,
+            goal.effective_repo(&talk.repo),
+        )?;
+    }
+    Ok(claimed)
+}
+
 fn check_hold_release(task: &Task, operation: &str) -> Result<()> {
     match task.status {
         TaskStatus::Queued
@@ -1644,7 +1736,14 @@ fn check_hold_release(task: &Task, operation: &str) -> Result<()> {
 
 /// Mark a task complete under its queue claim, as `magi task done` does.
 pub fn done(queue: &Queue, home: &Path, reference: &str) -> Result<Task> {
-    let (_claim, mut task) = claimed(queue, reference)?;
+    done_claimed(queue, home, claimed(queue, reference)?)
+}
+
+fn done_claimed(
+    queue: &Queue,
+    home: &Path,
+    (_claim, mut task): (crate::queue::Claim, Task),
+) -> Result<Task> {
     task.succeed();
     // Manual completion also retires earlier attempts when the latest one landed.
     crate::daemon::supersede_prior_runs(&task, home);
@@ -1654,7 +1753,14 @@ pub fn done(queue: &Queue, home: &Path, reference: &str) -> Result<Task> {
 
 /// Change priority under the same claim and state check as the terminal route.
 pub fn set_priority(queue: &Queue, reference: &str, priority: i32) -> Result<Task> {
-    let (_claim, mut task) = claimed(queue, reference)?;
+    priority_claimed(queue, claimed(queue, reference)?, priority)
+}
+
+fn priority_claimed(
+    queue: &Queue,
+    (_claim, mut task): (crate::queue::Claim, Task),
+    priority: i32,
+) -> Result<Task> {
     task.set_priority(priority)?;
     queue.put(&mut task)?;
     Ok(task)
@@ -1662,7 +1768,14 @@ pub fn set_priority(queue: &Queue, reference: &str, priority: i32) -> Result<Tas
 
 /// Hold a task for the owner.
 pub fn hold(queue: &Queue, reference: &str, reason: &str) -> Result<Task> {
-    let (_claim, mut task) = claimed(queue, reference)?;
+    hold_claimed(queue, claimed(queue, reference)?, reason)
+}
+
+fn hold_claimed(
+    queue: &Queue,
+    (_claim, mut task): (crate::queue::Claim, Task),
+    reason: &str,
+) -> Result<Task> {
     check_hold_release(&task, "hold")?;
     let reason = reason.trim();
     task.hold_manual((!reason.is_empty()).then(|| reason.to_owned()));
@@ -1674,7 +1787,10 @@ pub fn hold(queue: &Queue, reference: &str, reason: &str) -> Result<Task> {
 /// count restarts, the history stays). An operator hold is released too: the
 /// owner asked for it.
 pub fn release(queue: &Queue, reference: &str) -> Result<Task> {
-    let (_claim, mut task) = claimed(queue, reference)?;
+    release_claimed(queue, claimed(queue, reference)?)
+}
+
+fn release_claimed(queue: &Queue, (_claim, mut task): (crate::queue::Claim, Task)) -> Result<Task> {
     check_hold_release(&task, "release")?;
     crate::base_sync_recovery::ensure_generic_release(queue, &task)?;
     let run = task.execution_runs().last().cloned();
@@ -1699,11 +1815,19 @@ pub fn retry(
     title: Option<String>,
     instruction: &str,
 ) -> Result<Task> {
+    retry_claimed(queue, claimed(queue, reference)?, title, instruction)
+}
+
+fn retry_claimed(
+    queue: &Queue,
+    (_claim, mut task): (crate::queue::Claim, Task),
+    title: Option<String>,
+    instruction: &str,
+) -> Result<Task> {
     ensure!(
         !instruction.trim().is_empty(),
         "the new instruction is empty"
     );
-    let (_claim, mut task) = claimed(queue, reference)?;
     if let Some(state) = crate::base_sync_recovery::held_run(queue, &task)
         && state
             .base_sync_recovery
@@ -1977,6 +2101,73 @@ mod tests {
         assert!(recovered.retry_safe);
     }
 
+    #[tokio::test]
+    async fn resume_receipt_matches_checkout_root_not_filing_directory() {
+        use crate::task_decision::Status;
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let repo = home.join("checkout");
+        let subdir = repo.join("src");
+        let foreign = home.join("foreign");
+        std::fs::create_dir_all(&subdir).unwrap();
+        std::fs::create_dir(&foreign).unwrap();
+        for checkout in [&repo, &foreign] {
+            crate::git::git(checkout, &["init", "-q"]).await.unwrap();
+        }
+        let queue = Queue::at(home.join("queue"));
+        let mut task = Task::new("work".into(), "work".into(), subdir, Source::Human);
+        let mut state = crate::run::RunState::new(
+            repo,
+            "main".into(),
+            "base".into(),
+            "work".into(),
+            crate::config::Config::default(),
+        );
+        state.reserve_under(home).unwrap();
+        task.runs.push(state.id.clone());
+        queue.put(&mut task).unwrap();
+        let outbox = crate::task_inquiry::Outbox::at(home);
+        let inquiry = outbox
+            .file(
+                &task,
+                Some(state.id.clone()),
+                "resume".into(),
+                "Resume?",
+                "",
+            )
+            .unwrap();
+        let request = serde_json::to_string(&Operation::Resume {
+            run: state.id.clone(),
+        })
+        .unwrap();
+        outbox
+            .update_decision(&inquiry.id, |d| {
+                d.accept(&request)?;
+                d.start()
+            })
+            .unwrap();
+        task.dispatched_resumes
+            .insert(inquiry.id.clone(), state.id.clone());
+        queue.put(&mut task).unwrap();
+        reconcile_decisions(&queue, home).unwrap();
+        assert_eq!(
+            outbox.get(&inquiry.id).unwrap().decision.unwrap().status,
+            Status::InProgress
+        );
+
+        state.carry_dispatched_resumes(&task);
+        state.begin_pass();
+        state.save_under(home).unwrap();
+        let mut reassigned = task.clone();
+        reassigned.repo = foreign;
+        assert!(resume_started(home, &reassigned, &inquiry.id, &state.id).is_err());
+        reconcile_decisions(&queue, home).unwrap();
+        assert_eq!(
+            outbox.get(&inquiry.id).unwrap().decision.unwrap().status,
+            Status::Resolved
+        );
+    }
+
     #[test]
     fn only_the_chat_seat_of_an_open_talk_is_authorized() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2170,6 +2361,9 @@ mod goal_admission_tests {
         let tmp = tempfile::tempdir().unwrap();
         let talks = Talks::at(tmp.path().join("talks"));
         let queue = Queue::at(tmp.path().join("queue"));
+        let target = tmp.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        crate::git::git(&target, &["init", "-q"]).await.unwrap();
         let mut talk = crate::talk::seeded_for_test("goal-effect", tmp.path().into());
         talk.turns.push(
             serde_json::from_value(serde_json::json!({
@@ -2182,7 +2376,7 @@ mod goal_admission_tests {
         let mut task = Task::new(
             "work".into(),
             "work".into(),
-            talk.repo.clone(),
+            target.clone(),
             crate::queue::Source::Agent {
                 run: talk.id.clone(),
                 node: crate::queue::CHAT_NODE.into(),
@@ -2192,7 +2386,7 @@ mod goal_admission_tests {
         let mut unrelated = Task::new(
             "other".into(),
             "other".into(),
-            talk.repo.clone(),
+            target.clone(),
             crate::queue::Source::Agent {
                 run: talk.id.clone(),
                 node: crate::queue::CHAT_NODE.into(),
@@ -2211,11 +2405,13 @@ mod goal_admission_tests {
                 scope: "This task only".into(),
                 condition: "Verified delivery".into(),
                 completion: crate::chat_goal::Completion::TasksDone,
+                repo: Some(target),
                 tasks: vec![task.id.clone()],
                 runs: vec![],
                 watches: vec![],
             },
         )
+        .await
         .unwrap();
         talks
             .mutate(&talk.id, |talk| {
@@ -2259,6 +2455,30 @@ mod goal_admission_tests {
         )
         .await
         .unwrap();
+        let hold = Operation::Hold {
+            task: task.id.clone(),
+            reason: "pause".into(),
+        };
+        crate::chat_goal::with_source(source.clone(), async {
+            // Reassignment publishes under this same claim, between the first
+            // admission and the mutation's claim acquisition.
+            admit_goal_operation(&queue, tmp.path(), &talks, &talk.id, &hold).unwrap();
+            let original = task.repo.clone();
+            {
+                let claim = queue.claim(&task.id).unwrap();
+                task = queue.get(&task.id).unwrap();
+                task.repo = talk.repo.clone();
+                queue.put(&mut task).unwrap();
+                drop(claim);
+            }
+            let result = claimed_for_chat(&queue, &task.id, &talks, &talk.id)
+                .and_then(|claimed| hold_claimed(&queue, claimed, "pause"));
+            assert!(result.unwrap_err().to_string().contains(&task.id));
+            assert_eq!(queue.get(&task.id).unwrap().status, TaskStatus::Queued);
+            task.repo = original;
+            queue.put(&mut task).unwrap();
+        })
+        .await;
         talks
             .mutate(&talk.id, |talk| {
                 talk.turns.push(serde_json::from_value(serde_json::json!({

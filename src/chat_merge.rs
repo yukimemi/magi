@@ -271,6 +271,18 @@ pub(crate) fn admit(home: &Path, talks: &Talks, talk: &str, action: &Request) ->
     action.validate()?;
     let target = target_lock(home, &action.url())?;
     let conversation = crate::chat_control::authorize(talks, talk, crate::queue::CHAT_NODE)?;
+    let repo = match crate::chat_goal::current_source() {
+        crate::chat_goal::Source::Goal { id, generation } => {
+            let goal = conversation
+                .goals
+                .iter()
+                .find(|goal| goal.id == id)
+                .context("unknown goal")?;
+            goal.admit(generation)?;
+            goal.effective_repo(&conversation.repo).to_path_buf()
+        }
+        _ => conversation.repo,
+    };
     let dir = home.join("chat-controls").join(talk);
     std::fs::create_dir_all(&dir)?;
     let request = request_lock(&dir, &action.request)?;
@@ -288,7 +300,7 @@ pub(crate) fn admit(home: &Path, talks: &Talks, talk: &str, action: &Request) ->
     Ok(Admission {
         _target: target,
         _request: request,
-        repo: conversation.repo,
+        repo,
         path,
         receipt,
     })

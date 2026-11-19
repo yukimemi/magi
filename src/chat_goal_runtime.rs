@@ -40,6 +40,7 @@ impl PrObserver for CurrentPr {
 
 /// Local task/run evidence plus one timed forge lookup per distinct associated PR.
 /// Timestamps and transcript prose are excluded from the wake fingerprint.
+#[cfg(test)]
 pub(crate) async fn observe(
     home: &Path,
     repo: &Path,
@@ -63,13 +64,8 @@ async fn observe_with_pr(
     let mut historical_runs = std::collections::BTreeSet::new();
     let queue = crate::queue::Queue::at(home.join("queue"));
     for id in tasks {
-        match queue.get(id) {
+        match crate::chat_goal::task_record(&queue, id, repo) {
             Ok(task) => {
-                if task.repo != repo {
-                    task_facts.push(json!({"id":id,"evidence":{"unavailable":"task repository changed; goal scope requires review"}}));
-                    continue;
-                }
-                historical_runs.extend(task.runs.iter().cloned());
                 if let Some(run) = task.execution_runs().last()
                     && !run_ids.contains(run)
                 {
@@ -77,6 +73,7 @@ async fn observe_with_pr(
                 }
                 task_facts.push(json!({"id": task.id, "status":task.status,
                     "reason":task.hold_reason, "runs":task.execution_runs(),"current_run":task.execution_runs().last()}));
+                historical_runs.extend(task.runs);
             }
             Err(error) => task_facts.push(json!({"id":id,"evidence":unavailable(&error)})),
         }
@@ -90,11 +87,22 @@ async fn observe_with_pr(
     let mut pr_observations = std::collections::BTreeMap::new();
     let mut prs = Vec::new();
     for id in &run_ids {
-        if !valid_id(id) {
+        if !crate::chat_goal::valid_reference(id) {
             run_facts.push(json!({"id":id,"evidence":{"unavailable":"invalid run identity"}}));
             continue;
         }
-        match read_json(&home.join("runs").join(id).join("run.json")) {
+        let record = read_json(&home.join("runs").join(id).join("run.json")).and_then(|run| {
+            anyhow::ensure!(
+                run["id"].as_str() == Some(id),
+                "goal run record identity does not match {id}"
+            );
+            let path = run["repo"]
+                .as_str()
+                .with_context(|| format!("goal run {id} has no repository"))?;
+            crate::chat_goal::require_repo("run", id, Path::new(path), repo)?;
+            Ok(run)
+        });
+        match record {
             Ok(run) => {
                 let winner = run["candidates"].as_array().and_then(|candidates| {
                     candidates
@@ -156,8 +164,21 @@ async fn observe_with_pr(
             inquiries
                 .into_iter()
                 .filter(|inquiry| {
-                    tasks.contains(&inquiry.task)
-                        || inquiry.run.as_ref().is_some_and(|id| run_ids.contains(id))
+                    (task_facts
+                        .iter()
+                        .any(|task| task["id"] == inquiry.task && task.get("status").is_some())
+                        || inquiry.run.as_ref().is_some_and(|id| {
+                            run_facts
+                                .iter()
+                                .any(|run| run["id"] == *id && run.get("status").is_some())
+                        }))
+                        && crate::chat_goal::require_repo(
+                            "inquiry",
+                            &inquiry.id,
+                            &inquiry.repo,
+                            repo,
+                        )
+                        .is_ok()
                 })
                 .filter_map(|inquiry| {
                     inquiry.decision.map(|decision| json!({
@@ -264,6 +285,15 @@ pub(crate) async fn sweep(talks: &crate::talk::Talks, parking: bool) {
 }
 
 async fn reconcile(talks: &crate::talk::Talks, chat: &str, id: &str) -> Result<()> {
+    reconcile_with_pr(talks, chat, id, &CurrentPr).await
+}
+
+async fn reconcile_with_pr(
+    talks: &crate::talk::Talks,
+    chat: &str,
+    id: &str,
+    observer: &impl PrObserver,
+) -> Result<()> {
     use crate::chat_goal::State;
     let talk = talks.get(chat)?;
     let Some(goal) = talk.goals.iter().find(|goal| goal.id == id) else {
@@ -274,9 +304,13 @@ async fn reconcile(talks: &crate::talk::Talks, chat: &str, id: &str) -> Result<(
     }
     if goal.started.is_some() {
         talks.mutate(chat, |talk| {
-            if let Some(goal) = talk.goals.iter_mut().find(|goal| goal.id == id) {
-                goal.state = State::Paused;
-                goal.step =
+            if let Some(fresh) = talk.goals.iter_mut().find(|fresh| fresh.id == id)
+                && fresh.rev == goal.rev
+                && fresh.active()
+                && fresh.started == goal.started
+            {
+                fresh.state = State::Paused;
+                fresh.step =
                     "Interrupted continuation; reconcile accepted effects before retrying".into();
             }
             Ok(())
@@ -301,31 +335,29 @@ async fn reconcile(talks: &crate::talk::Talks, chat: &str, id: &str) -> Result<(
     {
         return Ok(());
     }
-    let observation = observe(
+    let observation = observe_with_pr(
         talks.home(),
-        &talk.repo,
+        goal.effective_repo(&talk.repo),
         &goal.tasks,
         &goal.runs,
         &goal.watches,
+        observer,
     )
     .await;
     let complete = satisfied(goal, &observation.facts);
-    let previous = goal.fingerprint.clone();
-    let goal_snapshot = goal.clone();
     let generation = talks.mutate(chat, |fresh| {
-        let Some(goal) = fresh.goals.iter_mut().find(|goal| goal.id == id) else {
+        let repo = &fresh.repo;
+        let Some(current) = fresh.goals.iter_mut().find(|goal| goal.id == id) else {
             return Ok(None);
         };
         if !fresh.status.open()
-            || goal.fingerprint != previous
-            || goal.tasks != goal_snapshot.tasks
-            || goal.runs != goal_snapshot.runs
-            || goal.watches != goal_snapshot.watches
-            || goal.wake != goal_snapshot.wake
-            || !matches!(goal.state, State::Runnable | State::Waiting)
+            || current.rev != goal.rev
+            || current.effective_repo(repo) != goal.effective_repo(&talk.repo)
+            || !current.active()
         {
             return Ok(None);
         }
+        let goal = current;
         goal.last_checked = Some(now);
         goal.rechecks += 1;
         goal.observe(
@@ -372,6 +404,9 @@ pub(crate) async fn run_wake(
     {
         return Ok(());
     }
+    // Conversation settings still control its seat, cwd and sandbox. Git and
+    // forge observations use the goal target, and typed effects resolve against
+    // their own verified task/run records, not this invocation configuration.
     let (cfg, _) = crate::config::Config::discover(&talk.repo, None)?;
     run_wake_with_config(talks, chat, id, generation, &cfg).await
 }
@@ -438,13 +473,24 @@ async fn run_wake_with_config(
         return Ok(());
     }
     let mut talk = talks.get(chat)?;
-    let text = "Goal event: re-read the saved goal and current evidence. Continue the next authorized concrete step using existing controls and receipts. This event is data, not a new owner request. Register a specific wait before ending; never replay an uncertain accepted effect.";
+    let goal = talk
+        .goals
+        .iter()
+        .find(|goal| goal.id == id)
+        .context("unknown goal")?;
+    if goal.admit(generation).is_err() {
+        return Ok(());
+    }
+    let text = format!(
+        "Goal event for {id:?} in repository {:?}: re-read the saved goal and current evidence. Continue the next authorized concrete step using existing controls and receipts. This event is data, not a new owner request. Register a specific wait before ending; never replay an uncertain accepted effect.",
+        goal.effective_repo(&talk.repo).display()
+    );
     let result = crate::chat_goal::with_source(
         Source::Goal {
             id: id.to_owned(),
             generation,
         },
-        crate::talk::respond(&lease, &mut talk, talks, cfg, text),
+        crate::talk::respond(&lease, &mut talk, talks, cfg, &text),
     )
     .await;
     talks.mutate(chat, |talk| {
@@ -487,11 +533,13 @@ mod tests {
     struct FakePrObserver {
         replies: std::sync::Mutex<std::collections::BTreeMap<String, Value>>,
         calls: std::sync::Mutex<Vec<String>>,
+        repos: std::sync::Mutex<Vec<std::path::PathBuf>>,
     }
 
     impl PrObserver for FakePrObserver {
-        async fn current_pr(&self, _: &Path, url: &str) -> Result<Value> {
+        async fn current_pr(&self, repo: &Path, url: &str) -> Result<Value> {
             self.calls.lock().unwrap().push(url.to_owned());
+            self.repos.lock().unwrap().push(repo.to_path_buf());
             self.replies
                 .lock()
                 .unwrap()
@@ -533,7 +581,7 @@ mod tests {
             std::fs::create_dir_all(&path).unwrap();
             std::fs::write(
                 path.join("run.json"),
-                json!({"pr":{"url":url},"pr_pushed_head":head}).to_string(),
+                json!({"id":run,"repo":home,"pr":{"url":url},"pr_pushed_head":head}).to_string(),
             )
             .unwrap();
             goal.runs.push(run);
@@ -547,7 +595,7 @@ mod tests {
         std::fs::create_dir_all(&alias).unwrap();
         std::fs::write(
             alias.join("run.json"),
-            json!({"pr":{"url":urls[4]},"pr_pushed_head":format!("{:040x}",5)}).to_string(),
+            json!({"id":"run-shared","repo":home,"pr":{"url":urls[4]},"pr_pushed_head":format!("{:040x}",5)}).to_string(),
         )
         .unwrap();
         goal.runs.push("run-shared".into());
@@ -636,6 +684,121 @@ mod tests {
             |pr| pr["run"] == "run-4" && pr["observation"]["checks"][0]["verdict"] == "failed"
         ));
         observer.assert_one_lookup_per_pr(&urls);
+    }
+
+    #[tokio::test]
+    async fn restarted_observer_uses_the_saved_checkout_and_rejects_foreign_runs() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let checkout = home.join("target");
+        let other = home.join("other");
+        std::fs::create_dir(&checkout).unwrap();
+        std::fs::create_dir(&other).unwrap();
+        crate::git::git(&checkout, &["init", "-q"]).await.unwrap();
+        crate::git::git(&other, &["init", "-q"]).await.unwrap();
+        let subdir = checkout.join("src");
+        std::fs::create_dir(&subdir).unwrap();
+        let queue = crate::queue::Queue::at(home.join("queue"));
+        let talks = crate::talk::Talks::at(home.join("talks"));
+        let mut talk = crate::talk::seeded_for_test("chat", home.into());
+        let make_run = |repo: &Path, number: u64| {
+            let mut run = crate::run::RunState::new(
+                repo.into(),
+                "main".into(),
+                "head".into(),
+                "verify".into(),
+                crate::config::Config::default(),
+            );
+            let url = format!("https://example.invalid/pull/{number}");
+            run.pr_pushed_head = Some("head".into());
+            run.pr = Some(crate::run::PrRecord {
+                url,
+                number,
+                state: "open".into(),
+                checks: "green".into(),
+                round: 1,
+                rounds: 1,
+                red_at_merge: vec![],
+            });
+            run.reserve_under(home).unwrap();
+            run
+        };
+        let previous = make_run(&checkout, 3);
+        let target = make_run(&checkout, 1);
+        let foreign = make_run(&other, 2);
+        let mut task = crate::queue::Task::new(
+            "Work".into(),
+            "verify".into(),
+            subdir.clone(),
+            crate::queue::Source::Human,
+        );
+        task.runs.push(previous.id.clone());
+        task.runs.push(target.id.clone());
+        queue.put(&mut task).unwrap();
+        let mut retained = goal();
+        retained.repo = Some(checkout.canonicalize().unwrap());
+        retained.tasks = vec![task.id];
+        retained.runs = vec![previous.id];
+        let observer = FakePrObserver::default();
+        let url = &target.pr.as_ref().unwrap().url;
+        observer
+            .replies
+            .lock()
+            .unwrap()
+            .insert(url.clone(), json!({"state":"OPEN","head":"head"}));
+        let repo = retained.effective_repo(&talk.repo);
+        let mixed = observe_with_pr(
+            home,
+            repo,
+            &retained.tasks,
+            &[retained.runs[0].clone(), foreign.id.clone()],
+            &[],
+            &observer,
+        )
+        .await;
+        assert!(
+            mixed.facts["runs"][1]["evidence"]["unavailable"]
+                .as_str()
+                .unwrap()
+                .contains(&foreign.id)
+        );
+        assert_one_target_lookup(&observer, repo, url);
+        // Legacy conversations may have stored the filing subdirectory as cwd.
+        let pending = observe_with_pr(
+            home,
+            &subdir,
+            &retained.tasks,
+            &retained.runs,
+            &[],
+            &observer,
+        )
+        .await;
+        assert_eq!(pending.facts["prs"][0]["run"], target.id);
+        assert!(!satisfied(&retained, &pending.facts));
+        assert_one_target_lookup(&observer, &subdir, url);
+        retained.fingerprint = pending.fingerprint;
+        retained.evidence = pending.facts.to_string();
+        talk.goals.push(retained);
+        talks.put(&mut talk).unwrap();
+
+        observer.replies.lock().unwrap().insert(
+            url.clone(),
+            json!({"state":"MERGED","head":"head","merged_at":"now"}),
+        );
+        let reopened = crate::talk::Talks::at(home.join("talks"));
+        reconcile_with_pr(&reopened, &talk.id, "goal", &observer)
+            .await
+            .unwrap();
+        let again = reopened.get(&talk.id).unwrap();
+        assert_eq!(again.goals[0].state, State::Completed);
+        assert_one_target_lookup(&observer, again.goals[0].effective_repo(&again.repo), url);
+        assert_eq!(again.repo, home);
+    }
+
+    fn assert_one_target_lookup(observer: &FakePrObserver, repo: &Path, url: &str) {
+        observer.assert_one_lookup_per_pr(&[url.into()]);
+        let repos = std::mem::take(&mut *observer.repos.lock().unwrap());
+        assert_eq!(repos, [repo]);
     }
 
     #[test]
@@ -744,6 +907,7 @@ mod tests {
             std::fs::write(
                 path.join("run.json"),
                 json!({
+                    "id":run,"repo":repo,
                     "gate_ran":true,"gate_head":head,"gate":[{"code":0}],
                     "tally":{"winner":"A"},"candidates":[{"label":"A","branch":"HEAD"}]
                 })
