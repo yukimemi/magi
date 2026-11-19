@@ -11605,8 +11605,13 @@ mod tests {
             let (mut opts, queue, _, home, worktrees) = idle_loop(dir.path());
             opts.once = true;
             opts.poll = Duration::from_millis(1);
+            // This test exercises answer scheduling, not explicit discard:
+            // ordinary Done requires a completed retained execution.
+            let mut state = run_state(RunStatus::Ready);
+            state.reserve_under(&home).unwrap();
+            state.save_under(&home).unwrap();
             let mut task = task();
-            task.runs.push("fixture-run".into());
+            task.runs.push(state.id.clone());
             queue.put(&mut task).unwrap();
             let claim = queue.claim(&task.id).unwrap();
 
@@ -11662,7 +11667,7 @@ mod tests {
             // An answer arrives while the service still owns the claim. A
             // fresh scheduling pass must apply it before declaring idle.
             let questions = Questions::at(home.join("questions"));
-            let mut q = action_question("fixture-run", ask::ChoiceAction::Done);
+            let mut q = action_question(&state.id, ask::ChoiceAction::Done);
             questions.put(&mut q).unwrap();
             drop(claim);
             // Model services that took longer than their cadence, without a
@@ -14818,7 +14823,8 @@ mod tests {
         let queue = Queue::at(dir.path().join("queue"));
         let questions = Questions::at(dir.path().join("questions"));
         let home = dir.path().join("home");
-        let mut state = run_state(RunStatus::Blocked);
+        // Execution finished before task settlement; Done is not a discard.
+        let mut state = run_state(RunStatus::Ready);
         state.id = "20260101-000000-act4".to_owned();
         state.save_under(&home).unwrap();
         let mut t = held_task_with(&state.id);
