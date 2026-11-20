@@ -1932,6 +1932,25 @@ fn check_hold_release(task: &Task, operation: &str) -> Result<()> {
     }
 }
 
+/// Mark a task complete as a terminal caller, using the audited close transition.
+pub async fn done(
+    queue: &Queue,
+    home: &Path,
+    reference: &str,
+    reason: Option<String>,
+    discard: bool,
+) -> Result<Task> {
+    crate::task_completion::close(
+        queue,
+        home,
+        reference,
+        crate::queue::CompletionActor::Cli,
+        reason,
+        discard,
+    )
+    .await
+}
+
 /// Change priority under the same claim and state check as the terminal route.
 pub fn set_priority(queue: &Queue, reference: &str, priority: i32) -> Result<Task> {
     priority_claimed(queue, claimed(queue, reference)?, priority)
