@@ -819,6 +819,9 @@ pub(crate) fn check_queue_resumption(home: &Path, task: &Task, state: &RunState)
         "repair grant held: owner decision or task contract changed after acceptance"
     );
     if receipt.request.kind == Kind::BaseConflict {
+        if let Some(checkout) = &state.foreign_checkout {
+            checkout.inspect_retained(&state.repo)?;
+        }
         let imported = state
             .repair_grants
             .iter()

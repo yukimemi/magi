@@ -3429,6 +3429,29 @@ impl Queue {
         tasks
     }
 
+    /// Confirm the unique owner (including historical runs), without treating
+    /// an unreadable task or directory as proof of absence.
+    pub(crate) fn inspect_run_owner(&self, run: &str) -> Result<Option<Task>> {
+        let entries = match std::fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error).context("unknown: cannot read queue ownership"),
+        };
+        let mut owner = None;
+        for entry in entries {
+            let path = entry.context("unknown: cannot read queue entry")?.path();
+            if path.extension().is_some_and(|ext| ext == "json") {
+                let task =
+                    read_path(&path).context("unknown: cannot read task for queue ownership")?;
+                if task.runs.iter().any(|id| id == run) {
+                    anyhow::ensure!(owner.is_none(), "ambiguous run queue ownership");
+                    owner = Some(task);
+                }
+            }
+        }
+        Ok(owner)
+    }
+
     /// Task files [`Queue::list`] skips because they cannot be parsed (a
     /// newer schema, a torn write). A guard that looks a task up by scanning
     /// the list must treat any of these as "the task might be there".

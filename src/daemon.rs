@@ -1371,7 +1371,12 @@ async fn apply_maintenance_choices(queue: &Queue, questions: &Questions, home: &
                         record("started")?;
                         let decided = q.answered_at.unwrap_or(q.asked_at);
                         if !crate::resume::pin_queued(queue, run, Some(decided), Some(&q.id))? {
-                            crate::resume::validate_unqueued(home, run)?;
+                            anyhow::ensure!(
+                                queue.inspect_run_owner(run)?.is_none(),
+                                "run already has a queue owner"
+                            );
+                            let state = crate::resume::validate(home, run)?;
+                            crate::resume::inspect_ownerless(home, &state)?;
                             crate::resume::start(home, run.clone()).await?;
                         }
                     }

@@ -178,6 +178,10 @@ tip no longer blocks continuation, but the retained checkout must match the
 saved repaired HEAD. Execution revalidates the applicable evidence. A
 maintenance resume answer can resolve its own question blocker, but cannot
 bypass an independent dependency.
+When the run retains an operator checkout, that checkout must independently
+pass the same read-only validation used by the driver. A completed conflict
+repair with failed confirmation needs a separate grant for the remaining
+failure, not ordinary resume.
 A native resume decision refused before the queue write can be retried or
 settled; a failed queue write still has an uncertain result.
 Suppressing an unrelated recovery offer keeps existing cache and release holds
@@ -185,6 +189,9 @@ intact and records the refusal separately.
 Ordinary resume and movement-recovery offers both use the dispatcher's saved
 implementer check; restore a mismatched seat selection before requesting either.
 Diagnostic reads do not upgrade saved approval cards.
+An ownerless legacy run can receive a maintenance resume offer only when the
+queue can be read, neither task records nor the run name an owner, and no
+other work is active. An unreadable ownership record is not proof of absence.
 
 Chat refreshes current run evidence for task notices and decision messages.
 The latest review's recorded E2E commands and failure tails are reported with
@@ -194,6 +201,9 @@ was recorded without deferral. The `head_e2e` and `gate_repair_e2e` records
 carry their own target SHA and results separately from the review and final
 gate. Neither an older round nor a gate on another head stands in for a
 missing current result.
+Command evidence is capped at 24 entries per result, with failures shown
+first when capped. Totals include all recorded commands, failures and omitted
+entries; a matching head alone does not mean verification passed.
 
 ## Verification
 

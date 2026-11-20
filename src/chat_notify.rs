@@ -132,6 +132,7 @@ pub(crate) fn run_verification(
             "verified_at": r.verified_at, "e2e_deferred": r.e2e_deferred,
             "applies_to_target": applies_to_target,
             "recorded_e2e": command_evidence(&r.e2e),
+            "e2e_totals": command_totals(&r.e2e),
         })
     });
     let post_review = |record: &crate::run::GateRepairE2e| {
@@ -140,6 +141,7 @@ pub(crate) fn run_verification(
             "applies_to_target": bound(Some(&record.head)),
             "passed": record.passed,
             "recorded_e2e": command_evidence(&record.outcomes),
+            "e2e_totals": command_totals(&record.outcomes),
         })
     };
     json!({
@@ -149,15 +151,30 @@ pub(crate) fn run_verification(
         "gate_repair_e2e": state.gate_repair_e2e.as_ref().map(post_review),
         "gate": {"ran": state.gate_ran, "head": state.gate_head,
             "current_head_result": (state.gate_ran && bound(state.gate_head.as_deref()))
-                .then(|| command_evidence(&state.gate))}
+                .then(|| command_evidence(&state.gate)),
+            "current_head_totals": (state.gate_ran && bound(state.gate_head.as_deref()))
+                .then(|| command_totals(&state.gate))}
+    })
+}
+
+const COMMAND_EVIDENCE_LIMIT: usize = 24;
+
+fn command_totals(commands: &[crate::run::CommandOutcome]) -> serde_json::Value {
+    serde_json::json!({
+        "total": commands.len(),
+        "failed": commands.iter().filter(|cmd| !cmd.ok()).count(),
+        "omitted": commands.len().saturating_sub(COMMAND_EVIDENCE_LIMIT),
     })
 }
 
 fn command_evidence(commands: &[crate::run::CommandOutcome]) -> Vec<serde_json::Value> {
     let identity = crate::scrub::Identity::current();
+    let capped = commands.len() > COMMAND_EVIDENCE_LIMIT;
     commands
         .iter()
-        .take(24)
+        .filter(|cmd| !capped || !cmd.ok())
+        .chain(commands.iter().filter(|cmd| capped && cmd.ok()))
+        .take(COMMAND_EVIDENCE_LIMIT)
         .map(|cmd| {
             let failure = (!cmd.ok()).then(|| {
                 let tail = crate::scrub::scrub(&cmd.output_tail, &identity);
@@ -943,6 +960,28 @@ mod tests {
             {"round":2,"head":"new","verified_head":"new","verified_at":"2026-11-18T01:02:03Z","reviews":[],
              "e2e":[{"command":"e2e","code":1,"output_tail":"latest_preview_timeout"}]}
         ])).unwrap();
+        let mut capped = run.clone();
+        let round = capped.reviews.last_mut().unwrap();
+        for index in 0..COMMAND_EVIDENCE_LIMIT {
+            round.e2e.insert(
+                index,
+                serde_json::from_value(json!({
+                    "command": format!("pass {index}"), "code": 0
+                }))
+                .unwrap(),
+            );
+        }
+        let evidence = run_verification(&capped, Some("new"));
+        let latest = &evidence["latest_review"];
+        assert_eq!(
+            latest["e2e_totals"],
+            json!({"total":25,"failed":1,"omitted":1})
+        );
+        assert_eq!(latest["recorded_e2e"].as_array().unwrap().len(), 24);
+        assert_eq!(
+            latest["recorded_e2e"][0]["failure_tail"],
+            "latest_preview_timeout"
+        );
         run.gate_ran = true;
         run.gate_head = Some("old".into());
         run.gate = serde_json::from_value(json!([{"command":"gate","code":0}])).unwrap();

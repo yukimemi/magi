@@ -38,6 +38,10 @@ pub(crate) fn check_checkpoint(home: &Path, state: &crate::run::RunState) -> Res
 /// Shared by Web requests and owner choices without a queue owner.
 pub(crate) fn validate_unqueued(home: &Path, id: &str) -> Result<()> {
     validate(home, id)?;
+    check_unqueued_capacity(home)
+}
+
+fn check_unqueued_capacity(home: &Path) -> Result<()> {
     if let Some(work) = crate::daemon::current_work(home, jiff::Timestamp::now())
         .into_iter()
         .next()
@@ -49,6 +53,21 @@ pub(crate) fn validate_unqueued(home: &Path, id: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Maintenance may adopt only a confirmed ownerless legacy run.
+pub(crate) fn inspect_ownerless(home: &Path, state: &crate::run::RunState) -> Result<()> {
+    ensure!(
+        state
+            .origin
+            .as_ref()
+            .and_then(|o| o.task.as_ref())
+            .is_none(),
+        "unknown: the recorded task owner is missing; restore its queue record"
+    );
+    check_run(home, state, false)?;
+    require_known_driver(home, state)?;
+    check_unqueued_capacity(home)
 }
 
 /// Adopt a legacy ownerless run into the same claimed task-worker path as CLI
@@ -138,16 +157,24 @@ pub(crate) fn inspect_queued(
         state,
         crate::daemon::is_working_on(home, &state.id, jiff::Timestamp::now()),
     )?;
+    require_known_driver(home, state)?;
+    if let Some(reason) = crate::repair_budget::conflict_failure(task, state) {
+        anyhow::bail!(reason);
+    }
+    check_pending_movement(queue, task, state, true)?;
+    if !crate::repair_budget::check_queue_resumption(home, task, state)? {
+        crate::daemon::check_resume_implementers(task, state)?;
+    }
+    Ok(())
+}
+
+fn require_known_driver(home: &Path, state: &crate::run::RunState) -> Result<()> {
     if state.liveness_under(home, false) == crate::run::Liveness::Unknown {
         return Err(Unconfirmed(
             "driver liveness is unknown; inspect the retained execution lease and driver identity"
                 .into(),
         )
         .into());
-    }
-    check_pending_movement(queue, task, state, true)?;
-    if !crate::repair_budget::check_queue_resumption(home, task, state)? {
-        crate::daemon::check_resume_implementers(task, state)?;
     }
     Ok(())
 }

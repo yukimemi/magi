@@ -311,6 +311,9 @@ async fn conflict_execution_rechecks_tip_checkout_owner_and_head_before_consumpt
     assert!(RunState::load(&request.run).unwrap().repair_grants.is_empty());
     git_ok(&fx.repo, &["update-ref", "refs/remotes/origin/main", original_tip]).await;
     std::fs::write(fx.repo.join("README.md"), "owner work in progress\n").unwrap();
+    let dirty = inspect(&request).await;
+    assert_eq!(dirty["recovery"]["resume"]["status"], "refused", "{dirty}");
+    assert!(dirty["recovery"]["resume"]["reason"].as_str().unwrap().contains("checkout is dirty"), "{dirty}");
     let mut resumed = Runner::resume(&request.run).unwrap();
     assert!(resumed.execute().await.unwrap_err().to_string().contains("checkout is dirty"));
     std::fs::write(fx.repo.join("README.md"), "timeout = 7200\n").unwrap();
@@ -461,6 +464,9 @@ async fn explicit_followup_review_retains_selection_and_rejects_changed_scope() 
     let mut resumed = Runner::resume(&request.run).unwrap(); resumed.execute().await.unwrap();
     assert!(!resumed.state.repair_grants[0].succeeded);
     assert!(resumed.state.reviews.len() < resumed.state.config.graph.review_rounds);
+    let failed = inspect(&request).await;
+    assert_eq!(failed["recovery"]["resume"]["status"], "refused", "{failed}");
+    assert!(failed["recovery"]["resume"]["reason"].as_str().unwrap().contains("completed without clearing fresh review or verification"), "{failed}");
     let mut followup = request.clone();
     followup.kind = Kind::Review; followup.tip = None; followup.instruction = None;
     followup.request = "explicit-review-followup".into();

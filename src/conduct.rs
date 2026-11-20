@@ -724,20 +724,14 @@ fn check_resume_offer(queue: &Queue, task: &Task, run: &str, maintenance: bool) 
     anyhow::ensure!(crate::run::is_run_id(run), "resume needs an exact run ID");
     let home = queue.root().parent().context("queue home is unknown")?;
     let state = load_recovery_run(run, home)?;
-    if maintenance && !task.execution_runs().last().is_some_and(|id| id == run) {
-        let mut owners = queue
-            .list()
-            .into_iter()
-            .filter(|t| t.execution_runs().last().is_some_and(|id| id == run));
-        let owner = owners
-            .next()
-            .context("no verified queue owner for this maintenance resume")?;
-        anyhow::ensure!(owners.next().is_none(), "ambiguous run queue ownership");
-        crate::resume::inspect_queued(home, queue, &owner, &state)?;
+    if maintenance {
+        match queue.inspect_run_owner(run)? {
+            Some(owner) => crate::resume::inspect_queued(home, queue, &owner, &state),
+            None => crate::resume::inspect_ownerless(home, &state),
+        }
     } else {
-        crate::resume::inspect_queued(home, queue, task, &state)?;
+        crate::resume::inspect_queued(home, queue, task, &state)
     }
-    Ok(())
 }
 
 fn recovery_refusal(queue: &Queue, task: &Task, action: &ChoiceAction) -> Option<anyhow::Error> {
@@ -2094,6 +2088,40 @@ mod tests {
         assert!(questions.list().is_empty());
         assert_eq!(std::fs::read(queue.path_of(&task.id)).unwrap(), before);
         assert!(recovery_offer_notice(dir.path(), &task.id).contains(&state.id));
+    }
+
+    #[test]
+    fn recovery_offer_requires_proof_that_a_legacy_run_is_ownerless() {
+        let home = tempdir().unwrap();
+        let queue = Queue::at(home.path().join("queue"));
+        let questions = Questions::at(home.path().join("questions"));
+        let mut task = task("inspect a retained execution");
+        task.hold_machine(Some("needs investigation".into()));
+        queue.put(&mut task).unwrap();
+        let mut state = RunState::new(
+            task.repo.clone(),
+            "main".into(),
+            "base".into(),
+            task.instruction.clone(),
+            Config::default(),
+        );
+        state.status = crate::run::RunStatus::Blocked;
+        state.driver_exited = true;
+        state.save_under(home.path()).unwrap();
+        let verdict = maintenance_resume_verdict(&task, &state);
+        let broken = queue.root().join("unreadable.json");
+        std::fs::write(&broken, "{").unwrap();
+        apply(&queue, &questions, &verdict).unwrap();
+        assert!(questions.list().is_empty());
+        assert!(recovery_offer_notice(home.path(), &task.id).contains("unknown"));
+
+        std::fs::remove_file(broken).unwrap();
+        apply(&queue, &questions, &verdict).unwrap();
+        let question = questions.list().pop().expect("ownerless resume offer");
+        assert_eq!(
+            question.actions.get("resume"),
+            Some(&ChoiceAction::ResumeRun { run: state.id })
+        );
     }
 
     fn maintenance_resume_verdict(task: &Task, state: &RunState) -> Verdict {

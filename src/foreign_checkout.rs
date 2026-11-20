@@ -43,32 +43,38 @@ pub(crate) async fn inspect(repo: &Path, branch: &str, path: &Path) -> Result<Fo
 
 impl ForeignCheckout {
     pub(crate) async fn validate(&self, repo: &Path) -> Result<()> {
+        let checkout = self.clone();
+        let repo = repo.to_path_buf();
+        tokio::task::spawn_blocking(move || checkout.inspect_retained(&repo)).await?
+    }
+
+    pub(crate) fn inspect_retained(&self, repo: &Path) -> Result<()> {
+        let read_git = crate::graph::Runner::read_base_git;
+        let admin = read_git(&self.path, &["rev-parse", "--absolute-git-dir"])?;
         ensure!(
-            administration(&self.path).await? == self.git_dir,
+            std::fs::canonicalize(admin)? == self.git_dir,
             "checkout was replaced"
         );
         ensure!(
-            git::git(
+            read_git(
                 &self.path,
                 &[
-                    "--no-optional-locks",
                     "status",
                     "--porcelain",
                     "--untracked-files=all",
                     "--ignore-submodules=none"
-                ]
-            )
-            .await?
+                ],
+            )?
             .is_empty(),
             "checkout is dirty"
         );
         ensure!(
-            git::git(&self.path, &["symbolic-ref", "HEAD"]).await?
+            read_git(&self.path, &["symbolic-ref", "HEAD"])?
                 == format!("refs/heads/{}", self.branch),
             "checkout switched branches"
         );
-        let checkout_head = git::rev_parse(&self.path, "HEAD").await?;
-        let branch_head = git::rev_parse(repo, &format!("refs/heads/{}", self.branch)).await?;
+        let checkout_head = read_git(&self.path, &["rev-parse", "HEAD"])?;
+        let branch_head = read_git(repo, &["rev-parse", &format!("refs/heads/{}", self.branch)])?;
         ensure!(
             checkout_head == self.synced_head && branch_head == self.synced_head,
             "branch moved since the last synchronization (expected {}, checkout {}, branch {})",
@@ -89,7 +95,7 @@ impl ForeignCheckout {
             "BISECT_LOG",
         ] {
             ensure!(
-                !self.git_dir.join(name).exists(),
+                !self.git_dir.join(name).try_exists()?,
                 "checkout has a lock or Git operation in progress ({name})"
             );
         }
