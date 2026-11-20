@@ -5363,7 +5363,8 @@ async fn avatar_settings_preview_isolation_reload_and_reset_on_phone() {
         eprintln!("SKIP avatar settings: no Chrome");
         return;
     };
-    // Avatar storage does not need a Git repository or a remote config layer.
+    // Avatar storage is independent of Git. Load local settings without
+    // reading a remote-tracking ref on each catalog and preview request.
     let fixture = tempfile::tempdir().unwrap();
     let repo = fixture.path().join("settings-context");
     std::fs::create_dir(&repo).unwrap();
