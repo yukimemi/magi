@@ -252,7 +252,7 @@ async fn serve_with_client_probe(
             "state, loadRun, observeRunProgress, renderRunProgress, tickActive, applyRevisions_",
         ),
         ClientProbe::TalkScroll => Some("state, renderTalk, applyRoute, scheduleTalkPosition"),
-        ClientProbe::Goals => Some("state, loadTalk, renderTalkTasks"),
+        ClientProbe::Goals => Some("state, loadTalk, detailSections"),
         ClientProbe::Upgrade => {
             Some("state, upgrade, renderLoop, renderUpgradeError, loadHealth, ok")
         }
@@ -268,6 +268,17 @@ async fn serve_with_client_probe(
             scrollCalls.push({ behavior: options.behavior, id: deck.state.talkDetail.id });
           return nativeScrollIntoView.call(this, options);
         };"#
+    } else if matches!(probe, ClientProbe::Goals) {
+        // These pages drive refreshes explicitly to isolate the effects of one
+        // loadTalk from the independent revision stream. Keep the real stream
+        // open so the client doesn't switch to revision polling.
+        r#"if (new URLSearchParams(location.search).has('manual-goal-refresh')) {
+          window.EventSource = class extends EventSource {
+            addEventListener(type, ...args) {
+              if (type !== 'change') super.addEventListener(type, ...args);
+            }
+          };
+        }"#
     } else {
         ""
     };
@@ -5664,7 +5675,8 @@ async fn chat_task_progress_refreshes_and_survives_operation_races() {
             deck.state.talkDetail = {{ id: {id:?}, talk: null }};
             document.getElementById('view-talk').hidden = false;
             await deck.loadTalk({id:?});
-            await deck.loadHealth({{ applyRevisions: true }});
+            const health = await (await fetch('/api/health')).json();
+            await deck.applyRevisions_(health);
         }})()"#,
                     id = chat.id
                 ),
@@ -5713,15 +5725,17 @@ async fn chat_task_progress_refreshes_and_survives_operation_races() {
             task.status = TaskStatus::Done;
             queue.put(task).expect("done");
         }
-        // Queue changes alone must update the visible chat.
-        browser
-            .eval(&page, "deck.loadHealth({ applyRevisions: true })")
-            .await
-            .expect("queue refresh");
+        // Apply each monitor snapshot to completion. loadHealth deliberately
+        // leaves revision reads in the background; those reads must not spill
+        // into the request count for the next event.
         browser
             .wait_for(
                 &page,
-                "(async () => { await deck.loadHealth({ applyRevisions: true }); return document.getElementById('talk-task-progress').textContent.includes('all 7 complete'); })()",
+                r#"(async () => {
+                    const health = await (await fetch('/api/health')).json();
+                    await deck.applyRevisions_(health);
+                    return document.getElementById('talk-task-progress').textContent.includes('all 7 complete');
+                })()"#,
                 Duration::from_secs(10),
             )
             .await
@@ -6024,7 +6038,7 @@ printf 'Registered the cross-repository goal.\n'
         task.status = TaskStatus::Queued;
         queue.put(&mut task).unwrap();
         let page = browser
-            .open_page(&format!("{base}#/chat/{}", chat.id), width, height, mobile)
+            .open_page(&format!("{base}?manual-goal-refresh#/chat/{}", chat.id), width, height, mobile)
             .await
             .unwrap();
         browser
@@ -6073,56 +6087,84 @@ printf 'Registered the cross-repository goal.\n'
             )
             .await
             .unwrap();
-        browser.eval(&page, "history.back()").await.unwrap();
-        browser
-            .wait_for(
-                &page,
-                "deck.state.route.name === 'talk' && !!deck.state.talkDetail.sections",
-                Duration::from_secs(30),
-            )
-            .await
-            .unwrap();
-
-        // Change the durable selection, not a client-only fixture. Refreshing
-        // must neither overwrite the composer nor expand the task panel.
+        // Intercept before returning to Chat so the route's first sections
+        // read is held even if another refresh joins it.
+        browser.eval(&page, &format!(r#"(() => {{
+          const native = window.fetch;
+          const suffix = '/api/talks/' + {id:?} + '/sections';
+          const reads = window.goalReads = [];
+          window.fetch = async (...args) => {{
+            const response = await native(...args);
+            if (String(args[0]) === suffix && response.ok) {{
+              const {{goal_link_for, goal_link}} = await response.clone().json();
+              const talk = deck.state.talkDetail.talk;
+              const link = document.getElementById('talk-goal-open');
+              const read = {{version: goal_link_for, target: goal_link,
+                pending: talk?.selected_goal === 'run-goal' && talk.updated_at === goal_link_for
+                  && link.hidden && !link.hasAttribute('href')}};
+              reads.push(read);
+              if (reads.length === 1) {{
+                window.oldGoalSections = [...deck.detailSections.values()]
+                  .find(job => job.controller.signal === args[1].signal).promise;
+                await new Promise(resolve => window.releaseOldGoalSections = resolve);
+              }}
+            }}
+            return response;
+          }};
+          window.restoreGoalFetch = () => window.fetch = native;
+          history.back();
+        }})()"#, id = chat.id)).await.unwrap();
+        browser.wait_for(&page, "!!window.releaseOldGoalSections", Duration::from_secs(30)).await
+            .unwrap_or_else(|error| panic!("hold previous sections at {width}px: {error}"));
         chat.selected_goal = Some("run-goal".into());
         talks.put(&mut chat).unwrap();
-        browser
-            .eval(&page, &format!("deck.loadTalk({:?})", chat.id))
-            .await
-            .unwrap();
-        browser
-            .wait_for(
-                &page,
-                &format!(
-                    "document.getElementById('talk-goal-open').getAttribute('href') === {:?}",
-                    format!("#/runs/{}", run.id)
-                ),
-                Duration::from_secs(30),
-            )
-            .await
-            .unwrap();
+        let version = chat.updated_at.to_string();
+        let run_href = format!("#/runs/{}", run.id);
+        browser.eval(&page, &format!("void (window.newGoalRefresh = deck.loadTalk({:?}))", chat.id)).await.unwrap();
+        let applied = browser.wait_for(
+            &page,
+            &format!(r#"(() => {{
+              const talk = deck.state.talkDetail.talk;
+              if (talk?.selected_goal !== 'run-goal' || talk.updated_at !== {version:?}
+                  || talk.goal_link_for !== talk.updated_at) return false;
+              const link = document.getElementById('talk-goal-open');
+              if (link.hidden || link.getAttribute('href') !== {run_href:?})
+                throw new Error(`Matching sections rendered the wrong link: ${{link.getAttribute('href')}}`);
+              return true;
+            }})()"#),
+            Duration::from_secs(30),
+        ).await;
+        let before_release = browser.eval(&page, r#"(() => {
+          const {selected_goal, updated_at, goal_link_for} = deck.state.talkDetail.talk;
+          return {selected_goal, updated_at, goal_link_for, reads: window.goalReads,
+            href: document.getElementById('talk-goal-open').getAttribute('href')};
+        })()"#).await.unwrap();
+        browser.eval(&page, r#"(async () => {
+          window.releaseOldGoalSections();
+          await Promise.all([window.oldGoalSections, window.newGoalRefresh]);
+          window.restoreGoalFetch();
+        })()"#).await.unwrap();
+        applied.unwrap_or_else(|error| panic!("matching sections at {width}px: {error}; {before_release}"));
+        assert_eq!(before_release["reads"][0]["target"]["goal"], "queued-goal");
+        assert!(before_release["reads"].as_array().unwrap().iter().any(|read|
+            read["version"] == version && read["target"]["goal"] == "run-goal" && read["pending"] == true
+        ), "new core exposed a link before its sections at {width}px: {before_release}");
         let got = browser
             .eval(
                 &page,
                 &format!(
                     r##"(() => {{
           const link = document.getElementById('talk-goal-open');
-          const talk = deck.state.talkDetail.talk;
           const out = {{
             waiting: document.getElementById('talk-goal-state').textContent === 'Waiting',
-            run: link.getAttribute('href') === '#/runs/' + {run_id:?},
+            run: !link.hidden && link.getAttribute('href') === {run_href:?},
             draft: document.getElementById('f-talk-say').value === 'Keep this unsent draft',
             folded: !document.getElementById('talk-tasks-panel').open,
             guarded: document.getElementById('talk-close-go').disabled,
           }};
-          deck.renderTalkTasks({{...talk, updated_at: 'newer-core'}});
-          out.staleHidden = link.hidden && !link.hasAttribute('href');
-          deck.renderTalkTasks(talk);
           link.click();
           return out;
-        }})()"##,
-                    run_id = run.id
+        }})()"##
                 ),
             )
             .await
@@ -6133,14 +6175,16 @@ printf 'Registered the cross-repository goal.\n'
             "draft",
             "folded",
             "guarded",
-            "staleHidden",
         ] {
             assert_eq!(got[key], true, "{key} at {width}px: {got}");
         }
         browser
             .wait_for(
                 &page,
-                "deck.state.route.name === 'run' && !document.getElementById('view-run').hidden",
+                &format!(
+                    "deck.state.route.name === 'run' && deck.state.route.id === {:?} && !document.getElementById('view-run').hidden",
+                    run.id
+                ),
                 Duration::from_secs(30),
             )
             .await
@@ -6161,6 +6205,69 @@ printf 'Registered the cross-repository goal.\n'
                 .unwrap(),
             "Keep this unsent draft"
         );
+
+        // Let the first sections response match the core, then save a newer
+        // selection before the coalesced trailing request reaches the server.
+        browser.eval(&page, &format!(r#"(() => {{
+          const native = window.fetch;
+          const suffix = '/api/talks/' + {id:?} + '/sections';
+          let reads = 0;
+          window.fetch = async (...args) => {{
+            const talk = deck.state.talkDetail.talk;
+            if (String(args[0]) !== suffix || talk?.selected_goal !== 'queued-goal') return native(...args);
+            const core = talk.updated_at;
+            if (++reads === 1) {{
+              const response = await native(...args);
+              window.firstGoalSections = await response.clone().json();
+              window.firstGoalJob = [...deck.detailSections.values()]
+                .find(job => job.controller.signal === args[1].signal);
+              await new Promise(resolve => window.releaseFirstGoalSections = resolve);
+              return response;
+            }}
+            await new Promise(resolve => window.sendGoalSections = resolve);
+            const response = await native(...args);
+            const {{goal_link_for: sections, goal_link}} = await response.clone().json();
+            window.splitGoalRead = {{core, sections, goal: goal_link?.goal}};
+            return response;
+          }};
+          window.restoreGoalFetch = () => window.fetch = native;
+        }})()"#, id = chat.id)).await.unwrap();
+        chat.selected_goal = Some("queued-goal".into());
+        talks.put(&mut chat).unwrap();
+        let old_version = chat.updated_at.to_string();
+        let refresh = format!("deck.loadTalk({:?}, {{ background: true }})", chat.id);
+        browser.eval(&page, &format!("void (window.firstGoalRefresh = {refresh})")).await.unwrap();
+        browser.wait_for(&page, "!!window.releaseFirstGoalSections", Duration::from_secs(30)).await
+            .unwrap_or_else(|error| panic!("hold matching sections response at {width}px: {error}"));
+        browser.eval(&page, &format!("void (window.trailingGoalRefresh = {refresh})")).await.unwrap();
+        browser.wait_for(&page, "!!window.firstGoalJob.refresh", Duration::from_secs(30)).await
+            .unwrap_or_else(|error| panic!("join matching sections request at {width}px: {error}"));
+        browser.eval(&page, "window.releaseFirstGoalSections()").await.unwrap();
+        browser.wait_for(&page, "!!window.sendGoalSections", Duration::from_secs(30)).await
+            .unwrap_or_else(|error| panic!("hold trailing sections request at {width}px: {error}"));
+        chat.selected_goal = Some("direct-run-goal".into());
+        talks.put(&mut chat).unwrap();
+        let new_version = chat.updated_at.to_string();
+        let recovered = browser.eval(&page, r#"(async () => {
+          window.sendGoalSections();
+          try {
+            await Promise.all([window.firstGoalRefresh, window.trailingGoalRefresh]);
+            const talk = deck.state.talkDetail.talk;
+            const link = document.getElementById('talk-goal-open');
+            return {first: window.firstGoalSections.goal_link_for,
+              split: window.splitGoalRead, core: talk.updated_at, selection: talk.selected_goal,
+              linked: talk.goal_link_for, href: link.hidden ? null : link.getAttribute('href')};
+          } finally {
+            window.restoreGoalFetch();
+          }
+        })()"#).await.unwrap();
+        assert_eq!(recovered, serde_json::json!({
+            "first": old_version,
+            "split": {"core": old_version, "sections": new_version, "goal": "direct-run-goal"},
+            "core": new_version, "selection": "direct-run-goal",
+            "linked": new_version, "href": format!("#/runs/{}", direct_run.id)
+        }), "recover split trailing sections read at {width}px");
+        eprintln!("Recovered split goal reads at {width}px: {recovered}");
 
         // Only persisted references resolve links. Exercise each unsafe record
         // alone, then after an earlier valid direct reference.

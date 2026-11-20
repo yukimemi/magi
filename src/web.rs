@@ -16231,6 +16231,9 @@ mod tests {
             .with_worktrees_root(home.path().join("wt")),
         );
         let cfg = config_for(&repo).await.expect("discover config");
+        // Both waits guard against hangs, not slow filesystem or Git work on
+        // a loaded test host. The gates and lock polls assert the ordering.
+        let hang_guard = Duration::from_secs(30);
 
         for attempt in 0..3u32 {
             let talk = talk::begin(&talks, &cfg, repo.clone(), None).expect("begin talk");
@@ -16263,7 +16266,7 @@ mod tests {
             // than for any fixed number of polls of anything - a bounded
             // wait rather than a bare `.await` so a regression that never
             // reaches the gate fails the test instead of hanging it.
-            tokio::time::timeout(Duration::from_secs(5), reached_rx)
+            tokio::time::timeout(hang_guard, reached_rx)
                 .await
                 .unwrap_or_else(|_| {
                     panic!(
@@ -16326,11 +16329,13 @@ mod tests {
             // branch already spawned - unaffected by the handler's abort
             // above, since that task was independent of the handler's own
             // future from the moment it was spawned.
-            let _ = release_tx.send(());
+            release_tx.send(()).expect("busy queue write still gated");
             drop(
-                tokio::time::timeout(Duration::from_secs(5), closing)
+                tokio::time::timeout(hang_guard, closing)
                     .await
-                    .expect("short admission transaction should release for replacement"),
+                    .unwrap_or_else(|_| {
+                        panic!("attempt {attempt}: talk {id} did not release admission after the queue gate opened")
+                    }),
             );
             assert!(
                 crate::chat_worker::try_publication_guard(&talks, &id)
