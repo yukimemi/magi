@@ -2574,31 +2574,43 @@ async fn edit_pr_title(repo: &Path, url: &str, title: &str) -> Result<()> {
 /// separately, precisely because it cannot drive an automatic correction on
 /// its own (see that function's own doc).
 pub async fn find_external_merge(state: &RunState) -> Result<Option<ExternalMerge>> {
-    find_external_merge_with(state, false).await
+    let Some(winner) = state.winner() else {
+        return Ok(None);
+    };
+    find_external_merge_with(
+        state,
+        state.pr_head.as_deref().unwrap_or(&winner.branch),
+        false,
+    )
+    .await
 }
 
 /// Reopening needs proof of absence, not merely failure to identify one PR.
 pub(crate) async fn find_external_merge_for_reopen(
     state: &RunState,
 ) -> Result<Option<ExternalMerge>> {
-    find_external_merge_with(state, true).await
+    let Some(branch) = state.pr_branch() else {
+        anyhow::ensure!(
+            state.pr.is_none() && state.pr_pushed_head.is_none(),
+            "run has public PR evidence but no known branch to check"
+        );
+        return Ok(None);
+    };
+    find_external_merge_with(state, branch, true).await
 }
 
 async fn find_external_merge_with(
     state: &RunState,
+    branch: &str,
     reject_ambiguous: bool,
 ) -> Result<Option<ExternalMerge>> {
-    let Some(winner) = state.winner() else {
-        return Ok(None);
-    };
-    let branch = state.pr_branch().unwrap_or(&winner.branch).to_owned();
     let out = gh(
         &state.repo,
         &[
             "pr".to_owned(),
             "list".to_owned(),
             "--head".to_owned(),
-            branch.clone(),
+            branch.to_owned(),
             "--state".to_owned(),
             "merged".to_owned(),
             "--json".to_owned(),

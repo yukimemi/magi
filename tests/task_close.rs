@@ -53,6 +53,24 @@ async fn unfinished_work_requires_discard_and_records_evidence() {
     for evidence in ["--discard", &run.id, "blocked", "PR none", "branches"] {
         assert!(refusal.contains(evidence), "{refusal}");
     }
+    for reason in [None, Some(String::new()), Some(" \t\n".into())] {
+        let error = close(
+            &queue,
+            dir.path(),
+            &task.id,
+            CompletionActor::Cli,
+            reason,
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("--discard requires a non-empty reason"),
+            "{error:#}"
+        );
+    }
     let refused = queue.get(&task.id).unwrap();
     assert_eq!(refused.status, TaskStatus::Held);
     assert!(refused.completion_history.is_empty());
@@ -97,7 +115,7 @@ async fn reopening_is_held_reasoned_and_preserves_all_runs() {
         dir.path(),
         &task.id,
         CompletionActor::Web,
-        None,
+        Some("stop unfinished work".into()),
         true,
     )
     .await

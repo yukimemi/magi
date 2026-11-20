@@ -89,6 +89,14 @@ impl<'a> Assessment<'a> {
 }
 
 fn validate_discard(context: &CompletionContext) -> Result<()> {
+    ensure!(
+        !context.discard
+            || context
+                .reason
+                .as_deref()
+                .is_some_and(|reason| !reason.trim().is_empty()),
+        "--discard requires a non-empty reason"
+    );
     let assessment = Assessment::new(context);
     ensure!(
         context.discard || !assessment.unfinished(),
@@ -201,14 +209,8 @@ async fn guard_runs(
                 pr.url
             );
             pr.state = lifecycle.as_str().to_owned();
-        } else if reopening {
-            // A publication receipt may be missing after an interrupted save.
-            // A winning branch must therefore also be checked on the forge.
-            ensure!(
-                state.winner().is_some()
-                    || (state.pr_head.is_none() && state.pr_pushed_head.is_none()),
-                "cannot reopen: run {id} has public head evidence but its publication outcome is unknown"
-            );
+        }
+        if reopening {
             let merged = crate::land::find_external_merge_for_reopen(&state)
                 .await
                 .with_context(|| format!("run {id} public merge evidence is unknown"))?;
@@ -493,9 +495,15 @@ mod tests {
         queue.put(&mut task).unwrap();
         let claim = queue.claim(&task.id).unwrap();
         let expected = queue.get(&task.id).unwrap();
-        let (guards, context) = admit_close(&task, dir.path(), CompletionActor::Cli, None, true)
-            .await
-            .unwrap();
+        let (guards, context) = admit_close(
+            &task,
+            dir.path(),
+            CompletionActor::Cli,
+            Some("discard unfinished work".into()),
+            true,
+        )
+        .await
+        .unwrap();
         assert!(crate::pr_head::owner_lock(dir.path(), &run.id).is_err());
         assert!(crate::driver::maintenance(dir.path(), &run.id).is_err());
         task.succeed(context);
@@ -515,21 +523,39 @@ mod tests {
         std::fs::write(dir.path().join("runs").join(&run.id).join("run.json"), "{").unwrap();
         let owner = crate::pr_head::owner_lock(dir.path(), &run.id).unwrap();
         assert!(
-            admit_close(&task, dir.path(), CompletionActor::Cli, None, true)
-                .await
-                .is_err()
+            admit_close(
+                &task,
+                dir.path(),
+                CompletionActor::Cli,
+                Some("discard".into()),
+                true
+            )
+            .await
+            .is_err()
         );
         drop(owner);
         let execution = crate::driver::maintenance(dir.path(), &run.id).unwrap();
         assert!(
-            admit_close(&task, dir.path(), CompletionActor::Cli, None, true)
-                .await
-                .is_err()
+            admit_close(
+                &task,
+                dir.path(),
+                CompletionActor::Cli,
+                Some("discard".into()),
+                true
+            )
+            .await
+            .is_err()
         );
         drop(execution);
-        let (guards, context) = admit_close(&task, dir.path(), CompletionActor::Cli, None, true)
-            .await
-            .unwrap();
+        let (guards, context) = admit_close(
+            &task,
+            dir.path(),
+            CompletionActor::Cli,
+            Some("discard".into()),
+            true,
+        )
+        .await
+        .unwrap();
         assert!(
             context
                 .unavailable_runs
@@ -571,6 +597,7 @@ mod tests {
         let mut task = task();
         let mut run = retained(dir.path(), &mut task, RunStatus::Blocked);
         run.repo = dir.path().to_owned();
+        run.pr_head = Some("magi/task-replacement".into());
         run.pr = Some(crate::run::PrRecord {
             url: "https://example.invalid/pull/1".into(),
             number: 1,
@@ -615,6 +642,30 @@ mod tests {
             error.to_string().contains("merged on the forge"),
             "{error:#}"
         );
+        std::fs::write(
+            &gh,
+            r#"#!/bin/sh
+case "$2" in
+view) printf '%s\n' '{"state":"CLOSED"}' ;;
+list)
+    [ "$3" = '--head' ] && [ "$4" = 'magi/task-replacement' ] || exit 1
+    printf '%s\n' '[{"url":"https://example.invalid/pull/2","number":2,"mergedAt":"2099-01-01T00:00:00Z","baseRefName":"main"}]'
+    ;;
+*) exit 1 ;;
+esac
+"#,
+        )
+        .unwrap();
+        let error = reopen(&queue, dir.path(), &task.id, CompletionActor::Cli, "retry")
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("merged public PR https://example.invalid/pull/2"),
+            "{error:#}"
+        );
+        assert_eq!(queue.get(&task.id).unwrap().status, TaskStatus::Done);
         std::fs::write(
             &gh,
             "#!/bin/sh\nprintf '%s\\n' 'forge unavailable' >&2\nexit 1\n",

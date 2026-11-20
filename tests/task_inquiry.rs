@@ -1239,7 +1239,7 @@ async fn superseded_resume_pins_reconcile_without_starting_or_replaying() {
             assert_eq!(outbox.get(&second.id).unwrap().decision.unwrap().status, Status::Queued);
         } else {
             let operation = if transition == "done" {
-                Operation::Done { task: task.id.clone(), reason: None, discard: true }
+                Operation::Done { task: task.id.clone(), reason: Some("owner discarded work".into()), discard: true }
             } else {
                 Operation::Retry { task: task.id.clone(), title: None, instruction: "New instruction".into() }
             };

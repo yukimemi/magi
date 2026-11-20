@@ -18806,6 +18806,12 @@ mod tests {
         let path = format!("/api/queue/{}/done", task.id);
         let refused = f.post(&path, None).await;
         assert_eq!(refused.status, 400, "{}", refused.body);
+        let blank = f
+            .post(&path, Some(r#"{"discard":true,"reason":" "}"#))
+            .await;
+        assert_eq!(blank.status, 400, "{}", blank.body);
+        assert!(blank.body.contains("--discard requires a non-empty reason"));
+        assert_eq!(queue.get(&task.id).unwrap().status, TaskStatus::Queued);
         assert!(queue.get(&task.id).unwrap().completion_history.is_empty());
         let closed = f
             .post(

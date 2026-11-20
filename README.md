@@ -518,10 +518,10 @@ Use `magi task control reopen <ID> --reason "<text>"` or Web **Reopen to Held** 
 incorrectly closed, unlanded task. The reason is required. Reopening preserves
 history and leaves the task **Held**; inspect/edit it and explicitly Release
 when ready. It refuses any historical Ready, Merged or AlreadyInBase run, any
-merged PR (including ambiguous merged-PR matches), and unknown/unreadable run or forge state rather than guessing that
-work is safe to repeat. Chat-filed tasks receive a distinct notice for every
-completion occurrence, so reopening and closing again is not hidden by an
-earlier notice.
+merged PR (including a replacement PR from the same public branch), ambiguous
+merge matches, and unknown run or forge state. Chat-filed tasks receive a
+distinct notice for every completion occurrence, so reopening and closing again
+is not hidden by an earlier notice.
 Automatic goal turns cannot discard or reopen tasks; those operations require
 an explicit owner turn. Non-discard completion still checks the goal's task scope
 and the shared unfinished-work admission rules.
