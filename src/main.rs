@@ -4506,7 +4506,7 @@ async fn task_cmd_inner(command: TaskCmd, q: Queue) -> Result<()> {
             reason,
             discard,
         } => {
-            if std::env::var("MAGI_NODE").as_deref() == Ok(queue::CHAT_NODE) {
+            if chat_has_control_channel() {
                 println!(
                     "{}",
                     control_from_chat(magi::chat_control::Operation::Done {
@@ -4518,7 +4518,15 @@ async fn task_cmd_inner(command: TaskCmd, q: Queue) -> Result<()> {
                 );
                 return Ok(());
             }
-            let t = magi::chat_control::done(&q, &magi::run::home(), &id, reason, discard).await?;
+            let actor = match agent_env() {
+                Some((chat, node)) if node == queue::CHAT_NODE => {
+                    magi::queue::CompletionActor::Chat(chat)
+                }
+                _ => magi::queue::CompletionActor::Cli,
+            };
+            let t =
+                magi::task_completion::close(&q, &magi::run::home(), &id, actor, reason, discard)
+                    .await?;
             println!("{}", magi::task_completion::describe(&t));
             Ok(())
         }

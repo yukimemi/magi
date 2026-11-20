@@ -497,6 +497,11 @@ and pay for a fresh implement wave every time.
 `magi task done <ID> [--reason "<text>"]` and Web **Mark done** preserve the task
 and append an audit event: occurrence ID, actor (CLI, Web, chat, conductor or
 daemon settle), reason, prior task status and the latest run/PR snapshot.
+
+Without a chat control channel, `magi task done` records a supplied chat ID
+as actor provenance even if no conversation record exists. The ID does not
+authorize chat control operations.
+
 **Done is not proof of merge.** Closing an unfinished latest run requires
 `--discard --reason "<text>"` (or the Web discard confirmation and reason); this
 records an intentional closure, not a successful delivery. Web **Mark done**

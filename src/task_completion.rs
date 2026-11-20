@@ -262,10 +262,21 @@ pub async fn close(
     discard: bool,
 ) -> Result<Task> {
     let id = queue.resolve_id(reference)?;
-    let _claim = queue
+    let claim = queue
         .claim(&id)
         .context("task is claimed; wait for its driver to stop")?;
-    let mut task = queue.get(&id)?;
+    let task = queue.get(&id)?;
+    close_claimed(queue, home, (claim, task), actor, reason, discard).await
+}
+
+pub(crate) async fn close_claimed(
+    queue: &Queue,
+    home: &Path,
+    (_claim, mut task): (crate::queue::Claim, Task),
+    actor: CompletionActor,
+    reason: Option<String>,
+    discard: bool,
+) -> Result<Task> {
     if task.status == TaskStatus::Done {
         return Ok(task);
     }
@@ -313,20 +324,20 @@ pub async fn reopen(
     actor: CompletionActor,
     reason: &str,
 ) -> Result<Task> {
-    ensure!(
-        !reason.trim().is_empty(),
-        "reopen requires a non-empty reason"
-    );
     let id = queue.resolve_id(reference)?;
-    let _claim = queue
+    let claim = queue
         .claim(&id)
         .context("task is claimed; wait for its driver to stop")?;
-    let mut task = queue.get(&id)?;
-    ensure!(
-        task.status == TaskStatus::Done,
-        "only a done task can be reopened (currently {})",
-        task.status.as_str()
-    );
+    reopen_claimed(queue, home, (claim, queue.get(&id)?), actor, reason).await
+}
+
+pub(crate) async fn reopen_claimed(
+    queue: &Queue,
+    home: &Path,
+    (_claim, mut task): (crate::queue::Claim, Task),
+    actor: CompletionActor,
+    reason: &str,
+) -> Result<Task> {
     let expected = task.clone();
     let (_guards, context) = admit_reopen(&task, home, actor, reason).await?;
     task.reopen(context)?;
