@@ -1545,6 +1545,15 @@ the graph; it does not reset or extend a node's budget. Zero times out immediate
 `command` agents also receive `MAGI_SEAT`, `MAGI_TURN`, `MAGI_PROMPT_FILE` and
 `MAGI_ALLOW_WRITE` in the environment.
 
+New `kind = "omp"` sessions use a separate session directory per conversation
+under `$MAGI_HOME/agent-sessions/omp/`, not the operator's normal omp history.
+Use an omp release that supports `--session-dir`. Authentication, settings,
+models, extensions and tools still resolve normally. Existing sessions resume
+from their original history and remain visible there. Claude Code, Codex,
+OpenCode and Antigravity session storage is unchanged. See
+[omp session storage](docs/seat-write-scope.md#omp-session-storage) for backup
+and recovery considerations.
+
 ### External repository coordination
 
 Coordination is disabled unless `[coordination]` is configured in the machine

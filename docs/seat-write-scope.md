@@ -59,6 +59,52 @@ it for `--add-dir`, the child's `MAGI_HOME` is pinned to the granted store, and
 the access evidence records it. Repository coordination, `SeatLease` and process
 containment are unchanged.
 
+## omp session storage
+
+For `kind = "omp"`, `agent::invoke` reserves a directory under
+`$MAGI_HOME/agent-sessions/omp/<opaque-id>` for each new conversation and
+passes it via `--session-dir`. The directory name contains neither the run
+nor the seat name. New seats, including fallbacks, get separate lookup
+directories; disabling graph session reuse starts a fresh persistent
+conversation each turn. The same launch path applies to resumes, waiter
+continuations and detached workers. Only transcript storage and lookup
+change; magi does not redirect omp's profile, authentication, settings,
+provider/model configuration, extensions or tools.
+
+Managed launches have piped stdin and omit omp's terminal identity variables
+(including `WT_SESSION` and `TMUX_PANE`) from the child environment, even if
+set in the agent's `env`. This prevents omp from updating the operator's
+per-terminal `--continue` pointer (verified with omp 19.0.0 on Windows).
+It does not remove pointers written by older launches or redirect omp's
+own custom-session registration and maintenance metadata. If an older pointer
+still opens a magi conversation, select the operator's session explicitly with
+`omp --resume`.
+
+The saved seat pairs the absolute directory with the CLI-reported session
+ID. A managed resume uses that exact directory and `--resume <id>`, even
+when the current magi home differs. If omp reports a different ID, magi
+accepts it only when JSONL session headers in that directory link it back to
+the saved ID through `continuationOf`. An unavailable directory, an unproven
+ID, or a successful exit without ID confirmation fails without replacing the
+stored session. A timeout or failed exit without an ID keeps
+the saved pair and follows normal agent failure handling. Saved IDs without a
+directory still use the old invocation and lookup. If omp reports a new
+continuation ID for a legacy session, magi follows it without adding a
+directory binding. Those transcripts are not moved or copied and remain
+visible in the operator's normal history.
+
+Use a build that supports `--session-dir` (verified with omp 18.22.2).
+For new and managed sessions, remove any session storage, resume/import
+or persistence overrides from `extra_args` so magi can manage those options.
+There is no automatic cleanup or relocation: keep the saved absolute paths
+accessible when restoring from backup or moving `MAGI_HOME`. This is
+history separation, not filesystem access control.
+
+Claude Code, Codex, OpenCode and Antigravity retain their existing behavior.
+Their installed CLI help exposes resume controls, but no equivalent
+session-directory option was verified. Changing a whole CLI home or
+disabling persistence is not a substitute.
+
 ## Parent-owned review and verification
 
 Child seats in an existing run implement and commit their assigned changes and

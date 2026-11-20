@@ -30,6 +30,7 @@
 //! turn has completed and [`has_session`] answers honestly instead of
 //! optimistically.
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -58,8 +59,12 @@ pub struct SeatState {
     /// Claude session uuid, minted up front so the first turn and every resume
     /// agree on it without parsing anything back.
     pub claude_session: Option<String>,
-    /// Session id reported by a CLI that mints its own (`opencode`, `agy`).
+    /// Session id reported by a CLI that mints its own.
     pub captured_session: Option<String>,
+    /// Absolute directory paired with an isolated omp session id.
+    /// An existing omp id without this field uses legacy lookup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub omp_session_dir: Option<PathBuf>,
 }
 
 impl SeatState {
@@ -72,6 +77,7 @@ impl SeatState {
             turns: 0,
             claude_session: Some(rng.uuid_v4()),
             captured_session: None,
+            omp_session_dir: None,
         }
     }
 }
@@ -510,6 +516,16 @@ pub async fn invoke(
         .await
         .with_context(|| format!("write {}", prompt_path.display()))?;
 
+    let omp_session = if spec.kind == AgentKind::Omp {
+        Some(OmpSession::prepare(
+            spec,
+            seat,
+            inv.sessions,
+            crate::run::home,
+        )?)
+    } else {
+        None
+    };
     let plan = build_command(spec, seat, inv, &prompt_path)?;
     tracing::debug!(seat = %seat.key, agent = %spec.id, argv = ?plan.logged_argv(), "spawning agent");
     // Store scope evidence without environment values or arbitrary extra args.
@@ -542,7 +558,7 @@ pub async fn invoke(
         std::path::PathBuf::into_os_string,
     );
     let mut cmd = Command::new(program);
-    cmd.args(&plan.argv[1..])
+    cmd.args(plan.args(omp_session.as_ref().and_then(|session| session.dir(seat))))
         .current_dir(inv.cwd)
         .envs(&spec.env)
         .env("MAGI_SEAT", &seat.key)
@@ -563,6 +579,9 @@ pub async fn invoke(
         // No console window. `magi web` has no console of its own, so Windows
         // would give each agent a fresh one - and draw it. See `crate::proc`.
         .quiet();
+    if let Some(session) = &omp_session {
+        session.isolate_terminal_history(&mut cmd, seat);
+    }
     crate::incremental::default_environment(&mut cmd);
     if repository_writer(inv) {
         crate::incremental::configure(&mut cmd, inv.cwd)?;
@@ -741,13 +760,15 @@ pub async fn invoke(
             "agent needs machine-side recovery"
         );
     }
-    if let Some(session) = extracted.session {
+    if let Some(omp_session) = omp_session {
+        omp_session.record(seat, extracted.session, code == Some(0))?;
+    } else if let Some(session) = extracted.session {
         match spec.kind {
             AgentKind::Claude => seat.claude_session = Some(session),
-            AgentKind::Opencode | AgentKind::Antigravity | AgentKind::Codex | AgentKind::Omp => {
+            AgentKind::Opencode | AgentKind::Antigravity | AgentKind::Codex => {
                 seat.captured_session = Some(session);
             }
-            AgentKind::Command => {}
+            AgentKind::Command | AgentKind::Omp => {}
         }
     }
     if let Some(status) = &extracted.status
@@ -791,6 +812,182 @@ fn file_name(p: &Path) -> String {
         .into_owned()
 }
 
+enum OmpSession {
+    Fresh(PathBuf),
+    Resume,
+}
+
+impl OmpSession {
+    fn prepare(
+        spec: &AgentSpec,
+        seat: &SeatState,
+        sessions: bool,
+        home: impl FnOnce() -> PathBuf,
+    ) -> Result<Self> {
+        let resume = has_session(AgentKind::Omp, seat, sessions);
+        if resume && seat.omp_session_dir.is_none() {
+            // Preserve the old argv and config for sessions started before isolation.
+            return Ok(Self::Resume);
+        }
+        for arg in &spec.extra_args {
+            let flag = arg.split_once('=').map_or(arg.as_str(), |(flag, _)| flag);
+            if matches!(
+                flag,
+                "--session-dir"
+                    | "--no-session"
+                    | "--resume"
+                    | "--session"
+                    | "--fork"
+                    | "--restore"
+                    | "--continue"
+                    | "--from-claude"
+                    | "--from-codex"
+                    | "-r"
+                    | "-c"
+            ) {
+                bail!("omp extra_args cannot set {flag} for isolated sessions");
+            }
+        }
+        if resume {
+            let dir = seat.omp_session_dir.as_ref().expect("managed resume");
+            anyhow::ensure!(
+                dir.is_absolute(),
+                "saved omp session directory is not absolute"
+            );
+            std::fs::read_dir(dir)
+                .with_context(|| format!("open saved omp session directory {}", dir.display()))?;
+            return Ok(Self::Resume);
+        }
+
+        let root = std::path::absolute(home().join("agent-sessions").join("omp"))
+            .context("resolve absolute omp session store")?;
+        // omp and the JSON seat store both require Unicode paths.
+        anyhow::ensure!(
+            root.to_str().is_some(),
+            "omp session store is not valid Unicode"
+        );
+        std::fs::create_dir_all(&root)
+            .with_context(|| format!("create omp session store {}", root.display()))?;
+        let ids =
+            crate::id_reserve::IdSource::new(|| SplitMix64::new(crate::rng::entropy()).uuid_v4());
+        let id = ids.reserve(None, "omp session directory", |id| {
+            crate::id_reserve::create_dir(&root.join(id))
+        })?;
+        Ok(Self::Fresh(root.join(id)))
+    }
+
+    fn dir<'a>(&'a self, seat: &'a SeatState) -> Option<&'a Path> {
+        match self {
+            Self::Fresh(dir) => Some(dir),
+            Self::Resume => seat.omp_session_dir.as_deref(),
+        }
+    }
+
+    fn isolate_terminal_history(&self, cmd: &mut Command, seat: &SeatState) {
+        if self.dir(seat).is_none() {
+            return;
+        }
+        // omp falls back to these identifiers even when stdin is piped.
+        // Otherwise ordinary `omp --continue` can follow its terminal
+        // breadcrumb outside the default session directory.
+        for key in [
+            "ZELLIJ_PANE_ID",
+            "TMUX_PANE",
+            "CMUX_SURFACE_ID",
+            "KITTY_WINDOW_ID",
+            "WEZTERM_PANE",
+            "TERM_SESSION_ID",
+            "WT_SESSION",
+        ] {
+            cmd.env_remove(key);
+        }
+    }
+
+    fn record(self, seat: &mut SeatState, reported: Option<String>, success: bool) -> Result<()> {
+        let reported = reported.filter(|id| !id.is_empty());
+        match self {
+            Self::Resume if seat.omp_session_dir.is_none() => {
+                // Legacy lookup can resolve a continuation with a new ID.
+                if let Some(id) = reported {
+                    seat.captured_session = Some(id);
+                }
+            }
+            Self::Resume => {
+                if let Some(id) = reported {
+                    let previous = seat.captured_session.as_deref().expect("managed resume");
+                    let dir = seat.omp_session_dir.as_deref().expect("managed resume");
+                    if previous != id {
+                        anyhow::ensure!(
+                            omp_continues(dir, previous, &id)?,
+                            "omp resumed a different session than requested"
+                        );
+                        seat.captured_session = Some(id);
+                    }
+                } else if success {
+                    // An unsuccessful turn may exit before reporting an ID.
+                    // Keep the saved pair and let the caller classify the output.
+                    bail!("omp did not confirm the requested session; see the seat output");
+                }
+            }
+            Self::Fresh(dir) => {
+                if let Some(id) = reported {
+                    seat.captured_session = Some(id);
+                    seat.omp_session_dir = Some(dir);
+                } else if success {
+                    bail!("omp did not report a new session id; see the seat output");
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A resume may move to a successor when omp cannot append to the old file.
+/// Only accept lineage recorded by session headers in this seat's directory.
+fn omp_continues(dir: &Path, previous: &str, reported: &str) -> Result<bool> {
+    use std::io::{BufRead as _, BufReader, Read as _};
+
+    let mut parents = BTreeMap::new();
+    let mut line = Vec::new();
+    for entry in std::fs::read_dir(dir).context("read omp continuation directory")? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension() != Some(OsStr::new("jsonl")) || !entry.file_type()?.is_file() {
+            continue;
+        }
+        line.clear();
+        // The rest of the transcript is unrelated and can be arbitrarily large.
+        BufReader::new(std::fs::File::open(path)?)
+            .take(64 * 1024)
+            .read_until(b'\n', &mut line)?;
+        if !line.ends_with(b"\n") {
+            continue;
+        }
+        let Ok(header) = serde_json::from_slice::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if header["type"].as_str() != Some("session") {
+            continue;
+        }
+        if let Some(id) = header["id"].as_str() {
+            let parent = header["continuationOf"].as_str().map(str::to_owned);
+            if parents.insert(id.to_owned(), parent).is_some() {
+                return Ok(false);
+            }
+        }
+    }
+
+    let mut current = reported.to_owned();
+    // Removing each visited ID also rejects cycles.
+    while let Some(Some(parent)) = parents.remove(&current) {
+        if parent == previous {
+            return Ok(true);
+        }
+        current = parent;
+    }
+    Ok(false)
+}
+
 /// The argv plus optional stdin body for one invocation.
 #[derive(Debug)]
 struct Plan {
@@ -799,6 +996,14 @@ struct Plan {
 }
 
 impl Plan {
+    /// Keep the storage path one native argument, independent of the child cwd.
+    fn args<'a>(&'a self, omp_dir: Option<&'a Path>) -> impl Iterator<Item = &'a OsStr> {
+        omp_dir
+            .into_iter()
+            .flat_map(|dir| [OsStr::new("--session-dir"), dir.as_os_str()])
+            .chain(self.argv[1..].iter().map(OsStr::new))
+    }
+
     /// Settings may have been loaded from a file containing credentials.
     /// Log the option, never its value, including repeated and equals forms.
     fn logged_argv(&self) -> Vec<&str> {
@@ -2745,6 +2950,217 @@ mod tests {
         assert!(!resumed.argv.iter().any(|a| a == "--continue"));
         // stdin still carries the prompt on a resumed turn.
         assert_eq!(resumed.stdin.as_deref(), Some("do the thing"));
+    }
+
+    #[test]
+    fn omp_terminal_breadcrumbs_are_disabled_only_for_managed_sessions() {
+        let mut seat = SeatState::new("review-1", "a", 7);
+        let mut cmd = Command::new("omp");
+        cmd.envs([
+            ("ZELLIJ_PANE_ID", "1"),
+            ("TMUX_PANE", "%2"),
+            ("CMUX_SURFACE_ID", "terminal"),
+            ("KITTY_WINDOW_ID", "3"),
+            ("WEZTERM_PANE", "4"),
+            ("TERM_SESSION_ID", "terminal"),
+            ("WT_SESSION", "terminal"),
+            ("OMP_PROFILE", "work"),
+        ]);
+        let envs = |cmd: &Command| {
+            cmd.as_std()
+                .get_envs()
+                .filter(|(_, value)| value.is_some())
+                .count()
+        };
+        OmpSession::Resume.isolate_terminal_history(&mut cmd, &seat);
+        assert_eq!(envs(&cmd), 8);
+        OmpSession::Fresh(PathBuf::from("managed")).isolate_terminal_history(&mut cmd, &seat);
+        assert_eq!(envs(&cmd), 1);
+        assert!(
+            cmd.as_std()
+                .get_envs()
+                .any(|(key, value)| { key == "OMP_PROFILE" && value == Some(OsStr::new("work")) })
+        );
+
+        seat.omp_session_dir = Some(PathBuf::from("managed"));
+        cmd.env("WT_SESSION", "terminal");
+        OmpSession::Resume.isolate_terminal_history(&mut cmd, &seat);
+        assert_eq!(envs(&cmd), 1);
+    }
+
+    #[test]
+    fn omp_managed_session_persists_native_path_and_reuses_it_after_reload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("magi home 日本語");
+        let spec = spec(AgentKind::Omp, None);
+        let mut seat = SeatState::new("review-1", "a", 7);
+        let art = tmp.path().join("art");
+        let cwd = tmp.path().join("other checkout");
+        let mut invocation = inv(&cwd, &art, false);
+        let prompt = art.join("p.md");
+
+        let fresh = OmpSession::prepare(&spec, &seat, true, || home.clone()).unwrap();
+        let dir = fresh.dir(&seat).unwrap().to_owned();
+        assert_eq!(dir.parent().unwrap(), home.join("agent-sessions/omp"));
+        assert!(dir.is_absolute() && dir.is_dir());
+        assert!(
+            !dir.file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains(&seat.key)
+        );
+        let plan = build_command(&spec, &seat, &invocation, &prompt).unwrap();
+        let args: Vec<_> = plan.args(Some(&dir)).collect();
+        assert_eq!(&args[..2], [OsStr::new("--session-dir"), dir.as_os_str()]);
+        assert!(!args.contains(&OsStr::new("--resume")));
+        fresh
+            .record(&mut seat, Some("first-id".into()), true)
+            .unwrap();
+        seat.turns += 1;
+
+        let mut seat: SeatState =
+            serde_json::from_slice(&serde_json::to_vec(&seat).unwrap()).unwrap();
+        let resumed = OmpSession::prepare(&spec, &seat, true, || {
+            panic!("resume must not resolve home")
+        })
+        .unwrap();
+        let plan = build_command(&spec, &seat, &invocation, &prompt).unwrap();
+        let args: Vec<_> = plan.args(resumed.dir(&seat)).collect();
+        assert_eq!(&args[..2], [OsStr::new("--session-dir"), dir.as_os_str()]);
+        assert!(args.windows(2).any(|w| w == ["--resume", "first-id"]));
+        let before = seat.clone();
+        assert!(
+            resumed
+                .record(&mut seat, Some("other-id".into()), true)
+                .is_err()
+        );
+        assert!(OmpSession::Resume.record(&mut seat, None, true).is_err());
+        assert_eq!(seat, before);
+        // Timeout and nonzero exit both reach record with success == false.
+        OmpSession::Resume.record(&mut seat, None, false).unwrap();
+        assert_eq!(seat, before);
+
+        let fallback = SeatState::new("review-1", "b", 7);
+        let next = OmpSession::prepare(&spec, &fallback, true, || home.clone()).unwrap();
+        assert_ne!(next.dir(&fallback).unwrap(), dir);
+        // A session-disabled turn still persists, but cannot look up the old turn.
+        invocation.sessions = false;
+        let fresh = OmpSession::prepare(&spec, &seat, false, || home.clone()).unwrap();
+        let new_dir = fresh.dir(&seat).unwrap().to_owned();
+        assert_ne!(new_dir, dir);
+        assert_ne!(next.dir(&fallback).unwrap(), new_dir);
+        assert!(
+            !build_command(&spec, &seat, &invocation, &prompt)
+                .unwrap()
+                .args(Some(&new_dir))
+                .any(|arg| arg == "--resume")
+        );
+        fresh
+            .record(&mut seat, Some("fresh-id".into()), true)
+            .unwrap();
+        assert_eq!(seat.omp_session_dir.as_deref(), Some(new_dir.as_path()));
+        assert_eq!(seat.captured_session.as_deref(), Some("fresh-id"));
+
+        std::fs::remove_dir(new_dir).unwrap();
+        assert!(OmpSession::prepare(&spec, &seat, true, || home.clone()).is_err());
+    }
+
+    #[test]
+    fn omp_pre_isolation_json_resumes_without_a_session_directory() {
+        let mut seat: SeatState = serde_json::from_str(
+            r#"{"key":"review-1","agent":"a","turns":1,"claude_session":null,"captured_session":"legacy-id"}"#,
+        )
+        .unwrap();
+        let resume = OmpSession::prepare(&spec(AgentKind::Omp, None), &seat, true, || {
+            panic!("legacy resume must not resolve or create a store")
+        })
+        .unwrap();
+        let plan = plan_for(AgentKind::Omp, &seat, false);
+        let args: Vec<_> = plan.args(resume.dir(&seat)).collect();
+        assert!(!args.contains(&OsStr::new("--session-dir")));
+        assert!(args.windows(2).any(|w| w == ["--resume", "legacy-id"]));
+        resume
+            .record(&mut seat, Some("continuation-id".into()), true)
+            .unwrap();
+        assert!(seat.omp_session_dir.is_none());
+        assert_eq!(seat.captured_session.as_deref(), Some("continuation-id"));
+        let plan = plan_for(AgentKind::Omp, &seat, false);
+        assert!(
+            plan.args(None)
+                .zip(plan.args(None).skip(1))
+                .any(|(flag, id)| flag == "--resume" && id == "continuation-id")
+        );
+    }
+
+    #[test]
+    fn omp_managed_resume_tracks_only_local_continuation_lineage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let managed = tmp.path().join("managed");
+        std::fs::create_dir(&managed).unwrap();
+        let mut seat = SeatState::new("review-1", "a", 7);
+        seat.turns = 1;
+        seat.captured_session = Some("original".into());
+        seat.omp_session_dir = Some(managed.clone());
+
+        let write_header = |dir: &Path, id: &str, parent: &str| {
+            let header = serde_json::json!({
+                "type": "session", "version": 3, "id": id, "continuationOf": parent,
+            });
+            std::fs::write(dir.join(format!("{id}.jsonl")), format!("{header}\n")).unwrap();
+        };
+        write_header(tmp.path(), "outside", "original");
+        write_header(&managed, "unrelated", "other-seat");
+        write_header(&managed, "middle", "original");
+        write_header(&managed, "latest", "middle");
+        for id in ["outside", "unrelated"] {
+            assert!(
+                OmpSession::Resume
+                    .record(&mut seat, Some(id.into()), true)
+                    .is_err()
+            );
+            assert_eq!(seat.captured_session.as_deref(), Some("original"));
+        }
+
+        OmpSession::Resume
+            .record(&mut seat, Some("latest".into()), true)
+            .unwrap();
+        assert_eq!(seat.omp_session_dir.as_deref(), Some(managed.as_path()));
+        let plan = plan_for(AgentKind::Omp, &seat, false);
+        assert!(plan.argv.windows(2).any(|w| w == ["--resume", "latest"]));
+    }
+
+    #[test]
+    fn omp_managed_session_rejects_extra_args_that_override_history() {
+        let mut spec = spec(AgentKind::Omp, None);
+        let mut seat = SeatState::new("review-1", "a", 7);
+        for arg in [
+            "--session-dir",
+            "--session-dir=other",
+            "--no-session",
+            "--continue",
+            "--resume=other",
+            "--session",
+            "--session=operator.jsonl",
+            "--fork",
+            "--fork=operator.jsonl",
+            "--restore",
+            "--from-claude",
+            "--from-codex",
+            "-c",
+            "-r=other",
+        ] {
+            spec.extra_args = vec![arg.into()];
+            for sessions in [false, true] {
+                let error = OmpSession::prepare(&spec, &seat, sessions, || panic!("invalid arg"))
+                    .err()
+                    .unwrap();
+                assert!(error.to_string().contains("omp extra_args"));
+            }
+            seat.turns = 1;
+            seat.captured_session = Some("existing-id".into());
+            seat.omp_session_dir = Some(PathBuf::from("not-opened"));
+        }
     }
 
     /// The extraction trap that cost three complete reviews when it was done by
