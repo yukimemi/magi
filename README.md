@@ -365,11 +365,12 @@ daemon killed mid-run leaves a queue the next one picks up.
 
 The Web Queue uses compact rows with the existing task detail alongside them
 on wide screens. Drag the ↕ handle (mouse or touch), or focus it and press
-Arrow Up / Down, to reorder within a section after clearing search. Queue
-moves persist priorities through the ordinary priority endpoint: higher values
-run first, ties use ascending task ID. Running tasks cannot move. Upgrade
-resumes occupy a fixed lane ahead of ordinary priorities; admission, urgent
-slots and other eligibility gates still apply. Saves are sequential, not atomic:
+Arrow Up or Arrow Down, to reorder within a section after clearing search.
+The yellow line marks where the task will go. Press Escape to cancel a drag.
+Queue moves persist priorities through the ordinary priority endpoint. Higher
+values run first, and ties use ascending task ID. Running tasks cannot move.
+Upgrade resumes occupy a fixed lane ahead of ordinary priorities. Admission,
+urgent slots, and other eligibility gates still apply. Saves are sequential:
 if a write is refused, remaining writes stop and the list reloads the saved order.
 The +/− priority controls, Edit and Actions remain available on every row,
 without selecting it first. Open confirmations and drafts survive list refreshes.
@@ -380,13 +381,8 @@ Open **Dependencies** from the navigation or the Backlog link to see what
 each blocked task waits on. The graph scrolls independently in both directions;
 select a task or question node to open its existing detail.
 
-Competition rows already use the existing run detail. Their handles reorder within
-a section in this browser after clearing search; scope and state filters may stay
-active. Filtered and unloaded runs retain their remembered positions. New runs
-appear before remembered rows; **Reset order** restores the default section order.
-Storage refusal keeps the choice for the current tab. Refreshes retain row identity
-and disclosures, freezing the DOM during a drag. Queue drops read fresh priorities
-and resolve the destination by neighbouring task IDs before saving.
+Queue drops read fresh priorities and use neighbouring task IDs to resolve the
+insertion point. Runs keep their default section order.
 
 `magi serve` runs **one competition at a time** on purpose. The graph is already
 parallel inside — candidates times judges — and two graphs at once doubles the

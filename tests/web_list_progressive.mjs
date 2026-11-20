@@ -4,7 +4,7 @@ import { runInNewContext } from 'node:vm';
 import { test } from 'node:test';
 const source = readFileSync(new URL('../assets/ui/app.js', import.meta.url), 'utf8');
 const loading = source.slice(source.indexOf('const storeReads ='), source.indexOf('function loadRuns('));
-const ordering = source.slice(source.indexOf('const priorityOrder ='), source.indexOf('function orderedRuns('));
+const ordering = source.slice(source.indexOf('const priorityOrder ='), source.indexOf('function priorityEdits('));
 const flush = () => new Promise(resolve => setImmediate(resolve));
 function harness(existing = null) {
   const requests = [], renders = [], notices = [];

@@ -2953,13 +2953,23 @@ h1 { overflow-wrap: anywhere; letter-spacing: 0; }
   display: flex; flex-direction: column; gap: var(--s1); width: 100%; min-width: 0;
 }
 #queue-sections .cards > li, #runs-sections .cards > li { width: 100%; min-width: 0; }
-#runs-sections .cards > li { position: relative; padding-left: calc(var(--tap) + var(--s1)); }
-#runs-sections .reorder-handle { position: absolute; left: 0; top: var(--s2); }
 .reorder-handle { touch-action: none; cursor: grab; padding: var(--s1); min-width: var(--tap); }
 .reorder-handle:disabled { cursor: not-allowed; opacity: .4; }
 .row-dragging { opacity: .6; }
-[data-drop="before"] { box-shadow: 0 -3px 0 var(--focus); }
-[data-drop="after"] { box-shadow: 0 3px 0 var(--focus); }
+#queue-sections .task-card[data-drop] { position: relative; }
+#queue-sections .task-card[data-drop]::after {
+  content: "";
+  position: absolute;
+  inset-inline: 0;
+  height: 5px;
+  border: 1px solid #241600;
+  border-radius: 3px;
+  background: #ffdb28;
+  z-index: 1;
+  pointer-events: none;
+}
+#queue-sections .task-card[data-drop="before"]::after { top: -3px; transform: translateY(-50%); }
+#queue-sections .task-card[data-drop="after"]::after { bottom: -3px; transform: translateY(50%); }
 @container (min-width: 700px) {
   :is(#queue-sections, #queue-search-results) .card.task-card {
     grid-template-columns: auto minmax(0, 1fr) auto;
