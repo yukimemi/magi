@@ -5675,7 +5675,8 @@ async fn chat_task_progress_refreshes_and_survives_operation_races() {
             deck.state.talkDetail = {{ id: {id:?}, talk: null }};
             document.getElementById('view-talk').hidden = false;
             await deck.loadTalk({id:?});
-            await deck.loadHealth({{ applyRevisions: true }});
+            const health = await (await fetch('/api/health')).json();
+            await deck.applyRevisions_(health);
         }})()"#,
                     id = chat.id
                 ),
@@ -5724,15 +5725,17 @@ async fn chat_task_progress_refreshes_and_survives_operation_races() {
             task.status = TaskStatus::Done;
             queue.put(task).expect("done");
         }
-        // Queue changes alone must update the visible chat.
-        browser
-            .eval(&page, "deck.loadHealth({ applyRevisions: true })")
-            .await
-            .expect("queue refresh");
+        // Apply each monitor snapshot to completion. loadHealth deliberately
+        // leaves revision reads in the background; those reads must not spill
+        // into the request count for the next event.
         browser
             .wait_for(
                 &page,
-                "(async () => { await deck.loadHealth({ applyRevisions: true }); return document.getElementById('talk-task-progress').textContent.includes('all 7 complete'); })()",
+                r#"(async () => {
+                    const health = await (await fetch('/api/health')).json();
+                    await deck.applyRevisions_(health);
+                    return document.getElementById('talk-task-progress').textContent.includes('all 7 complete');
+                })()"#,
                 Duration::from_secs(10),
             )
             .await
