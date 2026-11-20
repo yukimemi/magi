@@ -1667,6 +1667,17 @@ impl Questions {
         Ok(self.consumption_view_in(q, migrated, ownership))
     }
 
+    /// Read checkpoint bindings without persisting legacy choice upgrades.
+    pub(crate) fn read_for_effects(&self, id: &str) -> Result<Question> {
+        let q = self.read_history(id)?;
+        let ownership = crate::task_chat::InquiryOwnership::default();
+        let migrated = self
+            .root
+            .parent()
+            .is_some_and(|home| crate::task_chat::migrated_source_in(home, &q.id, &ownership));
+        Ok(self.consumption_view_in(q, migrated, &ownership))
+    }
+
     /// Whether this source is quarantined saved consent, including history
     /// without a current consumer. It must not expire into a default action.
     pub(crate) fn held_reply(&self, id: &str) -> bool {
@@ -1811,6 +1822,39 @@ impl Questions {
         self.list_view_in(true, ownership)
     }
 
+    /// Keep the same execution projection without upgrading any source record.
+    pub(crate) fn has_open_for_effects(&self, run: &str) -> bool {
+        let ownership = crate::task_chat::InquiryOwnership::default();
+        let sources = self.root.parent().map(crate::task_chat::migration_sources);
+        self.readable_questions()
+            .filter(|q| q.run == run)
+            .any(|q| self.project_effects(q, &sources, &ownership).status.open())
+    }
+
+    fn readable_questions(&self) -> impl Iterator<Item = Question> {
+        std::fs::read_dir(&self.root)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "json"))
+            .filter_map(|p| read_path(&p).ok())
+    }
+
+    fn project_effects(
+        &self,
+        q: Question,
+        sources: &Option<Result<Option<std::collections::BTreeSet<String>>>>,
+        ownership: &crate::task_chat::InquiryOwnership,
+    ) -> Question {
+        let migrated = match sources {
+            Some(Ok(Some(ids))) => ids.contains(&q.id),
+            Some(_) => true,
+            None => false,
+        };
+        self.consumption_view_in(q, migrated, ownership)
+    }
+
     fn list_view_in(
         &self,
         effects: bool,
@@ -1820,22 +1864,12 @@ impl Questions {
         QUESTION_SCANS.with(|count| count.set(count.get() + 1));
         // Parse the immutable boundary once per scan, rather than once per file.
         let sources = self.root.parent().map(crate::task_chat::migration_sources);
-        let mut all: Vec<Question> = std::fs::read_dir(&self.root)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|x| x == "json"))
-            .filter_map(|p| read_path(&p).ok())
+        let mut all: Vec<Question> = self
+            .readable_questions()
             .map(|q| {
-                let migrated = match &sources {
-                    Some(Ok(Some(ids))) => ids.contains(&q.id),
-                    Some(_) => true,
-                    None => false,
-                };
                 let q = self.with_repair_choice_in(q, ownership);
                 if effects {
-                    self.consumption_view_in(q, migrated, ownership)
+                    self.project_effects(q, &sources, ownership)
                 } else {
                     q
                 }

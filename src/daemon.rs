@@ -974,7 +974,10 @@ where
     // placed before it (even after the question was asked) was seen and
     // overruled by it, while a hold or release after it supersedes it.
     let decision_at = q.answered_at.unwrap_or(q.asked_at);
-    if task.operator_decided_at.is_some_and(|at| at > decision_at) {
+    if task
+        .latest_operator_decision_at()
+        .is_some_and(|at| at > decision_at)
+    {
         return if repair || stopping {
             ActionDecision::Refuse(format!(
                 "{} answer {} was superseded by a later operator decision; the task stays held. Inspect `magi show {}`; if this action is still wanted, explicitly release the existing owner with `magi task release {}`",
@@ -1056,12 +1059,12 @@ where
                 Ok(s) if s.liveness_under(home, false) == Liveness::Live => {
                     ActionDecision::Refuse("run already has a live driver".into())
                 }
-                Ok(s) => match crate::handover::resume_refusal_under(&s, Some(home)) {
-                    None => ActionDecision::Resume(run.clone()),
-                    Some(reason) => ActionDecision::Refuse((p.resume_cannot_progress)(
+                Ok(s) => match crate::resume::check_checkpoint(home, &s) {
+                    Ok(()) => ActionDecision::Resume(run.clone()),
+                    Err(reason) => ActionDecision::Refuse((p.resume_cannot_progress)(
                         q.short(),
                         ask::short_id(run),
-                        &reason.diagnostic(&s),
+                        &reason.to_string(),
                     )),
                 },
                 Err(e) => ActionDecision::Refuse((p.resume_unreadable)(
@@ -1368,7 +1371,12 @@ async fn apply_maintenance_choices(queue: &Queue, questions: &Questions, home: &
                         record("started")?;
                         let decided = q.answered_at.unwrap_or(q.asked_at);
                         if !crate::resume::pin_queued(queue, run, Some(decided), Some(&q.id))? {
-                            crate::resume::validate_unqueued(home, run)?;
+                            anyhow::ensure!(
+                                queue.inspect_run_owner(run)?.is_none(),
+                                "run already has a queue owner"
+                            );
+                            let state = crate::resume::validate(home, run)?;
+                            crate::resume::inspect_ownerless(home, &state)?;
                             crate::resume::start(home, run.clone()).await?;
                         }
                     }
@@ -1403,7 +1411,7 @@ async fn apply_maintenance_choices(queue: &Queue, questions: &Questions, home: &
                                 && task.held_at == Some(*held_at)
                                 && task.hold_reason.as_deref() == reason.as_deref()
                                 && task
-                                    .operator_decided_at
+                                    .latest_operator_decision_at()
                                     .is_none_or(|at| at <= q.answered_at.unwrap_or(q.asked_at)),
                             "task no longer has the hold this question names"
                         );
@@ -1452,10 +1460,18 @@ async fn apply_maintenance_choices(queue: &Queue, questions: &Questions, home: &
             && let Ok(mut origin) = queue.get(&listed.id)
         {
             if !origin.operator_held()
-                && origin.operator_decided_at.is_none_or(|at| at <= q.asked_at)
+                && origin
+                    .latest_operator_decision_at()
+                    .is_none_or(|at| at <= q.asked_at)
                 && !matches!(origin.status, TaskStatus::Running | TaskStatus::Done)
             {
-                if result.is_err() || matches!(action, ask::ChoiceAction::ResumeRun { .. }) {
+                if matches!(action, ask::ChoiceAction::ResumeRun { .. })
+                    && origin.blocked_by.iter().any(|id| id != &q.id)
+                {
+                    // Settle only this question, not an independent dependency
+                    // that appeared after it was filed.
+                    origin.unblock(&q.id);
+                } else if result.is_err() || matches!(action, ask::ChoiceAction::ResumeRun { .. }) {
                     origin.hold_machine(Some(format!(
                         "Maintenance choice {} settled; inspect its target before releasing this task",
                         q.id
@@ -1650,6 +1666,23 @@ pub(crate) fn apply_task_choice_actions(queue: &Queue, questions: &Questions, ho
             // carries an action (`waiter::decide_owned`), so it cannot race.
             continue;
         }
+        let decision = if let ActionDecision::Resume(run) = &decision {
+            match RunState::load_under(run, home).and_then(|state| {
+                crate::resume::prepare_pin(
+                    queue,
+                    home,
+                    &mut task,
+                    &state,
+                    Some(&q.id),
+                    crate::resume::PinSource::Choice,
+                )
+            }) {
+                Ok(()) => decision,
+                Err(error) => ActionDecision::Refuse(format!("{error:#}")),
+            }
+        } else {
+            decision
+        };
         let done = matches!(decision, ActionDecision::Done);
         // Resume owes an execution pass; only these task-local effects finish
         // in this write. Stale/refused actions never acquire an effect receipt.
@@ -1659,17 +1692,7 @@ pub(crate) fn apply_task_choice_actions(queue: &Queue, questions: &Questions, ho
         );
         match decision {
             ActionDecision::Skip => continue,
-            ActionDecision::Resume(run) => {
-                task.release_operator("choice", Some(&q.id));
-                task.resume_override = Some(crate::queue::OperatorResume {
-                    question_id: q.id.clone(),
-                    at: Timestamp::now(),
-                    conductor_rehold: None,
-                    forced: true,
-                    pinned_run: Some(run),
-                });
-            }
-            ActionDecision::Stale => {}
+            ActionDecision::Resume(_) | ActionDecision::Stale => {}
             ActionDecision::Requeue => {
                 task.release_operator("choice-requeue", Some(&q.id));
                 task.requeue();
@@ -1679,7 +1702,11 @@ pub(crate) fn apply_task_choice_actions(queue: &Queue, questions: &Questions, ho
             ActionDecision::Refuse(why) => {
                 let _ =
                     crate::task_inquiry::Outbox::at(home).update_decision(&q.id, |d| d.fail(&why));
-                if task.operator_held() {
+                if matches!(q.chosen_action(), Some(ask::ChoiceAction::Resume { .. }))
+                    && !task.blocked_by.is_empty()
+                {
+                    // The answer cannot clear independent dependencies.
+                } else if task.operator_held() {
                     // A rejected answer does not release the operator's hold
                     // or reclassify it as recoverable by the conductor.
                     task.hold_reason = Some(match task.hold_reason.take() {
@@ -1690,7 +1717,8 @@ pub(crate) fn apply_task_choice_actions(queue: &Queue, questions: &Questions, ho
                     task.notice_cause(&format!("resume-refused:{}", q.id), None, None);
                     task.hold_machine(Some(why));
                 }
-                notices::raise(
+                notices::raise_in(
+                    home,
                     Notice::warn(
                         &format!("action:{}", q.id),
                         "An answer asked the daemon to resume a run that cannot be resumed; the task stays held.",
@@ -4881,14 +4909,10 @@ async fn attempt(
         branch_exists,
         unfinished.as_deref(),
     );
-    let retry_selected = task.replacement.is_some()
-        && task.resumption.is_some()
-        && !task.fresh_start
-        && previous.as_ref().is_some_and(|run| {
-            run.replaces.is_some()
-                && ((run.status == RunStatus::Failed && run.viable().is_empty())
-                    || (run.status == RunStatus::Blocked && run.tally.is_none()))
-        });
+    let retry_selected = task.resumption.is_some()
+        && previous
+            .as_ref()
+            .is_some_and(|run| retry_selected_resume(task, run));
     let stop_pin = task
         .resume_override
         .as_ref()
@@ -5599,6 +5623,38 @@ fn implementers_match(task: &Task, state: &RunState) -> bool {
                 && state.config.graph.implementers == 1
         },
     )
+}
+
+fn retry_selected_resume(task: &Task, run: &RunState) -> bool {
+    task.replacement.is_some()
+        && !task.fresh_start
+        && run.replaces.is_some()
+        && ((run.status == RunStatus::Failed && run.viable().is_empty())
+            || (run.status == RunStatus::Blocked && run.tally.is_none()))
+}
+
+/// Ordinary dispatch applies the saved-seat check only when a higher-priority
+/// continuation does not already select the run. Repair grants are checked by
+/// the caller; the stop-only landing action has its own admission.
+pub(crate) fn check_resume_implementers(task: &Task, state: &RunState) -> Result<()> {
+    let selected = task.pr_recovery.as_ref().is_some_and(|selection| {
+        selection
+            .check_task_assignment(&task.id, &task.instruction, task.reassignments.len())
+            .is_ok()
+            && selected_starter(selection, Some(state), Some(&state.id))
+                == Starter::Resume(state.id.clone())
+    });
+    anyhow::ensure!(
+        implementers_match(task, state)
+            || crate::handover::landing_checkpoint(state)
+            || crate::merge_decision::resumable_hold(state)
+            || retry_selected_resume(task, state)
+            || selected,
+        "saved run implementer assignment differs from the current task (saved count: {}, requested count: {:?}); restore the saved seat assignment before resuming",
+        state.config.graph.implementers,
+        task.implementers()
+    );
+    Ok(())
 }
 
 /// Never resume or take over candidate work built for a different seat count.
@@ -13237,6 +13293,26 @@ mod tests {
         state.config.graph.review_rounds = 1;
         state.reviews = vec![review_round(1)];
         assert!(crate::handover::resume_refusal_under(&state, Some(home.path())).is_some());
+        let questions = Questions::at(home.path().join("questions"));
+        let mut other = run_state(RunStatus::Landing);
+        let mut legacy = ask::Question::new(
+            other.id.clone(),
+            land::APPROVAL_NODE.into(),
+            "land".into(),
+            "merge?".into(),
+            String::new(),
+            vec!["merge".into(), land::HOLD.into()],
+        );
+        other.land_approval = Some(crate::run::LandApproval {
+            question: legacy.id.clone(),
+            head: "legacy-head".into(),
+        });
+        other.save_under(home.path()).unwrap();
+        questions.put(&mut legacy).unwrap();
+        let path = questions.path_of(&legacy.id);
+        let before = std::fs::read(&path).unwrap();
+        assert!(crate::handover::resume_refusal_under(&state, Some(home.path())).is_some());
+        assert_eq!(std::fs::read(path).unwrap(), before);
         for checkpoint in ["publication", "approval", "armed", "landing", "question"] {
             let mut saved = state.clone();
             match checkpoint {

@@ -262,6 +262,51 @@ fn derive_textual(state: &RunState, head: &str, tip: &str) -> Result<(Stop, Opti
     Ok((stop, Some(Evidence { digest, source })))
 }
 
+pub(crate) fn recovery_facts(
+    queue: &crate::queue::Queue,
+    home: &std::path::Path,
+    task: &crate::queue::Task,
+    state: &RunState,
+) -> serde_json::Value {
+    use serde_json::json;
+    let resume = crate::resume::inspect_queued(home, queue, task, state);
+    let movement = crate::graph::Runner::inspect_base_recovery(home, state, task);
+    let scratch = home
+        .join("runs")
+        .join(&state.id)
+        .join("base-sync")
+        .try_exists();
+    let stop = &state.base_sync_recovery.stop;
+    let unavailable = |error: anyhow::Error| {
+        let status = if error.is::<crate::resume::Unconfirmed>() || error.is::<std::io::Error>() {
+            "unknown"
+        } else {
+            "refused"
+        };
+        json!({"status":status, "reason":format!("{error:#}")})
+    };
+    json!({
+        "resume": match resume {
+            Ok(()) => json!({"status": "locally_eligible"}),
+            Err(error) => unavailable(error),
+        },
+        "recover_base": match movement {
+            Ok(head) => json!({"status":"locally_eligible", "head":head, "requires_fresh_fetch_at_execution": true}),
+            Err(error) => unavailable(error),
+        },
+        "base_stop": state.base_sync.as_ref().map(|sync| json!({
+            "kind": stop.as_ref().map(|s| &s.kind),
+            "recorded_head": stop.as_ref().map(|s| &s.head),
+            "detail": sync.conflict, "recorded_tip": sync.tip,
+            "used": state.base_episode_used(), "limit": crate::graph::BASE_SYNC_ROUNDS,
+            "lifetime_attempts": sync.attempts, "scratch_present": scratch.ok(),
+            "pending_authorization": state.base_recovery_pending(),
+            "pending_closure": state.base_sync_closure_pending(),
+            "pending_conflict_repair": super::conflict_pending(task, state),
+        })),
+    })
+}
+
 /// Inspect saved evidence and present Git state without acquiring writable
 /// maintenance locks, fetching, changing a checkpoint or queueing a driver.
 pub async fn inspect(
@@ -277,11 +322,28 @@ pub async fn inspect(
             && state.origin.as_ref().and_then(|o| o.task.as_deref()) == Some(task.id.as_str()),
         "inspection refused: task/run ownership disagrees"
     );
-    let winner = state
-        .winner()
-        .context("missing retained winner; locate the owned retained branch before recovery")?;
-    let head = crate::git::rev_parse(&state.repo, &format!("refs/heads/{}", winner.branch))
-        .await.context("missing retained branch; locate the owned implementation ref before recovery, without replacing or resetting it")?;
+    let recovery = recovery_facts(queue, home, &task, &state);
+    let mut result = serde_json::json!({"task": task.id, "run": state.id, "recovery": recovery,
+        "scratch_present": recovery.pointer("/base_stop/scratch_present"),
+        "next_step": "Retain all records and commits. Inspect the missing evidence; do not edit JSON, reset budgets or start another run."});
+    let head = match crate::graph::Runner::retained_branch_head(&state) {
+        Ok(head) => head,
+        Err(error) => {
+            result["missing_evidence"] = format!("{error:#}").into();
+            result["classification"] = "insufficient-evidence".into();
+            result["verification"] = crate::chat_notify::run_verification(&state, None);
+            return Ok(result);
+        }
+    };
+    result["head"] = serde_json::json!(head);
+    result["verification"] = crate::chat_notify::run_verification(&state, Some(&head));
+    if !state.base_sync_blocked() {
+        result["classification"] = "no-base-stop".into();
+        result["next_step"] =
+            "Read the current resume eligibility and verification; no base recovery is applicable."
+                .into();
+        return Ok(result);
+    }
     let tip = crate::git::rev_parse(
         &state.repo,
         &format!(
@@ -289,25 +351,35 @@ pub async fn inspect(
             state.config.merge.remote, state.base_branch
         ),
     )
-    .await?;
-    let mut result = serde_json::json!({"task": task.id, "run": state.id, "head": head, "base": tip,
-        "scratch_present": home.join("runs").join(&state.id).join("base-sync").exists(),
-        "next_step": "Retain all records and commits. Inspect the missing evidence; do not edit JSON, reset budgets or start another run."});
-    let assessment = classify(&state, &head, &tip);
+    .await;
+    if let Err(error) = &tip {
+        result["tracking_ref_unavailable"] = format!("{error:#}").into();
+    }
+    // A missing tracking ref does not erase saved stop classification. It does
+    // prevent offering a textual repair whose target must match that ref.
+    let observed_tip = tip.as_deref().unwrap_or_default();
+    result["base"] = tip.as_deref().ok().into();
+    result["base_source"] = "local tracking ref; not a fresh fetch".into();
+    let assessment = classify(&state, &head, observed_tip);
     result
         .as_object_mut()
         .unwrap()
         .extend(assessment.report().as_object().unwrap().clone());
     if assessment.class == Class::MovementExhausted {
-        result["next_step"] = format!(
-            "Use task control recover-base {} --request <unique-id> --head {head}",
-            state.id
-        )
-        .into();
+        if recovery["recover_base"]["status"] == "locally_eligible" {
+            result["next_step"] = format!(
+                "Use task control recover-base {} --request <unique-id> --head {head}; execution must fetch and revalidate",
+                state.id
+            ).into();
+        } else {
+            result["admission_blocker"] = recovery["recover_base"]["reason"].clone();
+        }
         return Ok(result);
     }
     if let Ok((stop, evidence)) = assessment.textual() {
+        let tip = tip.context("textual repair needs a readable local base tracking ref");
         let checks = async {
+                let tip = tip.as_ref().map_err(|error| anyhow::anyhow!("{error:#}"))?;
                 ensure!(!state.passes.is_empty(), "missing stopped pass checkpoint; inspect retained run provenance before recovery");
                 super::controls(home, &task, &state, super::Kind::BaseConflict)?;
                 super::owner_effects_settled(home, &task, &state)?;
@@ -318,7 +390,7 @@ pub async fn inspect(
                     "driver is live or unknown; wait for supported driver cleanup before granting recovery");
                 super::head_and_public(&state, &head).await?;
                 ensure!(
-                    crate::git::is_ancestor(&state.repo, &stop.tip, &tip).await,
+                    crate::git::is_ancestor(&state.repo, &stop.tip, tip).await,
                     "current base does not descend from stopped base"
                 );
                 Ok::<_, anyhow::Error>(())
@@ -331,6 +403,7 @@ pub async fn inspect(
             let digest = evidence.as_ref().map_or(String::new(), |e| {
                 format!(" --evidence-digest {}", e.digest)
             });
+            let tip = tip.expect("checked tracking ref");
             result["next_step"] = format!("magi task grant-repair {} --run {} --kind base-conflict --rounds 1 --head {head} --tip {tip} --expect-pass {}{digest} --request <unique-id> --reason <reason> --instruction <approved-resolution>", task.id, state.id, state.passes.last().map_or(0, |p| p.index)).into();
         }
     }

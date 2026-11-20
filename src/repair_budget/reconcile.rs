@@ -171,8 +171,8 @@ pub(super) fn decision_matches(home: &Path, task: &Task, grant: &super::Receipt)
     }
     for receipt in &task.repair_reconciliations {
         if &receipt.grant == grant && task.operator_decided_at == Some(receipt.decision) {
-            let q =
-                Questions::at(home.join("questions")).get_for_effects(&receipt.request.question)?;
+            let q = Questions::at(home.join("questions"))
+                .read_for_effects(&receipt.request.question)?;
             return Ok(
                 source(&q)? == receipt.source && prove(task, grant, &q)? == receipt.application
             );

@@ -528,9 +528,12 @@ pub struct Task {
     /// Earlier explicit approvals retained for audit and instruction suffix matching.
     #[serde(default)]
     pub resumption_history: Vec<Resumption>,
-    /// Latest explicit release or manual hold, used to reject delayed answers.
+    /// Latest decision binding for authorizations that must survive a scoped resume.
     #[serde(default)]
     pub operator_decided_at: Option<Timestamp>,
+    /// Answer-order fence for a resume that preserves the authorization above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) base_recovery_resume_at: Option<Timestamp>,
     /// Set by `crate::conduct` when it chooses `Review` recovery for a task
     /// whose branch survived a blocked run: the branch to reopen with
     /// `crate::graph::Runner::review` instead of competing from scratch.
@@ -1034,6 +1037,7 @@ impl Task {
             resumption: None,
             resumption_history: Vec::new(),
             operator_decided_at: None,
+            base_recovery_resume_at: None,
             review_branch: None,
             review_instruction: None,
             pr_recovery: None,
@@ -1675,6 +1679,11 @@ impl Task {
     /// automatic holds record [`HoldSource::Machine`] and remain recoverable.
     pub fn operator_held(&self) -> bool {
         self.status == TaskStatus::Held && !matches!(self.hold_source, Some(HoldSource::Machine))
+    }
+
+    /// Latest decision for ordering answers, not for matching saved grants.
+    pub(crate) fn latest_operator_decision_at(&self) -> Option<Timestamp> {
+        self.operator_decided_at.max(self.base_recovery_resume_at)
     }
 
     /// Take this task out of the loop's reach by an operator action.
@@ -2845,6 +2854,9 @@ impl Queue {
                     task.base_recovery_requests.push(key.clone());
                 }
             }
+            task.base_recovery_resume_at = task
+                .base_recovery_resume_at
+                .max(stored.base_recovery_resume_at);
             for receipt in &stored.repair_grants {
                 if !task
                     .repair_grants
@@ -3415,6 +3427,29 @@ impl Queue {
             .collect();
         tasks.sort_unstable_by(|a, b| b.priority.cmp(&a.priority).then_with(|| b.id.cmp(&a.id)));
         tasks
+    }
+
+    /// Confirm the unique owner (including historical runs), without treating
+    /// an unreadable task or directory as proof of absence.
+    pub(crate) fn inspect_run_owner(&self, run: &str) -> Result<Option<Task>> {
+        let entries = match std::fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error).context("unknown: cannot read queue ownership"),
+        };
+        let mut owner = None;
+        for entry in entries {
+            let path = entry.context("unknown: cannot read queue entry")?.path();
+            if path.extension().is_some_and(|ext| ext == "json") {
+                let task =
+                    read_path(&path).context("unknown: cannot read task for queue ownership")?;
+                if task.runs.iter().any(|id| id == run) {
+                    anyhow::ensure!(owner.is_none(), "ambiguous run queue ownership");
+                    owner = Some(task);
+                }
+            }
+        }
+        Ok(owner)
     }
 
     /// Task files [`Queue::list`] skips because they cannot be parsed (a

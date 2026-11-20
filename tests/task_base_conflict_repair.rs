@@ -299,12 +299,21 @@ async fn conflict_execution_rechecks_tip_checkout_owner_and_head_before_consumpt
     let (fx, mut task, runner, request) = stopped().await;
     grant(&request).await;
     let original_tip = request.tip.as_ref().unwrap();
+    let before_move = inspect(&request).await;
+    assert_eq!(before_move["recovery"]["resume"]["status"], "locally_eligible", "{before_move}");
     git_ok(&fx.repo, &["update-ref", "refs/remotes/origin/main", &request.head]).await;
+    let moved = inspect(&request).await;
+    assert_eq!(moved["recovery"]["resume"]["status"], "refused", "{moved}");
+    let reason = moved["recovery"]["resume"]["reason"].as_str().unwrap();
+    assert!(reason.contains("base tip moved") && reason.contains("--replace-request"), "{reason}");
     let mut resumed = Runner::resume(&request.run).unwrap();
     assert!(resumed.execute().await.unwrap_err().to_string().contains("base tip moved"));
     assert!(RunState::load(&request.run).unwrap().repair_grants.is_empty());
     git_ok(&fx.repo, &["update-ref", "refs/remotes/origin/main", original_tip]).await;
     std::fs::write(fx.repo.join("README.md"), "owner work in progress\n").unwrap();
+    let dirty = inspect(&request).await;
+    assert_eq!(dirty["recovery"]["resume"]["status"], "refused", "{dirty}");
+    assert!(dirty["recovery"]["resume"]["reason"].as_str().unwrap().contains("checkout is dirty"), "{dirty}");
     let mut resumed = Runner::resume(&request.run).unwrap();
     assert!(resumed.execute().await.unwrap_err().to_string().contains("checkout is dirty"));
     std::fs::write(fx.repo.join("README.md"), "timeout = 7200\n").unwrap();
@@ -455,6 +464,9 @@ async fn explicit_followup_review_retains_selection_and_rejects_changed_scope() 
     let mut resumed = Runner::resume(&request.run).unwrap(); resumed.execute().await.unwrap();
     assert!(!resumed.state.repair_grants[0].succeeded);
     assert!(resumed.state.reviews.len() < resumed.state.config.graph.review_rounds);
+    let failed = inspect(&request).await;
+    assert_eq!(failed["recovery"]["resume"]["status"], "refused", "{failed}");
+    assert!(failed["recovery"]["resume"]["reason"].as_str().unwrap().contains("completed without clearing fresh review or verification"), "{failed}");
     let mut followup = request.clone();
     followup.kind = Kind::Review; followup.tip = None; followup.instruction = None;
     followup.request = "explicit-review-followup".into();
@@ -915,7 +927,7 @@ async fn legacy_scratch_descendant_and_owner_hold_refuse_without_losing_dirty_co
 
 common::e2e! {
 async fn legacy_movement_diagnostics_use_recover_base_without_mutation() {
-    let (_fx, task, mut runner, request) = stopped().await;
+    let (_fx, mut task, mut runner, request) = stopped().await;
     legacy_stop(&mut runner, &request.head, false);
     let branch = runner.state.winner().unwrap().branch.clone();
     for (noun, verb) in [("rebase(s)", "rebasing"), ("synchronization(s)", "synchronizing")] {
@@ -930,8 +942,22 @@ async fn legacy_movement_diagnostics_use_recover_base_without_mutation() {
         let assessment = magi::repair_budget::legacy::classify(&runner.state, &request.head, request.tip.as_deref().unwrap());
         assert_eq!(assessment.class, magi::repair_budget::legacy::Class::MovementExhausted);
         let report = inspect(&request).await;
+        if task.review_branch.is_some() {
+            assert_eq!(report["classification"], "movement-exhaustion");
+            assert_eq!(report["recovery"]["recover_base"]["status"], "refused");
+            assert_eq!(report["admission_blocker"], "run task ownership changed");
+            assert_eq!(std::fs::read(&run_path).unwrap(), before);
+            assert_eq!(std::fs::read(Queue::open().path_of(&task.id)).unwrap(), owner_before);
+            // The textual-repair fixture carries a separate review selection.
+            // Remove only that fixture checkpoint to inspect movement recovery.
+            task.review_branch = None;
+            Queue::open().put(&mut task).unwrap();
+        }
+        let owner_before = std::fs::read(Queue::open().path_of(&task.id)).unwrap();
+        let report = inspect(&request).await;
         assert_eq!(report["classification"], "movement-exhaustion");
-        assert!(report["next_step"].as_str().unwrap().contains("recover-base"));
+        assert_eq!(report["recovery"]["recover_base"]["status"], "locally_eligible", "{report}");
+        assert!(report["next_step"].as_str().unwrap().contains("recover-base"), "{report}");
         let refused = grant_output(&request);
         assert!(!refused.status.success());
         assert!(String::from_utf8_lossy(&refused.stderr).contains("recover-base"));

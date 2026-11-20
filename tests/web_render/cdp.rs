@@ -210,7 +210,7 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> Browser<S> {
         method: &str,
         params: Value,
     ) -> Result<Value, String> {
-        self.call_within(session, method, params, CALL_TIMEOUT)
+        self.call_within(session, method, params, CALL_TIMEOUT, diag::os_samples)
             .await
     }
 
@@ -220,12 +220,13 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> Browser<S> {
         method: &str,
         params: Value,
         within: Duration,
+        sample_os: impl FnOnce(u32) -> Value + Send + 'static,
     ) -> Result<Value, String> {
         let started_ms = diag::now();
         match tokio::time::timeout(within, self.call_inner(session, method, params)).await {
             Ok(result) => result,
             Err(_) => {
-                let evidence = self.diagnostics(session).await;
+                let evidence = self.diagnostics(session, sample_os).await;
                 Err(format!(
                     "{method}: no answer within {within:?}; started_ms={started_ms}; {evidence}"
                 ))
@@ -266,7 +267,11 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> Browser<S> {
 
     // Preserve evidence before cleanup deletes the profile. Probes address the
     // browser, not the unresponsive page, and share one six-second deadline.
-    async fn diagnostics(&mut self, session: Option<&str>) -> String {
+    async fn diagnostics(
+        &mut self,
+        session: Option<&str>,
+        sample_os: impl FnOnce(u32) -> Value + Send + 'static,
+    ) -> String {
         let at = diag::now();
         let process = match self.child.try_wait() {
             Ok(Some(status)) => format!("exited: {status}"),
@@ -286,7 +291,7 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> Browser<S> {
         let sampler = std::thread::Builder::new()
             .name("chrome-diagnostics".to_owned())
             .spawn(move || {
-                let _ = sender.send(diag::os_samples(pid.unwrap_or(0)));
+                let _ = sender.send(sample_os(pid.unwrap_or(0)));
             });
         let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
         let mut probes = Vec::new();
@@ -583,6 +588,15 @@ mod tests {
             event_trace: Default::default(),
             events: Vec::new(),
         };
+        // These protocol tests must not depend on how long host-wide process
+        // enumeration takes. Exercise both diagnostic outcomes deliberately.
+        let (release_sampler, stalled_sampler) = std::sync::mpsc::channel::<()>();
+        let sample_os = move |pid| {
+            if !respond {
+                let _ = stalled_sampler.recv();
+            }
+            json!([{"processes": [{"pid": pid, "cpu_ms": 42}]}])
+        };
         let started = Instant::now();
         let error = browser
             .call_within(
@@ -590,13 +604,22 @@ mod tests {
                 "Page.navigate",
                 json!({}),
                 Duration::from_millis(20),
+                sample_os,
             )
             .await
             .unwrap_err();
+        drop(release_sampler);
         assert!(started.elapsed() < Duration::from_secs(8));
         assert!(error.starts_with("Page.navigate: no answer within 20ms"));
         assert!(error.contains("fake-CDP"));
-        assert!(error.contains("cpu_ms"));
+        if respond {
+            assert!(error.contains("\"cpu_ms\":42"), "{error}");
+        } else {
+            assert!(
+                error.contains("OS sampling exceeded diagnostic deadline"),
+                "{error}"
+            );
+        }
         assert_eq!(
             server.await.unwrap(),
             [

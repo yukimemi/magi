@@ -21,6 +21,11 @@
 //! review missed. See [`stats`].
 #![deny(missing_docs)]
 
+// Cargo tracks `env!` in dep-info. The shared target directory must not
+// consider a library built from another checkout fresh just because its
+// relative source paths and package version match.
+const _: &str = env!("CARGO_MANIFEST_DIR");
+
 pub mod advise;
 pub mod agent;
 pub mod already;
@@ -120,6 +125,7 @@ pub mod worktree_setup;
 
 pub mod choice_effect;
 mod resume;
+pub use resume::prepare_cli_pin;
 
 // Run environment-sensitive unit fixtures as ordinary standalone invocations,
 // without mutating the concurrent test harness or inheriting worker ownership.

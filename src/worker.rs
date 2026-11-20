@@ -1399,6 +1399,14 @@ mod tests {
 
     #[test]
     fn acknowledgement_records_own_version_and_handler_failure() {
+        // Other tests can fork while pin_source has the executable open for
+        // writing. An inherited descriptor can keep exec blocked with ETXTBSY
+        // even after pin_source closes its own copy.
+        if !crate::standalone_test(
+            "worker::tests::acknowledgement_records_own_version_and_handler_failure",
+        ) {
+            return;
+        }
         let home = tempfile::tempdir().unwrap();
         let generation = pin_source(home.path(), &std::env::current_exe().unwrap()).unwrap();
         let (job, _) = reserve(
