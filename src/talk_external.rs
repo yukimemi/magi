@@ -35,15 +35,15 @@ fn read_binding(store: &Talks, request: &str) -> Result<Option<OwnerBinding>> {
     }
 }
 
-fn save_binding(store: &Talks, request: &str, binding: &OwnerBinding) -> Result<()> {
+fn reserve_binding(store: &Talks, request: &str, binding: &OwnerBinding) -> Result<bool> {
     let path = binding_path(store, request);
     std::fs::create_dir_all(path.parent().expect("binding directory"))?;
-    write_atomic(
-        &path.with_extension("tmp"),
+    publish_exclusive(
         &path,
+        &path.with_extension(format!("tmp.{}", fresh_token())),
         &serde_json::to_string(binding)?,
     )
-    .context("persist owner request binding")
+    .context("reserve owner request binding")
 }
 
 /// A durable occurrence, committed atomically with its exact transcript input.
@@ -406,8 +406,12 @@ async fn submit(
             return Ok(json!({"talk":fresh.id,"request":request,"status":"busy"}));
         }
         let index = fresh.turns.len();
-        if let Some(binding) = &expected_binding {
-            save_binding(store, request, binding)?;
+        if let Some(binding) = &expected_binding
+            && !reserve_binding(store, request, binding)?
+        {
+            let winner =
+                read_binding(store, request)?.context("owner request binding disappeared")?;
+            return Ok(binding_status(&winner));
         }
         fresh.turns.push(match input {
             InputKind::Owner => operator_turn(text, Vec::new(), None),
@@ -597,6 +601,28 @@ pub(crate) async fn run_worker(store: &Talks, id: &str, request: &str) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_owner_admission_cannot_replace_a_request_binding() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Talks::at(home.path().join("talks"));
+        let request = "follow";
+        let first = OwnerBinding {
+            talk: "first".into(),
+            text_sha256: digest("Observe the release"),
+        };
+        let second = OwnerBinding {
+            talk: "second".into(),
+            text_sha256: digest("Observe the release"),
+        };
+
+        // Both admissions observed an absent binding before the second won.
+        assert!(read_binding(&store, request).unwrap().is_none());
+        assert!(reserve_binding(&store, request, &second).unwrap());
+        assert!(!reserve_binding(&store, request, &first).unwrap());
+        assert!(!reserve_binding(&store, request, &second).unwrap());
+        assert!(read_binding(&store, request).unwrap().as_ref() == Some(&second));
+    }
 
     #[test]
     fn startup_timeout_preserves_the_reserved_request() {

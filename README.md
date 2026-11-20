@@ -930,6 +930,8 @@ same ID. The separate owner binding also survives older schedulers rewriting
 the Chat. Deleting a chat removes its transcript and effect evidence. If the
 binding survived but its transcript receipt is missing, the result is
 uncertain, not retryable.
+Concurrent owner submissions with the same ID cannot reserve two destinations:
+the first reservation wins, even if its transcript receipt is not yet visible.
 Never switch IDs to replay uncertain work. Neither a browser nor a running web
 server is needed to submit and get the reply. As with a web-established Goal,
 automatic follow-through requires the scheduler.
