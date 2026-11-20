@@ -625,7 +625,7 @@ pub struct Talk {
     /// Automatic notice references, saved atomically with their draft and key.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub completion_notices: Vec<crate::chat_notify::CompletionReference>,
-    /// Durable external admissions, correlated to exact transcript positions.
+    /// Durable CLI admissions, correlated to exact transcript positions.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub external_requests: Vec<external::Request>,
     /// When the conversation was opened.
@@ -1788,7 +1788,13 @@ pub fn record_reply(
     if text.trim().is_empty() && attachments.is_empty() {
         bail!("nothing to say");
     }
-    talk.turns.push(Turn {
+    talk.turns.push(operator_turn(text, attachments, reply));
+    store.put(talk)?;
+    Ok(text.to_owned())
+}
+
+fn operator_turn(text: &str, attachments: Vec<Attachment>, reply: Option<Reply>) -> Turn {
+    Turn {
         sender: Some(Sender::Operator),
         who: Who::Operator,
         body: text.to_owned(),
@@ -1804,9 +1810,7 @@ pub fn record_reply(
         usage: None,
         breaks: Some(Vec::new()),
         posted_by: None,
-    });
-    store.put(talk)?;
-    Ok(text.to_owned())
+    }
 }
 
 /// Undo only an exact admission whose execution is proven never started.
@@ -2295,9 +2299,20 @@ pub async fn respond(
     cfg: &Config,
     text: &str,
 ) -> Result<()> {
+    respond_at(lease, talk, store, cfg, text, None).await
+}
+
+async fn respond_at(
+    lease: &TurnLease,
+    talk: &mut Talk,
+    store: &Talks,
+    cfg: &Config,
+    text: &str,
+    submitted_input: Option<usize>,
+) -> Result<()> {
     check_lease(lease, talk)?;
     lease
-        .beating(turn(talk, store, cfg, text))
+        .beating(turn(talk, store, cfg, text, submitted_input))
         .await
         .and_then(|done| done)
 }
@@ -2765,7 +2780,13 @@ fn append_reply(talk: &mut Talk, reply: Turn, warn: bool) {
 /// else has told the agent what this conversation is or what it may do.
 /// Every turn after that resends nothing when the CLI can resume its own
 /// session, and falls back to [`transcript`] only when it cannot.
-async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Result<()> {
+async fn turn(
+    talk: &mut Talk,
+    store: &Talks,
+    cfg: &Config,
+    text: &str,
+    submitted_input: Option<usize>,
+) -> Result<()> {
     // Freeze both boundaries before invoking the CLI. Failure notes must not
     // hide unread posts in old records, and posts arriving during any attempt
     // (including fallback) were absent from this snapshot's prompt.
@@ -2776,7 +2797,7 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
     let input_turn = if goal_input {
         None
     } else {
-        external::active_input(talk).or_else(|| {
+        submitted_input.or_else(|| {
             talk.turns.len().checked_sub(1).filter(|&index| {
                 let turn = &talk.turns[index];
                 turn.who == Who::Operator && turn.body == text
@@ -3240,11 +3261,9 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
             talk.implementers_dirty = false;
             talk.posts_read_through = Some(prompt_turns);
         }
-        if external_input
-            && let Some(request) = talk.external_requests.iter_mut().find(|request| {
-                Some(request.input_turn) == input_turn && request.status == "started"
-            })
-        {
+        if let Some(request) = talk.external_requests.iter_mut().find(|request| {
+            Some(request.input_turn) == submitted_input && request.status == "started"
+        }) {
             request.status = if failure.is_some() {
                 "failed"
             } else {
@@ -3285,11 +3304,10 @@ async fn turn(talk: &mut Talk, store: &Talks, cfg: &Config, text: &str) -> Resul
                     talk.agent
                 ),
             };
-            if external_input
-                && let Some(request) = talk
-                    .external_requests
-                    .iter_mut()
-                    .find(|request| Some(request.input_turn) == input_turn)
+            if let Some(request) = talk
+                .external_requests
+                .iter_mut()
+                .find(|request| Some(request.input_turn) == submitted_input)
             {
                 request.status = "failed".to_owned();
                 request.error = Some(why.clone());
