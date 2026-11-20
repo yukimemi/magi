@@ -5,7 +5,7 @@ import { test } from 'node:test';
 const source = readFileSync(new URL('../assets/ui/app.js', import.meta.url), 'utf8');
 const logic = source.slice(source.indexOf('const priorityOrder ='), source.indexOf('function queueReorderNotice('));
 function harness() {
-  return runInNewContext(`${logic}\n({priorityEdits, queueMoveEdits, queueOrder})`, {
+  return runInNewContext(`${logic}\n({priorityEdits, queueMoveEdits, queueOrder, queueDropSlot})`, {
     queueSection: task => task.status || 'upnext',
   });
 }
@@ -48,4 +48,16 @@ test('upgrade resumes stay ahead of priority and order by dispatch time', () => 
   const { queueOrder } = harness();
   const tasks = [{ id: 'ordinary', priority: 2147483647 }, { id: 'later', priority: 0, upgrade_resume_at: '2026-01-02T00:00:00Z' }, { id: 'earlier', priority: -10, upgrade_resume_at: '2026-01-01T00:00:00Z' }];
   assert.deepEqual(tasks.sort(queueOrder).map(t => t.id), ['earlier', 'later', 'ordinary']);
+});
+test('neither side of an upgrade resume is a drop boundary', () => {
+  const { queueDropSlot } = harness();
+  const row = (fixed = false) => ({ hasAttribute: name => fixed && name === 'data-upgrade-resume' });
+  const [upgrade, a, b] = [row(true), row(), row()];
+  const rows = [upgrade, a, b];
+  assert.equal(queueDropSlot(rows, 3, 0, true), null);
+  assert.equal(queueDropSlot(rows, 3, 0, false), null);
+  assert.equal(queueDropSlot(rows, 3, 1, true), null);
+  const slot = queueDropSlot(rows, 3, 2, true);
+  assert.equal(slot.prev, a);
+  assert.equal(slot.next, b);
 });

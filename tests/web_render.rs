@@ -1097,6 +1097,12 @@ async fn queue_drag_paints_and_saves_the_insertion_boundary() {
             .await
             .unwrap();
         browser.wait_for(&page, &ordered(&ids), wait).await.unwrap();
+        let scroller = if mobile {
+            "document.scrollingElement"
+        } else {
+            "document.querySelector('#view-queue')"
+        };
+        let scroll_top = format!("{scroller}.scrollTop");
         let source = format!("{rows}[0].querySelector('.reorder-handle')");
         let third = format!("{rows}[2]");
         let center = format!("{rows}[1].scrollIntoView({{block:'center'}})");
@@ -1133,18 +1139,28 @@ async fn queue_drag_paints_and_saves_the_insertion_boundary() {
             .wait_for(&page, &format!("{third}.dataset.drop === 'after'"), wait)
             .await
             .unwrap();
+        let fourth = format!("{rows}[3]");
+        browser
+            .eval(
+                &page,
+                &format!(
+                    "{scroll_top} += {fourth}.getBoundingClientRect().top - {third}.getBoundingClientRect().top"
+                ),
+            )
+            .await
+            .unwrap();
+        browser
+            .wait_for(&page, &format!("{fourth}.dataset.drop === 'after'"), wait)
+            .await
+            .unwrap();
         let outside = (1.0, target.1);
         pointer(&mut browser, &page, mobile, 1, outside).await;
         let clear = "!document.querySelector('#queue-sections [data-drop]')";
         browser.wait_for(&page, clear, wait).await.unwrap();
         pointer(&mut browser, &page, mobile, 2, outside).await;
 
-        let scroller = if mobile {
-            "document.scrollingElement"
-        } else {
-            "document.querySelector('#view-queue')"
-        };
-        let scroll_top = format!("{scroller}.scrollTop");
+        browser.eval(&page, &center).await.unwrap();
+        let start = point(&mut browser, &page, &source, 0.5).await;
         let top = browser.eval(&page, &scroll_top).await.unwrap();
         let bottom = if mobile {
             "document.querySelector('.dock').getBoundingClientRect().top"

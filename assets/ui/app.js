@@ -2383,6 +2383,23 @@ function queueMoveEdits(tasks, key, prevKey, nextKey, section) {
   }
   return priorityEdits(items, items.indexOf(moved), to);
 }
+
+function queueDropSlot(rows, from, index, before) {
+  const anchor = rows[index];
+  if (!anchor) return null;
+  const at = index + (before ? 0 : 1);
+  const prev = rows[at - 1], next = rows[at];
+  if (at === from || prev?.hasAttribute("data-upgrade-resume") || next?.hasAttribute("data-upgrade-resume")) return null;
+  return { anchor, side: before ? "before" : "after", prev, next };
+}
+
+function queueDragRows(row) {
+  const rows = [...row.parentElement.children];
+  const from = rows.indexOf(row);
+  rows.splice(from, 1);
+  return { rows, from };
+}
+
 function queueReorderNotice(message) {
   setText($("queue-reorder-status"), message);
   announce(message);
@@ -2427,19 +2444,17 @@ function addQueueReorderHandle(row) {
     if (!["ArrowUp", "ArrowDown"].includes(event.key)) return;
     event.preventDefault();
     if (handle.disabled || queueDragging || !queueReorderAllowed()) return;
-    const prev = row.previousElementSibling;
-    const next = row.nextElementSibling;
-    if (event.key === "ArrowUp" && prev) void moveQueueRow(row, prev.previousElementSibling, prev);
-    if (event.key === "ArrowDown" && next) void moveQueueRow(row, next, next.nextElementSibling);
+    const { rows, from } = queueDragRows(row);
+    const up = event.key === "ArrowUp";
+    const slot = queueDropSlot(rows, from, up ? from - 1 : from, up);
+    if (slot) void moveQueueRow(row, slot.prev, slot.next);
   });
   handle.addEventListener("pointerdown", (event) => {
     if (event.button !== 0 || handle.disabled || queueDragging || !queueReorderAllowed()) return;
     event.preventDefault();
     const { pointerId } = event;
     const list = row.parentElement;
-    const rows = [...list.children];
-    const from = rows.indexOf(row);
-    rows.splice(from, 1);
+    const { rows, from } = queueDragRows(row);
     const pane = list.closest(".view");
     const scroller = getComputedStyle(pane).overflowY === "auto" ? pane : document.scrollingElement;
     const header = document.querySelector("header.top");
@@ -2456,11 +2471,7 @@ function addQueueReorderHandle(row) {
       for (const [i, anchor] of rows.entries()) {
         const { top, bottom } = anchor.getBoundingClientRect();
         if (y >= bottom && i < rows.length - 1) continue;
-        const before = y < (top + bottom) / 2;
-        const slot = i + (before ? 0 : 1);
-        return slot === from ? null : {
-          anchor, side: before ? "before" : "after", prev: rows[slot - 1], next: rows[slot],
-        };
+        return queueDropSlot(rows, from, i, y < (top + bottom) / 2);
       }
       return null;
     };
@@ -2471,6 +2482,7 @@ function addQueueReorderHandle(row) {
       markedSide = slot?.side;
       if (marked) marked.dataset.drop = markedSide;
     };
+    const refreshDrop = () => indicate(slotAtPointer());
     const scroll = () => {
       if (inList()) {
         const { top, bottom } = scroller === document.scrollingElement
@@ -2478,14 +2490,15 @@ function addQueueReorderHandle(row) {
           : scroller.getBoundingClientRect();
         const dy = y < top + 48 ? -10 : y > bottom - 48 ? 10 : 0;
         if (dy) scroller.scrollTop += dy;
+      } else {
+        indicate(null);
       }
-      indicate(slotAtPointer());
       frame = requestAnimationFrame(scroll);
     };
     const move = (e) => {
       if (e.pointerId !== pointerId) return;
       ({ clientX: x, clientY: y } = e);
-      indicate(slotAtPointer());
+      refreshDrop();
     };
     const finish = (e) => {
       if (e.type !== "keydown" && e.pointerId !== pointerId) return;
@@ -2500,6 +2513,7 @@ function addQueueReorderHandle(row) {
       handle.removeEventListener("pointercancel", finish);
       handle.removeEventListener("lostpointercapture", finish);
       document.removeEventListener("keydown", cancel, true);
+      document.removeEventListener("scroll", refreshDrop, true);
       row.classList.remove("row-dragging");
       indicate(null);
       queueDragging = false;
@@ -2518,6 +2532,7 @@ function addQueueReorderHandle(row) {
     handle.addEventListener("pointercancel", finish);
     handle.addEventListener("lostpointercapture", finish);
     document.addEventListener("keydown", cancel, true);
+    document.addEventListener("scroll", refreshDrop, true);
     frame = requestAnimationFrame(scroll);
   });
 }
@@ -2836,7 +2851,8 @@ function updateTaskCard(row, task) {
   const r = row.refs;
   const status = String(task.status_str || task.status || "");
   const meta = TASK_STATUS[status] || {};
-  row.refs.reorder.disabled = !queueReorderAllowed() || status === "running" || Boolean(task.upgrade_resume_at);
+  row.toggleAttribute("data-upgrade-resume", Boolean(task.upgrade_resume_at));
+  row.refs.reorder.disabled = !queueReorderAllowed() || status === "running" || row.hasAttribute("data-upgrade-resume");
 
   setAttr(r.card, "data-tone", toneOf(status, TASK_STATUS));
   /* The full id, a stable hook for jumpToTask() that does not depend on

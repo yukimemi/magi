@@ -366,10 +366,12 @@ daemon killed mid-run leaves a queue the next one picks up.
 The Web Queue uses compact rows with the existing task detail alongside them
 on wide screens. Drag the ↕ handle (mouse or touch), or focus it and press
 Arrow Up or Arrow Down, to reorder within a section after clearing search.
-The yellow line marks where the task will go. Press Escape to cancel a drag.
+The yellow line marks a valid insertion boundary and follows it while scrolling.
+Press Escape to cancel a drag.
 Queue moves persist priorities through the ordinary priority endpoint. Higher
 values run first, and ties use ascending task ID. Running tasks cannot move.
-Upgrade resumes occupy a fixed lane ahead of ordinary priorities. Admission,
+Upgrade resumes occupy a fixed lane ahead of ordinary priorities; neither input
+method can insert a task next to an upgrade resume. Admission,
 urgent slots, and other eligibility gates still apply. Saves are sequential:
 if a write is refused, remaining writes stop and the list reloads the saved order.
 The +/− priority controls, Edit and Actions remain available on every row,
