@@ -6748,7 +6748,7 @@ function applyTalkSections(detail) {
   if (goal_link_for === detail.talk.updated_at) Object.assign(detail.talk, { goal_link, goal_link_for });
 }
 
-async function loadTalk(id, { background = false } = {}) {
+async function loadTalk(id, { background = false, recoverVersion = true } = {}) {
   const release = typeof conversationPriority === "undefined" ? () => {} : conversationPriority.begin();
   const generation = detailSectionGeneration;
   const detail = state.talkDetail;
@@ -6807,6 +6807,7 @@ async function loadTalk(id, { background = false } = {}) {
     }
     sectionNotice("talk-task-progress", "talk-sections-state", "");
     renderTalkSections();
+    return data.goal_link_for != null && data.goal_link_for !== version;
   }, error => {
     if (currentSections()) {
       detail.sectionsError = true;
@@ -6814,7 +6815,11 @@ async function loadTalk(id, { background = false } = {}) {
       renderTalkSections();
     }
   }, false, background);
-  await sections;
+  // Distinct request keys prevent joining an older read, but the server can
+  // still save the conversation between our core and sections reads.
+  if (await sections && recoverVersion && currentSections()) {
+    await loadTalk(id, { background, recoverVersion: false });
+  }
 }
 
 /* The server uses Done alone as completion, for the same tasks as the list. */

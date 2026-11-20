@@ -252,7 +252,7 @@ async fn serve_with_client_probe(
             "state, loadRun, observeRunProgress, renderRunProgress, tickActive, applyRevisions_",
         ),
         ClientProbe::TalkScroll => Some("state, renderTalk, applyRoute, scheduleTalkPosition"),
-        ClientProbe::Goals => Some("state, loadTalk"),
+        ClientProbe::Goals => Some("state, loadTalk, detailSections"),
         ClientProbe::Upgrade => {
             Some("state, upgrade, renderLoop, renderUpgradeError, loadHealth, ok")
         }
@@ -268,6 +268,17 @@ async fn serve_with_client_probe(
             scrollCalls.push({ behavior: options.behavior, id: deck.state.talkDetail.id });
           return nativeScrollIntoView.call(this, options);
         };"#
+    } else if matches!(probe, ClientProbe::Goals) {
+        // These pages drive refreshes explicitly to isolate the effects of one
+        // loadTalk from the independent revision stream. Keep the real stream
+        // open so the client doesn't switch to revision polling.
+        r#"if (new URLSearchParams(location.search).has('manual-goal-refresh')) {
+          window.EventSource = class extends EventSource {
+            addEventListener(type, ...args) {
+              if (type !== 'change') super.addEventListener(type, ...args);
+            }
+          };
+        }"#
     } else {
         ""
     };
@@ -6024,7 +6035,7 @@ printf 'Registered the cross-repository goal.\n'
         task.status = TaskStatus::Queued;
         queue.put(&mut task).unwrap();
         let page = browser
-            .open_page(&format!("{base}#/chat/{}", chat.id), width, height, mobile)
+            .open_page(&format!("{base}?manual-goal-refresh#/chat/{}", chat.id), width, height, mobile)
             .await
             .unwrap();
         browser
@@ -6073,18 +6084,8 @@ printf 'Registered the cross-repository goal.\n'
             )
             .await
             .unwrap();
-        browser.eval(&page, "history.back()").await.unwrap();
-        browser
-            .wait_for(
-                &page,
-                "deck.state.route.name === 'talk' && !!deck.state.talkDetail.sections",
-                Duration::from_secs(30),
-            )
-            .await
-            .unwrap();
-
-        // Hold a real response from before the selection change. A refresh
-        // for the new core must not wait on that older sections request.
+        // Intercept before returning to Chat so the route's first sections
+        // read is held even if another refresh joins it.
         browser.eval(&page, &format!(r#"(() => {{
           const native = window.fetch;
           const suffix = '/api/talks/' + {id:?} + '/sections';
@@ -6099,14 +6100,19 @@ printf 'Registered the cross-repository goal.\n'
                 pending: talk?.selected_goal === 'run-goal' && talk.updated_at === goal_link_for
                   && link.hidden && !link.hasAttribute('href')}};
               reads.push(read);
-              if (reads.length === 1) await new Promise(resolve => window.releaseOldGoalSections = resolve);
+              if (reads.length === 1) {{
+                window.oldGoalSections = [...deck.detailSections.values()]
+                  .find(job => job.controller.signal === args[1].signal).promise;
+                await new Promise(resolve => window.releaseOldGoalSections = resolve);
+              }}
             }}
             return response;
           }};
           window.restoreGoalFetch = () => window.fetch = native;
-          window.oldGoalRefresh = deck.loadTalk({id:?});
+          history.back();
         }})()"#, id = chat.id)).await.unwrap();
-        browser.wait_for(&page, "!!window.releaseOldGoalSections", Duration::from_secs(30)).await.unwrap();
+        browser.wait_for(&page, "!!window.releaseOldGoalSections", Duration::from_secs(30)).await
+            .unwrap_or_else(|error| panic!("hold previous sections at {width}px: {error}"));
         chat.selected_goal = Some("run-goal".into());
         talks.put(&mut chat).unwrap();
         let version = chat.updated_at.to_string();
@@ -6132,7 +6138,7 @@ printf 'Registered the cross-repository goal.\n'
         })()"#).await.unwrap();
         browser.eval(&page, r#"(async () => {
           window.releaseOldGoalSections();
-          await Promise.all([window.oldGoalRefresh, window.newGoalRefresh]);
+          await Promise.all([window.oldGoalSections, window.newGoalRefresh]);
           window.restoreGoalFetch();
         })()"#).await.unwrap();
         applied.unwrap_or_else(|error| panic!("matching sections at {width}px: {error}; {before_release}"));
@@ -6196,6 +6202,53 @@ printf 'Registered the cross-repository goal.\n'
                 .unwrap(),
             "Keep this unsent draft"
         );
+
+        // Versioned keys cannot prevent a save between the two server reads.
+        // Hold the first sections request before it reaches the server, then
+        // make it read a newer snapshot than the already rendered core.
+        browser.eval(&page, &format!(r#"(() => {{
+          const native = window.fetch;
+          const suffix = '/api/talks/' + {id:?} + '/sections';
+          let first = true;
+          window.fetch = async (...args) => {{
+            const talk = deck.state.talkDetail.talk;
+            if (String(args[0]) !== suffix || !first || talk?.selected_goal !== 'queued-goal') return native(...args);
+            const core = talk.updated_at;
+            first = false;
+            await new Promise(resolve => window.sendGoalSections = resolve);
+            const response = await native(...args);
+            const {{goal_link_for: sections, goal_link}} = await response.clone().json();
+            window.splitGoalRead = {{core, sections, goal: goal_link?.goal}};
+            return response;
+          }};
+          window.restoreGoalFetch = () => window.fetch = native;
+        }})()"#, id = chat.id)).await.unwrap();
+        chat.selected_goal = Some("queued-goal".into());
+        talks.put(&mut chat).unwrap();
+        let old_version = chat.updated_at.to_string();
+        browser.eval(&page, &format!("void (window.goalRecovery = deck.loadTalk({:?}))", chat.id)).await.unwrap();
+        browser.wait_for(&page, "!!window.sendGoalSections", Duration::from_secs(30)).await
+            .unwrap_or_else(|error| panic!("hold split sections request at {width}px: {error}"));
+        chat.selected_goal = Some("direct-run-goal".into());
+        talks.put(&mut chat).unwrap();
+        let new_version = chat.updated_at.to_string();
+        let recovered = browser.eval(&page, r#"(async () => {
+          window.sendGoalSections();
+          try {
+            await window.goalRecovery;
+            const talk = deck.state.talkDetail.talk;
+            const link = document.getElementById('talk-goal-open');
+            return {split: window.splitGoalRead, core: talk.updated_at,
+              linked: talk.goal_link_for, href: link.hidden ? null : link.getAttribute('href')};
+          } finally {
+            window.restoreGoalFetch();
+          }
+        })()"#).await.unwrap();
+        assert_eq!(recovered, serde_json::json!({
+            "split": {"core": old_version, "sections": new_version, "goal": "direct-run-goal"},
+            "core": new_version, "linked": new_version, "href": format!("#/runs/{}", direct_run.id)
+        }), "recover split server reads at {width}px");
+        eprintln!("Recovered split goal reads at {width}px: {recovered}");
 
         // Only persisted references resolve links. Exercise each unsafe record
         // alone, then after an earlier valid direct reference.
