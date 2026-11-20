@@ -6741,9 +6741,11 @@ function acceptTalkUpdate(talk) {
 
 function applyTalkSections(detail) {
   if (!detail.talk || !detail.sections) return;
-  const { context, context_for, persona_name, persona_avatar, operator_name, ...metadata } = detail.sections;
+  const { context, context_for, persona_name, persona_avatar, operator_name,
+    goal_link, goal_link_for, ...metadata } = detail.sections;
   Object.assign(detail.talk, metadata);
   if (context_for === detail.talk.updated_at) Object.assign(detail.talk, { context, persona_name, persona_avatar, operator_name });
+  if (goal_link_for === detail.talk.updated_at) Object.assign(detail.talk, { goal_link, goal_link_for });
 }
 
 async function loadTalk(id, { background = false } = {}) {
@@ -6790,9 +6792,11 @@ async function loadTalk(id, { background = false } = {}) {
     }
   } finally { release(); }
   if (!loaded || !current()) return;
+  const version = detail.talk.updated_at;
+  const currentSections = () => current() && detail.talk?.updated_at === version;
   sectionNotice("talk-task-progress", "talk-sections-state", "Loading related tasks and choices…", null, { pending: true, snapshot: Boolean(detail.sections) });
-  const sections = sectionRequest(`talk:${id}:sections`, `${API.talk(id)}/sections`, data => {
-    if (!current()) return;
+  const sections = sectionRequest(`talk:${id}:sections:${version}`, `${API.talk(id)}/sections`, data => {
+    if (!currentSections()) return;
     detail.sections = data;
     detail.sectionsError = false;
     detail.roster = data.roster;
@@ -6804,7 +6808,7 @@ async function loadTalk(id, { background = false } = {}) {
     sectionNotice("talk-task-progress", "talk-sections-state", "");
     renderTalkSections();
   }, error => {
-    if (current()) {
+    if (currentSections()) {
       detail.sectionsError = true;
       sectionNotice("talk-task-progress", "talk-sections-state", `Related information: ${error.message}`, retry);
       renderTalkSections();
