@@ -6795,7 +6795,7 @@ async function loadTalk(id, { background = false, recoverVersion = true } = {}) 
   const version = detail.talk.updated_at;
   const currentSections = () => current() && detail.talk?.updated_at === version;
   sectionNotice("talk-task-progress", "talk-sections-state", "Loading related tasks and choices…", null, { pending: true, snapshot: Boolean(detail.sections) });
-  const sections = sectionRequest(`talk:${id}:sections:${version}`, `${API.talk(id)}/sections`, data => {
+  await sectionRequest(`talk:${id}:sections:${version}`, `${API.talk(id)}/sections`, data => {
     if (!currentSections()) return;
     detail.sections = data;
     detail.sectionsError = false;
@@ -6807,7 +6807,6 @@ async function loadTalk(id, { background = false, recoverVersion = true } = {}) 
     }
     sectionNotice("talk-task-progress", "talk-sections-state", "");
     renderTalkSections();
-    return data.goal_link_for != null && data.goal_link_for !== version;
   }, error => {
     if (currentSections()) {
       detail.sectionsError = true;
@@ -6815,9 +6814,11 @@ async function loadTalk(id, { background = false, recoverVersion = true } = {}) 
       renderTalkSections();
     }
   }, false, background);
-  // Distinct request keys prevent joining an older read, but the server can
-  // still save the conversation between our core and sections reads.
-  if (await sections && recoverVersion && currentSections()) {
+  // The server can save between reads, including during a trailing refresh.
+  // Inspect the latest applied snapshot, not the first callback's result.
+  const sectionsVersion = detail.sections?.goal_link_for;
+  if (recoverVersion && currentSections() && !detail.sectionsError
+      && sectionsVersion != null && sectionsVersion !== version) {
     await loadTalk(id, { background, recoverVersion: false });
   }
 }

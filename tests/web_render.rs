@@ -6203,18 +6203,24 @@ printf 'Registered the cross-repository goal.\n'
             "Keep this unsent draft"
         );
 
-        // Versioned keys cannot prevent a save between the two server reads.
-        // Hold the first sections request before it reaches the server, then
-        // make it read a newer snapshot than the already rendered core.
+        // Let the first sections response match the core, then save a newer
+        // selection before the coalesced trailing request reaches the server.
         browser.eval(&page, &format!(r#"(() => {{
           const native = window.fetch;
           const suffix = '/api/talks/' + {id:?} + '/sections';
-          let first = true;
+          let reads = 0;
           window.fetch = async (...args) => {{
             const talk = deck.state.talkDetail.talk;
-            if (String(args[0]) !== suffix || !first || talk?.selected_goal !== 'queued-goal') return native(...args);
+            if (String(args[0]) !== suffix || talk?.selected_goal !== 'queued-goal') return native(...args);
             const core = talk.updated_at;
-            first = false;
+            if (++reads === 1) {{
+              const response = await native(...args);
+              window.firstGoalSections = await response.clone().json();
+              window.firstGoalJob = [...deck.detailSections.values()]
+                .find(job => job.controller.signal === args[1].signal);
+              await new Promise(resolve => window.releaseFirstGoalSections = resolve);
+              return response;
+            }}
             await new Promise(resolve => window.sendGoalSections = resolve);
             const response = await native(...args);
             const {{goal_link_for: sections, goal_link}} = await response.clone().json();
@@ -6226,28 +6232,38 @@ printf 'Registered the cross-repository goal.\n'
         chat.selected_goal = Some("queued-goal".into());
         talks.put(&mut chat).unwrap();
         let old_version = chat.updated_at.to_string();
-        browser.eval(&page, &format!("void (window.goalRecovery = deck.loadTalk({:?}))", chat.id)).await.unwrap();
+        let refresh = format!("deck.loadTalk({:?}, {{ background: true }})", chat.id);
+        browser.eval(&page, &format!("void (window.firstGoalRefresh = {refresh})")).await.unwrap();
+        browser.wait_for(&page, "!!window.releaseFirstGoalSections", Duration::from_secs(30)).await
+            .unwrap_or_else(|error| panic!("hold matching sections response at {width}px: {error}"));
+        browser.eval(&page, &format!("void (window.trailingGoalRefresh = {refresh})")).await.unwrap();
+        browser.wait_for(&page, "!!window.firstGoalJob.refresh", Duration::from_secs(30)).await
+            .unwrap_or_else(|error| panic!("join matching sections request at {width}px: {error}"));
+        browser.eval(&page, "window.releaseFirstGoalSections()").await.unwrap();
         browser.wait_for(&page, "!!window.sendGoalSections", Duration::from_secs(30)).await
-            .unwrap_or_else(|error| panic!("hold split sections request at {width}px: {error}"));
+            .unwrap_or_else(|error| panic!("hold trailing sections request at {width}px: {error}"));
         chat.selected_goal = Some("direct-run-goal".into());
         talks.put(&mut chat).unwrap();
         let new_version = chat.updated_at.to_string();
         let recovered = browser.eval(&page, r#"(async () => {
           window.sendGoalSections();
           try {
-            await window.goalRecovery;
+            await Promise.all([window.firstGoalRefresh, window.trailingGoalRefresh]);
             const talk = deck.state.talkDetail.talk;
             const link = document.getElementById('talk-goal-open');
-            return {split: window.splitGoalRead, core: talk.updated_at,
+            return {first: window.firstGoalSections.goal_link_for,
+              split: window.splitGoalRead, core: talk.updated_at, selection: talk.selected_goal,
               linked: talk.goal_link_for, href: link.hidden ? null : link.getAttribute('href')};
           } finally {
             window.restoreGoalFetch();
           }
         })()"#).await.unwrap();
         assert_eq!(recovered, serde_json::json!({
+            "first": old_version,
             "split": {"core": old_version, "sections": new_version, "goal": "direct-run-goal"},
-            "core": new_version, "linked": new_version, "href": format!("#/runs/{}", direct_run.id)
-        }), "recover split server reads at {width}px");
+            "core": new_version, "selection": "direct-run-goal",
+            "linked": new_version, "href": format!("#/runs/{}", direct_run.id)
+        }), "recover split trailing sections read at {width}px");
         eprintln!("Recovered split goal reads at {width}px: {recovered}");
 
         // Only persisted references resolve links. Exercise each unsafe record
