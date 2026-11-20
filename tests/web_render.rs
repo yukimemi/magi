@@ -1430,7 +1430,7 @@ async fn completion_audit_discard_and_reopen_controls_work_at_phone_and_desktop_
                         .is_some_and(|text| text.contains("400")))
             })
             .collect();
-        for problem in console_problems(&events) {
+        if let Some(problem) = console_problems(&events).into_iter().next() {
             panic!("@{width}px: {problem}");
         }
         browser.close_page(&page).await;
