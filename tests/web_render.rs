@@ -1159,14 +1159,62 @@ async fn queue_drag_paints_and_saves_the_insertion_boundary() {
         browser.wait_for(&page, clear, wait).await.unwrap();
         pointer(&mut browser, &page, mobile, 2, outside).await;
 
-        browser.eval(&page, &center).await.unwrap();
-        let start = point(&mut browser, &page, &source, 0.5).await;
-        let top = browser.eval(&page, &scroll_top).await.unwrap();
         let bottom = if mobile {
             "document.querySelector('.dock').getBoundingClientRect().top"
         } else {
             "document.querySelector('#view-queue').getBoundingClientRect().bottom"
         };
+        let clipped = format!("{rows}[7]");
+        browser
+            .eval(
+                &page,
+                &format!(
+                    "{scroll_top} += {clipped}.getBoundingClientRect().bottom - ({bottom} + 6)"
+                ),
+            )
+            .await
+            .unwrap();
+        let handle = format!("{rows}[5].querySelector('.reorder-handle')");
+        let start = point(&mut browser, &page, &handle, 0.5).await;
+        let target = point(&mut browser, &page, &clipped, 0.53).await;
+        let (x, y) = target;
+        assert_eq!(
+            browser
+                .eval(&page, &format!(
+                    "{y} < {bottom} - 48 && {clipped}.getBoundingClientRect().bottom > {bottom} && {clipped}.contains(document.elementFromPoint({x}, {y}))"
+                ))
+                .await
+                .unwrap(),
+            true,
+            "{width}px: pointer must hit the visible lower half outside the auto-scroll zone"
+        );
+        pointer(&mut browser, &page, mobile, 0, start).await;
+        browser
+            .wait_for(
+                &page,
+                "!!document.querySelector('#queue-sections .row-dragging')",
+                wait,
+            )
+            .await
+            .unwrap();
+        pointer(&mut browser, &page, mobile, 1, target).await;
+        assert_eq!(
+            browser.eval(&page, clear).await.unwrap(),
+            true,
+            "{width}px: clipped boundary was offered"
+        );
+        pointer(&mut browser, &page, mobile, 2, target).await;
+        let unchanged = format!("!{handle}.disabled && ({})", ordered(&ids));
+        assert_eq!(browser.eval(&page, &unchanged).await.unwrap(), true);
+        browser
+            .call(Some(&page.session), "Page.reload", json!({}))
+            .await
+            .unwrap();
+        browser.wait_for(&page, &ordered(&ids), wait).await.unwrap();
+
+        browser.eval(&page, &center).await.unwrap();
+        let start = point(&mut browser, &page, &source, 0.5).await;
+        let top = browser.eval(&page, &scroll_top).await.unwrap();
         let y = browser
             .eval(&page, &format!("{bottom} - 20"))
             .await

@@ -2466,12 +2466,20 @@ function addQueueReorderHandle(row) {
     handle.setPointerCapture(pointerId);
 
     const inList = () => queueReorderAllowed() && list.contains(document.elementFromPoint(x, y));
+    const scrollBounds = () => scroller === document.scrollingElement
+      ? { top: header.getBoundingClientRect().bottom, bottom: dock.offsetHeight ? dock.getBoundingClientRect().top : innerHeight }
+      : scroller.getBoundingClientRect();
     const slotAtPointer = () => {
       if (!inList() || rows.length === 0) return null;
       for (const [i, anchor] of rows.entries()) {
         const { top, bottom } = anchor.getBoundingClientRect();
         if (y >= bottom && i < rows.length - 1) continue;
-        return queueDropSlot(rows, from, i, y < (top + bottom) / 2);
+        const before = y < (top + bottom) / 2;
+        const bounds = scrollBounds();
+        // The insertion line is centered in the gap, just beyond the card edge.
+        const line = before ? top - 2 : bottom + 2;
+        if (line <= bounds.top || line >= bounds.bottom) return null;
+        return queueDropSlot(rows, from, i, before);
       }
       return null;
     };
@@ -2485,9 +2493,7 @@ function addQueueReorderHandle(row) {
     const refreshDrop = () => indicate(slotAtPointer());
     const scroll = () => {
       if (inList()) {
-        const { top, bottom } = scroller === document.scrollingElement
-          ? { top: header.getBoundingClientRect().bottom, bottom: dock.offsetHeight ? dock.getBoundingClientRect().top : innerHeight }
-          : scroller.getBoundingClientRect();
+        const { top, bottom } = scrollBounds();
         const dy = y < top + 48 ? -10 : y > bottom - 48 ? 10 : 0;
         if (dy) scroller.scrollTop += dy;
       } else {
