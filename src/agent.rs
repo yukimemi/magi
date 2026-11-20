@@ -579,6 +579,9 @@ pub async fn invoke(
         // No console window. `magi web` has no console of its own, so Windows
         // would give each agent a fresh one - and draw it. See `crate::proc`.
         .quiet();
+    if let Some(session) = &omp_session {
+        session.isolate_terminal_history(&mut cmd, seat);
+    }
     crate::incremental::default_environment(&mut cmd);
     if repository_writer(inv) {
         crate::incremental::configure(&mut cmd, inv.cwd)?;
@@ -877,6 +880,26 @@ impl OmpSession {
         match self {
             Self::Fresh(dir) => Some(dir),
             Self::Resume => seat.omp_session_dir.as_deref(),
+        }
+    }
+
+    fn isolate_terminal_history(&self, cmd: &mut Command, seat: &SeatState) {
+        if self.dir(seat).is_none() {
+            return;
+        }
+        // omp falls back to these identifiers even when stdin is piped.
+        // Otherwise ordinary `omp --continue` can follow its terminal
+        // breadcrumb outside the default session directory.
+        for key in [
+            "ZELLIJ_PANE_ID",
+            "TMUX_PANE",
+            "CMUX_SURFACE_ID",
+            "KITTY_WINDOW_ID",
+            "WEZTERM_PANE",
+            "TERM_SESSION_ID",
+            "WT_SESSION",
+        ] {
+            cmd.env_remove(key);
         }
     }
 
@@ -2927,6 +2950,42 @@ mod tests {
         assert!(!resumed.argv.iter().any(|a| a == "--continue"));
         // stdin still carries the prompt on a resumed turn.
         assert_eq!(resumed.stdin.as_deref(), Some("do the thing"));
+    }
+
+    #[test]
+    fn omp_terminal_breadcrumbs_are_disabled_only_for_managed_sessions() {
+        let mut seat = SeatState::new("review-1", "a", 7);
+        let mut cmd = Command::new("omp");
+        cmd.envs([
+            ("ZELLIJ_PANE_ID", "1"),
+            ("TMUX_PANE", "%2"),
+            ("CMUX_SURFACE_ID", "terminal"),
+            ("KITTY_WINDOW_ID", "3"),
+            ("WEZTERM_PANE", "4"),
+            ("TERM_SESSION_ID", "terminal"),
+            ("WT_SESSION", "terminal"),
+            ("OMP_PROFILE", "work"),
+        ]);
+        let envs = |cmd: &Command| {
+            cmd.as_std()
+                .get_envs()
+                .filter(|(_, value)| value.is_some())
+                .count()
+        };
+        OmpSession::Resume.isolate_terminal_history(&mut cmd, &seat);
+        assert_eq!(envs(&cmd), 8);
+        OmpSession::Fresh(PathBuf::from("managed")).isolate_terminal_history(&mut cmd, &seat);
+        assert_eq!(envs(&cmd), 1);
+        assert!(
+            cmd.as_std()
+                .get_envs()
+                .any(|(key, value)| { key == "OMP_PROFILE" && value == Some(OsStr::new("work")) })
+        );
+
+        seat.omp_session_dir = Some(PathBuf::from("managed"));
+        cmd.env("WT_SESSION", "terminal");
+        OmpSession::Resume.isolate_terminal_history(&mut cmd, &seat);
+        assert_eq!(envs(&cmd), 1);
     }
 
     #[test]

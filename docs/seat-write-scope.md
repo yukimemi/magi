@@ -71,6 +71,15 @@ continuations and detached workers. Only transcript storage and lookup
 change; magi does not redirect omp's profile, authentication, settings,
 provider/model configuration, extensions or tools.
 
+Managed launches have piped stdin and omit omp's terminal identity variables
+(including `WT_SESSION` and `TMUX_PANE`) from the child environment, even if
+set in the agent's `env`. This prevents omp from updating the operator's
+per-terminal `--continue` pointer (verified with omp 19.0.0 on Windows).
+It does not remove pointers written by older launches or redirect omp's
+own custom-session registration and maintenance metadata. If an older pointer
+still opens a magi conversation, select the operator's session explicitly with
+`omp --resume`.
+
 The saved seat pairs the absolute directory with the CLI-reported session
 ID. A managed resume uses that exact directory and `--resume <id>`, even
 when the current magi home differs. If omp reports a different ID, magi
