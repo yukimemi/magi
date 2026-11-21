@@ -2594,6 +2594,17 @@ MAGI_CHROME=/path/to/chrome cargo test --test web_render   # name a binary expli
 - The Runs page keeps finished runs in a collapsed section that renders no rows
   until opened, so the harness seeds one in-flight run and only requires that
   one (`Case::expect`).
+- **On Windows every launch seeds the profile's `Local State`**
+  (`cdp::seed_os_password_cache`, called from `Browser::launch_once`). Since
+  Chromium 153 a fresh `--user-data-dir` makes Chrome call `LogonUser` with an
+  empty password at startup (crbug.com/541310282): one failed interactive logon
+  per launch, and a full `cargo test` launched enough browsers to lock the
+  operator's Windows account three times in one morning (policy: 10 failures in
+  10 minutes). The seed is the cached answer Chrome would otherwise probe for;
+  its timestamp must be a JSON string. Start real Chrome only through
+  `Browser::launch`. The playwright launchers (`tests/web_run_layout.mjs`,
+  `tools/demo/record.mjs`) are not covered: each of their launches still costs
+  one failed logon on such a machine.
 
 ### Every run belongs to a task
 

@@ -32,6 +32,8 @@ const LAUNCH_ATTEMPTS: usize = 3;
 const STDERR_LINES: usize = 20;
 /// Upper bound on the bytes of that tail.
 const STDERR_BYTES: usize = 4096;
+/// The file inside a profile directory where Chrome keeps browser-wide prefs.
+const LOCAL_STATE: &str = "Local State";
 
 /// Where a Chrome/Chromium binary is, if this machine has one.
 ///
@@ -71,6 +73,29 @@ fn on_path(name: &str) -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
+/// Tell a fresh profile that the OS password has already been checked.
+///
+/// Since Chromium 153 a Windows profile with no cached answer calls
+/// `LogonUser(user, ".", "")` at startup to learn whether the account's
+/// password is blank (`CheckBlankPasswordWithPrefs`, crbug.com/541310282).
+/// On a non-domain machine that is one failed interactive logon per launch
+/// (Security event 4625), and a single `cargo test` launches enough browsers
+/// to trip a 10-failure lockout policy: it locked the operator out of their
+/// own PC three times in one morning. Chrome skips the call when the cached
+/// timestamp is not older than the password's, so the largest timestamp always
+/// skips it. The timestamp must be a JSON *string*: Chrome stores int64 prefs
+/// that way, ignores a number, and probes anyway.
+fn seed_os_password_cache(profile: &Path) -> Result<(), String> {
+    let path = profile.join(LOCAL_STATE);
+    let state = json!({
+        "password_manager": {
+            "os_password_blank": false,
+            "os_password_last_changed": i64::MAX.to_string(),
+        }
+    });
+    std::fs::write(&path, state.to_string()).map_err(|e| format!("seed {}: {e}", path.display()))
+}
+
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 /// One running headless Chrome and its browser-level DevTools connection.
@@ -102,6 +127,10 @@ impl Browser {
 
     async fn launch_once(chrome: &Path) -> Result<Self, String> {
         let profile = tempfile::tempdir().map_err(|e| e.to_string())?;
+        // Only Windows Chrome has the probe; elsewhere the profile stays empty.
+        if cfg!(windows) {
+            seed_os_password_cache(profile.path())?;
+        }
         // stderr goes to a file, not a pipe: nobody reads a pipe while Chrome
         // starts, and a full one would block it.
         let log_path = profile.path().join("chrome-stderr.log");
@@ -654,6 +683,21 @@ mod tests {
         assert_eq!(
             got.unwrap_err(),
             "attempt 1/3: e1; attempt 2/3: e2; attempt 3/3: e3"
+        );
+    }
+
+    #[test]
+    fn os_password_cache_is_seeded_the_way_chrome_reads_it() {
+        let profile = tempfile::tempdir().unwrap();
+        seed_os_password_cache(profile.path()).unwrap();
+        let text = std::fs::read_to_string(profile.path().join(LOCAL_STATE)).unwrap();
+        let state: Value = serde_json::from_str(&text).unwrap();
+        let cache = &state["password_manager"];
+        assert_eq!(cache["os_password_blank"], json!(false));
+        // Written as a number, Chrome ignores it and the probe runs again.
+        assert_eq!(
+            cache["os_password_last_changed"],
+            json!("9223372036854775807")
         );
     }
 
