@@ -7636,7 +7636,14 @@ impl Runner {
                         let e2e_commands = e2e_commands.clone();
                         let worktree = winner.worktree.clone();
                         let context = context.clone();
+                        let winner = winner.clone();
                         async move {
+                            if !e2e_commands.is_empty() {
+                                // The suite certifies one SHA. Format before it
+                                // runs, or the commit `pre_gate` makes at the
+                                // gate owes the whole suite again.
+                                Self::run_pre_gate(state, &winner).await;
+                            }
                             run_e2e_with_retry(
                                 state,
                                 &shell,
@@ -7710,7 +7717,9 @@ impl Runner {
                 round_record.e2e_status(),
                 E2eStatus::Deferred | E2eStatus::NotConfigured
             ) {
-                round_record.verified_head = Some(head.clone());
+                // HEAD, not the reviewed `head`: `pre_gate` may have committed
+                // mechanical fixes before the commands ran.
+                round_record.verified_head = Some(git::rev_parse(&winner.worktree, "HEAD").await?);
                 round_record.verified_at = Some(Timestamp::now());
             }
 
@@ -8196,7 +8205,8 @@ impl Runner {
             let round = self.state.reviews[round_idx].round;
             let timeout = Duration::from_secs(self.state.config.graph.verify_timeout());
             let commands = self.state.config.verify.e2e.clone();
-            let attempted_head = git::rev_parse(worktree, "HEAD").await?;
+            let before_head = git::rev_parse(worktree, "HEAD").await?;
+            let winner = self.state.winner().cloned();
             let cache_dir = self.state.config.cache_dir();
             let context = format!(
                 "round {round}: verification unresolved, catching up before the final decision"
@@ -8208,7 +8218,7 @@ impl Runner {
                 "e2e",
                 "e2e",
                 worktree,
-                &attempted_head,
+                &before_head,
                 timeout,
                 &context,
                 &wait,
@@ -8217,12 +8227,19 @@ impl Runner {
                     let commands = commands.clone();
                     let context = context.clone();
                     async move {
+                        if let Some(winner) = winner.filter(|_| !commands.is_empty()) {
+                            // Same reason as in the round itself: format before
+                            // the suite, not after it.
+                            Self::run_pre_gate(state, &winner).await;
+                        }
                         run_e2e_with_retry(state, &shell, &commands, worktree, budget, &context)
                             .await
                     }
                 },
             )
             .await?;
+            // After `pre_gate`: the commit the commands actually ran against.
+            let attempted_head = git::rev_parse(worktree, "HEAD").await?;
             if !outcomes.is_empty() && !verify_inconclusive(&outcomes) {
                 self.state.record_base_progress(&attempted_head);
             }
@@ -8452,8 +8469,16 @@ impl Runner {
     }
 
     /// Run `verify.pre_gate` in the winner's worktree, then fold whatever it
-    /// changed into one commit. Reached only from [`Self::run_gate`], i.e.
-    /// after review is clean and never on a candidate awaiting judging.
+    /// changed into one commit. Runs before `verify.e2e` in the review loop
+    /// and again before the gate commands, always on the winner and never on
+    /// a candidate awaiting judging.
+    ///
+    /// Before e2e as well as before the gate because command evidence belongs
+    /// to a SHA ([`verify_current_head`]): a commit made only at the gate is a
+    /// commit e2e never saw, and the suite ran again for a formatter's diff -
+    /// 5 of the 22 gated runs on this repository in November 2026. The gate's
+    /// own call then finds nothing left to change. The commands must be
+    /// idempotent; one that is not makes a commit per call.
     ///
     /// Never fails the run: a non-zero exit or timeout is a warning and a
     /// recorded outcome, and the gate remains the single arbiter. Nothing
