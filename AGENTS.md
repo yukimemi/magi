@@ -2208,19 +2208,34 @@ correction path attempts.
 
 ### Running magi on magi
 
-`magi.toml` in this repo sets `e2e = cargo test` and `gate = cargo make check`,
-both with a **shared** `CARGO_TARGET_DIR` under `{{ vars.cache }}`. Without it
-every review round rebuilds this crate from scratch in the winner's worktree,
-which dwarfs the agent latency it is measuring. `magi fold --all` afterwards:
-`candidates + judges + reviewers` worktrees exist at peak.
+`magi.toml` in this repo splits `cargo make check` in two, each half run once:
+`e2e = cargo make test` (every test) and `gate = cargo make editorconfig-check`,
+`fmt-check`, `clippy` (everything else), with a **shared** `CARGO_TARGET_DIR`
+under `{{ vars.cache }}`. Without it every review round rebuilds this crate
+from scratch in the winner's worktree, which dwarfs the agent latency it is
+measuring. `magi fold --all` afterwards: `candidates + judges + reviewers`
+worktrees exist at peak.
 
-`cargo make check` runs the integration binaries under cargo-nextest
+**The gate has no tests on purpose.** `e2e` used to be `cargo test
+--all-targets` and `gate` the whole of `cargo make check`, so the suite ran at
+least twice on the same commit: 3.6 suite runs per gated run on average over 59
+runs in November 2026, a passing `e2e` at 36 min (median) and the gate another
+42 min, all of it serialised on the shared build cache. Nothing is lost by
+dropping the gate's copy: `graph::verify_current_head` runs `e2e` again whenever
+HEAD is not the SHA it last passed on, in the graph (`Runner::gate`, before and
+after the gate commands) and at publication (`land::publish_landing_head`), so
+no commit is pushed or merged without the tests having passed on that exact
+SHA. `tests/verify_covers_check.rs` fails when the two halves stop adding up to
+`tasks.check`'s dependencies, or when a task is in both.
+
+`cargo make test` runs the integration binaries under cargo-nextest
 (`PJ_RUST_TEST_RUNNER = "nextest"` in `Makefile.toml`'s `[env]`, the same split
 CI uses): lib / bin unit tests on `cargo test`, integration tests in parallel
-under `.config/nextest.toml`'s group caps. Install cargo-nextest wherever the
-gate runs; without it the task warns and falls back to the serial `cargo test`
-(measured locally: ~21 min serial against ~12 min with nextest for the same
-tests, on a loaded machine).
+under `.config/nextest.toml`'s group caps. Install cargo-nextest wherever
+verification runs; without it the task warns and falls back to the serial
+`cargo test` (measured locally: ~21 min serial against ~12 min with nextest for
+the same tests, on a loaded machine). The operator's Windows PC ran without it
+until 2026-11-21, and nothing but one warning line in the gate's output said so.
 
 **Never build by hand into the directory `verify` uses.** Two different source
 trees alternating through one `CARGO_TARGET_DIR` will link a test against the

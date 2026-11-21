@@ -30,19 +30,43 @@
 cache = "{{ env.MAGI_CACHE | default(value='/tmp') }}"
 
 [verify]
-# The real-machine leg, run in the winner's worktree once per review round.
+# `e2e` and `gate` together are exactly `cargo make check` (what CI runs), and
+# each half runs once: the tests in `e2e`, everything else in `gate`.
+#
+# They used to overlap completely - `e2e` was `cargo test --all-targets` and
+# `gate` was the whole of `cargo make check`, tests included - so every run paid
+# for the suite at least twice on the same commit. Measured on this repository
+# in November 2026 (59 runs): the suite ran 3.6 times per gated run on average,
+# a passing `e2e` took 36 min (median) and the gate another 42 min, and with
+# verification serialised on the shared build cache that is what the queue
+# behind it waited on.
+#
+# Dropping the tests from the gate loses nothing, because magi already binds
+# `e2e` to the commit that lands: `graph::verify_current_head` runs `e2e` again
+# whenever HEAD is not the SHA it last passed on (after `pre_gate` commits, after
+# a gate repair, after a base sync), before the gate and after it. A tree cannot
+# reach the merge without the tests having passed on that exact SHA.
+# `tests/verify_covers_check.rs` fails if the two halves stop adding up to
+# `check`.
+#
+# The real-machine leg, run in the winner's worktree once a round has no
+# blocking finding left. `cargo make test` is the unit and doc tests on
+# `cargo test` plus the integration binaries under cargo-nextest, the way CI
+# runs them (`.config/nextest.toml`); without cargo-nextest on PATH it falls
+# back to one binary after another and takes about twice as long.
 #
 # CARGO_TARGET_DIR is shared on purpose: each candidate worktree would otherwise
 # compile this crate from scratch, which is by far the slowest thing in a run on
 # a Rust repo (minutes, against ~90 s of agent latency per node). Only the
 # winner's worktree runs these commands, and only one at a time, so nothing
 # contends on cargo's lock.
-e2e = ["CARGO_TARGET_DIR={{ vars.cache }}/magi-target cargo test --locked --all-targets"]
-# Same gate as the pre-push hook. CI's test job runs the integration binaries
-# under cargo-nextest (`.config/nextest.toml`, profile `ci`) for wall time; this
-# gate runs the same tests under `cargo test`, so nextest-only failures (its
-# config, per-test processes, cross-binary concurrency) are caught by CI alone.
-gate = ["CARGO_TARGET_DIR={{ vars.cache }}/magi-target cargo make check"]
+e2e = ["CARGO_TARGET_DIR={{ vars.cache }}/magi-target cargo make test"]
+# The rest of `cargo make check`, cheapest first. Only clippy compiles.
+gate = [
+    "cargo make editorconfig-check",
+    "cargo make fmt-check",
+    "CARGO_TARGET_DIR={{ vars.cache }}/magi-target cargo make clippy",
+]
 # Run just before the gate, on the winner only. Run 892b was blocked by nothing
 # but a one-line rustfmt wrap; a formatter is deterministic, so run it rather
 # than argue about it with an agent. Changes land as one commit.
@@ -110,10 +134,12 @@ all = """
 This repository uses jj (Jujutsu) with a colocated git repo. `git commit` works \
 in a candidate worktree and is what magi expects, but never run `jj` commands \
 and never touch the main working copy.
-Full verification is parent-owned: magi runs `cargo test --locked --all-targets` \
-and `cargo make check` itself, once a round has no blocking findings left and \
-again before landing. Do not re-run the full suite or the full gate yourself — \
-a focused `cargo check` or a targeted `cargo test <name>` for what you touched \
+Full verification is parent-owned: magi runs the whole test suite (`cargo make \
+test`) itself once a round has no blocking findings left, and again whenever \
+the commit changes before landing, then the lints (`cargo make clippy`, \
+`fmt-check`, `editorconfig-check`) as the gate. Do not re-run the full suite or \
+the full gate yourself — a focused `cargo check` or a targeted \
+`cargo test <name>` for what you touched \
 is enough. Whenever you do build or test locally, set \
 `RUSTUP_TOOLCHAIN=stable`: the environment here pins an older toolchain than CI \
 uses, so a lint that fails CI is invisible without it.
