@@ -777,14 +777,16 @@ pub struct Verify {
     pub e2e: Vec<String>,
     /// Final gate. Must all exit 0 before a merge is attempted.
     pub gate: Vec<String>,
-    /// Mechanical fixers (formatters) run in the winner's worktree just before
-    /// `gate`, after review is clean. Anything they change is committed as one
-    /// neutral-identity commit so the gate and the PR see it. A command that
-    /// fails or times out is a warning, never a failed run: the gate stays the
-    /// single arbiter. Empty (the default) turns the feature off. Runs under
-    /// `graph.verify_timeout()` per command, like the gate. Meant for light
-    /// tools: it is not scanned for `CARGO_TARGET_DIR`, and it should be
-    /// idempotent since a resumed run may repeat it.
+    /// Mechanical fixers (formatters) run in the winner's worktree before
+    /// `e2e` and again just before `gate`. Anything they change is committed
+    /// as one neutral-identity commit, so e2e, the gate and the PR all see the
+    /// same tree and e2e is not owed a second time for a formatter's diff. A
+    /// command that fails or times out is a warning, never a failed run: the
+    /// gate stays the single arbiter. Empty (the default) turns the feature
+    /// off. Runs under `graph.verify_timeout()` per command, like the gate.
+    /// Meant for light tools: it is not scanned for `CARGO_TARGET_DIR`, and it
+    /// must be idempotent, since it runs more than once per run and a command
+    /// that changes the tree every time makes a commit every time.
     #[serde(default)]
     pub pre_gate: Vec<String>,
     /// Shell used to run the commands above. Defaults to `sh -c`, or
@@ -2524,10 +2526,10 @@ impl Config {
              e2e = []\n\
              # Final gate. Every command must exit 0 before a merge.\n\
              gate = []\n\
-             # Mechanical fixers (formatters) run in the winner's worktree just\n\
-             # before the gate; whatever they change becomes one commit. A failing\n\
-             # command only warns - the gate stays the arbiter. Same timeout as the\n\
-             # gate (timeout_verify). Keep it light and idempotent.\n\
+             # Mechanical fixers (formatters) run in the winner's worktree before\n\
+             # e2e and before the gate; whatever they change becomes one commit. A\n\
+             # failing command only warns - the gate stays the arbiter. Same timeout\n\
+             # as the gate (timeout_verify). Keep it light and idempotent.\n\
              # pre_gate = []\n\n\
              # Prepare each worktree magi creates (candidates, judges, advisors,\n\
              # reviewers, the operator-fix and review-takeover checkouts), in order,\n\

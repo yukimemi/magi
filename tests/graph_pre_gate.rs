@@ -1,5 +1,6 @@
-//! `verify.pre_gate` runs on the winner just before the gate, and whatever it
-//! changes reaches the gate as one commit. It never fails a run by itself.
+//! `verify.pre_gate` runs on the winner before e2e and again before the gate,
+//! and whatever it changes reaches both as one commit. It never fails a run by
+//! itself.
 mod common;
 
 use common::{Judges, fixture};
@@ -19,7 +20,7 @@ async fn a_hook_that_changes_files_lands_as_one_commit_before_the_gate() {
     let home = common::home_lock().await;
     let mut fx = fixture(home, Judges::Unanimous, false);
     fx.config.disk.min_free_bytes = 0;
-    fx.config.verify.pre_gate = vec!["echo formatted >> fmt.txt".to_owned()];
+    fx.config.verify.pre_gate = vec!["echo formatted > fmt.txt".to_owned()];
     fx.config.verify.gate = vec![gate_expects(1)];
     let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
@@ -32,6 +33,35 @@ async fn a_hook_that_changes_files_lands_as_one_commit_before_the_gate() {
     assert_eq!(state.pre_gate.len(), 1);
     assert!(state.pre_gate[0].ok());
     assert!(state.pre_gate_commit.is_some());
+}
+}
+
+common::e2e! {
+async fn a_hook_that_changes_files_does_not_cost_a_second_e2e() {
+    let home = common::home_lock().await;
+    let mut fx = fixture(home, Judges::Unanimous, false);
+    fx.config.disk.min_free_bytes = 0;
+    // Outside the worktree, so counting leaves the tree clean.
+    let runs = fx.tmp.path().join("e2e-runs");
+    fx.config.verify.pre_gate = vec!["echo formatted > fmt.txt".to_owned()];
+    fx.config.verify.e2e = vec![format!(
+        "test -f fmt.txt && echo run >> '{}'",
+        runs.display().to_string().replace('\\', "/")
+    )];
+    fx.config.verify.gate = vec![gate_expects(1)];
+    let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
+        .await
+        .expect("start");
+    runner.execute().await.expect("execute");
+    let state = &runner.state;
+
+    assert!(state.gate_ran);
+    assert!(state.gate.iter().all(|o| o.ok()), "{:?}", state.gate);
+    // e2e saw the formatted tree (`test -f fmt.txt`), so the commit the gate
+    // checks is the commit e2e already passed on.
+    let ran = std::fs::read_to_string(&runs).unwrap_or_default();
+    assert_eq!(ran.lines().count(), 1, "e2e ran more than once: {:?}", state.events);
+    assert_eq!(state.reviews.last().unwrap().verified_head, state.gate_head);
 }
 }
 
