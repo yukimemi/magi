@@ -1,0 +1,34 @@
+
+running 1 test
+
+thread 'avatar_settings_preview_isolation_reload_and_reset_on_phone' (61000) panicked at tests\common\mod.rs:143:5:
+isolated test `avatar_settings_preview_isolation_reload_and_reset_on_phone` did not pass (exit code: 101)
+--- stdout ---
+
+running 1 test
+test avatar_settings_preview_isolation_reload_and_reset_on_phone ... FAILED
+
+failures:
+
+failures:
+    avatar_settings_preview_isolation_reload_and_reset_on_phone
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 58 filtered out; finished in 55.87s
+
+
+--- stderr ---
+
+thread 'avatar_settings_preview_isolation_reload_and_reset_on_phone' (61756) panicked at tests\web_render.rs:5030:61:
+called `Result::unwrap()` on an `Err` value: "evaluate threw: {\"columnNumber\":123,\"exception\":{\"className\":\"Error\",\"description\":\"Error: UI timeout\\n    at until (<anonymous>:3:123)\\n    at async <anonymous>:16:7\",\"objectId\":\"2245115340540515876.2.1\",\"subtype\":\"error\",\"type\":\"object\"},\"exceptionId\":1,\"lineNumber\":3,\"scriptId\":\"7\",\"stackTrace\":{\"callFrames\":[{\"columnNumber\":122,\"functionName\":\"until\",\"lineNumber\":2,\"scriptId\":\"7\",\"url\":\"\"}]},\"text\":\"Uncaught (in promise) Error: UI timeout\"}"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test avatar_settings_preview_isolation_reload_and_reset_on_phone ... FAILED
+
+failures:
+
+failures:
+    avatar_settings_preview_isolation_reload_and_reset_on_phone
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 58 filtered out; finished in 55.92s
+
