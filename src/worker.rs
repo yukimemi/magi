@@ -11,7 +11,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -1008,6 +1008,23 @@ fn detached_standard_handles() -> std::io::Result<()> {
     Ok(())
 }
 
+/// A concurrent fork can inherit the generation's writable file descriptor.
+/// Even after pinning closes its copy, Unix exec can return ETXTBSY until the
+/// other child closes its copy on exec or exit. Retry only that spawn error.
+async fn spawn_generation(
+    mut spawn: impl FnMut() -> std::io::Result<Child>,
+) -> std::io::Result<Child> {
+    for delay_ms in [10, 20, 40, 80] {
+        match spawn() {
+            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+            result => return result,
+        }
+    }
+    spawn()
+}
+
 /// Reserve an exclusive operation and detach its immutable executable. Returns
 /// after acknowledgement; a timeout preserves the reservation and never kills
 /// the child or silently executes in the caller. Repeated identical requests
@@ -1025,9 +1042,13 @@ pub async fn spawn(home: &Path, kind: &str, key: &str, payload: serde_json::Valu
         .map_err(not_started_error)?;
     let (job, fresh) = reserve(&home, &generation, kind, key, payload)?;
     if fresh {
-        match detached_command(&home, &job, &generation)
-            .and_then(|mut command| Ok(command.spawn()?))
-        {
+        let child = match detached_command(&home, &job, &generation) {
+            Ok(mut command) => spawn_generation(|| command.spawn())
+                .await
+                .map_err(Into::into),
+            Err(error) => Err(error),
+        };
+        match child {
             Ok(mut child) => {
                 // std::process::Child has no kill-on-drop. The reaper is only
                 // bookkeeping; runtime or parent exit cannot terminate a worker.
@@ -1397,8 +1418,80 @@ mod tests {
         assert_eq!(std::fs::read(new.executable).unwrap(), b"new executable");
     }
 
-    #[test]
-    fn acknowledgement_records_own_version_and_handler_failure() {
+    #[tokio::test]
+    async fn generation_spawn_does_not_retry_a_missing_executable() {
+        let home = tempfile::tempdir().unwrap();
+        let mut command = Command::new(home.path().join("missing-executable"));
+        let mut attempts = 0;
+        let error = spawn_generation(|| {
+            attempts += 1;
+            command.spawn()
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(attempts, 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn busy_executable(dir: &Path) -> (Command, File) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = dir.join("busy-executable");
+        std::fs::copy("/bin/sh", &path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let writer = OpenOptions::new().write(true).open(&path).unwrap();
+        let mut command = Command::new(path);
+        command.args(["-c", "exit 0"]);
+        (command, writer)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn generation_spawn_retries_until_the_writer_closes() {
+        let home = tempfile::tempdir().unwrap();
+        let (mut command, writer) = busy_executable(home.path());
+        let error = command.spawn().unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::ExecutableFileBusy);
+
+        let (release, requested) = std::sync::mpsc::channel();
+        let closer = std::thread::spawn(move || {
+            if requested.recv().is_ok() {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            drop(writer);
+        });
+        let mut release = Some(release);
+        let child = spawn_generation(|| {
+            let result = command.spawn();
+            if let Some(release) = release.take() {
+                release.send(()).unwrap();
+            }
+            result
+        })
+        .await;
+        closer.join().unwrap();
+        assert!(child.unwrap().wait().unwrap().success());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn generation_spawn_stops_retrying_while_the_writer_remains_open() {
+        let home = tempfile::tempdir().unwrap();
+        let (mut command, _writer) = busy_executable(home.path());
+        let mut attempts = 0;
+        let error = spawn_generation(|| {
+            attempts += 1;
+            assert!(attempts <= 5, "busy generation exceeded its retry bound");
+            command.spawn()
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::ExecutableFileBusy);
+    }
+
+    #[tokio::test]
+    async fn acknowledgement_records_own_version_and_handler_failure() {
         let home = tempfile::tempdir().unwrap();
         let generation = pin_source(home.path(), &std::env::current_exe().unwrap()).unwrap();
         let (job, _) = reserve(
@@ -1409,8 +1502,9 @@ mod tests {
             serde_json::Value::Null,
         )
         .unwrap();
-        let invoke = || {
-            let output = Command::new(&generation.executable)
+        let invoke = || async {
+            let mut command = Command::new(&generation.executable);
+            command
                 .args([
                     "--exact",
                     "worker::tests::pinned_entrypoint_helper",
@@ -1419,7 +1513,13 @@ mod tests {
                 ])
                 .env("MAGI_WORKER_TEST_HOME", home.path())
                 .env("MAGI_WORKER_TEST_ID", &job.id)
-                .output()
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let output = spawn_generation(|| command.spawn())
+                .await
+                .unwrap()
+                .wait_with_output()
                 .unwrap();
             assert!(
                 output.status.success(),
@@ -1427,14 +1527,14 @@ mod tests {
                 String::from_utf8_lossy(&output.stderr)
             );
         };
-        invoke();
+        invoke().await;
         let failed = get(home.path(), &job.id).unwrap();
         assert_eq!(failed.status, Status::Failed);
         assert_eq!(failed.version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
         assert!(failed.result.unwrap().contains("unknown worker kind"));
         assert!(active(home.path()).unwrap().is_empty());
         assert!(!job_dir(home.path(), &job.id).unwrap().exists());
-        invoke();
+        invoke().await;
         assert!(!job_dir(home.path(), &job.id).unwrap().exists());
     }
 
@@ -1502,8 +1602,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn detached_startup_preserves_stdout_and_stderr_in_record_log() {
+    #[tokio::test]
+    async fn detached_startup_preserves_stdout_and_stderr_in_record_log() {
         use std::os::unix::fs::PermissionsExt;
         let home = tempfile::tempdir().unwrap();
         let source = home.path().join("startup-diagnostic");
@@ -1533,7 +1633,8 @@ mod tests {
                     .any(|(name, value)| name == key && value.is_none())
             );
         }
-        assert_eq!(command.spawn().unwrap().wait().unwrap().code(), Some(7));
+        let mut child = spawn_generation(|| command.spawn()).await.unwrap();
+        assert_eq!(child.wait().unwrap().code(), Some(7));
         let log = job_dir(home.path(), &job.id).unwrap().join("worker.log");
         let output = std::fs::read_to_string(log).unwrap();
         assert!(output.contains("startup stdout"));
