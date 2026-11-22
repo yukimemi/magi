@@ -1252,7 +1252,15 @@ impl Runner {
 
         startup_stage(state, "worktree-setup")?;
         let setup = match ensure_setup_config(state, repo).await {
-            Ok(()) => worktree_setup::prepare(&state.config, repo, &worktree).await,
+            Ok(()) => {
+                worktree_setup::prepare_with(
+                    &state.config,
+                    repo,
+                    &worktree,
+                    crate::build_target::Coordination::Held(_coordination.as_ref()),
+                )
+                .await
+            }
             Err(e) => Err(e),
         };
         if let Err(e) = setup {
@@ -2051,7 +2059,12 @@ impl Runner {
             let repo = self.state.repo.clone();
             let _coordination = self.coordinate(&repo).await?;
             ensure_setup_config(&mut self.state, &repo).await?;
-            crate::retention::restore_execution_seats(&archive_home, &self.state).await?;
+            crate::retention::restore_execution_seats(
+                &archive_home,
+                &self.state,
+                _coordination.as_ref(),
+            )
+            .await?;
         }
         self.state.configure_recovery_resume()?;
         if self
@@ -2458,9 +2471,23 @@ impl Runner {
     /// run with the step and its output in the event; it is never swallowed.
     /// During `prep` (`in_prep`) the whole preparation is rolled back, so a
     /// resume starts over instead of finding candidates and missing seats.
-    async fn setup_seat_worktree(&mut self, repo: &Path, wt: &Path, in_prep: bool) -> Result<()> {
+    async fn setup_seat_worktree(
+        &mut self,
+        repo: &Path,
+        wt: &Path,
+        in_prep: bool,
+        coordination: Option<&crate::repo_lock::SeatLease>,
+    ) -> Result<()> {
         let result = match ensure_setup_config(&mut self.state, repo).await {
-            Ok(()) => worktree_setup::prepare(&self.state.config, repo, wt).await,
+            Ok(()) => {
+                worktree_setup::prepare_with(
+                    &self.state.config,
+                    repo,
+                    wt,
+                    crate::build_target::Coordination::Held(coordination),
+                )
+                .await
+            }
             Err(e) => Err(e),
         };
         if let Err(e) = result {
@@ -2592,7 +2619,14 @@ impl Runner {
                 git::set_worktree_hooks_path(&worktree, &hooks_dir).await?;
             }
             git::local_exclude(&worktree, "/.magi/").await?;
-            if let Err(e) = worktree_setup::prepare(&self.state.config, &repo, &worktree).await {
+            if let Err(e) = worktree_setup::prepare_with(
+                &self.state.config,
+                &repo,
+                &worktree,
+                crate::build_target::Coordination::Held(_coordination.as_ref()),
+            )
+            .await
+            {
                 // Nothing of this prep may survive: a resume must start over,
                 // not find half the candidates and skip the rest.
                 git::worktree_remove_clean(&repo, &worktree).await.ok();
@@ -2601,7 +2635,9 @@ impl Runner {
                 self.state.status = RunStatus::Blocked;
                 self.state
                     .event("prep", format!("worktree setup failed: {e:#}"));
-                self.state.prep_failure = Some(format!("worktree setup failed: {e:#}"));
+                if !e.is::<crate::repo_lock::ResourceBlocked>() {
+                    self.state.prep_failure = Some(format!("worktree setup failed: {e:#}"));
+                }
                 self.state.save()?;
                 return Err(e);
             }
@@ -2639,7 +2675,8 @@ impl Runner {
             let wt = root.join(format!("judge-{j}"));
             if !wt.exists() {
                 git::worktree_add_detached(&repo, &wt, &base).await?;
-                self.setup_seat_worktree(&repo, &wt, true).await?;
+                self.setup_seat_worktree(&repo, &wt, true, _coordination.as_ref())
+                    .await?;
             }
         }
 
@@ -2655,7 +2692,8 @@ impl Runner {
                 let wt = root.join(format!("advisor-{k}"));
                 if !wt.exists() {
                     git::worktree_add_detached(&repo, &wt, &base).await?;
-                    self.setup_seat_worktree(&repo, &wt, true).await?;
+                    self.setup_seat_worktree(&repo, &wt, true, _coordination.as_ref())
+                        .await?;
                 }
             }
         }
@@ -5308,6 +5346,9 @@ impl Runner {
         }
         let repo = self.state.repo.clone();
         let _coordination = self.coordinate(&repo).await?;
+        let home = crate::run::home();
+        let root = self.state.worktree_root();
+        let isolated = crate::build_target::isolated(&self.state.config);
         let mut folded = Vec::new();
         for i in 0..self.state.candidates.len() {
             let c = &self.state.candidates[i];
@@ -5315,7 +5356,9 @@ impl Runner {
                 continue;
             }
             let (wt, branch, label) = (c.worktree.clone(), c.branch.clone(), c.label);
+            let target = fold_target(&home, &root, &wt, isolated);
             remove_preserved_worktree(&repo, &wt).await?;
+            reclaim_fold_target(&home, target);
             if git::branch_exists(&repo, &branch).await?
                 && !git::branch_delete(&repo, &branch).await?
             {
@@ -5326,11 +5369,12 @@ impl Runner {
             folded.push(label.to_string());
         }
         // The judges are finished; their checkouts are pure cost from here.
-        let root = self.state.worktree_root();
         for j in 1..=self.roles.judges.len() {
             let wt = root.join(format!("judge-{j}"));
             if wt.exists() {
+                let target = fold_target(&home, &root, &wt, isolated);
                 remove_read_seat_worktree(&mut self.state, &wt).await?;
+                reclaim_fold_target(&home, target);
                 self.state.save()?;
             }
         }
@@ -5340,7 +5384,9 @@ impl Runner {
             for k in 1..=self.state.config.graph.advisors {
                 let wt = root.join(format!("advisor-{k}"));
                 if wt.exists() {
+                    let target = fold_target(&home, &root, &wt, isolated);
                     remove_read_seat_worktree(&mut self.state, &wt).await?;
+                    reclaim_fold_target(&home, target);
                     self.state.save()?;
                 }
             }
@@ -6443,7 +6489,13 @@ impl Runner {
         let repo_for_setup = self.state.repo.clone();
         let setup = match ensure_setup_config(&mut self.state, &repo_for_setup).await {
             Ok(()) => {
-                worktree_setup::prepare(&self.state.config, &repo_for_setup, &fix_worktree).await
+                worktree_setup::prepare_with(
+                    &self.state.config,
+                    &repo_for_setup,
+                    &fix_worktree,
+                    crate::build_target::Coordination::Held(coordination.as_ref()),
+                )
+                .await
             }
             Err(e) => Err(e),
         };
@@ -7272,7 +7324,13 @@ impl Runner {
                 } else {
                     self.coordinate(&repo).await?
                 };
-                self.setup_seat_worktree(&repo, &wt, false).await?;
+                self.setup_seat_worktree(
+                    &repo,
+                    &wt,
+                    false,
+                    coordination.as_ref().or(_setup_lease.as_ref()),
+                )
+                .await?;
                 let seat_key = format!("review-{}", r + 1);
                 // The seat starts the round on whoever answered it last, not
                 // on the agent the spec names, so a failure is not re-paid.
@@ -10735,11 +10793,18 @@ fn repository_wait(
 }
 
 fn record_repository_block(state: &mut RunState, error: &anyhow::Error) {
+    if let Some(timeout) = error.downcast_ref::<agent::IsolatedSeatWait>() {
+        state.event("resource", timeout.0.description());
+        state.resource_block = Some(timeout.0.clone());
+        return;
+    }
     if error.is::<crate::repo_lock::ResourceBlocked>() {
         state.resource_block = Some(crate::run::ResourceBlock {
             cause: crate::run::ResourceBlockCause::Other,
             node: "repository".into(),
-            kind: if error.to_string().contains("disk pressure") {
+            kind: if error.is::<crate::build_target::AdmissionDiskWait>() {
+                "disk admission"
+            } else if error.to_string().contains("disk pressure") {
                 "disk pressure"
             } else if error.to_string().contains("disk admission") {
                 "disk admission"
@@ -10749,7 +10814,7 @@ fn record_repository_block(state: &mut RunState, error: &anyhow::Error) {
                 "repository coordination"
             }
             .into(),
-            detail: error.to_string(),
+            detail: format!("{error:#}"),
             at: Timestamp::now(),
         });
         state.event("resource", error.to_string());
@@ -10806,6 +10871,7 @@ async fn wave(
         carry_seats: _,
         pauses,
     } = *ctx;
+    let cache = cache.filter(|_| !crate::build_target::isolated(&state.config));
     for job in &jobs {
         state.seat_started(node, &job.seat.key, job.timeout, attempt);
     }
@@ -10816,21 +10882,8 @@ async fn wave(
         // watching.
         tracing::warn!("could not persist in-progress seats: {e:#}");
     }
-    // Hold the shared build cache's lease for the whole batch, not per job:
-    // several candidates (an implement wave) or a fixer legitimately share
-    // one cache concurrently within this run, and that stays untouched — a
-    // single lease taken once for the whole wave and released once it is
-    // done is what stops a *different* borrower (another run's own wave, its
-    // e2e/gate, a human's `magi review`) from interleaving a build into the
-    // same directory while this one is in flight. Best-effort, not
-    // all-or-nothing: a wave that cannot get the lease within its own
-    // longest job's budget still runs — an hour of paid implementer calls is
-    // not thrown away over cache contention — but every write-allowed seat
-    // then goes without `CARGO_TARGET_DIR` for this wave too (see the filter
-    // below), the same fallback a read-only seat always gets, rather than
-    // building into a directory this run was never granted. The identity
-    // record is still invalidated below either way, so the next tracked
-    // caller (`e2e`/`gate`) never trusts a match it cannot vouch for.
+    // Shared-mode waves keep their existing single lease. Isolated writers
+    // acquire their own checkout's target at seat admission.
     let jobs_had_a_writer = jobs.iter().any(|j| j.allow_write);
     // The wait for the lease has its own bound, `timeout_resource_wait`; it is
     // never borrowed from a job's agent budget (and never charged to it either,
@@ -10959,6 +11012,7 @@ async fn wave(
                             "no parallel slot became free within {}s",
                             slot_limit.as_secs()
                         )),
+                        None,
                         false,
                     );
                 }
@@ -10987,6 +11041,11 @@ async fn wave(
                     },
                 ))
                 .await;
+            let cache_block = out
+                .as_ref()
+                .err()
+                .and_then(|error| error.downcast_ref::<agent::IsolatedSeatWait>())
+                .map(|timeout| timeout.0.clone());
             let interrupted = out
                 .as_ref()
                 .err()
@@ -11012,7 +11071,7 @@ async fn wave(
                 }
                 Err(e) => AgentOutcome::Failed(e.to_string()),
             };
-            (i, seat, out, interrupted)
+            (i, seat, out, cache_block, interrupted)
         });
     }
     drop(spawned_tx);
@@ -11032,7 +11091,7 @@ async fn wave(
         let Some(joined) = joined else {
             break;
         };
-        let (i, seat, out, interrupted) = match joined {
+        let (i, seat, out, cache_block, interrupted) = match joined {
             Ok(v) => v,
             // No seat to clear: a panicked task never reported which one it
             // was. The defensive sweep below this loop is what stops that
@@ -11057,6 +11116,12 @@ async fn wave(
             );
             state.interrupted_implementations.insert(label);
         }
+        if let Some(block) = cache_block
+            && state.resource_block.is_none()
+        {
+            state.event("resource", block.description());
+            state.resource_block = Some(block);
+        }
         if let AgentOutcome::ResourceBlocked(why) = &out
             && state.resource_block.is_none()
         {
@@ -11069,6 +11134,8 @@ async fn wave(
                     "disk admission"
                 } else if why.contains(crate::incremental::BLOCKED) {
                     "incremental cache admission"
+                } else if why.contains(crate::build_target::KIND) {
+                    crate::build_target::KIND
                 } else if why.contains("repository coordination") {
                     "repository coordination"
                 } else {
@@ -11756,6 +11823,11 @@ async fn acquire_cache_lease(
     cancel: &(dyn Fn() -> bool + Sync),
 ) -> Result<Option<crate::cache::Guard>> {
     let home = crate::run::home();
+    let kind = if crate::build_target::isolated(&state.config) {
+        crate::build_target::KIND
+    } else {
+        "shared build cache"
+    };
     let started = Instant::now();
     let busy = match crate::cache::try_acquire(&home, cache_dir, owner) {
         Ok(crate::cache::AcquireOutcome::Acquired(g)) => return Ok(Some(g)),
@@ -11763,7 +11835,10 @@ async fn acquire_cache_lease(
         Err(e) => {
             state.event(
                 "verify",
-                format!("{context}: could not check the shared build cache: {e:#}"),
+                format!(
+                    "{context}: could not check the {kind} at {}: {e:#}",
+                    cache_dir.display()
+                ),
             );
             if let Err(e2) = state.save() {
                 tracing::warn!("could not persist a cache-check failure: {e2:#}");
@@ -11774,7 +11849,7 @@ async fn acquire_cache_lease(
     state.event(
         "verify",
         format!(
-            "{context}: waiting for the shared build cache at {} ({})",
+            "{context}: waiting for the {kind} at {} ({})",
             cache_dir.display(),
             busy.describe()
         ),
@@ -11783,8 +11858,8 @@ async fn acquire_cache_lease(
     // reader sees only ever measures an agent that has been spawned.
     state.resource_wait = Some(crate::run::ResourceWait {
         node: context.to_owned(),
-        kind: "shared build cache".to_owned(),
-        holder: busy.describe(),
+        kind: kind.to_owned(),
+        holder: format!("{}: {}", cache_dir.display(), busy.describe()),
         since: Timestamp::now(),
         limit_secs: budget.as_secs(),
     });
@@ -11805,6 +11880,15 @@ async fn acquire_cache_lease(
     let cause = match &waited {
         Ok(Some(_)) => None,
         Ok(None) => Some(crate::run::ResourceBlockCause::Cancelled { park: None }),
+        Err(error)
+            if error.is::<crate::cache::WaitTimeout>() && kind == crate::build_target::KIND =>
+        {
+            Some(crate::run::ResourceBlockCause::IsolatedCacheTimeout {
+                target: cache_dir.to_owned(),
+                waited_secs: started.elapsed().as_secs(),
+                limit_secs: budget.as_secs(),
+            })
+        }
         Err(error) if error.is::<crate::cache::WaitTimeout>() => {
             Some(crate::run::ResourceBlockCause::Timeout {
                 waited_secs: started.elapsed().as_secs(),
@@ -11821,8 +11905,8 @@ async fn acquire_cache_lease(
         state.resource_block = Some(crate::run::ResourceBlock {
             cause,
             node: node.to_owned(),
-            kind: "shared build cache".into(),
-            detail,
+            kind: kind.into(),
+            detail: format!("{}: {detail}", cache_dir.display()),
             at: Timestamp::now(),
         });
         state.event(
@@ -11853,18 +11937,27 @@ impl std::error::Error for CacheCheckError {}
 
 /// Keep a specific acquisition outcome when the caller adds command evidence.
 fn record_cache_error(state: &mut RunState, node: &str, error: &anyhow::Error) {
+    let kind = if crate::build_target::isolated(&state.config) {
+        crate::build_target::KIND
+    } else {
+        "shared build cache"
+    };
     state
         .resource_block
         .get_or_insert_with(|| crate::run::ResourceBlock {
             cause: crate::run::ResourceBlockCause::Other,
             node: node.to_owned(),
-            kind: "shared build cache".into(),
+            kind: kind.into(),
             detail: format!("{error:#}"),
             at: Timestamp::now(),
         });
     if let Err(error) = state.save() {
         tracing::warn!("could not persist cache resource block: {error:#}");
     }
+}
+
+tokio::task_local! {
+    static VERIFY_TARGET: PathBuf;
 }
 
 /// Run `body` — a verify command batch — while holding the shared build
@@ -11908,6 +12001,32 @@ where
     // pre_gate must never hold the repository while waiting for a wave's cache.
     let started = Instant::now();
     let home = crate::run::home();
+    let isolated = crate::build_target::isolated(&state.config);
+    let planned_target = if isolated {
+        let plan = (|| -> Result<PathBuf> {
+            crate::build_target::supports(&state.config)?;
+            crate::build_target::resolve(&home, worktree)
+        })();
+        match plan {
+            Ok(path) => Some(path),
+            Err(error) => {
+                record_cache_error(state, node, &error);
+                return Ok((
+                    vec![CommandOutcome {
+                        command: "(planning isolated build cache)".into(),
+                        code: None,
+                        output_tail: format!("{error:#}"),
+                        duration_ms: 0,
+                        resource_blocked: true,
+                    }],
+                    false,
+                ));
+            }
+        }
+    } else {
+        None
+    };
+    let cache_dir = planned_target.as_deref().or(cache_dir);
     let resource_limit = Duration::from_secs(state.config.graph.timeout_resource_wait);
     let guard = if let Some(cache_dir) = cache_dir {
         let owner = crate::cache::Owner::here(&state.id, node, seat, worktree, head);
@@ -11929,7 +12048,12 @@ where
                 record_cache_error(state, node, &e);
                 return Ok((
                     vec![CommandOutcome {
-                        command: "(waiting for the shared build cache)".into(),
+                        command: if isolated {
+                            "(waiting for the isolated build cache)"
+                        } else {
+                            "(waiting for the shared build cache)"
+                        }
+                        .into(),
                         code: None,
                         output_tail: e.to_string(),
                         duration_ms: started.elapsed().as_millis() as u64,
@@ -11943,19 +12067,23 @@ where
         None
     };
     let _coordination = coordinate_operation(state, worktree, wait).await?;
-    if let Some(cache_dir) = cache_dir {
+    if let Some(path) = &planned_target {
+        state.event(node, format!("isolated build target: {}", path.display()));
+    }
+    if let Some(cache_dir) = cache_dir.filter(|_| !isolated) {
         let identity = crate::cache::Identity::new(worktree, head);
-        if let Err(e) = crate::cache::ensure_fresh(
+        let fresh = crate::cache::ensure_fresh(
             &home,
             cache_dir,
             &identity,
             &state.config.verify.cargo_manifests(),
-        ) {
+        );
+        if let Err(e) = fresh {
             record_cache_error(state, node, &e);
             state.event(
                 "verify",
                 format!(
-                    "{context}: could not confirm the shared build cache matches {} at {}: {e:#}",
+                    "{context}: could not confirm the build cache matches {} at {}: {e:#}",
                     worktree.display(),
                     short(head)
                 ),
@@ -11965,7 +12093,7 @@ where
             }
             return Ok((
                 vec![CommandOutcome {
-                    command: "(confirming the shared build cache is fresh)".into(),
+                    command: "(confirming the build cache is fresh)".into(),
                     code: None,
                     output_tail: e.to_string(),
                     duration_ms: started.elapsed().as_millis() as u64,
@@ -11975,7 +12103,12 @@ where
             ));
         }
     }
-    let (outcomes, retried, timed_out_pids) = body(state, budget).await;
+    let future = body(state, budget);
+    let (outcomes, retried, timed_out_pids) = if let Some(target) = planned_target {
+        VERIFY_TARGET.scope(target, future).await
+    } else {
+        future.await
+    };
     if !timed_out_pids.is_empty() {
         wait_for_timed_out_children_to_die(&timed_out_pids).await;
     }
@@ -12279,6 +12412,19 @@ async fn run_commands(
     cwd: &Path,
     timeout: Duration,
 ) -> (Vec<CommandOutcome>, Vec<u32>) {
+    let isolated = crate::build_target::isolated(&state.config);
+    if isolated && let Some(block) = &state.resource_block {
+        return (
+            vec![CommandOutcome {
+                command: "(isolated build admission)".into(),
+                code: None,
+                output_tail: block.description(),
+                duration_ms: 0,
+                resource_blocked: true,
+            }],
+            Vec::new(),
+        );
+    }
     if commands.is_empty() {
         // Nothing to mark as running and nothing to clear — an empty list
         // means "not configured", and touching `active` (or the disk) over
@@ -12304,33 +12450,58 @@ async fn run_commands(
             cmd.env_remove(key);
         }
         cmd.args(&shell[1..])
-            .arg(command)
             .current_dir(cwd)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
         let mut outputs = Vec::new();
+        let mut cache = None;
+        let home = crate::run::home();
+        let head = if isolated {
+            Some(git::rev_parse(cwd, "HEAD").await)
+        } else {
+            None
+        };
         let protected = (|| -> Result<()> {
             crate::incremental::configure(&mut cmd, cwd)?;
+            cache = if isolated {
+                let target = VERIFY_TARGET
+                    .try_with(Clone::clone)
+                    .context("isolated verification has no target lease")?;
+                cmd.arg(crate::build_target::command::normalize(command)?);
+                crate::build_target::command::configure(&mut cmd, &target)?;
+                Some(target)
+            } else {
+                crate::build_target::command::clear(&mut cmd)?;
+                cmd.arg(command);
+                state.config.cache_dir()
+            };
             let mut paths = vec![cwd.to_owned()];
-            if let Some(cache) = state.config.cache_dir() {
-                paths.push(cache);
+            if let Some(cache) = &cache {
+                paths.push(cache.clone());
             }
-            outputs.extend(crate::retention::OutputLease::admit(
-                &crate::run::home(),
-                &paths,
-                state.config.disk.min_free_bytes,
-            )?);
+            let admit = if isolated {
+                crate::retention::OutputLease::admit_isolated
+            } else {
+                crate::retention::OutputLease::admit
+            };
+            outputs.extend(admit(&home, &paths, state.config.disk.min_free_bytes)?);
             if let Some(guard) = crate::retention::OutputLease::borrow(cwd)? {
                 outputs.push(guard);
             }
-            if let Some(cache) = state.config.cache_dir() {
+            if let Some(cache) = &cache {
                 outputs.push(crate::retention::OutputLease::cache(
                     &crate::run::home(),
-                    &cache,
+                    cache,
                     false,
                 )?);
+                if let Some(head) = head {
+                    crate::build_target::ensure_fresh(&home, cache, cwd, &head?, &state.config)?;
+                    if task == "pre_gate" {
+                        crate::cache::invalidate_identity(&home, cache);
+                    }
+                }
             }
             Ok(())
         })();
@@ -12357,20 +12528,24 @@ async fn run_commands(
             });
             break;
         }
-        let spawned = crate::seat_process::Running::spawn(cmd, None, outputs);
+        let spawned = if isolated {
+            crate::seat_process::Running::spawn_build(cmd, None, outputs)
+        } else {
+            crate::seat_process::Running::spawn(cmd, None, outputs)
+        };
         let (code, body) = match spawned {
             Ok(mut running) => {
                 let pid = running.child().id();
                 let (stdout, out_reader) = agent::drain(running.child().stdout.take());
                 let (stderr, err_reader) = agent::drain(running.child().stderr.take());
                 let mut paths = vec![cwd.to_owned()];
-                if let Some(cache) = state.config.cache_dir() {
+                if let Some(cache) = cache {
                     paths.push(cache);
                 }
                 let mut pressure = None;
                 let status = tokio::select! {
                     status = tokio::time::timeout(timeout, running.child().wait()) => Some(status),
-                    reason = crate::retention::emergency(paths, state.config.disk.min_free_bytes) => {
+                    reason = crate::retention::emergency(paths, state.config.disk.min_free_bytes, isolated) => {
                         pressure = Some(reason); None
                     }
                 };
@@ -12426,6 +12601,19 @@ async fn run_commands(
                     body.push_str(&failure);
                 }
                 (code, body)
+            }
+            Err(e) if isolated => {
+                let e = anyhow::Error::new(e)
+                    .context(format!("could not start managed build `{}`", shell[0]));
+                record_cache_error(state, node, &e);
+                out.push(CommandOutcome {
+                    command: command.clone(),
+                    code: None,
+                    output_tail: format!("{e:#}"),
+                    duration_ms: 0,
+                    resource_blocked: true,
+                });
+                break;
             }
             Err(e) => (None, format!("failed to spawn `{}`: {e}", shell[0])),
         };
@@ -13522,6 +13710,32 @@ async fn remove_read_seat_worktree(state: &mut RunState, path: &Path) -> Result<
     Ok(())
 }
 
+fn fold_target(
+    home: &Path,
+    root: &Path,
+    path: &Path,
+    isolated: bool,
+) -> Option<crate::build_target::FoldTarget> {
+    if !isolated {
+        return None;
+    }
+    match crate::build_target::FoldTarget::for_checkout(home, path, root) {
+        Ok(target) => target,
+        Err(error) => {
+            tracing::warn!(checkout = %path.display(), %error, "isolated target binding not proved at fold");
+            None
+        }
+    }
+}
+
+fn reclaim_fold_target(home: &Path, target: Option<crate::build_target::FoldTarget>) {
+    if let Some(target) = target
+        && let Err(error) = target.reclaim_orphaned_target(home)
+    {
+        tracing::warn!(%error, "isolated target retained after fold");
+    }
+}
+
 /// Tear a run's worktrees and branches down.
 ///
 /// `home` is where the updated `run.json` is saved (via
@@ -13629,6 +13843,7 @@ async fn fold_run_with_policy(
     let root = state.worktree_root();
     let winner = state.tally.as_ref().map(|t| t.winner);
     let mut removed = Vec::new();
+    let isolated = crate::build_target::isolated(&state.config);
 
     for i in 0..state.candidates.len() {
         let c = state.candidates[i].clone();
@@ -13637,9 +13852,11 @@ async fn fold_run_with_policy(
             continue;
         }
         let existed = c.worktree.exists();
+        let target = fold_target(home, &root, &c.worktree, isolated);
         // A vanished directory can still have a Git registration that keeps
         // its branch checked out. Remove that registration before the branch.
         remove_preserved_worktree(&repo, &c.worktree).await?;
+        reclaim_fold_target(home, target);
         if existed {
             removed.push(c.worktree.to_string_lossy().into_owned());
         }
@@ -13665,7 +13882,9 @@ async fn fold_run_with_policy(
         if keep {
             continue;
         }
+        let target = fold_target(home, &root, &path, isolated);
         remove_read_seat_worktree(state, &path).await?;
+        reclaim_fold_target(home, target);
         removed.push(path.to_string_lossy().into_owned());
     }
 
@@ -16139,6 +16358,34 @@ mod tests {
         });
         runner.state.save().unwrap();
         (tmp, runner)
+    }
+
+    #[tokio::test]
+    async fn fold_losers_reclaims_isolated_outputs_without_a_pool_limit() {
+        let (_tmp, mut runner) = preservation_resume_fixture().await;
+        runner.state.config.verify.build_cache = crate::config::BuildCache::Isolated;
+        runner.state.config.disk.cache_limit_bytes = 0;
+        runner.state.config.graph.advise = true;
+        runner.state.config.graph.advisors = 1;
+        let advisor = runner.state.worktree_root().join("advisor-1");
+        git::worktree_add_detached(&runner.state.repo, &advisor, "main")
+            .await
+            .unwrap();
+        let home = crate::run::home();
+        let loser =
+            crate::build_target::resolve(&home, &runner.state.candidates[0].worktree).unwrap();
+        let winner =
+            crate::build_target::resolve(&home, &runner.state.candidates[1].worktree).unwrap();
+        let advisor = crate::build_target::resolve(&home, &advisor).unwrap();
+        for target in [&loser, &winner, &advisor] {
+            std::fs::write(target.join("build-output"), "compiled").unwrap();
+        }
+
+        runner.fold_losers().await.unwrap();
+
+        assert!(!loser.join("build-output").exists());
+        assert!(!advisor.join("build-output").exists());
+        assert!(winner.join("build-output").is_file());
     }
 
     #[tokio::test]
@@ -19816,6 +20063,57 @@ esac
             ask::QuestionStatus::Answered,
             "a real answer is a decision on record, never overwritten by a sweep"
         );
+    }
+
+    #[tokio::test]
+    async fn fold_reclaims_only_proven_idle_isolated_outputs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo);
+
+        let mut config = Config::default();
+        config.graph.worktree_root = Some(tmp.path().join("wt"));
+        config.verify.build_cache = crate::config::BuildCache::Isolated;
+        let mut state = RunState::new(
+            repo.clone(),
+            "main".into(),
+            "base".into(),
+            "fold fixture".into(),
+            config,
+        );
+        let root = state.worktree_root();
+        let mut outputs = Vec::new();
+        for name in ["idle", "busy"] {
+            let checkout = root.join(name);
+            git::worktree_add_detached(&repo, &checkout, "main")
+                .await
+                .unwrap();
+            let target = crate::build_target::resolve(&home, &checkout).unwrap();
+            let output = target.join("generated");
+            std::fs::write(&output, name).unwrap();
+            outputs.push((target, output));
+        }
+        let unknown = crate::build_target::root(&home)
+            .join("00000000-0000-0000-0000-000000000000")
+            .join("target");
+        std::fs::create_dir_all(&unknown).unwrap();
+        let unowned = unknown.join("generated");
+        std::fs::write(&unowned, "keep").unwrap();
+        let owner = crate::cache::Owner::here("fixture", "build", "busy", &root.join("busy"), "");
+        let crate::cache::AcquireOutcome::Acquired(_lease) =
+            crate::cache::try_acquire(&home, &outputs[1].0, &owner).unwrap()
+        else {
+            panic!("fixture target must be free");
+        };
+
+        fold_run(&mut state, true, &home).await.unwrap();
+        assert!(!root.exists());
+        assert!(!outputs[0].1.exists());
+        assert!(outputs[1].1.is_file());
+        assert!(unowned.is_file());
     }
 
     /// `fold_run(&mut state, drop_winner = false)` is exactly the call
@@ -24336,6 +24634,100 @@ mod resource_wait_tests {
             pauses: None,
         };
         wave(jobs, sem, &ctx, st, 0).await
+    }
+
+    #[tokio::test]
+    async fn isolated_editing_seat_wait_releases_only_after_its_own_target_is_free() {
+        crate::run::pin_test_home();
+        let home = crate::run::home();
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let checkout = tmp.path().join("checkout");
+        std::fs::create_dir(&repo).unwrap();
+        git::git(&repo, &["init"]).await.unwrap();
+        git::git(
+            &repo,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "initial",
+            ],
+        )
+        .await
+        .unwrap();
+        git::worktree_add_detached(&repo, &checkout, "HEAD")
+            .await
+            .unwrap();
+        let target = crate::build_target::resolve(&home, &checkout).unwrap();
+        let target_lease = hold(&target);
+        let shared = tmp.path().join("unrelated");
+        let _shared_lease = hold(&shared);
+        let mut st = state(0);
+        st.repo = repo.clone();
+        st.config.verify.build_cache = crate::config::BuildCache::Isolated;
+        st.config.verify.e2e = vec![format!(
+            "CARGO_TARGET_DIR='{}' cargo test",
+            git::path_arg(&shared)
+        )];
+        let config = tmp.path().join("config.toml");
+        std::fs::write(&config, toml::to_string(&st.config).unwrap()).unwrap();
+        let prompts = Prompts::default();
+        let run_id = st.id.clone();
+        let ctx = WaveCtx {
+            run: &run_id,
+            node: "implement",
+            prompts: &prompts,
+            cache: None,
+            round: None,
+            carry_seats: false,
+            pauses: None,
+        };
+        let writer = job(sh("writer", "exit 99"), &checkout, Duration::from_secs(30));
+        let results = wave(vec![writer], Arc::new(Semaphore::new(1)), &ctx, &mut st, 0).await;
+        assert!(matches!(results[0].2, AgentOutcome::ResourceBlocked(_)));
+        assert_eq!(results[0].1.turns, 0);
+        let saved = RunState::load_under(&run_id, &home).unwrap();
+        let block = saved.resource_block.unwrap();
+        assert!(matches!(
+            block.cause,
+            crate::run::ResourceBlockCause::IsolatedCacheTimeout { target: ref actual, .. }
+                if actual == &target
+        ));
+        let queue = crate::queue::Queue::at(tmp.path().join("queue"));
+        let mut task = crate::queue::Task::new(
+            "build".into(),
+            "build".into(),
+            repo,
+            crate::queue::Source::Human,
+        );
+        task.runs.push(run_id);
+        task.hold_machine(Some(format!(
+            "{}{}",
+            crate::cache::RESOURCE_HOLD,
+            block.description()
+        )));
+        queue.put(&mut task).unwrap();
+        let questions = crate::ask::Questions::at(tmp.path().join("questions"));
+        let triage =
+            || crate::triage::run_once(&queue, &questions, Some(&config), Timestamp::now());
+        let pending = triage();
+        assert!(pending.resumed.is_empty() && pending.asked.is_empty());
+        assert_eq!(
+            queue.get(&task.id).unwrap().status,
+            crate::queue::TaskStatus::Held
+        );
+        drop(target_lease);
+        assert_eq!(triage().resumed, vec![task.id.clone()]);
+        assert_eq!(
+            queue.get(&task.id).unwrap().status,
+            crate::queue::TaskStatus::Queued
+        );
+        assert!(crate::cache::in_use(&home, &shared));
     }
 
     #[tokio::test]

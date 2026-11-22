@@ -12,6 +12,8 @@ pub(crate) struct Running {
     outputs: Vec<crate::retention::OutputLease>,
     witness: Option<std::fs::File>,
     owner: Option<std::ffi::OsString>,
+    #[cfg(windows)]
+    job: Option<crate::chat_watch::windows::Containment>,
 }
 
 impl Running {
@@ -24,6 +26,8 @@ impl Running {
             outputs: Vec::new(),
             witness: None,
             owner: None,
+            #[cfg(windows)]
+            job: None,
         }
     }
 
@@ -32,7 +36,15 @@ impl Running {
         lease: Option<SeatLease>,
         outputs: Vec<crate::retention::OutputLease>,
     ) -> std::io::Result<Self> {
-        Self::spawn_inner(command, lease, outputs, false)
+        Self::spawn_inner(command, lease, outputs, false, false)
+    }
+
+    pub(crate) fn spawn_build(
+        command: tokio::process::Command,
+        lease: Option<SeatLease>,
+        outputs: Vec<crate::retention::OutputLease>,
+    ) -> std::io::Result<Self> {
+        Self::spawn_inner(command, lease, outputs, true, true)
     }
 
     /// Launcher Git operations need descendant cleanup even without a registered repository.
@@ -42,7 +54,7 @@ impl Running {
         outputs: Vec<crate::retention::OutputLease>,
     ) -> std::io::Result<Self> {
         // SeatLease enforces registered-repository platform limits before spawn.
-        Self::spawn_inner(command, lease, outputs, true)
+        Self::spawn_inner(command, lease, outputs, true, false)
     }
 
     fn spawn_inner(
@@ -50,6 +62,7 @@ impl Running {
         lease: Option<SeatLease>,
         outputs: Vec<crate::retention::OutputLease>,
         supervised: bool,
+        isolated: bool,
     ) -> std::io::Result<Self> {
         #[cfg(unix)]
         let mut witness = None;
@@ -102,7 +115,37 @@ impl Running {
         } else {
             None
         };
+        #[cfg(windows)]
+        if isolated {
+            command.creation_flags(0x0800_0004); // CREATE_NO_WINDOW | CREATE_SUSPENDED
+        }
+        #[cfg(not(windows))]
+        let _ = isolated;
         let child = command.spawn()?;
+        #[cfg(windows)]
+        let job = if isolated {
+            let result = (|| {
+                let pid = child
+                    .id()
+                    .ok_or_else(|| std::io::Error::other("missing build PID"))?;
+                let handle = child
+                    .raw_handle()
+                    .ok_or_else(|| std::io::Error::other("missing build handle"))?;
+                let job = crate::chat_watch::windows::Containment::assign_handle(handle)?;
+                job.resume_suspended(pid)?;
+                Ok::<_, std::io::Error>(job)
+            })();
+            match result {
+                Ok(job) => Some(job),
+                Err(error) => {
+                    let mut child = child;
+                    let _ = child.start_kill();
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
         let mut running = Self::new(child, lease);
         if supervised || !outputs.is_empty() {
             running.group = running.child.as_ref().and_then(Child::id);
@@ -110,6 +153,10 @@ impl Running {
         running.outputs = outputs;
         running.witness = witness;
         running.owner = owner;
+        #[cfg(windows)]
+        {
+            running.job = job;
+        }
         Ok(running)
     }
 
@@ -133,6 +180,8 @@ impl Running {
                 self.group,
                 self.witness.take(),
                 self.owner.take(),
+                #[cfg(windows)]
+                self.job.take(),
             )
             .await
             .is_err()
@@ -165,6 +214,8 @@ impl Drop for Running {
             group,
             self.witness.take(),
             self.owner.take(),
+            #[cfg(windows)]
+            self.job.take(),
         ));
     }
 }
@@ -176,6 +227,7 @@ fn cleanup(
     group: Option<u32>,
     witness: Option<std::fs::File>,
     owner: Option<std::ffi::OsString>,
+    #[cfg(windows)] job: Option<crate::chat_watch::windows::Containment>,
 ) -> tokio::sync::oneshot::Receiver<()> {
     let (done, receiver) = tokio::sync::oneshot::channel();
     // Retain a fallback owner if the OS cannot start a cleanup thread. Losing
@@ -190,6 +242,10 @@ fn cleanup(
             else {
                 return;
             };
+            #[cfg(windows)]
+            if let Some(job) = job {
+                job.stop_and_wait();
+            }
             stop(&mut child, group, owner.as_deref());
             if let Some(mut witness) = witness {
                 use std::io::Read;

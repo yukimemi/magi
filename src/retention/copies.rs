@@ -1461,7 +1461,11 @@ pub(super) async fn seat_evidence(home: &Path, id: &str) -> Result<Vec<String>> 
 
 // Called under the execution/owner lease and repository coordination, before
 // graph dispatch or continuation delivery. Existing entities are never replaced.
-pub(super) async fn restore_execution_seats(home: &Path, state: &RunState) -> Result<()> {
+pub(super) async fn restore_execution_seats(
+    home: &Path,
+    state: &RunState,
+    coordination: Option<&crate::repo_lock::SeatLease>,
+) -> Result<()> {
     let mut latest = BTreeMap::new();
     for record in archived_records(home, &state.id).await? {
         if authority(state, &record.source) == Authority::ReviewSeat {
@@ -1544,7 +1548,34 @@ pub(super) async fn restore_execution_seats(home: &Path, state: &RunState) -> Re
         crate::fold_evidence::import_snapshot(&record.evidence, &state.repo).await?;
         crate::fold_evidence::atomic_write(&marker, record.head.as_bytes())?;
         git::worktree_add_detached(&state.repo, &path, &record.head).await?;
-        crate::worktree_setup::prepare(&state.config, &state.repo, &path).await?;
+        if let Err(error) = crate::worktree_setup::prepare_with(
+            &state.config,
+            &state.repo,
+            &path,
+            crate::build_target::Coordination::Held(coordination),
+        )
+        .await
+        {
+            if error.is::<crate::build_target::AdmissionDiskWait>() {
+                // Setup admission precedes all steps. Discard only the
+                // pristine checkout we just created and leave its archive
+                // available for another attempt. Started setup must retain
+                // both the checkpoint and checkout for inspection.
+                ensure!(
+                    git::rev_parse(&path, "HEAD").await? == record.head
+                        && git::git(&path, &["rev-parse", "--abbrev-ref", "HEAD"]).await? == "HEAD",
+                    "restored seat identity changed before admission rollback"
+                );
+                tracked_base(&path, &record.head).await?;
+                exact_inventory(&path, &record.head, &[]).await?;
+                ensure!(
+                    git::worktree_remove_clean(&state.repo, &path).await?,
+                    "restored seat removal refused after disk admission wait"
+                );
+                std::fs::remove_file(&marker)?;
+            }
+            return Err(error);
+        }
         ensure!(
             git::rev_parse(&path, "HEAD").await? == record.head,
             "restored seat HEAD changed during setup"
@@ -1620,4 +1651,108 @@ fn reflog_heads(admin: &BTreeMap<PathBuf, Vec<u8>>) -> Result<std::collections::
     }
     ensure!(logs == 1, "missing or ambiguous raw HEAD reflog");
     Ok(heads)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn archived_seat_retries_after_isolated_setup_disk_admission() {
+        crate::run::pin_test_home();
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let home = root.join("home");
+        let repo = root.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        for args in [
+            &["init", "-b", "main"][..],
+            &["config", "core.autocrlf", "false"],
+            &["config", "user.name", "Fixture"],
+            &["config", "user.email", "fixture@example.invalid"],
+        ] {
+            git::git(&repo, args).await.unwrap();
+        }
+        std::fs::write(repo.join("source"), b"base\n").unwrap();
+        git::git(&repo, &["add", "."]).await.unwrap();
+        git::git(&repo, &["commit", "--no-gpg-sign", "-m", "fixture"])
+            .await
+            .unwrap();
+        git::acquire_worktree_config(&repo).await.unwrap();
+        let head = git::rev_parse(&repo, "HEAD").await.unwrap();
+        let mut cfg = crate::config::Config::default();
+        cfg.graph.worktree_root = Some(root.join("worktrees"));
+        cfg.verify.build_cache = crate::config::BuildCache::Isolated;
+        cfg.verify.shell = Some(vec!["sh".into(), "-c".into()]);
+        cfg.disk.min_free_bytes = u64::MAX;
+        cfg.worktree.setup = vec![
+            crate::config::SetupStep {
+                copy: Some("source -> setup-copy".into()),
+                ..Default::default()
+            },
+            crate::config::SetupStep {
+                run: Some("cp setup-copy setup-completed".into()),
+                ..Default::default()
+            },
+        ];
+        let mut state = RunState::new(
+            repo.clone(),
+            "main".into(),
+            head.clone(),
+            "task".into(),
+            cfg,
+        );
+        state.save_under(&home).unwrap();
+        let review = state.worktree_root().join("review-1");
+        git::worktree_add_detached(&repo, &review, &head)
+            .await
+            .unwrap();
+        let admin = git::git(&review, &["rev-parse", "--absolute-git-dir"])
+            .await
+            .unwrap();
+        let log = std::fs::read(Path::new(&admin).join("logs/HEAD")).unwrap();
+        let evidence = crate::fold_evidence::snapshot(&state, &home, &head, EVIDENCE_BUDGET)
+            .await
+            .unwrap();
+        let artifacts = home.join("runs").join(&state.id).join("artifacts");
+        let archived = Eviction {
+            version: 2,
+            run: state.id.clone(),
+            source: review.clone(),
+            head: head.clone(),
+            base: Some(head.clone()),
+            admin: BTreeMap::new(),
+            admin_contents: BTreeMap::from([(PathBuf::from("logs/HEAD"), log)]),
+            history: BTreeMap::from([(head.clone(), evidence.clone())]),
+            evidence,
+            phase: "evicted".into(),
+        };
+        std::fs::write(
+            artifacts.join("eviction-review-1.json"),
+            serde_json::to_vec(&archived).unwrap(),
+        )
+        .unwrap();
+        assert!(git::worktree_remove_clean(&repo, &review).await.unwrap());
+
+        let error = restore_execution_seats(&home, &state, None)
+            .await
+            .unwrap_err();
+        assert!(
+            error.is::<crate::build_target::AdmissionDiskWait>(),
+            "{error:#}"
+        );
+        assert!(!review.join("setup-completed").exists());
+
+        // Recover capacity without manually deleting any checkout or marker.
+        let mut resumed = RunState::load_under(&state.id, &home).unwrap();
+        resumed.config.disk.min_free_bytes = 0;
+        restore_execution_seats(&home, &resumed, None)
+            .await
+            .unwrap();
+        assert_eq!(git::rev_parse(&review, "HEAD").await.unwrap(), head);
+        assert_eq!(
+            std::fs::read(review.join("setup-completed")).unwrap(),
+            b"base\n"
+        );
+    }
 }

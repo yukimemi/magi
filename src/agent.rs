@@ -432,12 +432,104 @@ pub(crate) async fn collect(
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
+#[derive(Debug)]
+pub(crate) struct IsolatedSeatWait(pub(crate) crate::run::ResourceBlock);
+
+impl std::fmt::Display for IsolatedSeatWait {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0.description())
+    }
+}
+
 /// Invoke `spec` for `seat`, updating the seat's conversation state.
+///
+/// The work itself runs as one heap-allocated future. Every caller holds this
+/// future inside its own (a chat turn nests it four levels deep), and in a
+/// debug build each level also keeps by-value temporaries of it in its poll
+/// frame. Inline, that pushed a chat worker turn past the 2 MiB a test thread
+/// has on Windows; boxed, callers carry a pointer.
 pub async fn invoke(
     spec: &AgentSpec,
     seat: &mut SeatState,
     inv: &Invocation<'_>,
 ) -> Result<AgentOutput> {
+    Box::pin(invoke_on_heap(spec, seat, inv)).await
+}
+
+async fn invoke_on_heap(
+    spec: &AgentSpec,
+    seat: &mut SeatState,
+    inv: &Invocation<'_>,
+) -> Result<AgentOutput> {
+    let home = crate::run::home();
+    // Graph writers use their saved configuration on every turn.
+    let (min_free, isolated) = if repository_writer(inv) && repository_seat(inv) {
+        match crate::run::RunState::load_under(inv.run, &home) {
+            Ok(state) => (
+                state.config.disk.min_free_bytes,
+                crate::build_target::isolated(&state.config).then(|| Box::new(state.config)),
+            ),
+            Err(error) if crate::run::is_run_id(inv.run) => {
+                return Err(crate::repo_lock::ResourceBlocked(format!(
+                    "cannot confirm saved build policy: {error:#}"
+                ))
+                .into());
+            }
+            Err(_) => (0, None),
+        }
+    } else {
+        (0, None)
+    };
+    let isolated = isolated.as_deref();
+    let resource = |error: anyhow::Error| {
+        crate::repo_lock::ResourceBlocked(format!("{}: {error:#}", crate::build_target::KIND))
+    };
+    let mut build_guard = None;
+    let mut target = None;
+    if let Some(config) = isolated {
+        let path = crate::build_target::resolve(&home, inv.cwd).map_err(resource)?;
+        let head = crate::git::rev_parse(inv.cwd, "HEAD")
+            .await
+            .map_err(resource)?;
+        let owner = crate::cache::Owner::here(inv.run, inv.node, &seat.key, inv.cwd, &head);
+        let started = std::time::Instant::now();
+        build_guard = Some(
+            crate::build_target::acquire(&home, &path, &owner, config)
+                .await
+                .map_err(|error| {
+                    let detail = format!("{}: {error:#}", path.display());
+                    let timeout = error.is::<crate::cache::WaitTimeout>().then(|| {
+                        IsolatedSeatWait(crate::run::ResourceBlock {
+                            cause: crate::run::ResourceBlockCause::IsolatedCacheTimeout {
+                                target: path.clone(),
+                                waited_secs: started.elapsed().as_secs(),
+                                limit_secs: config.graph.timeout_resource_wait,
+                            },
+                            node: inv.node.to_owned(),
+                            kind: crate::build_target::KIND.into(),
+                            detail: detail.clone(),
+                            at: jiff::Timestamp::now(),
+                        })
+                    });
+                    let error = anyhow::Error::new(crate::repo_lock::ResourceBlocked(format!(
+                        "{}: {detail}",
+                        crate::build_target::KIND
+                    )));
+                    match timeout {
+                        Some(timeout) => error.context(timeout),
+                        None => error,
+                    }
+                })?,
+        );
+        target = Some((path, head));
+    }
+    let inv = &Invocation {
+        cache_dir: target
+            .as_ref()
+            .map(|(path, _)| path.as_path())
+            .or(inv.cache_dir.filter(|_| inv.allow_write)),
+        ..inv.clone()
+    };
     // Wait for repository scheduling before spawning or starting a seat's
     // budget. Readers hold the real lock; editors exclude local readers while
     // taking their own repository-prescribed lock inside the seat. Running
@@ -454,16 +546,19 @@ pub async fn invoke(
     };
     let mut outputs = Vec::new();
     if repository_writer(inv) {
-        let min_free = crate::run::RunState::load_under(inv.run, &crate::run::home())
-            .map_or(0, |state| state.config.disk.min_free_bytes);
         let mut paths = vec![inv.cwd.to_owned()];
         if let Some(cache) = inv.cache_dir {
             paths.push(cache.to_owned());
         }
-        outputs.extend(
-            crate::retention::OutputLease::admit(&crate::run::home(), &paths, min_free)
-                .map_err(|e| crate::repo_lock::ResourceBlocked(format!("disk admission: {e:#}")))?,
-        );
+        let admit = if isolated.is_some() {
+            crate::retention::OutputLease::admit_isolated
+        } else {
+            crate::retention::OutputLease::admit
+        };
+        outputs
+            .extend(admit(&home, &paths, min_free).map_err(|e| {
+                crate::repo_lock::ResourceBlocked(format!("disk admission: {e:#}"))
+            })?);
     }
     if repository_seat(inv) {
         if let Some(guard) = crate::retention::OutputLease::borrow(inv.cwd).map_err(|e| {
@@ -478,6 +573,14 @@ pub async fn invoke(
                 false,
             )?);
         }
+    }
+    if let (Some(config), Some((path, head))) = (isolated, &target) {
+        crate::build_target::ensure_fresh(&home, path, inv.cwd, head, config)
+            .with_context(|| format!("target {}", path.display()))
+            .map_err(resource)?;
+        // A seat may edit or build a dirty tree without changing HEAD.
+        crate::cache::invalidate_identity(&home, path);
+        tracing::info!(target = %path.display(), seat = %seat.key, "admitted isolated build cache");
     }
 
     let mut prompt = inv.prompt.to_owned();
@@ -498,6 +601,10 @@ pub async fn invoke(
                 writable.push(root);
             }
         }
+    }
+    if let Some((path, _)) = &target {
+        writable.push(path.clone());
+        prompt.push_str("\n\nUse the launcher-provided Cargo target and Cargo command. Do not set a different target or bypass the managed Cargo launcher.");
     }
     if repository_writer(inv) {
         prompt.push_str("\n\n");
@@ -537,6 +644,7 @@ pub async fn invoke(
             "allow_write": inv.allow_write,
             "unsandboxed": repository_writer(inv),
             "writable_roots": inv.writable,
+            "isolated_build_target": target.as_ref().map(|(path, _)| path),
             "fetched_base": inv.fetched_base,
         }))?,
     )
@@ -591,7 +699,12 @@ pub async fn invoke(
         // MAGI_HOME or a per-agent environment override.
         cmd.env("MAGI_HOME", std::fs::canonicalize(home)?);
     }
-    if let Some(cache) = inv.cache_dir {
+    if target.is_none() {
+        crate::build_target::command::clear(&mut cmd)?;
+    }
+    if let Some((path, _)) = &target {
+        crate::build_target::command::configure(&mut cmd, path).map_err(resource)?;
+    } else if let Some(cache) = inv.cache_dir {
         // Same directory the verify commands build into: one cache to prune,
         // and the compile the seat pays for is the compile the gate reuses.
         cmd.env("CARGO_TARGET_DIR", cache);
@@ -604,6 +717,8 @@ pub async fn invoke(
         // anyway - the write refusal this is meant to prevent in the first
         // place. Strip it explicitly.
         cmd.env_remove("CARGO_TARGET_DIR");
+        cmd.env_remove("CARGO_BUILD_TARGET_DIR")
+            .env_remove("CARGO_BUILD_BUILD_DIR");
     }
 
     #[cfg(any(unix, windows))]
@@ -641,8 +756,18 @@ pub async fn invoke(
         bridge
     };
 
-    let mut running = crate::seat_process::Running::spawn(cmd, lease, outputs)
-        .with_context(|| format!("spawn `{}` for seat {}", plan.argv[0], seat.key))?;
+    let spawn = if build_guard.is_some() {
+        crate::seat_process::Running::spawn_build
+    } else {
+        crate::seat_process::Running::spawn
+    };
+    let spawned = spawn(cmd, lease, outputs)
+        .with_context(|| format!("spawn `{}` for seat {}", plan.argv[0], seat.key));
+    let mut running = if isolated.is_some() {
+        spawned.map_err(resource)?
+    } else {
+        spawned?
+    };
     // Feed stdin from a task rather than inline: a `command` agent that never
     // reads its stdin, or a prompt larger than the pipe buffer, would
     // otherwise deadlock here before the process is ever waited on.
@@ -672,9 +797,6 @@ pub async fn invoke(
     let (out_buf, out_reader) = drain(running.child().stdout.take());
     let (err_buf, err_reader) = drain(running.child().stderr.take());
 
-    let min_free = crate::run::RunState::load_under(inv.run, &crate::run::home())
-        .ok()
-        .map_or(0, |state| state.config.disk.min_free_bytes);
     #[cfg(all(test, unix))]
     let min_free = test_watchdog::floor(inv.run, min_free);
     let mut paths = vec![inv.cwd.to_owned()];
@@ -684,7 +806,7 @@ pub async fn invoke(
     let mut pressure = None;
     let waited = tokio::select! {
         waited = tokio::time::timeout(inv.timeout, running.child().wait()) => Some(waited),
-        reason = crate::retention::emergency(paths, min_free) => {
+        reason = crate::retention::emergency(paths, min_free, isolated.is_some()) => {
             pressure = Some(reason);
             None
         }

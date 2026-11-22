@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context as _, Result, bail, ensure};
 use clap::{ArgAction, CommandFactory as _, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
-use magi::config::{Config, MergeMode};
+use magi::config::{BuildCache, Config, MergeMode};
 use magi::graph::{Runner, fold_run};
 use magi::proc::Quiet as _;
 use magi::queue::{self, Queue, Source, Task, TaskStatus};
@@ -106,6 +106,13 @@ impl MergeArg {
     }
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum BuildCacheArg {
+    Shared,
+    Isolated,
+    Default,
+}
+
 /// Source selection is never inferred from task or conversation text.
 #[derive(Debug, Clone, Default, clap::Args)]
 struct SourceArgs {
@@ -168,6 +175,9 @@ struct RunOpts {
     /// What to do with the winning branch.
     #[arg(long, value_enum)]
     merge: Option<MergeArg>,
+    /// Cargo build output policy. Defaults to the repository setting.
+    #[arg(long, value_enum)]
+    build_cache: Option<BuildCache>,
     /// Seed for label assignment, to reproduce a run.
     #[arg(long)]
     seed: Option<u64>,
@@ -204,6 +214,7 @@ impl RunOpts {
             judges: self.judges.or(other.judges),
             review_rounds: self.review_rounds.or(other.review_rounds),
             merge: self.merge.or(other.merge),
+            build_cache: self.build_cache.or(other.build_cache),
             seed: self.seed.or(other.seed),
             dry_run: self.dry_run || other.dry_run,
             force: self.force || other.force,
@@ -262,7 +273,8 @@ enum Command {
         #[arg(long, conflicts_with_all = ["instruction", "file"])]
         issue: Option<u64>,
         /// Continue an interrupted run.
-        #[arg(long, value_name = "RUN_ID", conflicts_with_all = ["instruction", "file", "issue"])]
+        /// Uses the saved build-cache mode; --build-cache cannot override it.
+        #[arg(long, value_name = "RUN_ID", conflicts_with_all = ["instruction", "file", "issue", "build_cache"])]
         resume: Option<String>,
         /// Authorize a new bounded base synchronization interval after movement exhaustion.
         #[arg(long, requires = "resume", conflicts_with = "dry_run")]
@@ -298,6 +310,9 @@ enum Command {
         /// What to do with the branch once it is clean.
         #[arg(long, value_enum)]
         merge: Option<MergeArg>,
+        /// Cargo build output policy. Defaults to the repository setting.
+        #[arg(long, value_enum)]
+        build_cache: Option<BuildCache>,
         /// Review even though an unfinished task or run already owns this
         /// branch.
         #[arg(long)]
@@ -1008,6 +1023,9 @@ enum TaskCmd {
         /// Parallel implementations (`--candidates` is a deprecated alias).
         #[arg(long, alias = "candidates")]
         implementers: Option<usize>,
+        /// Cargo build output policy. Without an override, urgent tasks isolate.
+        #[arg(long, value_enum)]
+        build_cache: Option<BuildCache>,
         /// Run this task alone: one implementer, straight into review, rather
         /// than the usual multi-candidate competition. For work whose design
         /// is already settled and only needs building - the shape a standing
@@ -1114,6 +1132,14 @@ enum TaskCmd {
         /// Number of implementers (1..=3).
         count: u8,
     },
+    /// Change a queued or held task's build cache policy for new runs.
+    BuildCache {
+        /// Task id or unambiguous prefix/suffix.
+        id: String,
+        /// Use shared or isolated outputs, or clear the task override.
+        #[arg(value_enum)]
+        mode: BuildCacheArg,
+    },
     /// Enable the single additional urgent slot for a queued or held task.
     Urgent {
         /// Task id or unambiguous prefix/suffix.
@@ -1205,10 +1231,10 @@ enum TaskCmd {
     },
 }
 
-/// Operations on the shared build cache.
+/// Operations on build outputs.
 #[derive(Debug, Subcommand)]
 enum CacheCmd {
-    /// Print the cache's path, size, and cap.
+    /// Print the repository's build cache mode and configured shared cache.
     Show {
         /// Repository, for the config that names the cache.
         #[arg(long, default_value = ".")]
@@ -1217,11 +1243,10 @@ enum CacheCmd {
         #[arg(long)]
         config: Option<PathBuf>,
     },
-    /// Delete the whole cache directory and print how many bytes were freed.
+    /// Clear a build cache and print how many bytes were freed.
     ///
-    /// The cache is derived state - a rebuilt crate is the same source compiled
-    /// again - so clearing it loses nothing but the operator's next build time.
-    /// Homework-sized repairs for the one thing magi already prunes on its own.
+    /// Clearing a cache removes derived outputs, not source code.
+    /// Use `--path` for an isolated target. Its directory is retained.
     Clear {
         /// Repository, for the config that names the cache. Ignored when
         /// `--path` is given.
@@ -1294,7 +1319,10 @@ enum CacheCmd {
 /// on a thread whose stack size is set explicitly.
 const STACK_SIZE: usize = 32 * 1024 * 1024;
 
-fn main() -> Result<()> {
+fn main() -> Result<std::process::ExitCode> {
+    if let Some(code) = magi::build_target::command::shim() {
+        return Ok(code);
+    }
     if std::env::args_os()
         .nth(1)
         .is_some_and(|s| s == "__magi_incremental")
@@ -1310,6 +1338,7 @@ fn main() -> Result<()> {
         .expect("spawn the thread this binary actually runs on")
         .join()
         .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        .map(|()| std::process::ExitCode::SUCCESS)
 }
 
 /// Build the async runtime and run the CLI on it. Kept separate from `main`
@@ -1420,6 +1449,7 @@ fn guard_standing_chat_command(command: &Command) -> Result<()> {
                             },
                             force: false,
                             issue: None,
+                            build_cache: None,
                             ..
                         }
                 }
@@ -1744,6 +1774,7 @@ async fn dispatch(command: Command) -> Result<()> {
                     review_rounds: opts.review_rounds,
                     seed: opts.seed,
                     config: opts.config.as_deref().map(|c| absolute_path(c, &cwd)),
+                    build_cache: opts.build_cache,
                     inherit_daemon_options: false,
                 };
                 return run_existing_task(&queue, task_id, patch, None).await;
@@ -1758,6 +1789,7 @@ async fn dispatch(command: Command) -> Result<()> {
                 review_rounds: opts.review_rounds,
                 seed: opts.seed,
                 config: opts.config.as_deref().map(|c| absolute_path(c, &cwd)),
+                build_cache: opts.build_cache,
                 inherit_daemon_options: false,
             };
             let repo = resolve_repo(&repo, &cwd, Some(&text)).await?;
@@ -1804,6 +1836,7 @@ async fn dispatch(command: Command) -> Result<()> {
             reviewers,
             review_rounds,
             merge,
+            build_cache,
             force,
             task,
         } => {
@@ -1818,6 +1851,7 @@ async fn dispatch(command: Command) -> Result<()> {
                     review_rounds,
                     seed: None,
                     config: config.as_deref().map(|c| absolute_path(c, &cwd)),
+                    build_cache,
                     inherit_daemon_options: false,
                 };
                 return run_existing_task(&queue, task_id, patch, Some(branch)).await;
@@ -1831,6 +1865,7 @@ async fn dispatch(command: Command) -> Result<()> {
                 review_rounds,
                 seed: None,
                 config: config.as_deref().map(|c| absolute_path(c, &cwd)),
+                build_cache,
                 inherit_daemon_options: false,
             };
             let repo = resolve_repo(&repo, &cwd, None).await?;
@@ -2540,6 +2575,9 @@ fn cache(command: CacheCmd) -> Result<()> {
             let path = PathBuf::from(&e.cache_dir);
             let (state, detail) = cache_status_line(&e.status);
             println!("{}", path.display());
+            if matches!(magi::build_target::check_prune(&home, &path), Ok(true)) {
+                println!("  mode    isolated");
+            }
             println!("  status  {state} ({detail})");
             println!("  size    {}", bytes(magi::disk::dir_size(&path)));
             match magi::disk::free_bytes(&path) {
@@ -2678,6 +2716,10 @@ fn cache(command: CacheCmd) -> Result<()> {
     };
     let (cfg, _from) = Config::discover(repo, config)?;
     if matches!(command, CacheCmd::Show { .. }) {
+        println!("build cache  {}", cfg.verify.build_cache);
+        if cfg.verify.build_cache == BuildCache::Isolated {
+            println!("see `magi cache list` for isolated target paths");
+        }
         if let Ok(body) = std::fs::read(magi::run::home().join("retention.json")) {
             println!(
                 "retained worktree cleanup\n{}",
@@ -2753,6 +2795,22 @@ fn cache(command: CacheCmd) -> Result<()> {
 fn clear_cache_dir(home: &Path, dir: &Path) -> Result<()> {
     if !dir.exists() {
         println!("cache not present on disk: {}", dir.display());
+        return Ok(());
+    }
+    if magi::build_target::check_prune(home, dir)? {
+        let free_before = magi::disk::free_bytes(dir).ok();
+        match magi::cache::maintenance_prune(home, dir, 0)? {
+            Some(pruned) => {
+                let free_after = magi::disk::free_bytes(dir).ok();
+                println!(
+                    "cleared {} file(s) from {}: {} (isolated target directory retained)",
+                    pruned.files,
+                    dir.display(),
+                    reclaim_report(pruned.freed, free_before, free_after)
+                );
+            }
+            None => println!("cache is in use right now, not clearing: {}", dir.display()),
+        }
         return Ok(());
     }
     // A live borrower - this run's own build, another run's, or a human's
@@ -3666,14 +3724,16 @@ fn task_cmd_on(
             force,
             json,
             implementers,
+            build_cache,
         } => Box::pin(async move {
             let recovery = standing.standing_task.is_some();
             ensure!(
                 !recovery
                     || (!force
                         && issue.is_none()
+                        && build_cache.is_none()
                         && std::env::var("MAGI_NODE").as_deref() == Ok(queue::CHAT_NODE)),
-                "standing fix filing requires a chat turn and cannot use --force or --issue"
+                "standing fix filing requires a chat turn and cannot use --force, --issue, or --build-cache"
             );
             if let Some(why) = mistyped_command(
                 "magi task add",
@@ -3744,6 +3804,7 @@ fn task_cmd_on(
                             solo,
                             urgent,
                             implementers,
+                            build_cache,
                             attach: absolute_paths(&attach, &cwd),
                         }),
                     }))
@@ -3758,9 +3819,11 @@ fn task_cmd_on(
                 task.priority = priority;
                 task.solo = solo;
                 task.urgent = urgent;
-                if implementers.is_some() {
+                if implementers.is_some() || build_cache.is_some() {
                     task.overrides = Some(magi::queue::RunOverrides {
+                        inherit_daemon_options: implementers.is_none(),
                         candidates: implementers,
+                        build_cache,
                         ..Default::default()
                     });
                 }
@@ -3976,8 +4039,12 @@ async fn task_cmd_inner(command: TaskCmd, q: Queue) -> Result<()> {
 
         TaskCmd::Show { id, json } => {
             let t = q.get(&id)?;
+            let (mode, source) = task_build_cache(&t);
             if json {
-                println!("{}", serde_json::to_string_pretty(&t)?);
+                let mut view = serde_json::to_value(&t)?;
+                view["effective_build_cache"] =
+                    serde_json::json!({ "mode": mode, "source": source });
+                println!("{}", serde_json::to_string_pretty(&view)?);
                 return Ok(());
             }
             println!("{}  {}", t.id, t.title);
@@ -3995,6 +4062,11 @@ async fn task_cmd_inner(command: TaskCmd, q: Queue) -> Result<()> {
                 "urgent    {}",
                 if t.urgent { "enabled" } else { "disabled" }
             );
+            if let Some(mode) = mode {
+                println!("build cache (new run)  {mode} ({source})");
+            } else {
+                println!("build cache (new run)  unknown (configuration unavailable)");
+            }
             println!("attempts  {}", t.attempts);
             let attachments = q.attachment_paths(&t);
             if !attachments.is_empty() {
@@ -4283,6 +4355,26 @@ async fn task_cmd_inner(command: TaskCmd, q: Queue) -> Result<()> {
             t.change_implementers(count)?;
             q.put(&mut t)?;
             println!("{} implementers now {count} - {}", t.short(), t.title);
+            Ok(())
+        }
+        TaskCmd::BuildCache { id, mode } => {
+            let resolved = q.resolve_id(&id)?;
+            let _claim = q
+                .claim(&resolved)
+                .with_context(|| format!("task {resolved} is claimed by a running daemon"))?;
+            let mut t = q.get(&resolved)?;
+            let mode = match mode {
+                BuildCacheArg::Shared => Some(BuildCache::Shared),
+                BuildCacheArg::Isolated => Some(BuildCache::Isolated),
+                BuildCacheArg::Default => None,
+            };
+            t.change_build_cache(mode)?;
+            q.put(&mut t)?;
+            if let Some(mode) = mode {
+                println!("{} build cache now {mode} - {}", t.short(), t.title);
+            } else {
+                println!("{} build cache override cleared - {}", t.short(), t.title);
+            }
             Ok(())
         }
         TaskCmd::Urgent { id, clear } => {
@@ -4938,8 +5030,14 @@ async fn run_as_task(queue: &Queue, filing: magi::direct::Filing, dry_run: bool)
                 )
                 .await?;
                 runner.state.sources = task.sources.clone();
+                if let Some((mode, source)) = task.build_cache_override(&runner.state.config) {
+                    runner
+                        .state
+                        .event("build-cache", format!("{mode} selected by {source}"));
+                }
                 runner.state.save()?;
                 print!("{}", report::run(&runner.state));
+                println!("build cache: {}", runner.state.config.verify.build_cache);
                 println!("\ndry run: stopping before the first agent call");
                 // Link the prepared run (not `start`: no attempt was spent) so
                 // `task show` lists it and a release resumes it.
@@ -5025,6 +5123,43 @@ fn live_loop(home: &Path) -> bool {
         std::process::id(),
     )
     .is_some()
+}
+
+// Preview the policy for new runs. A resume reads the saved run's configuration.
+fn task_build_cache(task: &Task) -> (Option<BuildCache>, &'static str) {
+    if let Some(mode) = task.overrides.as_ref().and_then(|o| o.build_cache) {
+        return (Some(mode), "task-override");
+    }
+    let overrides = task.overrides.as_ref();
+    let home = magi::run::home();
+    let daemon = if live_loop(&home) {
+        std::fs::read(home.join("scheduler-options.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<magi::daemon::Opts>(&bytes).ok())
+    } else {
+        Some(magi::daemon::Opts::default())
+    };
+    let use_daemon_config = overrides.is_none_or(|o| o.inherit_daemon_options);
+    let repo = if task.repo.as_os_str().is_empty() || task.repo == Path::new(".") {
+        daemon.as_ref().map(|opts| opts.repo.as_path())
+    } else {
+        Some(task.repo.as_path())
+    };
+    let config = repo.and_then(|repo| {
+        let explicit = if use_daemon_config {
+            daemon.as_ref()?.config.as_deref()
+        } else {
+            overrides.and_then(|o| o.config.as_deref())
+        };
+        Config::discover(repo, explicit).ok().map(|(cfg, _)| cfg)
+    });
+    match config {
+        Some(cfg) => match task.build_cache_override(&cfg) {
+            Some((mode, source)) => (Some(mode), source),
+            None => (Some(cfg.verify.build_cache), "config"),
+        },
+        None => (None, "config"),
+    }
 }
 
 /// `--task <id>` on `run` / `review`: nothing new is filed; the named task is
@@ -5119,6 +5254,7 @@ async fn resume_run(id: &str, dry_run: bool, recover_base: bool) -> Result<()> {
             None => println!("no task owns this run; a real `--resume` would file one"),
         }
         print!("{}", report::run(&runner.state));
+        println!("build cache: {}", runner.state.config.verify.build_cache);
         println!("\ndry run: stopping before the first agent call");
         return Ok(());
     }
@@ -5781,6 +5917,30 @@ mod tests {
                 "--clear",
                 "--start-from",
                 "branch"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn review_accepts_a_build_cache_override_but_resume_uses_the_saved_policy() {
+        let cli =
+            Cli::try_parse_from(["magi", "review", "branch", "--build-cache", "isolated"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Review {
+                build_cache: Some(BuildCache::Isolated),
+                ..
+            })
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "magi",
+                "run",
+                "--resume",
+                "run",
+                "--build-cache",
+                "isolated",
             ])
             .is_err()
         );
@@ -6948,6 +7108,7 @@ mod tests {
                 force: false,
                 json: false,
                 implementers: None,
+                build_cache: None,
             },
             q.clone(),
         )
@@ -7096,6 +7257,7 @@ mod tests {
                 force: false,
                 json: false,
                 implementers: None,
+                build_cache: None,
             },
             q.clone(),
         )
@@ -7119,6 +7281,7 @@ mod tests {
                 force: false,
                 json: false,
                 implementers: None,
+                build_cache: None,
             },
             q.clone(),
         )
@@ -7157,6 +7320,7 @@ mod tests {
                 urgent: false,
                 attach: Vec::new(),
                 force: false,
+                build_cache: None,
                 json: false,
                 implementers: None,
             },
@@ -7180,6 +7344,7 @@ mod tests {
                 urgent: false,
                 attach: Vec::new(),
                 force: false,
+                build_cache: None,
                 json: false,
                 implementers: None,
             },
@@ -7226,6 +7391,7 @@ mod tests {
                 force: false,
                 json: false,
                 implementers: None,
+                build_cache: None,
             },
             q.clone(),
         )
@@ -7251,6 +7417,7 @@ mod tests {
                 force: false,
                 json: false,
                 implementers: None,
+                build_cache: None,
             },
             q.clone(),
         )
@@ -7292,6 +7459,7 @@ mod tests {
                 force: false,
                 json: false,
                 implementers: None,
+                build_cache: None,
             },
             q.clone(),
         )
@@ -7883,6 +8051,7 @@ done
                 force: false,
                 json: false,
                 implementers: None,
+                build_cache: None,
             },
             q.clone(),
         )
@@ -7915,6 +8084,7 @@ done
                 force: false,
                 json: false,
                 implementers: None,
+                build_cache: None,
             },
             q.clone(),
         )
@@ -7983,6 +8153,7 @@ command = ['sh', '-c', 'cat >/dev/null; printf "%s" "{\"duplicate\":true,\"reaso
             force,
             json: false,
             implementers: None,
+            build_cache: None,
         };
 
         let err = task_cmd_on(add(false), q.clone())

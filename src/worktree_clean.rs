@@ -148,32 +148,53 @@ pub(crate) async fn reset(state: &mut RunState, wt: &Path, rev: Option<&str>) ->
         state
             .save()
             .context("persist pre-clean attempt before starting command")?;
-        let mut paths = vec![wt.to_owned()];
-        if let Some(cache) = state.config.cache_dir() {
-            paths.push(cache);
-        }
-        let mut outputs = crate::retention::OutputLease::admit(
-            &crate::run::home(),
-            &paths,
-            state.config.disk.min_free_bytes,
-        )?;
+        let home = crate::run::home();
+        let shell = state.config.shell();
+        let mut build = if crate::build_target::isolated(&state.config) {
+            crate::build_target::command::check_shell(&shell)?;
+            crate::build_target::command::normalize(&step.run)?;
+            let build = crate::build_target::Operation::admit(
+                &state.config,
+                wt,
+                &state.id,
+                "pre-clean",
+                crate::build_target::Coordination::Acquire,
+            )
+            .await?;
+            state.event(
+                "pre-clean",
+                format!("isolated build target: {}", build.target.display()),
+            );
+            Some(build)
+        } else {
+            None
+        };
+        let (lease, mut outputs) = if let Some(build) = &mut build {
+            (build.lease.take(), std::mem::take(&mut build.outputs))
+        } else {
+            let cache = state.config.cache_dir();
+            let mut paths = vec![wt.to_owned()];
+            paths.extend(cache.iter().cloned());
+            let mut outputs = crate::retention::OutputLease::admit(
+                &home,
+                &paths,
+                state.config.disk.min_free_bytes,
+            )?;
+            if let Some(cache) = cache {
+                outputs.push(crate::retention::OutputLease::cache(&home, &cache, false)?);
+            }
+            let lease = crate::repo_lock::SeatLease::operation_with(
+                wt,
+                state.config.coordination.as_ref(),
+                &wait,
+            )
+            .await?;
+            (lease, outputs)
+        };
         outputs.push(lock.duplicate());
         outputs.push(output.duplicate());
-        if let Some(cache) = state.config.cache_dir() {
-            outputs.push(crate::retention::OutputLease::cache(
-                &crate::run::home(),
-                &cache,
-                false,
-            )?);
-        }
-        let lease = crate::repo_lock::SeatLease::operation_with(
-            wt,
-            state.config.coordination.as_ref(),
-            &wait,
-        )
-        .await?;
         let result = crate::worktree_setup::run_command(
-            &state.config.shell(),
+            &shell,
             &step.run,
             wt,
             Duration::from_secs(
@@ -183,6 +204,9 @@ pub(crate) async fn reset(state: &mut RunState, wt: &Path, rev: Option<&str>) ->
             lease,
             outputs,
             true,
+            build
+                .as_ref()
+                .map(|build| (build.target.as_path(), state.config.disk.min_free_bytes)),
         )
         .await
         .with_context(|| format!("{context}: git clean was not run"));

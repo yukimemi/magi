@@ -463,8 +463,37 @@ fn machine_cause_resolved(task: &Task, cfg: &Config) -> Option<bool> {
 
 fn machine_cause_resolved_under(task: &Task, cfg: &Config, home: &Path) -> Option<bool> {
     machine_cause_resolved_with_admission(task, cfg, home, |paths, floor| {
-        crate::retention::OutputLease::admit(home, paths, floor).is_ok()
+        let admit = if paths.contains(&crate::build_target::root(home)) {
+            crate::retention::OutputLease::admit_isolated
+        } else {
+            crate::retention::OutputLease::admit
+        };
+        admit(home, paths, floor).is_ok()
     })
+}
+
+fn cache_wait_run(task: &Task, home: &Path) -> Option<crate::run::RunState> {
+    if !task
+        .hold_reason
+        .as_deref()?
+        .starts_with(crate::cache::RESOURCE_HOLD)
+    {
+        return None;
+    }
+    let id = task.execution_runs().last()?;
+    let state = crate::run::RunState::load_under(id, home).ok()?;
+    (state.id == *id).then_some(state)
+}
+
+fn known_isolated_cache_wait(task: &Task, home: &Path) -> bool {
+    let Some(crate::run::ResourceBlockCause::IsolatedCacheTimeout { target, .. }) =
+        cache_wait_run(task, home)
+            .and_then(|state| state.resource_block)
+            .map(|block| block.cause)
+    else {
+        return false;
+    };
+    crate::build_target::check_prune(home, &target).is_ok_and(|owned| owned)
 }
 
 fn machine_cause_resolved_with_admission(
@@ -474,46 +503,79 @@ fn machine_cause_resolved_with_admission(
     admission_available: impl Fn(&[PathBuf], u64) -> bool,
 ) -> Option<bool> {
     if disk_wait_known(task, home) {
-        if crate::daemon::disk_gate(&repo_for(task), cfg).is_some() {
-            return Some(false);
-        }
-        let mut floor = cfg.disk.min_free_bytes;
-        let mut paths = vec![repo_for(task)];
-        paths.extend(cfg.cache_dir());
-        paths.push(
-            cfg.graph
-                .worktree_root
-                .clone()
-                .unwrap_or_else(crate::run::default_worktree_root),
-        );
-        if let Some(id) = task.execution_runs().last() {
+        let saved = if let Some(id) = task.disk_wait_run() {
             let Ok(state) = crate::run::RunState::load_under(id, home) else {
                 return Some(false);
             };
             if state.id != *id || !state.status.resumable() {
                 return Some(false);
             }
-            if crate::daemon::disk_gate(&state.repo, &state.config).is_some() {
+            Some(state)
+        } else {
+            None
+        };
+        let override_config = task
+            .build_cache_override(cfg)
+            .map(|(mode, _)| mode)
+            .filter(|mode| saved.is_none() && *mode != cfg.verify.build_cache)
+            .map(|mode| {
+                let mut config = cfg.clone();
+                config.verify.build_cache = mode;
+                config
+            });
+        let (repo, config) = saved.as_ref().map_or_else(
+            || (repo_for(task), override_config.as_ref().unwrap_or(cfg)),
+            |state| (state.repo.clone(), &state.config),
+        );
+        if crate::daemon::disk_gate_at(&repo, config, || home.to_owned()).is_some() {
+            return Some(false);
+        }
+        let mut paths = vec![repo];
+        if let Some(state) = &saved {
+            paths.push(state.worktree_root());
+            paths.extend(state.candidates.iter().map(|c| c.worktree.clone()));
+        } else {
+            paths.push(
+                config
+                    .graph
+                    .worktree_root
+                    .clone()
+                    .unwrap_or_else(crate::run::default_worktree_root),
+            );
+        }
+        if crate::build_target::isolated(config) {
+            paths.push(crate::build_target::root(home));
+        } else {
+            paths.extend(config.cache_dir());
+        }
+        let mut floor = config.disk.min_free_bytes;
+        if saved.is_some()
+            && !crate::build_target::isolated(config)
+            && !crate::build_target::isolated(cfg)
+        {
+            let repo = repo_for(task);
+            if crate::daemon::disk_gate_at(&repo, cfg, || home.to_owned()).is_some() {
                 return Some(false);
             }
-            floor = floor.max(state.config.disk.min_free_bytes);
-            paths.extend([state.repo.clone(), state.worktree_root()]);
-            paths.extend(state.candidates.iter().map(|c| c.worktree.clone()));
-            paths.extend(state.config.cache_dir());
+            paths.push(repo);
+            paths.extend(cfg.cache_dir());
+            paths.push(
+                cfg.graph
+                    .worktree_root
+                    .clone()
+                    .unwrap_or_else(crate::run::default_worktree_root),
+            );
+            floor = floor.max(cfg.disk.min_free_bytes);
         }
         return Some(admission_available(&paths, floor));
     }
-    if task
-        .hold_reason
-        .as_deref()
-        .is_some_and(|r| r.starts_with(crate::cache::RESOURCE_HOLD))
-    {
-        // Require evidence from the exact latest run before auto-releasing.
-        let id = task.execution_runs().last()?;
-        let state = crate::run::RunState::load_under(id, home).ok()?;
+    if let Some(state) = cache_wait_run(task, home) {
         let block = state.resource_block.as_ref()?;
-        if state.id != *id {
-            return None;
+        if let crate::run::ResourceBlockCause::IsolatedCacheTimeout { target, .. } = &block.cause {
+            return Some(
+                crate::build_target::check_prune(home, target).is_ok_and(|owned| owned)
+                    && !crate::cache::in_use(home, target),
+            );
         }
         // A free cache lease resolves contention, not malformed manifests,
         // failed writes, cancellation, or unknown infrastructure failures.
@@ -523,7 +585,9 @@ fn machine_cause_resolved_with_admission(
             return None;
         }
         return Some(
-            cfg.cache_dir()
+            state
+                .config
+                .cache_dir()
                 .is_none_or(|dir| !crate::cache::in_use(home, &dir)),
         );
     }
@@ -1440,7 +1504,7 @@ fn resume_disk_task(
         .root()
         .parent()
         .ok_or_else(|| anyhow::anyhow!("missing question home"))?;
-    let _lease = if let Some(id) = task.execution_runs().last() {
+    let _lease = if let Some(id) = task.disk_wait_run() {
         anyhow::ensure!(
             task.resume_override
                 .as_ref()
@@ -1784,15 +1848,9 @@ fn run_once_with_probe(
                     if queue.put(&mut task).is_ok() {
                         report.resumed.push(task.id.clone());
                     }
-                } else if file_question(
-                    questions,
-                    &ownership,
-                    &task,
-                    Bucket::MachineUnknown,
-                    w,
-                    now,
-                )
-                .is_some()
+                } else if !known_isolated_cache_wait(&task, &crate::run::home())
+                    && file_question(questions, &ownership, &task, Bucket::MachineUnknown, w, now)
+                        .is_some()
                 {
                     report.asked.push(task.id.clone());
                 }
@@ -2147,6 +2205,64 @@ mod tests {
                 "{kind}"
             );
         }
+    }
+
+    #[test]
+    fn startup_disk_wait_probes_the_task_override_and_does_not_pin_history() {
+        use crate::config::BuildCache;
+        // `disk_wait_eligible` reads the process home; without this the test
+        // passes only when another test in the same process pinned it first.
+        crate::run::pin_test_home();
+        let (dir, queue, questions) = store();
+        let shared = dir.path().join("shared");
+        let isolated = crate::build_target::root(dir.path());
+        let mut config = Config::default();
+        config.disk.min_free_bytes = 0;
+        config.graph.worktree_root = Some(dir.path().to_owned());
+        config.verify.gate = vec![format!(
+            "CARGO_TARGET_DIR='{}' cargo check",
+            shared.display()
+        )];
+        let mut task = disk_task(dir.path().to_owned());
+        task.mark_startup_disk_capacity();
+        task.overrides = Some(crate::queue::RunOverrides {
+            build_cache: Some(BuildCache::Isolated),
+            ..Default::default()
+        });
+        let check = |task: &Task, config: &Config, blocked: &Path| {
+            machine_cause_resolved_with_admission(task, config, dir.path(), |paths, _| {
+                !paths.iter().any(|path| path == blocked)
+            })
+        };
+        assert_eq!(check(&task, &config, &isolated), Some(false));
+        assert_eq!(check(&task, &config, &shared), Some(true));
+        config.verify.build_cache = BuildCache::Isolated;
+        task.overrides.as_mut().unwrap().build_cache = Some(BuildCache::Shared);
+        assert_eq!(check(&task, &config, &shared), Some(false));
+        assert_eq!(check(&task, &config, &isolated), Some(true));
+        task.urgent = true;
+        config.verify.build_cache = BuildCache::Shared;
+        task.overrides.as_mut().unwrap().build_cache = None;
+        assert_eq!(check(&task, &config, &isolated), Some(false));
+        assert_eq!(check(&task, &config, &shared), Some(true));
+        task.overrides.as_mut().unwrap().build_cache = Some(BuildCache::Shared);
+
+        task.runs.push("historical-execution".into());
+        queue.put(&mut task).unwrap();
+        let cfg = gate_disabled_config(dir.path());
+        let report = run_once_with_probe(
+            &queue,
+            &questions,
+            Some(&cfg),
+            Timestamp::now(),
+            true,
+            |task, _| check(task, &config, &isolated),
+        );
+        assert_eq!(report.resumed, [task.id.clone()]);
+        let saved = queue.get(&task.id).unwrap();
+        assert_eq!(saved.attempts, task.attempts);
+        assert_eq!(saved.runs, task.runs);
+        assert!(saved.disk_resume_run.is_none());
     }
 
     #[test]

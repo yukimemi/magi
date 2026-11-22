@@ -2469,6 +2469,32 @@ async fn write_release_files(state: &RunState, worktree: &Path, version: &str) -
     tokio::fs::write(&cargo_toml_path, rewritten)
         .await
         .with_context(|| format!("write {}", cargo_toml_path.display()))?;
+    if crate::build_target::isolated(&state.config) {
+        let shell = state.config.shell();
+        crate::build_target::command::check_shell(&shell)?;
+        let mut build = crate::build_target::Operation::admit(
+            &state.config,
+            worktree,
+            &state.id,
+            "bump-lockfile",
+            crate::build_target::Coordination::Acquire,
+        )
+        .await?;
+        if let Some(output) = crate::retention::OutputLease::borrow(worktree)? {
+            build.outputs.push(output);
+        }
+        return crate::worktree_setup::run_command(
+            &shell,
+            "cargo build",
+            worktree,
+            Duration::from_secs(state.config.graph.verify_timeout()),
+            build.lease.take(),
+            std::mem::take(&mut build.outputs),
+            false,
+            Some((&build.target, state.config.disk.min_free_bytes)),
+        )
+        .await;
+    }
     sync_lockfile(worktree, state.config.cache_dir().as_deref()).await
 }
 

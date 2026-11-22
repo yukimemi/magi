@@ -726,6 +726,26 @@ pub(crate) mod windows {
         peak_process_memory: usize,
         peak_job_memory: usize,
     }
+    #[repr(C)]
+    #[derive(Default)]
+    struct ThreadEntry {
+        size: u32,
+        usage: u32,
+        id: u32,
+        owner: u32,
+        base_priority: i32,
+        delta_priority: i32,
+        flags: u32,
+    }
+    #[repr(C)]
+    #[derive(Default)]
+    struct Accounting {
+        times: [i64; 4],
+        faults: u32,
+        total: u32,
+        active: u32,
+        terminated: u32,
+    }
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn LockFileEx(
@@ -746,6 +766,12 @@ pub(crate) mod windows {
         fn CreateJobObjectW(attributes: Handle, name: *const u16) -> Handle;
         fn SetInformationJobObject(job: Handle, class: i32, info: *const c_void, size: u32) -> i32;
         fn AssignProcessToJobObject(job: Handle, process: Handle) -> i32;
+        fn TerminateJobObject(job: Handle, code: u32) -> i32;
+        fn CreateToolhelp32Snapshot(flags: u32, pid: u32) -> Handle;
+        fn Thread32First(snapshot: Handle, entry: *mut ThreadEntry) -> i32;
+        fn Thread32Next(snapshot: Handle, entry: *mut ThreadEntry) -> i32;
+        fn OpenThread(access: u32, inherit: i32, id: u32) -> Handle;
+        fn ResumeThread(thread: Handle) -> u32;
         fn CloseHandle(handle: Handle) -> i32;
         fn GetCurrentProcess() -> Handle;
         fn IsProcessInJob(process: Handle, job: Handle, result: *mut i32) -> i32;
@@ -766,8 +792,16 @@ pub(crate) mod windows {
         ) -> i32;
     }
     pub fn lock_file(file: Handle, immediate: bool) -> std::io::Result<bool> {
+        lock_file_mode(file, immediate, true)
+    }
+    pub(crate) fn lock_file_mode(
+        file: Handle,
+        immediate: bool,
+        exclusive: bool,
+    ) -> std::io::Result<bool> {
         let mut overlapped = Overlapped::default();
-        if unsafe { LockFileEx(file, 2 | u32::from(immediate), 0, 1, 0, &mut overlapped) } != 0 {
+        let flags = (if exclusive { 2 } else { 0 }) | u32::from(immediate);
+        if unsafe { LockFileEx(file, flags, 0, 1, 0, &mut overlapped) } != 0 {
             return Ok(true);
         }
         let error = std::io::Error::last_os_error();
@@ -818,8 +852,14 @@ pub(crate) mod windows {
     }
 
     pub struct Containment(Handle);
+    // Jobs have no thread affinity; the owned handle moves to the cleanup thread.
+    unsafe impl Send for Containment {}
     impl Containment {
         pub fn assign(child: &std::process::Child) -> std::io::Result<Self> {
+            Self::assign_handle(child.as_raw_handle())
+        }
+
+        pub(crate) fn assign_handle(process: Handle) -> std::io::Result<Self> {
             unsafe {
                 let handle = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
                 if handle.is_null() {
@@ -834,11 +874,67 @@ pub(crate) mod windows {
                     std::ptr::from_ref(&limits).cast(),
                     std::mem::size_of::<ExtendedLimits>() as u32,
                 ) == 0
-                    || AssignProcessToJobObject(handle, child.as_raw_handle()) == 0
+                    || AssignProcessToJobObject(handle, process) == 0
                 {
                     return Err(std::io::Error::last_os_error());
                 }
                 Ok(job)
+            }
+        }
+
+        pub(crate) fn resume_suspended(&self, pid: u32) -> std::io::Result<()> {
+            use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
+            // The suspended process cannot yet create additional threads.
+            unsafe {
+                let snapshot = CreateToolhelp32Snapshot(4, 0); // TH32CS_SNAPTHREAD
+                if snapshot as isize == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let snapshot = OwnedHandle::from_raw_handle(snapshot);
+                let mut entry = ThreadEntry {
+                    size: std::mem::size_of::<ThreadEntry>() as u32,
+                    ..ThreadEntry::default()
+                };
+                let mut found = Thread32First(snapshot.as_raw_handle(), &mut entry);
+                while found != 0 {
+                    if entry.owner == pid {
+                        let thread = OpenThread(2, 0, entry.id); // THREAD_SUSPEND_RESUME
+                        if thread.is_null() {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        let thread = OwnedHandle::from_raw_handle(thread);
+                        return match ResumeThread(thread.as_raw_handle()) {
+                            1 => Ok(()),
+                            u32::MAX => Err(std::io::Error::last_os_error()),
+                            _ => Err(std::io::Error::other("unexpected process suspend count")),
+                        };
+                    }
+                    entry.size = std::mem::size_of::<ThreadEntry>() as u32;
+                    found = Thread32Next(snapshot.as_raw_handle(), &mut entry);
+                }
+            }
+            Err(std::io::Error::other("primary thread not found"))
+        }
+
+        pub(crate) fn stop_and_wait(&self) {
+            let mut info = Accounting::default();
+            loop {
+                // Failure is unknown, so retain the output leases and retry.
+                unsafe {
+                    TerminateJobObject(self.0, 1);
+                    if QueryInformationJobObject(
+                        self.0,
+                        1,
+                        std::ptr::from_mut(&mut info).cast(),
+                        std::mem::size_of::<Accounting>() as u32,
+                        std::ptr::null_mut(),
+                    ) != 0
+                        && info.active == 0
+                    {
+                        return;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
             }
         }
     }

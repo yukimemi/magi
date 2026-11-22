@@ -1944,6 +1944,15 @@ pub enum ResourceBlockCause {
         /// Configured resource wait budget.
         limit_secs: u64,
     },
+    /// Isolation waits bind recovery to the exact managed target.
+    IsolatedCacheTimeout {
+        /// Target whose lease blocked this execution.
+        target: PathBuf,
+        /// Measured wait duration.
+        waited_secs: u64,
+        /// Configured resource wait budget.
+        limit_secs: u64,
+    },
     /// Acquisition was cancelled, possibly by a known park request.
     Cancelled {
         /// Available only when the caller retained the park request.
@@ -1978,6 +1987,11 @@ impl ResourceBlock {
             ResourceBlockCause::Timeout {
                 waited_secs,
                 limit_secs,
+            }
+            | ResourceBlockCause::IsolatedCacheTimeout {
+                waited_secs,
+                limit_secs,
+                ..
             } => format!("resource wait timed out after {waited_secs}s (limit {limit_secs}s)"),
             ResourceBlockCause::Cancelled { park: Some(cause) } => {
                 format!("resource wait cancelled for parking ({})", cause.label())
@@ -4095,10 +4109,21 @@ pub fn short_of(id: &str) -> &str {
 /// In a unit test build (`cfg(test)`), falling through to the real
 /// `<data_local>/magi` is not a fallback worth having: it is exactly how
 /// three broken fixture runs ended up in the operator's actual history and
-/// were counted as `unreadable` by the deck. A test that reaches this point
-/// forgot to call [`set_home`] (or set `MAGI_HOME`) - that is a bug in the
-/// test, not a case to serve, so it panics instead of writing anywhere.
+/// were counted as `unreadable` by the deck. So a unit test that reaches this
+/// point without [`set_home`] or `MAGI_HOME` gets this process's own temp
+/// home (`test_home`) pinned for it.
+///
+/// It used to panic instead, to flag the test. But the home is process-global
+/// and first-wins, so that panic fired only when no earlier test in the same
+/// process had pinned one: the same test passed or failed by test order, and
+/// the panic, raised from deep inside nested futures, showed up on Windows as
+/// a stack overflow that took the whole test binary down. The protection the
+/// panic was for - never the operator's real home - is kept either way.
 pub fn home() -> PathBuf {
+    #[cfg(test)]
+    if HOME.get().is_none() && std::env::var_os("MAGI_HOME").is_none() {
+        pin_test_home();
+    }
     resolve_home(HOME.get().cloned(), std::env::var_os("MAGI_HOME"))
 }
 

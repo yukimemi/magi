@@ -3983,7 +3983,13 @@ async fn restore_landing_worktree(state: &mut RunState) -> Result<()> {
             .await?;
         }
     }
-    crate::worktree_setup::prepare(&state.config, &state.repo, &winner.worktree).await?;
+    crate::worktree_setup::prepare_with(
+        &state.config,
+        &state.repo,
+        &winner.worktree,
+        crate::build_target::Coordination::Held(_coordination.as_ref()),
+    )
+    .await?;
     state.land_rebase_from = None;
     state.save()?;
     Ok(())
@@ -5627,11 +5633,12 @@ pub async fn fix_round(
     {
         artifacts = artifacts.join(format!("merge-repair-{}", request.question));
     }
-    let prompt = if state.config.cache_dir().is_some() {
-        format!("{prompt}\n\n{}", prompt::build_cache_note("fix", true))
-    } else {
-        prompt
-    };
+    let prompt =
+        if !crate::build_target::isolated(&state.config) && state.config.cache_dir().is_some() {
+            format!("{prompt}\n\n{}", prompt::build_cache_note("fix", true))
+        } else {
+            prompt
+        };
     // Read before the fixer runs: it normally commits for itself, so HEAD has
     // already moved by the time it returns and a later read would see no
     // progress (run 20261004-041622-5769 stopped on a fix that had landed).
@@ -7924,6 +7931,45 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             .await
             .unwrap();
         state.config.verify.gate = vec!["test -f advance && test -f .env".into()];
+    }
+
+    #[tokio::test]
+    async fn landing_restores_isolated_setup_in_a_linked_checkout() {
+        let (tmp, mut state, head) = landing_git_fixture().await;
+        git::git(&state.repo, &["checkout", "main"]).await.unwrap();
+        git::acquire_worktree_config(&state.repo).await.unwrap();
+        let winner = tmp.path().join("landing");
+        git::worktree_add_existing(&state.repo, &winner, "winner", false)
+            .await
+            .unwrap();
+        state.candidates[0].worktree = winner.clone();
+        state.config.verify.build_cache = crate::config::BuildCache::Isolated;
+        state.config.verify.shell = Some(vec!["sh".into(), "-c".into()]);
+        state.config.disk.min_free_bytes = 0;
+        state.config.worktree.setup = vec![crate::config::SetupStep {
+            run: Some("touch setup-completed".into()),
+            ..Default::default()
+        }];
+        #[cfg(unix)]
+        {
+            std::fs::write(state.repo.join(".git/fixture-contract"), "fixture-v1").unwrap();
+            state.config.coordination = Some(crate::config::Coordination {
+                contract_file: "fixture-contract".into(),
+                contract_token: "fixture-v1".into(),
+                lock_file: "fixture-lock".into(),
+            });
+        }
+        state.land_rebase_from = Some(head);
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            restore_landing_worktree(&mut state),
+        )
+        .await
+        .expect("landing setup must not wait for its own repository operation")
+        .unwrap();
+        assert!(winner.join("setup-completed").is_file());
+        assert!(git::is_clean(&winner).await.unwrap());
+        assert!(state.land_rebase_from.is_none());
     }
 
     #[tokio::test]

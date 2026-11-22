@@ -496,7 +496,10 @@ async fn evidence_with(
                                 | "magi-setup-paths"
                                 | "magi-setup-exclude"
                         )
-                    ) || executing && crate::incremental::current_wrapper(&entry.path())?,
+                    ) || name
+                        .to_str()
+                        .is_some_and(crate::build_target::admin_artifact)
+                        || executing && crate::incremental::current_wrapper(&entry.path())?,
                     "unknown Git administration artifact: {}",
                     name.to_string_lossy()
                 );

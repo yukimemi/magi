@@ -246,7 +246,11 @@ fn explicit_incremental_uses_proven_generations_and_keeps_existing_wrappers() {
     let entries = root.join("entries.log");
     let mut cargo = Command::new("cargo");
     cargo.env_clear();
-    for key in ["PATH", "HOME", "RUSTUP_HOME"] {
+    cargo.env(
+        "PATH",
+        magi::build_target::command::standalone_fixture_path().unwrap(),
+    );
+    for key in ["HOME", "RUSTUP_HOME"] {
         if let Some(value) = std::env::var_os(key) {
             cargo.env(key, value);
         }

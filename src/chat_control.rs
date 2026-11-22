@@ -249,6 +249,9 @@ pub struct Filing {
     pub urgent: bool,
     /// Optional implementer count.
     pub implementers: Option<usize>,
+    /// Optional Cargo build output policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_cache: Option<crate::config::BuildCache>,
     /// Absolute attachment paths to copy into the queue.
     pub attach: Vec<std::path::PathBuf>,
 }
@@ -634,9 +637,11 @@ fn file_task(queue: &Queue, filing: Filing) -> Result<Task> {
     task.priority = filing.priority;
     task.solo = filing.solo;
     task.urgent = filing.urgent;
-    if filing.implementers.is_some() {
+    if filing.implementers.is_some() || filing.build_cache.is_some() {
         task.overrides = Some(crate::queue::RunOverrides {
+            inherit_daemon_options: filing.implementers.is_none(),
             candidates: filing.implementers,
+            build_cache: filing.build_cache,
             ..Default::default()
         });
     }

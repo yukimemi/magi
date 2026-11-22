@@ -2277,6 +2277,15 @@ enter the alternate screen and block on input forever.
 that is also why there is no colour crate: the ones available decide for you
 whether the stream supports colour, which makes the output untestable.
 
+A unit test that reaches `run::home()` without either gets the process's own
+temp home pinned for it (`run::test_home`). It used to panic, but the home is
+process-global and first-wins, so the panic fired only when no earlier test in
+the same process had pinned one: about a hundred unit tests passed or failed by
+test order, and on Windows the panic, raised deep inside nested futures,
+appeared as a stack overflow that killed the whole test binary. Do not bring
+the panic back; `run::resolve_home(None, None)` still panics and is tested
+directly.
+
 ### Changes to this repo go through the graph
 
 A feature or a fix here is written as a task file and put through the graph —
@@ -3885,3 +3894,38 @@ more distinct runs, almost always while other runs shared the machine.
 - Tests: `tests/graph_e2e_rerun.rs` (real shell commands that fail once, fail
   twice, or fail to build; counters live outside the worktree) and the unit
   tests in `src/flake.rs`.
+
+### Build cache policy and isolated outputs
+
+New task runs select `[verify] build_cache` at admission: explicit task
+choice first (including `shared` on urgent work), then `isolated` for urgent
+tasks, then the layered config (default `shared`). The urgent rule applies only
+where it helps and works (`build_target::urgent_isolation`): the repository
+has a shared cache to wait behind and its verification commands fit the
+grammar isolated mode accepts. Otherwise an urgent task keeps the configured
+mode, because isolation must never be what stops urgent work; only an explicit
+`isolated` is strict. Historical tasks retain
+their shared choice until changed. The resolved mode belongs to
+`RunState.config.verify`; resumes use it regardless of later task or config
+edits. Non-config selections are recorded in the run's `build-cache` events.
+Use the same precedence for startup disk recovery and the task-show preview.
+
+In shared mode, keep the configured shared-path wave lease and existing
+source freshness behavior. In isolated mode, never lease the configured shared
+path: `build_target` gives each linked-checkout generation its own target and
+leases that actual path, with source freshness and maintenance exclusion.
+Publish the Git admin anchor only after the target ownership proof is complete.
+Editing seats and managed commands in the checkout use that target; read-only
+agent seats get no target write grant. Launcher-run setup still uses the
+checkout's target. Do not bypass the managed Cargo shim or relax repository
+coordination, admission, registry or incremental-cache locks.
+
+Isolated targets are full build outputs outside source trees under
+`MAGI_HOME/isolated-builds`. Probe source, worktree and output volumes; charge
+one 1 GiB reservation per active managed writer per affected volume when
+`min_free_bytes` is enabled, and keep output leases through descendant cleanup.
+The pool cap is separate from the shared cache cap. Snapshot the checkout's
+binding before fold removes its Git admin anchor; reclaim only proved idle
+outputs after the source is gone. Reserve isolated setup once before any step
+so an archived seat can roll back a pristine restoration on disk admission
+failure without replaying a started setup.

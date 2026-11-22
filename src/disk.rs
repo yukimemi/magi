@@ -199,6 +199,23 @@ fn free_bytes_by_os(path: &Path) -> Result<u64> {
 /// Free bytes on the volume containing `path`.
 #[cfg(windows)]
 fn free_bytes_by_os(path: &Path) -> Result<u64> {
+    let abs = std::path::absolute(path)
+        .with_context(|| format!("absolute path for {}", path.display()))?;
+    let root = volume_root(&abs)
+        .with_context(|| format!("no volume root in {} to measure", abs.display()))?;
+    windows_free_bytes(Path::new(&root))
+}
+
+pub(crate) fn managed_free_bytes(path: &Path) -> Result<u64> {
+    #[cfg(windows)]
+    return windows_free_bytes(path);
+    #[cfg(not(windows))]
+    free_bytes(path)
+}
+
+#[cfg(windows)]
+fn windows_free_bytes(path: &Path) -> Result<u64> {
+    use std::os::windows::ffi::OsStrExt as _;
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn GetDiskFreeSpaceExW(
@@ -208,15 +225,7 @@ fn free_bytes_by_os(path: &Path) -> Result<u64> {
             free: *mut u64,
         ) -> i32;
     }
-    // Keep the existing drive-root contract, including verbatim drive paths
-    // and refusal of UNC shares; do not depend on the queried directory existing.
-    let abs = std::path::absolute(path)
-        .with_context(|| format!("absolute path for {}", path.display()))?;
-    let root = volume_root(&abs)
-        .with_context(|| format!("no volume root in {} to measure", abs.display()))?;
-    // Encode the complete root and append NUL explicitly, without assuming
-    // a fixed root length when constructing the native API buffer.
-    let wide: Vec<u16> = root.encode_utf16().chain(std::iter::once(0)).collect();
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
     let mut available = 0_u64;
     // SAFETY: wide is a live NUL-terminated UTF-16 root, available is writable,
     // and the optional totals are null. The API retains none of these pointers.
@@ -230,7 +239,7 @@ fn free_bytes_by_os(path: &Path) -> Result<u64> {
     } == 0
     {
         let error = std::io::Error::last_os_error();
-        return Err(error).with_context(|| format!("query free bytes for {}", abs.display()));
+        return Err(error).with_context(|| format!("query free bytes for {}", path.display()));
     }
     // Caller-available bytes, not total free bytes: preserve quota semantics.
     Ok(available)
@@ -478,17 +487,27 @@ impl Tree {
                 continue;
             };
             for entry in rd.flatten() {
-                let Ok(meta) = entry.metadata() else {
+                let path = entry.path();
+                let Ok(meta) = path.symlink_metadata() else {
                     continue;
                 };
-                let path = entry.path();
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::MetadataExt as _;
+                    if meta.file_attributes() & 0x400 != 0 {
+                        continue;
+                    }
+                }
                 if meta.is_dir() {
                     dirs.push((depth + 1, path.clone()));
                     stack.push((depth + 1, path));
                 } else if meta.is_file() {
                     let size = meta.len();
                     total += size;
-                    if depth == 0 && entry.file_name() == PRESERVED_AT_ROOT {
+                    if depth == 0
+                        && (entry.file_name() == PRESERVED_AT_ROOT
+                            || entry.file_name() == crate::build_target::TARGET_PROOF)
+                    {
                         continue;
                     }
                     let mtime = meta
