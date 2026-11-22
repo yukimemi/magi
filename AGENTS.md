@@ -3819,3 +3819,57 @@ off, such a goal's wake is refused by `admit_goal_operation`). And a goal
 establish/update is audited but neither needs nor spends the per-cause
 reservation; the chat registers the goal first, because the report stops
 matching once the recovery moves the task.
+
+### A red `verify.e2e` is rerun once on the same commit before it is believed
+
+`graph::run_e2e_with_retry` is the one implementation, called by every place
+`verify.e2e` decides something: the review loop's per-round leg, the deferred
+catch-up in `stop_reviewing`, `verify_current_head` (before and after the gate,
+after a base sync, at publication) and `check_gate_repair_e2e`. `verify.gate`
+is untouched. Measured on this repository over ten days: 65 of 113 e2e runs
+failed, and 46 of 74 failure outputs named only tests that failed in three or
+more distinct runs, almost always while other runs shared the machine.
+
+- **What reruns.** `rerunnable_failure`: every red command ran, exited non-zero
+  other than 126 / 127, is not `build_failed`, and nothing in the list is
+  `resource_blocked`. A timeout (`code: None`), a spawn failure and a resource
+  block are never rerun. Only the failed commands run again; commands that
+  passed keep their first outcome.
+- **Bounded.** One extra attempt per failed verification, a plain `if`, never a
+  loop. The build/link retry stays and runs first, so one decision is run at
+  most three times (`a_verification_never_runs_more_than_three_times`). The
+  rerun is made inside the caller's `with_cache_lease`, so the lease is held
+  across both attempts, and `run_commands` gives it its own full
+  `timeout_verify`. It spends no review round, fix round, task attempt or
+  repair budget: nothing in `ReviewRound`, `FixRecord` or `Task` counts it.
+- **Second run passes: a flake.** The head is verified, and the first failure is
+  recorded in `RunState::verify_flakes` (`run::VerifyFlake`, `#[serde(default)]`,
+  `run::SCHEMA` unchanged) with the round, context, commit, command, excerpt,
+  fingerprint and the task. It shows as a `verify` event, as "e2e green on
+  rerun only (flake)" on the round in `magi show` / the web run page
+  (`E2eView::flaked`, `app.js` `renderRound`) and in a "flaky verification"
+  section. `ReviewRound::e2e_status()` still says `Passed`: the round record
+  itself is not changed, the ledger is the record, matched to a round by
+  `VerifyFlake::round`.
+- **Second run fails: the failure stands.** The second outcome replaces the
+  first and its `output_tail` starts with `FAILED_TWICE`, so the fixer's
+  prompt (`ReviewRound::verification_summary`) says both attempts failed.
+- **A flake is filed once, by `src/flake.rs`.** A failure is identified without
+  knowing the test framework: the lines of the saved excerpt that mention a
+  failure word (`FAILURE_WORDS`), minus `test result: ok` lines, with numbers,
+  long hex words and `tmp...` names replaced, sorted and de-duplicated, hashed
+  with the repository (`fingerprint`). The task id is derived from that hash,
+  never from the run, and written with `Queue::create_new`, so concurrent runs
+  still leave one task. A task that is not `Done` covers every later
+  occurrence (the run only records the id); a `Done` task does not, and the
+  next generation id (`flake-r<N>-<key>`) is filed. `Source::Agent` with node
+  `flake`, solo, `dupes::check` deliberately not run. Filing is best effort:
+  a failure is `VerifyFlake::filing_error` plus an event, never a failed run.
+  The signature depends on the excerpt `summarize_verify` kept, so a very
+  different excerpt of the same failure can file a second task; accepted.
+- **The switch** is `[graph] rerun_failed_e2e` (default true). Off, the
+  function takes the exact path it took before (no rerun, no new events);
+  `with_the_switch_off_the_first_result_decides_as_before` pins the events.
+- Tests: `tests/graph_e2e_rerun.rs` (real shell commands that fail once, fail
+  twice, or fail to build; counters live outside the worktree) and the unit
+  tests in `src/flake.rs`.

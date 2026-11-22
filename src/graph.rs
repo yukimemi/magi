@@ -7651,6 +7651,7 @@ impl Runner {
                                 &worktree,
                                 budget,
                                 &context,
+                                Some(round),
                             )
                             .await
                         }
@@ -8232,8 +8233,16 @@ impl Runner {
                             // the suite, not after it.
                             Self::run_pre_gate(state, &winner).await;
                         }
-                        run_e2e_with_retry(state, &shell, &commands, worktree, budget, &context)
-                            .await
+                        run_e2e_with_retry(
+                            state,
+                            &shell,
+                            &commands,
+                            worktree,
+                            budget,
+                            &context,
+                            Some(round),
+                        )
+                        .await
                     }
                 },
             )
@@ -12080,13 +12089,45 @@ fn e2e_outcome_label(o: &CommandOutcome) -> String {
     )
 }
 
+/// Does `outcomes` hold a failure worth one more run on the same commit?
+///
+/// Only an ordinary test result qualifies: every red command ran, exited
+/// non-zero and said which way (not a build/link failure, a timeout or kill,
+/// a spawn failure, the shell's own 126 / 127, or a resource block). Those are
+/// evidence about the machine or the toolchain, never about a flaky test.
+fn rerunnable_failure(outcomes: &[CommandOutcome]) -> bool {
+    let mut red = outcomes.iter().filter(|o| !o.ok()).peekable();
+    red.peek().is_some()
+        && !verify_inconclusive(outcomes)
+        && red.all(|o| {
+            !o.build_failed() && matches!(o.code, Some(c) if c != 0 && c != 126 && c != 127)
+        })
+}
+
+/// Said at the top of the output a fixer gets when the same command failed on
+/// both attempts, so it reads as a reproduced failure and not a one-off.
+const FAILED_TWICE: &str = "[this command failed twice on the same commit; the output below is \
+                            the second attempt's]";
+
 /// Run `verify.e2e`, retrying once if the first attempt could not build or
 /// link — a build/link failure is frequently a race against a shared
 /// `CARGO_TARGET_DIR` (see AGENTS.md), not a verdict on the patch. Emits one
 /// `verify` event per command, tagged with `context` (normally `"round N"`)
-/// so the two call sites that need this — the ordinary per-round leg in
-/// `review_loop`, and the deferred catch-up run `stop_reviewing` makes before
-/// it will ever call a round green — read identically in the event log.
+/// so the call sites that need this — the ordinary per-round leg in
+/// `review_loop`, the deferred catch-up run `stop_reviewing` makes before it
+/// will ever call a round green, `verify_current_head` and the gate-repair
+/// check — read identically in the event log.
+///
+/// A failure that is a test result (see [`rerunnable_failure`]) is believed
+/// only after the failed commands have run once more on the same commit, in
+/// the same worktree and — because the caller holds it around this whole
+/// function — under the same cache lease, with a full `timeout` of their own
+/// (`[graph] rerun_failed_e2e`). A command that passes the second time is a
+/// flake: the head is verified, the first failure is recorded and filed
+/// (`crate::flake`, `RunState::verify_flakes`). A command that fails again
+/// stands, carrying the second attempt's output. One verification is therefore
+/// run at most three times: the build/link retry, then this one rerun.
+/// `round` is the review round the verification belongs to, if any.
 async fn run_e2e_with_retry(
     state: &mut RunState,
     shell: &[String],
@@ -12094,6 +12135,7 @@ async fn run_e2e_with_retry(
     worktree: &Path,
     timeout: Duration,
     context: &str,
+    round: Option<usize>,
 ) -> (Vec<CommandOutcome>, bool, Vec<u32>) {
     let (mut e2e, mut timed_out_pids) = run_commands(
         state, "verify", "e2e", 0, shell, commands, worktree, timeout,
@@ -12133,6 +12175,78 @@ async fn run_e2e_with_retry(
                     o.command,
                     e2e_outcome_label(o)
                 ),
+            );
+        }
+    }
+    if state.config.graph.rerun_failed_e2e && rerunnable_failure(&e2e) {
+        let failed: Vec<usize> = (0..e2e.len()).filter(|&i| !e2e[i].ok()).collect();
+        let rerun_commands: Vec<String> = failed.iter().map(|&i| e2e[i].command.clone()).collect();
+        let head = git::rev_parse(worktree, "HEAD").await.unwrap_or_default();
+        state.event(
+            "verify",
+            format!(
+                "{context}: {} failed with a test result — running it once more on the same \
+                 commit {} before deciding",
+                rerun_commands
+                    .iter()
+                    .map(|c| format!("`{c}`"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                short(&head)
+            ),
+        );
+        let (second, pids) = run_commands(
+            state,
+            "verify",
+            "e2e",
+            1 + usize::from(verify_retried),
+            shell,
+            &rerun_commands,
+            worktree,
+            timeout,
+        )
+        .await;
+        timed_out_pids.extend(pids);
+        for o in &second {
+            state.event(
+                "verify",
+                format!(
+                    "{context}: rerun `{}` -> {}",
+                    o.command,
+                    e2e_outcome_label(o)
+                ),
+            );
+        }
+        let mut reproduced = false;
+        for (slot, &i) in failed.iter().enumerate() {
+            let Some(again) = second.get(slot) else {
+                break;
+            };
+            let first = std::mem::replace(&mut e2e[i], again.clone());
+            if again.ok() {
+                let signature = crate::flake::signature(&first.output_tail, first.code);
+                let flake = crate::run::VerifyFlake {
+                    round,
+                    context: context.to_owned(),
+                    head: head.clone(),
+                    command: first.command.clone(),
+                    first_failure: summarize_verify(&first.output_tail, EVENT_OUTPUT_TAIL),
+                    fingerprint: crate::flake::fingerprint(&state.repo, &signature),
+                    at: Timestamp::now(),
+                    task: None,
+                    filed: false,
+                    filing_error: None,
+                };
+                crate::flake::record(state, flake, &signature.label, &crate::queue::Queue::open());
+            } else if !again.resource_blocked {
+                reproduced = true;
+                e2e[i].output_tail = format!("{FAILED_TWICE}\n{}", again.output_tail);
+            }
+        }
+        if reproduced {
+            state.event(
+                "verify",
+                format!("{context}: the failure reproduced on the second run — it stands"),
             );
         }
     }
@@ -12738,6 +12852,7 @@ pub(crate) async fn verify_current_head(
                     &winner.worktree,
                     budget,
                     "current head e2e",
+                    None,
                 )
                 .await
             },
@@ -12817,6 +12932,7 @@ pub(crate) async fn check_gate_repair_e2e(
                     &winner.worktree,
                     budget,
                     "gate repair e2e",
+                    None,
                 )
                 .await
             },
@@ -14353,6 +14469,7 @@ mod tests {
             temp.path(),
             Duration::from_secs(5),
             "fixture",
+            None,
         )
         .await;
         assert_eq!(outcomes.len(), 1);
@@ -20713,6 +20830,7 @@ esac
             &repo,
             Duration::from_secs(10),
             "initial",
+            None,
         )
         .await;
         assert!(!retried && pids.is_empty());

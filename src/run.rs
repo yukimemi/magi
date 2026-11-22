@@ -2704,6 +2704,13 @@ pub struct RunState {
     /// record is the source of truth and this is rebuilt from the queue.
     #[serde(default)]
     pub deputy_followups: Vec<String>,
+    /// `verify.e2e` commands that failed once and passed when rerun on the
+    /// same commit (`graph::run_e2e_with_retry`, `crate::flake`). The head they
+    /// verified is green, but a pass that needed a second run must never read
+    /// as a plain green: reports, `magi show` and the web run page list these.
+    /// Additive and `#[serde(default)]`, so `SCHEMA` stays put.
+    #[serde(default)]
+    pub verify_flakes: Vec<VerifyFlake>,
 }
 
 /// One follow-up task filed from a merged run. See [`RunState::followups`].
@@ -2713,6 +2720,41 @@ pub struct FollowupRecord {
     pub task: String,
     /// Finding ids it covers.
     pub findings: Vec<String>,
+}
+
+/// One `verify.e2e` command whose failure did not reproduce: it failed, then
+/// passed when run again on the same commit in the same worktree. See
+/// [`RunState::verify_flakes`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerifyFlake {
+    /// The review round this belongs to (the per-round leg and the deferred
+    /// catch-up); `None` for the current-head and gate-repair checks.
+    #[serde(default)]
+    pub round: Option<usize>,
+    /// Where the verification ran, as in its `verify` events: `round 2`,
+    /// `current head e2e`, `gate repair e2e`.
+    pub context: String,
+    /// The commit both attempts ran on.
+    pub head: String,
+    /// The configured command, as in [`CommandOutcome::command`].
+    pub command: String,
+    /// What the first attempt printed, bounded by `summarize_verify`.
+    pub first_failure: String,
+    /// Identifies the failure without knowing the test framework
+    /// (`crate::flake::fingerprint`).
+    pub fingerprint: String,
+    /// When the rerun passed.
+    pub at: Timestamp,
+    /// The queue task that tracks this failure: the one this occurrence filed
+    /// or one already filed for the same failure.
+    #[serde(default)]
+    pub task: Option<String>,
+    /// This occurrence created [`Self::task`].
+    #[serde(default)]
+    pub filed: bool,
+    /// Why no task could be filed; a filing failure never fails the run.
+    #[serde(default)]
+    pub filing_error: Option<String>,
 }
 
 /// A monotonic owner hold observed in a reviewed commit.
@@ -2904,6 +2946,7 @@ impl RunState {
             followups: Vec::new(),
             followup_generation: None,
             deputy_followups: Vec::new(),
+            verify_flakes: Vec::new(),
             origin_chat: None,
             followup_commented: false,
             events: Vec::new(),

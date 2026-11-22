@@ -425,6 +425,9 @@ pub struct E2eView {
     pub defer_reason: Option<String>,
     /// Retried once.
     pub retried: bool,
+    /// The leg passed only because a failed command passed when run again on
+    /// the same commit; it must not read as a plain pass.
+    pub flaked: bool,
 }
 
 /// A verdict vote.
@@ -718,7 +721,7 @@ fn status_tone(state: &RunState) -> Tone {
     }
 }
 
-fn round_view(r: &ReviewRound, last: bool) -> RoundView {
+fn round_view(r: &ReviewRound, last: bool, flaked: bool) -> RoundView {
     let raised = r.reviews.iter().map(|x| x.findings.len()).sum();
     let status = if r.incomplete() {
         "incomplete"
@@ -743,10 +746,11 @@ fn round_view(r: &ReviewRound, last: bool) -> RoundView {
             .clone()
             .filter(|_| e2e_state == "deferred"),
         retried: r.verify_retried,
+        flaked: flaked && e2e_state == "pass",
     };
     let tone = if e2e_state == "fail" && !e2e.build_failed {
         Tone::Fail
-    } else if status == "clean" {
+    } else if status == "clean" && !e2e.flaked {
         Tone::Ok
     } else {
         Tone::Warn
@@ -1419,7 +1423,10 @@ pub fn build_with(
             .reviews
             .iter()
             .enumerate()
-            .map(|(i, r)| round_view(r, i + 1 == n))
+            .map(|(i, r)| {
+                let flaked = state.verify_flakes.iter().any(|f| f.round == Some(r.round));
+                round_view(r, i + 1 == n, flaked)
+            })
             .collect();
         let handed_off = state.handed_off_with_open_findings().then(|| {
             format!(
@@ -1438,6 +1445,33 @@ pub fn build_with(
             rounds,
             handed_off,
         });
+    }
+
+    if !state.verify_flakes.is_empty() {
+        let lines: Vec<String> = state
+            .verify_flakes
+            .iter()
+            .map(|f| {
+                let tracked = match (&f.task, &f.filing_error) {
+                    (Some(task), _) if f.filed => format!("filed task {task}"),
+                    (Some(task), _) => format!("already tracked by task {task}"),
+                    (None, Some(why)) => format!("no task filed: {why}"),
+                    (None, None) => "no task filed".to_owned(),
+                };
+                format!(
+                    "`{}` failed, then passed on the same commit {} ({}); {tracked}",
+                    f.command,
+                    short(&f.head),
+                    f.context
+                )
+            })
+            .collect();
+        sections.extend(notes(
+            "verify_flakes",
+            "flaky verification",
+            Tone::Warn,
+            lines,
+        ));
     }
 
     if !state.merge_repairs.is_empty() {

@@ -167,9 +167,15 @@ pub fn final_verification(state: &RunState, head: FinalHead<'_>) -> String {
         None => lines.push("- Tests (`verify.e2e`): not configured or never run".to_owned()),
         Some(r) => lines.push(match r.e2e_status() {
             E2eStatus::Passed => format!(
-                "- Tests (`verify.e2e`): passed {} (round {})",
+                "- Tests (`verify.e2e`): passed {} (round {}){}",
                 ran_on(r.verified_head.as_deref()),
-                r.round
+                r.round,
+                // Green only because a failed command passed when run again.
+                if state.verify_flakes.iter().any(|f| f.round == Some(r.round)) {
+                    "; a command failed once and passed when run again on the same commit (flaky, tracked separately)"
+                } else {
+                    ""
+                }
             ),
             E2eStatus::Failed => format!(
                 "- Tests (`verify.e2e`): FAILED {} (round {})",
