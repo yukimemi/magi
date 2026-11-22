@@ -7960,13 +7960,16 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             });
         }
         state.land_rebase_from = Some(head);
-        tokio::time::timeout(
-            Duration::from_secs(15),
-            restore_landing_worktree(&mut state),
-        )
-        .await
-        .expect("landing setup must not wait for its own repository operation")
-        .unwrap();
+        let restore = restore_landing_worktree(&mut state);
+        // Only the registered Unix fixture can deadlock by reacquiring its
+        // own operation lease. Don't time the whole Git/setup path elsewhere.
+        #[cfg(unix)]
+        let restore = async {
+            tokio::time::timeout(Duration::from_secs(15), restore)
+                .await
+                .expect("landing setup must not wait for its own repository operation")
+        };
+        restore.await.unwrap();
         assert!(winner.join("setup-completed").is_file());
         assert!(git::is_clean(&winner).await.unwrap());
         assert!(state.land_rebase_from.is_none());
