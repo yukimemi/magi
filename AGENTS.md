@@ -1708,6 +1708,10 @@ remain outside those lanes and global queue-worker park requests.
   The hidden `__worker` spelling appears in `main.rs` and
   `worker::detached_command`; change both together. Do not use the ordinary task
   word `worker` as this internal command: the typo guard would reject real prose.
+- **Retry a busy generation at spawn.** On Unix a concurrent fork can inherit
+  the copy's writable descriptor until exec or exit, even after pinning closes
+  its own copy. Generation spawns go through `worker::spawn_generation`, which
+  retries only `ExecutableFileBusy` with a short bounded backoff.
 - **Finite services, independent deputies.** Waiter/release/maintenance work
   outlives a scheduler in finite jobs. Each deputy question has its own job;
   global capacity counts both reservations and fresh question leases. An active
