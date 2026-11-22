@@ -1,8 +1,11 @@
 //! Finite, evidence-triggered continuation of accepted conversation goals.
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
+
+use crate::chat_goal::{ArtifactBaseline, Goal};
 
 /// A current observation is data, never a new owner instruction.
 #[derive(Debug)]
@@ -13,40 +16,60 @@ struct Observation {
 }
 
 impl Observation {
-    fn apply(mut self, goal: &mut crate::chat_goal::Goal) {
+    fn apply(mut self, goal: &mut Goal) {
         let complete = satisfied(goal, &self.facts);
         let evidence = self.facts.to_string();
-        let mut previous = std::mem::take(&mut goal.artifact_baselines);
-        let mut substituted = false;
+        let fingerprint = self
+            .fingerprint_against(&goal.artifact_baselines)
+            .unwrap_or_else(|| evidence.clone());
+        self.remember(&mut goal.artifact_baselines);
+        goal.observe(fingerprint, evidence, complete);
+    }
+
+    // Substitute only in the comparison, after capturing fresh evidence.
+    fn fingerprint_against(
+        &mut self,
+        baselines: &BTreeMap<String, ArtifactBaseline>,
+    ) -> Option<String> {
         let runs = self.facts["runs"].as_array_mut().expect("observed runs");
+        let mut substituted = false;
+        for (index, branch, observed) in &self.artifacts {
+            if *observed != ArtifactHead::Unknown {
+                continue;
+            }
+            let run = &mut runs[*index];
+            let id = run["id"].as_str().expect("observed run id");
+            if let Some(last) = baselines
+                .get(id)
+                .filter(|last| last.repo == self.repo && last.branch == *branch)
+            {
+                run["artifact_head"] = json!(last.head);
+                substituted = true;
+            }
+        }
+        substituted.then(|| self.facts.to_string())
+    }
+
+    fn remember(self, baselines: &mut BTreeMap<String, ArtifactBaseline>) {
+        let mut previous = std::mem::take(baselines);
+        let runs = self.facts["runs"].as_array().expect("observed runs");
         for (index, branch, observed) in self.artifacts {
-            let run = &mut runs[index];
-            let id = run["id"].as_str().expect("observed run id").to_owned();
+            let id = runs[index]["id"].as_str().expect("observed run id");
             let baseline = match observed {
-                ArtifactHead::Known(head) => Some(crate::chat_goal::ArtifactBaseline {
+                ArtifactHead::Known(head) => Some(ArtifactBaseline {
                     repo: self.repo.clone(),
                     branch,
                     head,
                 }),
                 ArtifactHead::Unknown => previous
-                    .remove(&id)
-                    .filter(|last| last.repo == self.repo && last.branch == branch)
-                    .inspect(|last| {
-                        run["artifact_head"] = json!(last.head);
-                        substituted = true;
-                    }),
+                    .remove(id)
+                    .filter(|last| last.repo == self.repo && last.branch == branch),
                 ArtifactHead::Absent => None,
             };
             if let Some(baseline) = baseline {
-                goal.artifact_baselines.insert(id, baseline);
+                baselines.insert(id.to_owned(), baseline);
             }
         }
-        let fingerprint = if substituted {
-            self.facts.to_string()
-        } else {
-            evidence.clone()
-        };
-        goal.observe(fingerprint, evidence, complete);
     }
 }
 
