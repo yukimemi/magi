@@ -155,6 +155,13 @@ struct Report {
     goals: Vec<String>,
 }
 
+/// The chat filed the task, or the task's persisted chat is this conversation.
+/// `Task::chat` is written only by `task_chat::destination` (the launcher), never
+/// from agent input, so it is as trustworthy as filing provenance.
+fn owns(talk: &Talk, task: &Task) -> bool {
+    task.filed_by_chat() == Some(&talk.id) || task.chat.as_deref() == Some(&talk.id)
+}
+
 fn tracks(goal: &chat_goal::Goal, talk: &Talk, task: &Task) -> bool {
     goal.active()
         && (goal.tasks.contains(&task.id)
@@ -221,8 +228,7 @@ pub(crate) fn capture(
                         && task.id == *id
                         && Stop::of(&task).as_ref() == Some(stop)
                     {
-                        let own = task.filed_by_chat() == Some(&talk.id);
-                        if own {
+                        if owns(talk, &task) {
                             add(&task, stop.clone(), true, None);
                         }
                         for goal in talk.goals.iter().filter(|goal| tracks(goal, talk, &task)) {
@@ -373,12 +379,12 @@ fn fresh(talk: &Talk, scope: &Scope, task: &Task, report: &Report) -> Result<()>
         "new owner input supersedes the automatic report"
     );
     ensure!(
-        report.direct && task.filed_by_chat() == Some(&talk.id)
+        report.direct && owns(talk, task)
             || talk
                 .goals
                 .iter()
                 .any(|goal| report.goals.contains(&goal.id) && tracks(goal, talk, task)),
-        "task was neither filed by this chat nor tracked by an active goal for this report"
+        "task is neither this chat's own nor tracked by an active goal for this report"
     );
     if let Source::Goal { id, generation } = &scope.origin {
         ensure!(

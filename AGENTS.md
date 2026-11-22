@@ -3798,9 +3798,13 @@ gate runs the tests the way CI does. `[profile.default]` in
 layer, independently of repository templates and their variables. It supersedes
 “automatic reports authorize nothing” only for the recovery allowlist in
 `chat_control::standing`. Reports and watched output remain data. A launcher
-scope binds the actual automatic input to current stops on chat-filed tasks or
-tasks in active goals; watch results require a goal link. Check the same scope
-again under the task claim, and retain the existing goal-generation fence.
+scope binds the actual automatic input to current stops on chat-filed tasks,
+tasks whose own chat (`Task::chat`) is this conversation, or tasks in active
+goals; watch results require a goal link. Check the same scope again under the
+task claim, and retain the existing goal-generation fence.
+`chat_control::standing::owns` is the single ownership test (filed by the chat or
+`Task::chat`); `Task::chat` is written only by `task_chat::destination` and kept by
+`Queue::put_unlocked`, never from agent input, so no agent can enrol a chat.
 
 Use the producer's semantic stop identity. A new execution pass may deliver
 another report, but it does not renew a spent cause. The task-wide reservation in
