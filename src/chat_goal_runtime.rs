@@ -1,14 +1,53 @@
 //! Finite, evidence-triggered continuation of accepted conversation goals.
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
 /// A current observation is data, never a new owner instruction.
 #[derive(Debug)]
-pub(crate) struct Observation {
+struct Observation {
     pub facts: Value,
-    pub fingerprint: String,
+    repo: PathBuf,
+    artifacts: Vec<(usize, String, ArtifactHead)>,
+}
+
+impl Observation {
+    fn apply(mut self, goal: &mut crate::chat_goal::Goal) {
+        let complete = satisfied(goal, &self.facts);
+        let evidence = self.facts.to_string();
+        let mut previous = std::mem::take(&mut goal.artifact_baselines);
+        let mut substituted = false;
+        let runs = self.facts["runs"].as_array_mut().expect("observed runs");
+        for (index, branch, observed) in self.artifacts {
+            let run = &mut runs[index];
+            let id = run["id"].as_str().expect("observed run id").to_owned();
+            let baseline = match observed {
+                ArtifactHead::Known(head) => Some(crate::chat_goal::ArtifactBaseline {
+                    repo: self.repo.clone(),
+                    branch,
+                    head,
+                }),
+                ArtifactHead::Unknown => previous
+                    .remove(&id)
+                    .filter(|last| last.repo == self.repo && last.branch == branch)
+                    .inspect(|last| {
+                        run["artifact_head"] = json!(last.head);
+                        substituted = true;
+                    }),
+                ArtifactHead::Absent => None,
+            };
+            if let Some(baseline) = baseline {
+                goal.artifact_baselines.insert(id, baseline);
+            }
+        }
+        let fingerprint = if substituted {
+            self.facts.to_string()
+        } else {
+            evidence.clone()
+        };
+        goal.observe(fingerprint, evidence, complete);
+    }
 }
 
 fn read_json(path: &Path) -> Result<Value> {
@@ -28,32 +67,62 @@ fn unavailable(error: &anyhow::Error) -> Value {
 
 const ARTIFACT_HEAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-async fn git_artifact_head(repo: &Path, branch: &str) -> Option<String> {
-    let revision = format!("{branch}^{{commit}}");
-    crate::git::git_raw(
-        repo,
-        &["rev-parse", "--verify", "--end-of-options", &revision],
-    )
-    .await
-    .ok()
-    .filter(|output| output.ok())
-    .map(|output| output.stdout)
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+enum ArtifactHead {
+    Known(String),
+    #[default]
+    Unknown,
+    Absent,
 }
 
-async fn bounded_artifact_head<F>(timeout: std::time::Duration, probe: F) -> Option<String>
-where
-    F: Future<Output = Option<String>>,
-{
-    tokio::time::timeout(timeout, probe).await.ok().flatten()
+async fn git_artifact_head(repo: &Path, branch: &str) -> ArtifactHead {
+    if branch.starts_with('-') {
+        return ArtifactHead::Unknown;
+    }
+    let candidate = format!("refs/heads/{branch}");
+    if let Ok(reference) =
+        crate::git::git_raw(repo, &["show-ref", "--verify", "--hash", "--", &candidate]).await
+        && reference.ok()
+    {
+        let revision = format!("{}^{{commit}}", reference.stdout);
+        return match crate::git::git_raw(
+            repo,
+            &["rev-parse", "--verify", "--end-of-options", &revision],
+        )
+        .await
+        {
+            Ok(output) if output.ok() => ArtifactHead::Known(output.stdout),
+            _ => ArtifactHead::Unknown,
+        };
+    }
+    // --exists distinguishes a missing ref (2) from an unreadable one (1).
+    // Git can also return 2 for a malformed name, so validate before clearing a baseline.
+    if crate::git::git_raw(repo, &["show-ref", "--exists", &candidate])
+        .await
+        .is_ok_and(|out| out.code == Some(2))
+        && crate::git::git_raw(repo, &["check-ref-format", &candidate])
+            .await
+            .is_ok_and(|out| out.ok())
+    {
+        ArtifactHead::Absent
+    } else {
+        ArtifactHead::Unknown
+    }
+}
+
+async fn bounded_artifact_head(
+    timeout: std::time::Duration,
+    probe: impl Future<Output = ArtifactHead>,
+) -> ArtifactHead {
+    tokio::time::timeout(timeout, probe)
+        .await
+        .unwrap_or_default()
 }
 
 trait EvidenceObserver: Sync {
     fn current_pr(&self, repo: &Path, url: &str) -> impl Future<Output = Result<Value>> + Send;
-    fn artifact_head(
-        &self,
-        repo: &Path,
-        branch: &str,
-    ) -> impl Future<Output = Option<String>> + Send;
+    fn artifact_head(&self, repo: &Path, branch: &str)
+    -> impl Future<Output = ArtifactHead> + Send;
 }
 
 struct LiveObserver;
@@ -63,7 +132,7 @@ impl EvidenceObserver for LiveObserver {
         crate::chat_notify::current_pr(repo, url).await
     }
 
-    async fn artifact_head(&self, repo: &Path, branch: &str) -> Option<String> {
+    async fn artifact_head(&self, repo: &Path, branch: &str) -> ArtifactHead {
         bounded_artifact_head(ARTIFACT_HEAD_TIMEOUT, git_artifact_head(repo, branch)).await
     }
 }
@@ -71,7 +140,7 @@ impl EvidenceObserver for LiveObserver {
 /// Local task/run evidence plus one timed forge lookup per distinct associated PR.
 /// Timestamps and transcript prose are excluded from the wake fingerprint.
 #[cfg(test)]
-pub(crate) async fn observe(
+async fn observe(
     home: &Path,
     repo: &Path,
     tasks: &[String],
@@ -114,6 +183,7 @@ async fn observe_with(
         }
     }
     let mut run_facts = Vec::new();
+    let mut artifacts = Vec::new();
     let mut pr_observations = std::collections::BTreeMap::new();
     let mut prs = Vec::new();
     for id in &run_ids {
@@ -140,10 +210,17 @@ async fn observe_with(
                         .find(|candidate| candidate["label"] == run["tally"]["winner"])
                 });
                 let branch = winner.and_then(|candidate| candidate["branch"].as_str());
-                let artifact_head = if let Some(branch) = branch {
-                    observer.artifact_head(repo, branch).await
-                } else {
-                    None
+                let artifact_head = match branch {
+                    Some(branch) => {
+                        let observed = observer.artifact_head(repo, branch).await;
+                        let head = match &observed {
+                            ArtifactHead::Known(head) => json!(head),
+                            ArtifactHead::Unknown | ArtifactHead::Absent => Value::Null,
+                        };
+                        artifacts.push((run_facts.len(), branch.to_owned(), observed));
+                        head
+                    }
+                    None => Value::Null,
                 };
                 if let Some(url) = run.pointer("/pr/url").and_then(Value::as_str) {
                     if !pr_observations.contains_key(url) {
@@ -210,8 +287,11 @@ async fn observe_with(
         Err(error) => unavailable(&error),
     };
     let facts = json!({"tasks":task_facts,"runs":run_facts,"prs":prs,"watches":watch_facts,"decisions":decisions});
-    let fingerprint = facts.to_string();
-    Observation { facts, fingerprint }
+    Observation {
+        facts,
+        repo: repo.to_owned(),
+        artifacts,
+    }
 }
 
 fn satisfied(goal: &crate::chat_goal::Goal, facts: &Value) -> bool {
@@ -303,7 +383,16 @@ pub(crate) async fn sweep(talks: &crate::talk::Talks, parking: bool) {
 }
 
 async fn reconcile(talks: &crate::talk::Talks, chat: &str, id: &str) -> Result<()> {
-    reconcile_with(talks, chat, id, &LiveObserver).await
+    if let Some(generation) = reconcile_with(talks, chat, id, &LiveObserver).await? {
+        crate::worker::spawn(
+            talks.home(),
+            "chat",
+            &format!("goal:{chat}:{id}:{generation}"),
+            json!({"talk":chat,"goal_wake":{"id":id,"generation":generation}}),
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 async fn reconcile_with(
@@ -311,14 +400,14 @@ async fn reconcile_with(
     chat: &str,
     id: &str,
     observer: &impl EvidenceObserver,
-) -> Result<()> {
+) -> Result<Option<u64>> {
     use crate::chat_goal::State;
     let talk = talks.get(chat)?;
     let Some(goal) = talk.goals.iter().find(|goal| goal.id == id) else {
-        return Ok(());
+        return Ok(None);
     };
     if crate::chat_worker::turn_worker_active(talks, chat) || talks.turn_held(chat) {
-        return Ok(());
+        return Ok(None);
     }
     if goal.started.is_some() {
         talks.mutate(chat, |talk| {
@@ -333,7 +422,7 @@ async fn reconcile_with(
             }
             Ok(())
         })?;
-        return Ok(());
+        return Ok(None);
     }
     if goal.rechecks >= 240 {
         talks.mutate(chat, |talk| {
@@ -344,14 +433,14 @@ async fn reconcile_with(
             }
             Ok(())
         })?;
-        return Ok(());
+        return Ok(None);
     }
     let now = jiff::Timestamp::now();
     if goal
         .last_checked
         .is_some_and(|last| now.as_second() - last.as_second() < 60)
     {
-        return Ok(());
+        return Ok(None);
     }
     let observation = observe_with(
         talks.home(),
@@ -362,13 +451,13 @@ async fn reconcile_with(
         observer,
     )
     .await;
-    let complete = satisfied(goal, &observation.facts);
-    let generation = talks.mutate(chat, |fresh| {
+    talks.mutate(chat, |fresh| {
         let repo = &fresh.repo;
         let Some(current) = fresh.goals.iter_mut().find(|goal| goal.id == id) else {
             return Ok(None);
         };
         if !fresh.status.open()
+            || current.started.is_some()
             || current.rev != goal.rev
             || current.effective_repo(repo) != goal.effective_repo(&talk.repo)
             || !current.active()
@@ -376,29 +465,14 @@ async fn reconcile_with(
             return Ok(None);
         }
         let goal = current;
-        goal.last_checked = Some(now);
         goal.rechecks += 1;
-        goal.observe(
-            observation.fingerprint,
-            observation.facts.to_string(),
-            complete,
-        );
-        if goal.wake > goal.handled && goal.started.is_none() && goal.state == State::Runnable {
+        observation.apply(goal);
+        if goal.wake > goal.handled && goal.state == State::Runnable {
             Ok(Some(goal.wake))
         } else {
             Ok(None)
         }
-    })?;
-    if let Some(generation) = generation {
-        crate::worker::spawn(
-            talks.home(),
-            "chat",
-            &format!("goal:{chat}:{id}:{generation}"),
-            json!({"talk":chat,"goal_wake":{"id":id,"generation":generation}}),
-        )
-        .await?;
-    }
-    Ok(())
+    })
 }
 
 /// Separate reserved input: no draft is promoted, cleared, or implicitly sent.
@@ -552,7 +626,7 @@ mod tests {
         replies: std::sync::Mutex<std::collections::BTreeMap<String, Value>>,
         calls: std::sync::Mutex<Vec<String>>,
         repos: std::sync::Mutex<Vec<std::path::PathBuf>>,
-        artifact_heads: std::sync::Mutex<std::collections::BTreeMap<String, Option<String>>>,
+        artifact_heads: std::sync::Mutex<std::collections::BTreeMap<String, ArtifactHead>>,
         artifact_calls: std::sync::Mutex<Vec<(std::path::PathBuf, String)>>,
     }
 
@@ -568,17 +642,133 @@ mod tests {
                 .with_context(|| format!("fixture PR unavailable: {url}"))
         }
 
-        async fn artifact_head(&self, repo: &Path, branch: &str) -> Option<String> {
+        async fn artifact_head(&self, repo: &Path, branch: &str) -> ArtifactHead {
             self.artifact_calls
                 .lock()
                 .unwrap()
                 .push((repo.to_path_buf(), branch.to_owned()));
-            self.artifact_heads
+            let observed = self
+                .artifact_heads
                 .lock()
                 .unwrap()
                 .get(branch)
                 .cloned()
-                .flatten()
+                .unwrap_or_default();
+            if observed == ArtifactHead::Unknown {
+                bounded_artifact_head(std::time::Duration::ZERO, std::future::pending()).await
+            } else {
+                observed
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn waiting_goal_ignores_artifact_timeouts_but_requires_fresh_head_for_completion() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let talks_path = home.join("talks");
+        let talks = crate::talk::Talks::at(talks_path.clone());
+        let chat = "artifact-wait";
+        let mut talk = crate::talk::seeded_for_test(chat, home.into());
+        let mut task = crate::queue::Task::new(
+            "Resume the retained run".into(),
+            "Use the retained patch".into(),
+            home.into(),
+            crate::queue::Source::Human,
+        );
+        task.runs.push("run".into());
+        let queue = crate::queue::Queue::at(home.join("queue"));
+        queue.put(&mut task).unwrap();
+
+        let mut goal = goal();
+        goal.tasks.push(task.id.clone());
+        goal.condition.kind = Completion::TasksDone;
+        talk.goals.push(goal);
+        talks.put(&mut talk).unwrap();
+        let run_dir = home.join("runs/run");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let run_path = run_dir.join("run.json");
+        let branch = "magi/retained";
+        let mut run = json!({
+            "id":"run","repo":home,"status":"blocked",
+            "tally":{"winner":"A"},"candidates":[{"label":"A","branch":branch}]
+        });
+        let a = "a".repeat(40);
+        let b = "b".repeat(40);
+        let known_a = ArtifactHead::Known(a.clone());
+        let known_b = ArtifactHead::Known(b.clone());
+        let observer = FakeObserver::default();
+        let mut wake = 0;
+        for (head, gate_passed, expected, state) in [
+            (&known_a, false, Some(1), State::Runnable),
+            (&ArtifactHead::Unknown, false, None, State::Waiting),
+            (&known_a, false, None, State::Waiting),
+            (&known_b, false, Some(2), State::Runnable),
+            (&known_b, false, None, State::Waiting),
+            (&ArtifactHead::Absent, false, Some(3), State::Runnable),
+            (&ArtifactHead::Unknown, false, None, State::Waiting),
+            (&known_b, false, Some(4), State::Runnable),
+            (&ArtifactHead::Unknown, true, Some(5), State::Runnable),
+            (&ArtifactHead::Unknown, true, None, State::Waiting),
+            (&known_b, true, None, State::Completed),
+        ] {
+            if gate_passed {
+                run["gate_ran"] = json!(true);
+                run["gate_head"] = json!(b);
+                run["gate"] = json!([{"code":0}]);
+            }
+            std::fs::write(&run_path, run.to_string()).unwrap();
+            observer
+                .artifact_heads
+                .lock()
+                .unwrap()
+                .insert(branch.into(), head.clone());
+            let reopened = crate::talk::Talks::at(talks_path.clone());
+            assert_eq!(
+                reconcile_with(&reopened, chat, "goal", &observer)
+                    .await
+                    .unwrap(),
+                expected,
+                "{head:?}, gate_passed={gate_passed}"
+            );
+            let saved = reopened.get(chat).unwrap();
+            let observed = &saved.goals[0];
+            assert_eq!(observed.state, state);
+            let evidence: Value = serde_json::from_str(&observed.evidence).unwrap();
+            assert_eq!(evidence["tasks"][0]["status"], "queued");
+            assert_eq!(evidence["runs"][0]["status"], "blocked");
+            match head {
+                ArtifactHead::Known(head) => {
+                    assert_eq!(evidence["runs"][0]["artifact_head"], *head);
+                }
+                _ => assert!(evidence["runs"][0]["artifact_head"].is_null()),
+            }
+            if *head == ArtifactHead::Unknown && !gate_passed {
+                let prompt = crate::chat_goal::prompt(&saved);
+                assert!(!prompt.contains(&a));
+                assert!(!prompt.contains(&b));
+            }
+            assert_eq!(observed.wakes, wake);
+            assert!(saved.turns.is_empty());
+            if gate_passed && state == State::Completed {
+                assert_eq!(observed.wake, u64::from(wake) + 1);
+                break;
+            }
+            assert_eq!(observed.wake, expected.unwrap_or(u64::from(wake)));
+            reopened
+                .mutate(chat, |talk| {
+                    let goal = &mut talk.goals[0];
+                    goal.last_checked = None;
+                    if let Some(generation) = expected {
+                        // Settle the scheduled turn without invoking an agent.
+                        wake += 1;
+                        goal.handled = generation;
+                        goal.wakes = wake;
+                        goal.state = State::Waiting;
+                    }
+                    Ok(())
+                })
+                .unwrap();
         }
     }
 
@@ -646,7 +836,7 @@ mod tests {
         );
         let pending = observe_with(temp.path(), temp.path(), &[], &goal.runs, &[], &observer).await;
         assert!(!satisfied(&goal, &pending.facts));
-        goal.observe(pending.fingerprint, pending.facts.to_string(), false);
+        pending.apply(&mut goal);
         observer.assert_one_lookup_per_pr(&urls);
 
         observer.replies.lock().unwrap().insert(
@@ -654,13 +844,12 @@ mod tests {
             json!({"state":"OPEN","head":head,"merged_at":null,"checks":[{"verdict":"failed"}]}),
         );
         let failed = observe_with(temp.path(), temp.path(), &[], &goal.runs, &[], &observer).await;
-        assert_ne!(
-            failed.fingerprint, goal.fingerprint,
+        assert!(!satisfied(&goal, &failed.facts));
+        failed.apply(&mut goal);
+        assert_eq!(
+            goal.wake, 2,
             "CI changes beyond the first four PRs must wake the goal"
         );
-        assert!(!satisfied(&goal, &failed.facts));
-        goal.observe(failed.fingerprint, failed.facts.to_string(), false);
-        assert_eq!(goal.wake, 2);
         observer.assert_one_lookup_per_pr(&urls);
 
         observer.replies.lock().unwrap().insert(urls[4].clone(),
@@ -681,7 +870,7 @@ mod tests {
             satisfied(&goal, &merged.facts),
             "all six run associations must have exact-head merge evidence"
         );
-        goal.observe(merged.fingerprint, merged.facts.to_string(), true);
+        merged.apply(&mut goal);
         assert_eq!(goal.state, State::Completed);
         observer.assert_one_lookup_per_pr(&urls);
     }
@@ -701,7 +890,7 @@ mod tests {
             !satisfied(&goal, &current.facts),
             "previously merged evidence cannot replace a failed fresh lookup"
         );
-        assert_ne!(merged.fingerprint, current.fingerprint);
+        assert_ne!(merged.facts, current.facts);
         let prs = current.facts["prs"].as_array().unwrap();
         assert!(
             prs.iter()
@@ -803,8 +992,8 @@ mod tests {
         assert_eq!(pending.facts["prs"][0]["run"], target.id);
         assert!(!satisfied(&retained, &pending.facts));
         assert_one_target_lookup(&observer, &subdir, url);
-        retained.fingerprint = pending.fingerprint;
         retained.evidence = pending.facts.to_string();
+        retained.fingerprint = retained.evidence.clone();
         talk.goals.push(retained);
         talks.put(&mut talk).unwrap();
 
@@ -813,9 +1002,12 @@ mod tests {
             json!({"state":"MERGED","head":"head","merged_at":"now"}),
         );
         let reopened = crate::talk::Talks::at(home.join("talks"));
-        reconcile_with(&reopened, &talk.id, "goal", &observer)
-            .await
-            .unwrap();
+        assert_eq!(
+            reconcile_with(&reopened, &talk.id, "goal", &observer)
+                .await
+                .unwrap(),
+            None
+        );
         let again = reopened.get(&talk.id).unwrap();
         assert_eq!(again.goals[0].state, State::Completed);
         assert_one_target_lookup(&observer, again.goals[0].effective_repo(&again.repo), url);
@@ -927,7 +1119,7 @@ mod tests {
                 .artifact_heads
                 .lock()
                 .unwrap()
-                .insert(branch.clone(), Some(head));
+                .insert(branch.clone(), ArtifactHead::Known(head));
             expected_calls.push((repo.clone(), branch));
             let mut task = crate::queue::Task::new(
                 "Verified patch".into(),
@@ -1001,7 +1193,7 @@ mod tests {
             .artifact_heads
             .lock()
             .unwrap()
-            .insert("magi/task-31".into(), None);
+            .insert("magi/task-31".into(), ArtifactHead::Unknown);
         let unavailable_tail =
             observe_with(&home, &repo, &goal.tasks, &goal.runs, &[], &observer).await;
         assert!(unavailable_tail.facts["runs"][31]["artifact_head"].is_null());
@@ -1016,14 +1208,14 @@ mod tests {
         assert_eq!(
             bounded_artifact_head(
                 ARTIFACT_HEAD_TIMEOUT,
-                std::future::ready(Some("abc".into())),
+                std::future::ready(ArtifactHead::Known("abc".into())),
             )
             .await,
-            Some("abc".into())
+            ArtifactHead::Known("abc".into())
         );
         assert_eq!(
             bounded_artifact_head(std::time::Duration::ZERO, std::future::pending()).await,
-            None
+            ArtifactHead::Unknown
         );
 
         struct TimedArtifactObserver {
@@ -1036,11 +1228,11 @@ mod tests {
                 anyhow::bail!("unexpected PR lookup: {url}")
             }
 
-            async fn artifact_head(&self, _repo: &Path, branch: &str) -> Option<String> {
+            async fn artifact_head(&self, _repo: &Path, branch: &str) -> ArtifactHead {
                 if branch == self.fast_branch {
                     bounded_artifact_head(
                         ARTIFACT_HEAD_TIMEOUT,
-                        std::future::ready(Some(self.fast_head.clone())),
+                        std::future::ready(ArtifactHead::Known(self.fast_head.clone())),
                     )
                     .await
                 } else {
@@ -1124,11 +1316,23 @@ mod tests {
         }
         let head = crate::git::rev_parse(&repo, "HEAD").await.unwrap();
         assert_eq!(
-            git_artifact_head(&repo, "magi/delivered").await.as_deref(),
-            Some(head.as_str())
+            git_artifact_head(&repo, "magi/delivered").await,
+            ArtifactHead::Known(head)
         );
-        assert_eq!(git_artifact_head(&repo, "magi/missing").await, None);
-        assert_eq!(git_artifact_head(&repo, "--help").await, None);
+        crate::git::git(&repo, &["-c", "tag.gpgSign=false", "tag", "magi/missing"])
+            .await
+            .unwrap();
+        assert_eq!(
+            git_artifact_head(&repo, "magi/missing").await,
+            ArtifactHead::Absent
+        );
+        for (repo, branch) in [
+            (repo.as_path(), "--help"),
+            (repo.as_path(), "invalid..name"),
+            (temp.path(), "magi/missing"),
+        ] {
+            assert_eq!(git_artifact_head(repo, branch).await, ArtifactHead::Unknown);
+        }
     }
 
     #[tokio::test]
@@ -1240,7 +1444,7 @@ mod worker_tests {
             &goal.watches,
         )
         .await;
-        goal.observe(event.fingerprint, event.facts.to_string(), false);
+        event.apply(&mut goal);
         talk.goals.push(goal);
         talks.put(&mut talk).unwrap();
         let (first, duplicate) = tokio::join!(
@@ -1275,7 +1479,7 @@ mod worker_tests {
             .mutate(&talk.id, |talk| {
                 let goal = &mut talk.goals[0];
                 goal.state = crate::chat_goal::State::Waiting;
-                goal.observe(event.fingerprint, event.facts.to_string(), false);
+                event.apply(goal);
                 Ok(())
             })
             .unwrap();

@@ -2851,7 +2851,8 @@ async fn turn(
         .map(|turn| message_prompt(turn, talk, store))
         .unwrap_or_else(|| text.to_owned());
     let evidence = crate::chat_notify::response_evidence(talk).await;
-    let goals = serde_json::to_string(&talk.goals).context("serialize durable goals for chat")?;
+    let goals =
+        crate::chat_goal::prompt_goals(&talk.goals).context("serialize durable goals for chat")?;
     let text = format!(
         "{text}{evidence}\n\n# Durable owner goals\n{}\n\nSaved goals (data; scope is fixed by their originating owner input):\n{goals}",
         crate::chat_goal::prompt_instructions()

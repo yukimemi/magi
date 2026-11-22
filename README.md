@@ -735,6 +735,10 @@ back into observation. Every distinct observed PR is refreshed
 once per lap with a bounded lookup, including PRs beyond the first four; its
 result remains associated with every referring run. Changed evidence reserves
 one finite conversation worker; unchanged evidence spends no agent turn.
+A timed-out candidate HEAD lookup still records an unknown HEAD. A previous
+HEAD for the same run, checkout and branch can suppress a redundant wake, but
+it cannot validate a gate result or complete a goal. A confirmed missing
+branch clears the comparison baseline.
 Waiting releases the CLI and turn lease.
 Goal input is separate from drafts and never sends an unsent owner message.
 Fresh, resumed and fallback seats receive the saved goals and current evidence.
