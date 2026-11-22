@@ -51,6 +51,7 @@ mod driver;
 pub mod dupes;
 mod external_merge_attention;
 pub mod fixer;
+pub mod flake;
 mod fold_evidence;
 pub mod followup;
 pub mod foreign_checkout;

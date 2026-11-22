@@ -1470,6 +1470,7 @@ deliberate_rounds = 1
 reviewers = 3
 review_rounds = 6
 incomplete_review = "block"  # block | warn — a round a seat never answered in
+rerun_failed_e2e = true        # run a failed verify.e2e once more on the same commit; a pass is a recorded, filed flake (see "The review loop")
 max_parallel = 4
 language = "en"          # prose language for the agents; "ja" etc.
 github_language = "en"   # language of PR / issue titles, bodies and GitHub comments; anything but English drops the English-only check (commits stay English)
@@ -1842,6 +1843,33 @@ The winner — and only the winner — enters a bounded loop:
 Finding ids (`R2-1-3`) are assigned by magi, never by the agent, because the
 fixer's adoption report is keyed by them — that is what makes reviewer precision
 measurable rather than self-reported.
+
+**A red e2e is run again before it is believed.** When `verify.e2e` fails with
+an ordinary test result (not a build/link failure, a timeout or a resource
+block), the failed command runs once more on the same commit, in the same
+worktree, under the same build-cache lease and with its own full
+`timeout_verify`; no review round, fix round, task attempt or repair budget is
+spent. This applies wherever `verify.e2e` decides something: the per-round leg,
+the deferred catch-up, the current-head check (before and after the gate, after
+a base sync, at publication) and the gate-repair check. A verification runs at
+most three times for one decision (the existing build/link retry, then this
+rerun).
+
+- **The second run fails:** the failure stands, and the fixer receives the
+  second run's output, marked as the output of a command that failed twice.
+- **The second run passes:** the head is verified, but the failure is recorded
+  as a flake — a `verify` event, `RunState::verify_flakes`, a "flaky
+  verification" section in `magi show` and on the web run page, and the round
+  reads "e2e green on rerun only", never plain green. magi files one queue task
+  per distinct failure (`Source::Agent`, node `flake`) asking for the root cause
+  to be fixed rather than the test loosened or retried away. A failure is
+  identified by its normalised failure lines (numbers, hashes and temporary
+  directory names removed, sorted), so ten runs hitting the same flaky test leave
+  one task; a task that is already `done` does not cover a recurrence. A filing
+  failure is an event, never a run failure.
+
+`[graph] rerun_failed_e2e = false` turns the rerun off: the first result decides,
+as before.
 
 **A seat that never answered is not a seat that found nothing.** Every round
 records how many reviewers it expected against how many actually came back, so

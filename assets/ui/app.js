@@ -8175,13 +8175,15 @@ function reviewVoteBadge(vote) {
 }
 
 function renderRound(runId, r) {
-  const e2eTone = { pass: "ok", fail: r.e2e && r.e2e.build_failed ? "warn" : "fail", blocked: "warn", deferred: "warn", not_configured: "neutral" };
-  const e2eText = { pass: "e2e pass", fail: "e2e FAIL", blocked: "e2e blocked", deferred: "e2e deferred", not_configured: "no e2e" };
+  const e2eTone = { pass: r.e2e && r.e2e.flaked ? "warn" : "ok", fail: r.e2e && r.e2e.build_failed ? "warn" : "fail", blocked: "warn", deferred: "warn", not_configured: "neutral" };
+  const e2eText = { pass: r.e2e && r.e2e.flaked ? "e2e pass on rerun (flake)" : "e2e pass", fail: "e2e FAIL", blocked: "e2e blocked", deferred: "e2e deferred", not_configured: "no e2e" };
   const e2e = r.e2e || {};
   const badges = [
     rtag(r.status, r.tone),
     rtag(e2eText[e2e.state] || "e2e ?", e2eTone[e2e.state] || "neutral",
-      e2e.build_failed ? "Build or link failure, not a verdict on the patch" : e2e.defer_reason || null),
+      e2e.build_failed ? "Build or link failure, not a verdict on the patch"
+        : e2e.flaked ? "A command failed, then passed when run again on the same commit"
+          : e2e.defer_reason || null),
   ];
   if (r.verdict) badges.push(rtag(r.verdict.label, r.verdict.vote === "approve" ? "ok" : r.verdict.vote === "reject" ? "fail" : "warn"));
   if (r.verdict && r.verdict.split) badges.push(rtag("panel split", "warn"));

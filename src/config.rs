@@ -579,6 +579,18 @@ pub struct Graph {
     /// have caught by reading), and this is the way back to seeing it every
     /// round instead of only once the panel has nothing left to flag.
     pub e2e_every_round: bool,
+    /// When `verify.e2e` fails with an ordinary test result (not a build/link
+    /// failure, timeout or resource block), run the failed command once more
+    /// on the same commit, in the same worktree and under the same cache
+    /// lease, before anything is decided from it. A second run that passes
+    /// verifies the head, but the first failure is recorded as a flake
+    /// (`RunState::verify_flakes`, a `verify` event, `magi show`, the web run
+    /// page) and filed once as a queue task asking for the root cause
+    /// (`crate::flake`). A second failure stands exactly as before, with the
+    /// second run's output handed to the fixer. The rerun gets its own full
+    /// `timeout_verify` and spends no review round, fix round or task attempt.
+    /// On; off decides on the first result, as before this existed.
+    pub rerun_failed_e2e: bool,
     /// Run the design-deliberation stage before `implement`: independent
     /// advisor seats each sketch a design, and (when at least one produced a
     /// usable proposal) a synthesis blends them into a brief carried in the
@@ -645,6 +657,7 @@ impl Default for Graph {
             answer_timeout: 86_400,
             incomplete_review: IncompleteReviewPolicy::Block,
             e2e_every_round: false,
+            rerun_failed_e2e: true,
             advise: true,
             advisors: 3,
             graft_runner_up: true,
@@ -2526,6 +2539,8 @@ impl Config {
              gate_fix_rounds = 1\n\
              # Rerun a failed required CI check once before a land fix round (flaky tests).\n\
              rerun_flaky_checks = true\n\
+             # Rerun a failed verify.e2e once on the same commit before deciding; a pass is recorded as a flake and filed once as a task.\n\
+             rerun_failed_e2e = true\n\
              # Port the strengths judges named in the losing candidates onto the\n\
              # winner before review (best-effort; rolled back on failure or a big diff).\n\
              graft_runner_up = true\n\

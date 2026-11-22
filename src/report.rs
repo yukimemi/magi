@@ -678,6 +678,7 @@ pub fn run(state: &RunState) -> String {
             // "not configured" from "skipped on purpose" apart, which is
             // exactly why `e2e_status` exists rather than reading `e2e`
             // directly here.
+            let flaked = state.verify_flakes.iter().any(|f| f.round == Some(r.round));
             let e2e = match r.e2e_status() {
                 E2eStatus::NotConfigured => dim("no e2e"),
                 E2eStatus::Deferred => yellow(&format!(
@@ -687,6 +688,9 @@ pub fn run(state: &RunState) -> String {
                         .map(|why| format!(" ({why})"))
                         .unwrap_or_default()
                 )),
+                // Green only because a failed command passed when run again
+                // on the same commit: never the same as a plain green.
+                E2eStatus::Passed if flaked => yellow("e2e green on rerun only (flake)"),
                 E2eStatus::Passed => green("e2e green"),
                 E2eStatus::Failed if r.e2e.iter().any(CommandOutcome::build_failed) => {
                     yellow("e2e could not run (build/link failure)")
@@ -899,6 +903,26 @@ pub fn run(state: &RunState) -> String {
                      see above for what a person should still look at",
                     state.open_findings().len()
                 ))
+            );
+        }
+    }
+
+    if !state.verify_flakes.is_empty() {
+        let _ = writeln!(s, "\n{}", bold("flaky verification"));
+        for f in &state.verify_flakes {
+            let tracked = match (&f.task, &f.filing_error) {
+                (Some(task), _) if f.filed => format!("filed task {task}"),
+                (Some(task), _) => format!("already tracked by task {task}"),
+                (None, Some(why)) => format!("no task filed: {why}"),
+                (None, None) => "no task filed".to_owned(),
+            };
+            let _ = writeln!(
+                s,
+                "  {}  `{}` failed, then passed on the same commit {} ({}); {tracked}",
+                yellow("FLAKE"),
+                f.command,
+                short(&f.head),
+                f.context
             );
         }
     }
