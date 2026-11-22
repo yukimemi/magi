@@ -9,21 +9,39 @@ pub(crate) fn validate(home: &Path, id: &str) -> Result<crate::run::RunState> {
     crate::task_reassign::ensure_current(&crate::queue::Queue::at(home.join("queue")), id)?;
     let _owner = crate::pr_head::owner_lock(home, id)?;
     let state = crate::run::RunState::load_under(id, home)?;
-    if let Some(reason) = crate::handover::resume_refusal_under(&state, Some(home)) {
-        anyhow::bail!(reason.diagnostic(&state));
-    }
-    let claims = crate::daemon::is_working_on(home, id, jiff::Timestamp::now());
+    check_run(
+        home,
+        &state,
+        crate::daemon::is_working_on(home, id, jiff::Timestamp::now()),
+    )?;
+    Ok(state)
+}
+
+/// Read-only part of resume admission. The caller must not treat this
+/// observation as a replacement for acquiring the execution and owner locks.
+pub(crate) fn check_run(home: &Path, state: &crate::run::RunState, claimed: bool) -> Result<()> {
     ensure!(
-        state.liveness_under(home, claims) != crate::run::Liveness::Live,
+        state.liveness_under(home, claimed) != crate::run::Liveness::Live,
         "run already has a live driver"
     );
-    Ok(state)
+    check_checkpoint(home, state)
+}
+
+pub(crate) fn check_checkpoint(home: &Path, state: &crate::run::RunState) -> Result<()> {
+    if let Some(reason) = crate::handover::resume_refusal_under(state, Some(home)) {
+        anyhow::bail!(reason.diagnostic(state));
+    }
+    Ok(())
 }
 
 /// Resumes outside the queue must not bypass the daemon's execution limits.
 /// Shared by Web requests and owner choices without a queue owner.
 pub(crate) fn validate_unqueued(home: &Path, id: &str) -> Result<()> {
     validate(home, id)?;
+    check_unqueued_capacity(home)
+}
+
+fn check_unqueued_capacity(home: &Path) -> Result<()> {
     if let Some(work) = crate::daemon::current_work(home, jiff::Timestamp::now())
         .into_iter()
         .next()
@@ -35,6 +53,21 @@ pub(crate) fn validate_unqueued(home: &Path, id: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Maintenance may adopt only a confirmed ownerless legacy run.
+pub(crate) fn inspect_ownerless(home: &Path, state: &crate::run::RunState) -> Result<()> {
+    ensure!(
+        state
+            .origin
+            .as_ref()
+            .and_then(|o| o.task.as_ref())
+            .is_none(),
+        "unknown: the recorded task owner is missing; restore its queue record"
+    );
+    check_run(home, state, false)?;
+    require_known_driver(home, state)?;
+    check_unqueued_capacity(home)
 }
 
 /// Adopt a legacy ownerless run into the same claimed task-worker path as CLI
@@ -63,16 +96,8 @@ pub(crate) async fn spawn_detached(home: &Path, id: &str) -> Result<crate::worke
     // and execution lease. Preflight checked run liveness, and the task claim
     // acquired above excludes a concurrent queue driver; no scheduler reclaim
     // is required before this explicit resume.
-    if !crate::repair_budget::queue_resumption(&queue, &mut task, id)? {
-        task.release_operator("resume", None);
-    }
-    task.resume_override = Some(crate::queue::OperatorResume {
-        question_id: String::new(),
-        at: jiff::Timestamp::now(),
-        conductor_rehold: None,
-        forced: true,
-        pinned_run: Some(id.to_owned()),
-    });
+    let state = crate::run::RunState::load_under(id, home)?;
+    prepare_pin(&queue, home, &mut task, &state, None, PinSource::Web)?;
     queue.put(&mut task)?;
     let opts = crate::daemon::Opts {
         repo: task.repo.clone(),
@@ -93,6 +118,130 @@ pub(crate) async fn start(home: &Path, id: String) -> Result<()> {
 #[error("resume did not reach its queue write: {0:#}")]
 pub(crate) struct BeforeQueueWrite(pub anyhow::Error);
 
+pub(crate) fn check_queue_owner(
+    task: &crate::queue::Task,
+    run: &str,
+    decided_before: Option<jiff::Timestamp>,
+) -> Result<()> {
+    use crate::queue::TaskStatus;
+    ensure!(
+        task.execution_runs().last().map(String::as_str) == Some(run)
+            && !matches!(task.status, TaskStatus::Running | TaskStatus::Done),
+        "run queue owner changed, is running, or is done"
+    );
+    ensure!(
+        decided_before.is_none_or(|answered| {
+            task.latest_operator_decision_at()
+                .is_none_or(|at| at <= answered)
+        }),
+        "resume was superseded by a newer operator decision"
+    );
+    Ok(())
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct Unconfirmed(pub String);
+
+/// Observe the queued maintenance path without creating locks or receipts.
+pub(crate) fn inspect_queued(
+    home: &Path,
+    queue: &crate::queue::Queue,
+    task: &crate::queue::Task,
+    state: &crate::run::RunState,
+) -> Result<()> {
+    crate::task_reassign::ensure_current(queue, &state.id)?;
+    check_queue_owner(task, &state.id, None)?;
+    check_run(
+        home,
+        state,
+        crate::daemon::is_working_on(home, &state.id, jiff::Timestamp::now()),
+    )?;
+    require_known_driver(home, state)?;
+    if let Some(reason) = crate::repair_budget::conflict_failure(task, state) {
+        anyhow::bail!(reason);
+    }
+    check_pending_movement(queue, task, state, true)?;
+    if !crate::repair_budget::check_queue_resumption(home, task, state)? {
+        crate::daemon::check_resume_implementers(task, state)?;
+    }
+    Ok(())
+}
+
+fn require_known_driver(home: &Path, state: &crate::run::RunState) -> Result<()> {
+    if state.liveness_under(home, false) == crate::run::Liveness::Unknown {
+        return Err(Unconfirmed(
+            "driver liveness is unknown; inspect the retained execution lease and driver identity"
+                .into(),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// A request-backed approval must be published before ordinary resume can
+/// use it. `true` means queueing must preserve the existing owner generation.
+/// Explicit resume leaves base-tip validation to the live driver: it can
+/// invalidate a stale published approval without spending its budget.
+fn check_pending_movement(
+    queue: &crate::queue::Queue,
+    task: &crate::queue::Task,
+    state: &crate::run::RunState,
+    inspect_tracking: bool,
+) -> Result<bool> {
+    if !state.base_sync_blocked() || !state.base_recovery_pending() {
+        return Ok(false);
+    }
+    let head = crate::graph::Runner::base_recovery_head(state)?;
+    state.check_base_recovery_head(&head)?;
+    let authorization = state.base_sync_recovery.authorizations.last().unwrap();
+    ensure!(
+        authorization.task == task.id && !task.fresh_start && task.review_branch.is_none(),
+        "base recovery task ownership or continuation changed"
+    );
+    if let Some(reason) = crate::base_recovery_control::queue_binding_refusal(authorization, task) {
+        if let Some(key) = &authorization.request {
+            anyhow::bail!(
+                "pending base recovery cannot resume: {reason}; if queue publication was interrupted, complete the existing recover-base request {key} with the same ID and original arguments from base-recovery-controls/{key}.json, not ordinary resume"
+            );
+        }
+        anyhow::bail!("pending base recovery cannot resume: {reason}");
+    }
+    if let Some(question) = &authorization.question {
+        ensure!(
+            crate::base_recovery_control::decision_current(queue, state, &task.id, question),
+            "recovery decision ownership, routing or stop evidence changed"
+        );
+    }
+    if let Some(scope) = &authorization.scope {
+        ensure!(
+            task.instruction == scope.instruction
+                && state
+                    .base_sync_recovery
+                    .episodes
+                    .last()
+                    .is_some_and(|e| e.id == scope.episode),
+            "base recovery task instruction or synchronization interval changed"
+        );
+    }
+    if inspect_tracking && let Some(scope) = &authorization.scope {
+        let tracking = format!(
+            "refs/remotes/{}/{}",
+            state.config.merge.remote, state.base_branch
+        );
+        let tip = crate::graph::Runner::read_base_git(
+            &state.repo,
+            &["rev-parse", "--verify", &tracking],
+        )?;
+        ensure!(
+            scope.tip == tip,
+            "pending base recovery cannot resume: local tracking ref {tracking} is {tip}, not approved tip {}; inspect the changed base before recovery (not a fresh fetch)",
+            scope.tip
+        );
+    }
+    Ok(authorization.request.is_some() || authorization.generation.is_some())
+}
+
 /// Hand a resumable run back to the queue task that owns it, pinned to that
 /// exact run, so the loop's ordinary start logic resumes it under the graph's
 /// execution lease. Never starts a driver itself. `Ok(false)` means no task
@@ -108,7 +257,6 @@ pub(crate) fn pin_queued(
     decided_before: Option<jiff::Timestamp>,
     applied: Option<&str>,
 ) -> Result<bool> {
-    use crate::queue::TaskStatus;
     crate::task_reassign::ensure_current(queue, run).map_err(BeforeQueueWrite)?;
     let Some(listed) = queue
         .list()
@@ -119,44 +267,92 @@ pub(crate) fn pin_queued(
     };
     let _claim = queue.claim(&listed.id).map_err(BeforeQueueWrite)?;
     let mut task = queue.get(&listed.id).map_err(BeforeQueueWrite)?;
-    let preflight = || -> Result<()> {
-        ensure!(
-            task.execution_runs().last().map(String::as_str) == Some(run)
-                && !matches!(task.status, TaskStatus::Running | TaskStatus::Done),
-            "run queue owner changed"
-        );
-        ensure!(
-            match decided_before {
-                Some(answered) => task.operator_decided_at.is_none_or(|at| at <= answered),
-                None => true,
-            },
-            "resume was superseded by a newer operator decision"
-        );
-        Ok(())
-    };
-    preflight().map_err(BeforeQueueWrite)?;
+    check_queue_owner(&task, run, decided_before).map_err(BeforeQueueWrite)?;
+    let home = queue
+        .root()
+        .parent()
+        .context("queue has no home")
+        .map_err(BeforeQueueWrite)?;
+    let state = crate::run::RunState::load_under(run, home).map_err(BeforeQueueWrite)?;
     if applied.is_none()
-        && task.status == TaskStatus::Queued
+        && task.status == crate::queue::TaskStatus::Queued
         && task
             .resume_override
             .as_ref()
             .is_some_and(|pin| pin.pinned_run.as_deref() == Some(run))
     {
+        if check_pending_movement(queue, &task, &state, false).map_err(BeforeQueueWrite)? {
+            // A new explicit request supersedes earlier answers even when
+            // the exact-run pin is already queued.
+            task.base_recovery_resume_at = Some(jiff::Timestamp::now());
+            queue.put(&mut task)?;
+        }
         return Ok(true);
     }
-    if !crate::repair_budget::queue_resumption(queue, &mut task, run)? {
-        task.release_operator(if applied.is_some() { "choice" } else { "chat" }, applied);
-    }
-    task.resume_override = Some(crate::queue::OperatorResume {
-        question_id: applied.unwrap_or_default().to_owned(),
-        at: jiff::Timestamp::now(),
-        conductor_rehold: None,
-        forced: true,
-        pinned_run: Some(run.to_owned()),
-    });
+    let source = if decided_before.is_some() {
+        PinSource::Choice
+    } else {
+        PinSource::Chat
+    };
+    prepare_pin(queue, home, &mut task, &state, applied, source).map_err(BeforeQueueWrite)?;
     if let Some(id) = applied {
         task.mark_action_applied(id);
     }
     queue.put(&mut task)?;
     Ok(true)
+}
+
+/// Prepare a terminal resume under the caller's task claim without saving.
+pub fn prepare_cli_pin(
+    queue: &crate::queue::Queue,
+    task: &mut crate::queue::Task,
+    run: &str,
+) -> Result<()> {
+    let home = queue.root().parent().context("queue has no home")?;
+    let state = crate::run::RunState::load_under(run, home)?;
+    prepare_pin(queue, home, task, &state, None, PinSource::Cli)
+}
+
+pub(crate) enum PinSource {
+    Cli,
+    Web,
+    Chat,
+    Choice,
+}
+
+/// Prepare the exact-run pin without saving. Callers hold the task claim and
+/// commit their own bookkeeping with the pin in one queue write.
+pub(crate) fn prepare_pin(
+    queue: &crate::queue::Queue,
+    home: &Path,
+    task: &mut crate::queue::Task,
+    state: &crate::run::RunState,
+    applied: Option<&str>,
+    source: PinSource,
+) -> Result<()> {
+    let preserve_movement =
+        check_pending_movement(queue, task, state, matches!(source, PinSource::Choice))?;
+    let at = jiff::Timestamp::now();
+    if !crate::repair_budget::queue_resumption_after_answer(home, task, state, applied)? {
+        if preserve_movement {
+            task.release();
+            task.base_recovery_resume_at = Some(at);
+        } else {
+            let label = match source {
+                PinSource::Cli => "cli-run-resume",
+                PinSource::Web => "resume",
+                PinSource::Chat => "chat",
+                PinSource::Choice => "choice",
+            };
+            task.release_operator(label, applied);
+        }
+    }
+    task.resume_override = Some(crate::queue::OperatorResume {
+        question_id: applied.unwrap_or_default().to_owned(),
+        at,
+        conductor_rehold: None,
+        forced: true,
+        pinned_run: Some(state.id.clone()),
+    });
+    Ok(())
 }

@@ -1365,19 +1365,64 @@ impl Runner {
         Self::authorize_base_recovery_request(home, &id, task, false, Some(control)).await
     }
 
-    async fn authorize_base_recovery_request(
+    /// Read-only standing recovery inspection. No fetch, authorization, lock
+    /// creation or queue write; execution must check again under its leases.
+    pub(crate) fn inspect_base_recovery(
         home: &Path,
-        id: &str,
-        task: &str,
-        resumption: bool,
-        mut control: Option<&mut crate::base_recovery_control::Transaction>,
+        state: &RunState,
+        task: &crate::queue::Task,
+    ) -> Result<String> {
+        let queue = crate::queue::Queue::at(home.join("queue"));
+        crate::task_reassign::ensure_current(&queue, &state.id)?;
+        Self::check_base_recovery_checkpoint(state)?;
+        // A saved head can prove ineligibility without a worktree. It never
+        // proves eligibility: the actual retained HEAD is checked below.
+        if let Some(stop) = &state.base_sync_recovery.stop {
+            state.check_movement_stop(&stop.head, &task.id)?;
+        }
+        Self::check_base_recovery_owner(home, state, task)?;
+        let head = Self::base_recovery_head(state)?;
+        Self::check_standing_base_recovery(state, task, &head)?;
+        let stop = state.check_movement_stop(&head, &task.id)?;
+        state.check_new_base_authorization(&stop)?;
+        crate::daemon::check_resume_implementers(task, state)?;
+        Ok(head)
+    }
+
+    fn check_standing_base_recovery(
+        state: &RunState,
+        task: &crate::queue::Task,
+        head: &str,
     ) -> Result<()> {
-        let _owner = crate::pr_head::owner_lock(home, id)?;
-        let mut state = RunState::load_under(id, home)?;
-        crate::pr_head::ensure_owner(&state)?;
-        let queued = crate::queue::Queue::at(home.join("queue")).get(task)?;
         anyhow::ensure!(
-            queued.execution_runs().last().is_some_and(|run| run == id)
+            state
+                .base_sync_recovery
+                .stop
+                .as_ref()
+                .is_none_or(|stop| stop.head == head),
+            "retained HEAD differs from the recorded stop head; inspect it first"
+        );
+        anyhow::ensure!(
+            crate::daemon::compatible_run_instruction(state, task),
+            "task instruction does not match the retained run"
+        );
+        anyhow::ensure!(
+            task.status != crate::queue::TaskStatus::Running,
+            "run queue owner changed"
+        );
+        Ok(())
+    }
+
+    fn check_base_recovery_owner(
+        home: &Path,
+        state: &RunState,
+        queued: &crate::queue::Task,
+    ) -> Result<()> {
+        crate::pr_head::ensure_owner_record(state, None)?;
+        let id = &state.id;
+        let task = &queued.id;
+        anyhow::ensure!(
+            queued.execution_runs().last() == Some(id)
                 && queued.status != crate::queue::TaskStatus::Done
                 && !queued.fresh_start
                 && queued.review_branch.is_none(),
@@ -1387,18 +1432,22 @@ impl Runner {
             state
                 .origin
                 .as_ref()
-                .and_then(|o| o.task.as_deref())
+                .and_then(|o| o.task.as_ref())
                 .is_none_or(|owner| owner == task),
             "run belongs to another task"
         );
         let claimed = crate::daemon::is_working_on_other(home, id, Timestamp::now())?;
-        anyhow::ensure!(
-            state.liveness_under(home, claimed) == crate::run::Liveness::Dead,
-            "run is live or its ownership is unknown"
-        );
-        // Judge the previous driver's lease before acquiring our maintenance
-        // lease. The owner lock excludes new driver claims across both steps.
-        let _execution = crate::driver::maintenance(home, id)?;
+        match state.liveness_under(home, claimed) {
+            crate::run::Liveness::Dead => {}
+            crate::run::Liveness::Live => anyhow::bail!("run already has a live driver"),
+            crate::run::Liveness::Unknown => return Err(crate::resume::Unconfirmed(
+                "driver liveness is unknown; inspect the retained execution lease and driver identity".into(),
+            ).into()),
+        }
+        Ok(())
+    }
+
+    fn check_base_recovery_checkpoint(state: &RunState) -> Result<()> {
         anyhow::ensure!(
             state.status.resumable()
                 && state.released_to.is_none()
@@ -1409,44 +1458,88 @@ impl Runner {
         anyhow::ensure!(state.base_sync_blocked(), "run has no base-sync stop");
         anyhow::ensure!(
             !state.pr_publication_pending
-                && !crate::handover::landing_checkpoint(&state)
+                && !crate::handover::landing_checkpoint(state)
                 && state.merge_decision.is_none(),
             "publication or landing has its own retained checkpoint; base recovery cannot replace it"
         );
+        Ok(())
+    }
+
+    pub(crate) fn base_recovery_head(state: &RunState) -> Result<String> {
         let winner = state.winner().context("run has no retained winner")?;
         anyhow::ensure!(
-            git::is_clean(&winner.worktree).await?,
+            Self::read_base_git(&winner.worktree, &["status", "--porcelain"])?.is_empty(),
             "retained worktree has uncommitted changes"
         );
-        let head = git::rev_parse(&winner.worktree, "HEAD").await?;
+        let head = Self::read_base_git(&winner.worktree, &["rev-parse", "--verify", "HEAD"])?;
         anyhow::ensure!(
-            git::rev_parse(&state.repo, &format!("refs/heads/{}", winner.branch)).await? == head,
+            Self::retained_branch_head(state)? == head,
             "retained worktree does not match the winner branch"
         );
+        Ok(head)
+    }
+
+    pub(crate) fn retained_branch_head(state: &RunState) -> Result<String> {
+        let winner = state.winner().context("missing retained winner")?;
+        Self::read_base_git(
+            &state.repo,
+            &[
+                "rev-parse",
+                "--verify",
+                &format!("refs/heads/{}^{{commit}}", winner.branch),
+            ],
+        )
+        .context("cannot resolve the retained branch; locate the owned ref without resetting it")
+    }
+
+    pub(crate) fn read_base_git(repo: &Path, args: &[&str]) -> Result<String> {
+        use crate::proc::Quiet as _;
+        let output = std::process::Command::new("git")
+            .arg("--no-optional-locks")
+            .args(args)
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .current_dir(repo)
+            .quiet()
+            .output()
+            .with_context(|| format!("read retained Git state ({})", args.join(" ")))?;
+        if !output.status.success() {
+            return Err(crate::resume::Unconfirmed(format!(
+                "cannot read retained Git state ({}): {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))
+            .into());
+        }
+        Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+    }
+
+    async fn authorize_base_recovery_request(
+        home: &Path,
+        id: &str,
+        task: &str,
+        resumption: bool,
+        mut control: Option<&mut crate::base_recovery_control::Transaction>,
+    ) -> Result<()> {
+        let _owner = crate::pr_head::owner_lock(home, id)?;
+        let mut state = RunState::load_under(id, home)?;
+        let queued = crate::queue::Queue::at(home.join("queue")).get(task)?;
+        Self::check_base_recovery_owner(home, &state, &queued)?;
+        // Judge the previous driver's lease before acquiring our maintenance
+        // lease. The owner lock excludes new driver claims across both steps.
+        let _execution = crate::driver::maintenance(home, id)?;
+        Self::check_base_recovery_checkpoint(&state)?;
+        let head = Self::base_recovery_head(&state)?;
         if let Some(control) = control.as_ref() {
             anyhow::ensure!(
                 head.starts_with(&control.request.head),
                 "retained HEAD changed since the owner request"
             );
-            anyhow::ensure!(
-                state
-                    .base_sync_recovery
-                    .stop
-                    .as_ref()
-                    .is_none_or(|stop| stop.head == head),
-                "retained HEAD differs from the recorded stop head; inspect it first"
-            );
+            Self::check_standing_base_recovery(&state, &queued, &head)?;
         }
         state.ensure_base_episode();
         state.record_base_sync_stop(&head);
-        anyhow::ensure!(
-            state
-                .base_sync_recovery
-                .stop
-                .as_ref()
-                .is_some_and(|s| s.kind == crate::base_sync_recovery::StopKind::Exhausted),
-            "base recovery refused: missing eligible movement-exhaustion evidence; inspect with `magi task inspect-base-stop {task} --run {id}`. Textual stops require an evidence-bound base-conflict grant"
-        );
+        state.check_movement_stop(&head, task)?;
+        crate::daemon::check_resume_implementers(&queued, &state)?;
         let fetched =
             git::fetch(&state.repo, &state.config.merge.remote, &state.base_branch).await?;
         anyhow::ensure!(
@@ -5672,12 +5765,10 @@ impl Runner {
             });
             let invalidation = if !owner_valid {
                 Some("latest task ownership changed")
-            } else if !owner.as_ref().is_ok_and(|t| {
-                authorization
-                    .generation
-                    .is_none_or(|g| t.resumption.as_ref().is_some_and(|r| r.generation == g))
+            } else if let Some(reason) = owner.as_ref().ok().and_then(|task| {
+                crate::base_recovery_control::queue_binding_refusal(authorization, task)
             }) {
-                Some("owner approval generation changed")
+                Some(reason)
             } else if authorization.question.as_ref().is_some_and(|question| {
                 !crate::base_recovery_control::decision_current(
                     &crate::queue::Queue::at(crate::run::home().join("queue")),
@@ -5687,12 +5778,6 @@ impl Runner {
                 )
             }) {
                 Some("recovery decision ownership, routing or stop evidence changed")
-            } else if authorization.request.is_some()
-                && !owner
-                    .as_ref()
-                    .is_ok_and(|t| t.operator_decided_at == authorization.decision)
-            {
-                Some("owner decision changed")
             } else if let Some(scope) = &authorization.scope {
                 if scope.tip != tip {
                     Some("fetched base changed")
@@ -17726,7 +17811,6 @@ esac
         assert_eq!(runner.state.base_sync.as_ref().unwrap().attempts, 5);
     }
 
-    #[cfg(unix)]
     async fn advance_base_fixture(runner: &Runner) {
         let repo = &runner.state.repo;
         for args in [
@@ -17992,17 +18076,56 @@ esac
         assert_eq!(runner.state.base_sync.as_ref().unwrap().attempts, 4);
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn base_recovery_stale_fetched_base_invalidates_approval() {
         let (_tmp, mut runner, head, task) = exhausted_base_fixture().await;
         runner.state.driver_exited = true;
+        let home = crate::run::home();
+        let queue = crate::queue::Queue::open();
+        runner.state.task_instruction = Some(queue.get(&task).unwrap().instruction);
+        runner.state.config.graph.implementers = 2;
         runner.state.save().unwrap();
-        Runner::authorize_base_recovery(&crate::run::home(), &runner.state.id, &task)
+        let request = crate::base_recovery_control::Request {
+            run: runner.state.id.clone(),
+            head: head.clone(),
+            actor: "test-chat".into(),
+            request: "initial".into(),
+            decision: None,
+            expected_stop: None,
+        };
+        let mut mismatched = queue.get(&task).unwrap();
+        mismatched.solo = true;
+        queue.put(&mut mismatched).unwrap();
+        let error = Runner::inspect_base_recovery(&home, &runner.state, &mismatched).unwrap_err();
+        assert!(error.to_string().contains("saved count: 2"), "{error:#}");
+        let error = crate::base_recovery_control::recover(&queue, &home, request.clone())
+            .await
+            .err()
+            .expect("mismatched implementers must refuse authorization");
+        assert!(error.to_string().contains("saved count: 2"), "{error:#}");
+        assert!(
+            RunState::load(&runner.state.id)
+                .unwrap()
+                .base_sync_recovery
+                .authorizations
+                .is_empty()
+        );
+        mismatched.solo = false;
+        queue.put(&mut mismatched).unwrap();
+        Runner::inspect_base_recovery(&home, &runner.state, &mismatched).unwrap();
+        crate::base_recovery_control::recover(&queue, &home, request.clone())
             .await
             .unwrap();
         runner.state = RunState::load(&runner.state.id).unwrap();
         advance_base_fixture(&runner).await;
+        let mut held = queue.get(&task).unwrap();
+        held.hold_machine(Some("base synchronization stopped".into()));
+        queue.put(&mut held).unwrap();
+        let reason = crate::resume::inspect_queued(&home, &queue, &held, &runner.state)
+            .unwrap_err()
+            .to_string();
+        assert!(reason.contains("local tracking ref"), "{reason}");
+        assert!(crate::resume::pin_queued(&queue, &runner.state.id, None, None).unwrap());
         runner.sync_to_base().await.unwrap();
         let a = runner
             .state
@@ -18022,9 +18145,16 @@ esac
             git::rev_parse(&runner.state.repo, "HEAD").await.unwrap(),
             head
         );
-        Runner::authorize_base_recovery(&crate::run::home(), &runner.state.id, &task)
-            .await
-            .unwrap();
+        crate::base_recovery_control::recover(
+            &queue,
+            &home,
+            crate::base_recovery_control::Request {
+                request: "renewed".into(),
+                ..request
+            },
+        )
+        .await
+        .unwrap();
         runner.state = RunState::load(&runner.state.id).unwrap();
         runner.sync_to_base().await.unwrap();
         assert!(!runner.state.base_sync_blocked());

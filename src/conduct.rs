@@ -372,7 +372,9 @@ fn new_blocking_evidence(
                             && dep.status != TaskStatus::Done
                             && (dep.created_at > r.at
                                 || dep.held_at.is_some_and(|at| at > r.at)
-                                || dep.operator_decided_at.is_some_and(|at| at > r.at)
+                                || dep
+                                    .latest_operator_decision_at()
+                                    .is_some_and(|at| at > r.at)
                                 || dep.passes.iter().any(|p| p.settled_at > r.at)
                                 || (dep.status == TaskStatus::Blocked
                                     && dep.blocked_at.is_some_and(|at| at > r.at)))
@@ -710,6 +712,88 @@ fn repo_for(task: &Task, fallback: &Path) -> PathBuf {
     }
 }
 
+fn load_recovery_run(run: &str, home: &Path) -> Result<RunState> {
+    RunState::load_under(run, home).with_context(|| {
+        format!(
+            "unknown: run {run} state is unreadable; restore read access to a valid run record before rechecking eligibility"
+        )
+    })
+}
+
+fn check_resume_offer(queue: &Queue, task: &Task, run: &str, maintenance: bool) -> Result<()> {
+    anyhow::ensure!(crate::run::is_run_id(run), "resume needs an exact run ID");
+    let home = queue.root().parent().context("queue home is unknown")?;
+    let state = load_recovery_run(run, home)?;
+    if maintenance {
+        match queue.inspect_run_owner(run)? {
+            Some(owner) => crate::resume::inspect_queued(home, queue, &owner, &state),
+            None => crate::resume::inspect_ownerless(home, &state),
+        }
+    } else {
+        crate::resume::inspect_queued(home, queue, task, &state)
+    }
+}
+
+fn recovery_refusal(queue: &Queue, task: &Task, action: &ChoiceAction) -> Option<anyhow::Error> {
+    let result = match action {
+        ChoiceAction::Resume { run } => check_resume_offer(queue, task, run, false),
+        ChoiceAction::ResumeRun { run } => check_resume_offer(queue, task, run, true),
+        ChoiceAction::RecoverBase { run, stop, episode } => (|| {
+            anyhow::ensure!(crate::run::is_run_id(run), "recovery needs an exact run ID");
+            let home = queue.root().parent().context("queue home is unknown")?;
+            let state = load_recovery_run(run, home)?;
+            crate::graph::Runner::inspect_base_recovery(home, &state, task)?;
+            crate::base_recovery_control::check_stop_binding(&state, stop, *episode)
+        })(),
+        ChoiceAction::Requeue if crate::base_sync_recovery::held_task(queue, task) => {
+            let run = task.execution_runs().last().expect("held run");
+            check_resume_offer(queue, task, run, false)
+        }
+        _ => return None,
+    };
+    result.err()
+}
+
+fn guard_recovery_offers(queue: &Queue, task: &Task, q: &mut Question, d: &Decision) -> bool {
+    let mut rejected = Vec::new();
+    q.choices.retain(|label| {
+        let Some(error) = q
+            .actions
+            .get(label)
+            .and_then(|a| recovery_refusal(queue, task, a))
+        else {
+            return true;
+        };
+        rejected.push(format!("- {}: {error:#}", q.actions[label].describe()));
+        false
+    });
+    q.actions.retain(|label, _| q.choices.contains(label));
+    if q.actions.values().all(|a| matches!(a, ChoiceAction::Hold))
+        && let Some(QuestionDecision {
+            operation: QuestionOperation::Resume,
+            target: QuestionTarget::Run { id },
+        }) = &d.question_decision
+        && let Err(error) = check_resume_offer(queue, task, id, false)
+    {
+        rejected.push(format!("- Resume: {error:#}"));
+    }
+    if rejected.is_empty() {
+        return false;
+    }
+
+    q.summary = "実行できない復旧操作を除外しました".into();
+    q.detail = format!(
+        "提示しなかった操作と、再確認に必要な情報:\n{}",
+        rejected.join("\n")
+    );
+    let only_hold = q.actions.values().all(|a| matches!(a, ChoiceAction::Hold));
+    if only_hold {
+        q.detail
+            .push_str("\n利用可能な復旧操作は確認できません。再選択は不要です。");
+    }
+    only_hold
+}
+
 /// Apply one decision to the queue and the question store.
 ///
 /// Takes the task's own claim before touching it: a model call spans a whole
@@ -781,13 +865,8 @@ fn apply_one(
     }
 
     if crate::base_sync_recovery::held_task(queue, &task)
-        && (d.recovery == Some(Recovery::Requeue)
-            || d.question_decision
-                .as_ref()
-                .is_some_and(|q| q.operation == QuestionOperation::Resume)
-            || d.actions
-                .values()
-                .any(|a| matches!(a, ChoiceAction::Resume { .. })))
+        && d.recovery == Some(Recovery::Requeue)
+        && d.question.is_none()
     {
         // Additional base rebases require their own explicit authorization.
         return Ok(());
@@ -924,12 +1003,12 @@ fn apply_one(
         // `Question::run` is a task id for conductor questions, but ordinary
         // graph questions use it as a run id. A coincidental equality must
         // not block this task on an answer meant for another node.
-        let question_id = match questions
+        let (question_id, detail) = match questions
             .list_for_effects()
             .into_iter()
             .find(|q| q.status.open() && q.node == NODE && q.run == task.id)
         {
-            Some(existing) => existing.id,
+            Some(existing) => (existing.id, existing.detail),
             None => {
                 let mut q = Question::new(
                     task.id.clone(),
@@ -941,25 +1020,53 @@ fn apply_one(
                 );
                 q.actions = d.actions.clone();
                 crate::choice_effect::executable_conductor(&mut q);
+                if guard_recovery_offers(queue, &task, &mut q, d) {
+                    // An omitted recovery offer must not clear an independent
+                    // dependency, approval, or typed resource wait.
+                    if task.status == TaskStatus::Blocked || task.has_disk_capacity_cause() {
+                        return Ok(());
+                    }
+                    if task.status == TaskStatus::Held {
+                        // Hold reasons carry recovery state for other services.
+                        // A refused offer is a separate observation.
+                        if let Some(home) = queue.root().parent() {
+                            use crate::notices::{Link, Notice};
+                            crate::notices::raise_in(
+                                home,
+                                Notice::warn(&format!("task:{}:recovery-offer", task.id), q.detail)
+                                    .link(Link::Task {
+                                        id: task.id.clone(),
+                                    })
+                                    .since(task.held_at),
+                            );
+                        }
+                        return Ok(());
+                    }
+                    task.hold_machine(Some(q.detail));
+                    queue.put(&mut task)?;
+                    if let (Some(home), Some(notice)) =
+                        (queue.root().parent(), crate::notices::task_held(&task))
+                    {
+                        crate::notices::raise_in(home, notice);
+                    }
+                    return Ok(());
+                }
                 q.decision_context = Some(context);
                 // The wait is handed to a deputy (`crate::deputy`), so a
                 // free-text reply reaches an agent that knows why this was
                 // asked. The conductor still never blocks: this only records
                 // what the deputy will be told, and `serve` starts it.
                 q.deputy = Some(Deputy::new(crate::deputy::brief(
-                    &task.id,
-                    d.reason.as_deref().unwrap_or_default(),
-                    &q.choices,
-                    &q.actions,
+                    &task.id, &q.detail, &q.choices, &q.actions,
                 )));
                 if task.repo.is_dir() && task.repo != Path::new(".") {
                     q.cwd = Some(task.repo.to_string_lossy().into_owned());
                 }
                 questions.put_executable(&mut q)?;
-                q.id
+                (q.id, q.detail)
             }
         };
-        task.block(vec![question_id], d.reason.clone());
+        task.block(vec![question_id], Some(detail).filter(|s| !s.is_empty()));
         return queue.put(&mut task);
     }
 
@@ -1454,6 +1561,159 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn recovery_offer_filters_stops_and_rechecks_at_application() {
+        use crate::ask::Answer;
+        use crate::run::{BaseSync, Origin, RunStatus};
+        let dir = tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let questions = Questions::at(dir.path().join("questions"));
+        let unreadable = "20260101-000000-aaaa";
+        let unreadable_dir = dir.path().join("runs").join(unreadable);
+        std::fs::create_dir_all(&unreadable_dir).unwrap();
+        std::fs::write(unreadable_dir.join("run.json"), "{").unwrap();
+        for (initial_stop, stop_after_offer) in [(true, false), (false, false), (false, true)] {
+            let mut task = task("retain implementation");
+            let mut state = RunState::new(
+                dir.path().into(),
+                "main".into(),
+                "base".into(),
+                task.instruction.clone(),
+                Config::default(),
+            );
+            state.origin = Some(Origin::queue(&task.id));
+            state.status = RunStatus::Blocked;
+            state.driver_exited = true;
+            task.link_run(&state.id);
+            task.hold_machine(Some("retained work".into()));
+            queue.put(&mut task).unwrap();
+            let stop = |state: &mut RunState| {
+                state.base_sync = Some(BaseSync {
+                    tip: "base-tip".into(),
+                    behind: 2,
+                    attempts: 1,
+                    conflict: Some("rebase preparation: os error 267".into()),
+                    already_in: None,
+                });
+                state.record_base_sync_stop("candidate-head");
+            };
+            if initial_stop {
+                stop(&mut state);
+            }
+            state.save_under(dir.path()).unwrap();
+            let mut actions = serde_json::json!({
+                "resume": {"do":"resumerun","run":state.id},
+                "damaged": {"do":"resumerun","run":unreadable}
+            });
+            let mut choices = vec!["resume", "damaged", "hold"];
+            actions["hold"] = serde_json::json!({"do":"hold"});
+            if initial_stop {
+                actions["recover"] = serde_json::json!({"do":"recoverbase","run":state.id,
+                    "stop":state.base_sync_recovery.stop,"episode":0});
+                choices.push("recover");
+            }
+            let reply = serde_json::json!({"decisions":[{
+                "id":task.id,"question":"How should the retained run continue?",
+                "choices":choices,"actions":actions,
+            }]})
+            .to_string();
+            let cfg = config(mock_agent(dir.path(), REPLY, env(&reply)));
+            Conductor::new()
+                .run_once(
+                    &cfg,
+                    dir.path(),
+                    &queue,
+                    &questions,
+                    dir.path(),
+                    &[],
+                    &[],
+                    std::slice::from_ref(&task),
+                    1,
+                )
+                .await
+                .unwrap();
+            let filed = questions.list().into_iter().find(|q| q.run == task.id);
+            if initial_stop {
+                assert!(filed.is_none(), "no decision can advance this stop");
+                let held = queue.get(&task.id).unwrap();
+                assert_eq!(held.hold_reason.as_deref(), Some("retained work"));
+                let reason = recovery_offer_notice(dir.path(), &task.id);
+                assert!(
+                    reason.contains("1/4") && reason.contains("movement-exhaustion evidence"),
+                    "{reason}"
+                );
+                assert!(held.resume_override.is_none());
+                continue;
+            }
+            let mut question = filed.expect("healthy resume offer");
+            assert!(!question.choices.iter().any(|choice| choice == "damaged"));
+            assert!(!question.actions.contains_key("damaged"));
+            assert!(
+                question
+                    .detail
+                    .contains(&format!("unknown: run {unreadable} state is unreadable"))
+                    && question.detail.contains("restore read access"),
+                "{}",
+                question.detail
+            );
+            assert!(
+                question
+                    .deputy
+                    .as_ref()
+                    .unwrap()
+                    .brief
+                    .contains(&question.detail),
+                "the deputy must receive the same refusal and repair information"
+            );
+            assert_eq!(
+                question.actions["resume"],
+                ChoiceAction::ResumeRun {
+                    run: state.id.clone()
+                }
+            );
+            if stop_after_offer {
+                stop(&mut state);
+                state.save_under(dir.path()).unwrap();
+            }
+            question.answer(Answer::Choice("resume".into())).unwrap();
+            questions.put(&mut question).unwrap();
+            crate::daemon::apply_choice_actions(&queue, &questions, dir.path()).await;
+            let settled = queue.get(&task.id).unwrap();
+            let receipt: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(
+                    dir.path()
+                        .join("choice-actions")
+                        .join(format!("{}.json", question.id)),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            if stop_after_offer {
+                assert_eq!(settled.status, TaskStatus::Held);
+                assert!(settled.resume_override.is_none());
+                assert!(
+                    receipt["status"]
+                        .as_str()
+                        .unwrap()
+                        .contains("no eligible resume checkpoint")
+                );
+            } else {
+                assert_eq!(settled.status, TaskStatus::Queued);
+                assert_eq!(
+                    settled.resume_override.unwrap().pinned_run,
+                    Some(state.id.clone())
+                );
+                assert_eq!(receipt["status"], "applied");
+            }
+            assert!(
+                RunState::load_under(&state.id, dir.path())
+                    .unwrap()
+                    .passes
+                    .is_empty()
+            );
+        }
+    }
+
     #[test]
     fn delivery_bookkeeping_does_not_restart_conductor_deliberation() {
         let mut t = task("waiting");
@@ -1512,6 +1772,585 @@ mod tests {
         std::fs::write(dir.join("change.txt"), "x\n").unwrap();
         run(&["add", "-A"]);
         run(&["commit", "-m", "candidate work"]);
+    }
+
+    #[tokio::test]
+    async fn recovery_offer_requires_pending_base_authorization_publication_and_head() {
+        use crate::run::{BaseSync, Origin, RunStatus};
+        use serde_json::json;
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo_with_branch(&repo, "candidate");
+        let approved = crate::git::rev_parse(&repo, "HEAD").await.unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let questions = Questions::at(dir.path().join("questions"));
+        let mut task = task("resume approved movement recovery");
+        task.repo = repo.clone();
+        let mut state = RunState::new(
+            repo.clone(),
+            "main".into(),
+            "base".into(),
+            task.instruction.clone(),
+            Config::default(),
+        );
+        state.driver_exited = true;
+        state.status = RunStatus::Blocked;
+        state.origin = Some(Origin::queue(&task.id));
+        state.candidates = serde_json::from_value(json!([
+            {"index":0,"label":"A","agent":"fixture","branch":"candidate","worktree":repo}
+        ]))
+        .unwrap();
+        state.tally = Some(
+            serde_json::from_value(json!({
+                "first_choice":{},"borda":{},"winner":"A","unanimous_initial":true,
+                "unanimous_final":true,"deliberated":false,"changed_votes":0,"met_quorum":true,
+            }))
+            .unwrap(),
+        );
+        state.base_sync = Some(BaseSync {
+            tip: "base-tip".into(),
+            behind: 2,
+            attempts: 4,
+            conflict: Some("main moved 2 commit(s) ahead of candidate after 4 rebase(s); rebasing again would only race it".into()),
+            already_in: None,
+        });
+        state.ensure_base_episode();
+        state.record_base_sync_stop(&approved);
+        state.authorize_base_sync(&task.id).unwrap();
+        state.save_under(dir.path()).unwrap();
+        task.link_run(&state.id);
+        task.hold_machine(Some("retained work".into()));
+        queue.put(&mut task).unwrap();
+        check_resume_offer(&queue, &task, &state.id, true).unwrap();
+        let mut published = task.clone();
+        published.release_operator("base-recovery", None);
+        let decision = "2026-01-01T00:00:00Z".parse().unwrap();
+        published.operator_decided_at = Some(decision);
+        published.resumption.as_mut().unwrap().at = decision;
+        let key = "owner-chat/interrupted";
+        published.base_recovery_requests.push(key.into());
+        published.hold_machine(Some("retained work".into()));
+        let authorization = state.base_sync_recovery.authorizations.last_mut().unwrap();
+        authorization.request = Some(key.into());
+        authorization.generation = published.resumption.as_ref().map(|r| r.generation);
+        authorization.decision = published.operator_decided_at;
+        let tip = crate::git::rev_parse(&repo, "main").await.unwrap();
+        authorization.scope = Some(crate::base_sync_recovery::Scope {
+            tip: tip.clone(),
+            instruction: task.instruction.clone(),
+            episode: state.base_sync_recovery.episodes.last().unwrap().id,
+        });
+        let tracking = "refs/remotes/origin/main";
+        crate::git::git(&repo, &["update-ref", tracking, &tip])
+            .await
+            .unwrap();
+        state.save_under(dir.path()).unwrap();
+        let authorization = state.base_sync_recovery.authorizations.last().unwrap();
+
+        let verdict = maintenance_resume_verdict(&task, &state);
+        apply(&queue, &questions, &verdict).unwrap();
+        assert!(questions.list().is_empty());
+        let reason = recovery_offer_notice(dir.path(), &task.id);
+        assert!(reason.contains("has not been published to the queue"));
+        assert!(reason.contains("owner-chat/interrupted.json"));
+        let task_path = queue.path_of(&task.id);
+        let before = std::fs::read(&task_path).unwrap();
+        assert!(crate::resume::pin_queued(&queue, &state.id, None, None).is_err());
+        assert_eq!(std::fs::read(&task_path).unwrap(), before);
+
+        queue.put(&mut published).unwrap();
+        check_resume_offer(&queue, &published, &state.id, true).unwrap();
+        for web in [false, true] {
+            let mut manual = published.clone();
+            if web {
+                crate::resume::prepare_pin(
+                    &queue,
+                    dir.path(),
+                    &mut manual,
+                    &state,
+                    None,
+                    crate::resume::PinSource::Web,
+                )
+                .unwrap();
+            } else {
+                crate::prepare_cli_pin(&queue, &mut manual, &state.id).unwrap();
+            }
+            assert_eq!(manual.status, TaskStatus::Queued);
+            assert_eq!(
+                manual.resume_override.as_ref().unwrap().pinned_run.as_ref(),
+                Some(&state.id)
+            );
+            assert_eq!(
+                crate::base_recovery_control::queue_binding_refusal(authorization, &manual),
+                None
+            );
+        }
+
+        // Move only the observed base, not the retained winner or approval.
+        let tree = format!("{tip}^{{tree}}");
+        let later_tip = crate::git::git(
+            &repo,
+            &["commit-tree", &tree, "-p", &tip, "-m", "Advance upstream"],
+        )
+        .await
+        .unwrap();
+        crate::git::git(&repo, &["update-ref", tracking, &later_tip])
+            .await
+            .unwrap();
+        let facts =
+            crate::repair_budget::legacy::recovery_facts(&queue, dir.path(), &published, &state);
+        assert_eq!(facts["resume"]["status"], "refused");
+        let reason = facts["resume"]["reason"].as_str().unwrap();
+        assert!(reason.contains(&later_tip) && reason.contains(&tip));
+        assert!(reason.contains("not a fresh fetch"));
+        let run_path = dir.path().join("runs").join(&state.id).join("run.json");
+        let approval_before = std::fs::read(&run_path).unwrap();
+        let mut delayed_hold = Question::new(
+            task.id.clone(),
+            NODE.into(),
+            SEAT.into(),
+            "Hold?".into(),
+            String::new(),
+            vec!["hold".into()],
+        );
+        delayed_hold
+            .actions
+            .insert("hold".into(), ChoiceAction::Hold);
+        delayed_hold
+            .answer(crate::ask::Answer::Choice("hold".into()))
+            .unwrap();
+        delayed_hold.answered_at = Some("2026-01-01T00:00:01Z".parse().unwrap());
+        delayed_hold.asked_at = delayed_hold.answered_at.unwrap();
+        delayed_hold.accepted_answer_at = delayed_hold.answered_at;
+        questions.put(&mut delayed_hold).unwrap();
+        assert!(crate::resume::pin_queued(&queue, &state.id, None, None).unwrap());
+        crate::daemon::apply_task_choice_actions(&queue, &questions, dir.path());
+        published = queue.get(&task.id).unwrap();
+        assert_eq!(published.status, TaskStatus::Queued);
+        assert!(published.action_applied(&delayed_hold.id));
+        assert_eq!(
+            crate::base_recovery_control::queue_binding_refusal(authorization, &published),
+            None
+        );
+        assert_eq!(
+            std::fs::read(&run_path).unwrap(),
+            approval_before,
+            "the live driver, not queue admission, disposes of a stale approval"
+        );
+        crate::git::git(&repo, &["update-ref", tracking, &tip])
+            .await
+            .unwrap();
+
+        // An already-filed legacy Resume uses the same exact-run pin as
+        // maintenance ResumeRun without spending the approval generation.
+        let mut question = Question::new(
+            task.id.clone(),
+            NODE.into(),
+            SEAT.into(),
+            "Resume?".into(),
+            String::new(),
+            vec!["resume".into()],
+        );
+        question.actions.insert(
+            "resume".into(),
+            ChoiceAction::Resume {
+                run: state.id.clone(),
+            },
+        );
+        questions.put_executable(&mut question).unwrap();
+        published.block(vec![question.id.clone()], None);
+        queue.put(&mut published).unwrap();
+        question
+            .answer(crate::ask::Answer::Choice("resume".into()))
+            .unwrap();
+        questions.put(&mut question).unwrap();
+        crate::daemon::apply_task_choice_actions(&queue, &questions, dir.path());
+        let queued = queue.get(&task.id).unwrap();
+        assert_eq!(queued.status, TaskStatus::Queued);
+        assert_eq!(queued.operator_decided_at, published.operator_decided_at);
+        assert_eq!(
+            queued.resumption.as_ref().unwrap().generation,
+            published.resumption.as_ref().unwrap().generation,
+        );
+        let pin = queued.resume_override.as_ref().unwrap();
+        assert_eq!(pin.pinned_run.as_ref(), Some(&state.id));
+        assert_eq!(pin.question_id, question.id);
+
+        crate::git::git(
+            &repo,
+            &["commit", "--allow-empty", "-m", "Advance kept work"],
+        )
+        .await
+        .unwrap();
+        let moved = crate::git::rev_parse(&repo, "HEAD").await.unwrap();
+        let reason = check_resume_offer(&queue, &queued, &state.id, true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            reason.contains(&format!("retained HEAD changed from {approved} to {moved}")),
+            "{reason}"
+        );
+        assert_eq!(
+            queue
+                .get(&task.id)
+                .unwrap()
+                .resume_override
+                .unwrap()
+                .question_id,
+            question.id
+        );
+        assert!(
+            RunState::load_under(&state.id, dir.path())
+                .unwrap()
+                .base_recovery_pending()
+        );
+    }
+
+    #[test]
+    fn recovery_offer_requires_the_saved_implementer_count_for_ordinary_resume() {
+        use crate::run::{Origin, RunStatus};
+        let home = tempdir().unwrap();
+        let queue = Queue::at(home.path().join("queue"));
+        let questions = Questions::at(home.path().join("questions"));
+        let mut task = task("retain implementation");
+        let mut state = RunState::new(
+            task.repo.clone(),
+            "main".into(),
+            "base".into(),
+            task.instruction.clone(),
+            Config::default(),
+        );
+        state.origin = Some(Origin::queue(&task.id));
+        state.status = RunStatus::Blocked;
+        state.driver_exited = true;
+        state.config.graph.implementers = 2;
+        state.save_under(home.path()).unwrap();
+        task.link_run(&state.id);
+        task.hold_machine(Some("retained work".into()));
+        queue.put(&mut task).unwrap();
+        check_resume_offer(&queue, &task, &state.id, true).unwrap();
+
+        task.solo = true;
+        queue.put(&mut task).unwrap();
+        apply(
+            &queue,
+            &questions,
+            &maintenance_resume_verdict(&task, &state),
+        )
+        .unwrap();
+        assert!(questions.list().is_empty());
+        let reason = recovery_offer_notice(home.path(), &task.id);
+        assert!(
+            reason.contains("saved count: 2") && reason.contains("requested count: Some(1)"),
+            "{reason}"
+        );
+        assert_eq!(queue.get(&task.id).unwrap().status, TaskStatus::Held);
+    }
+
+    fn recovery_offer_notice(home: &Path, task: &str) -> String {
+        crate::notices::Notices::at(home.join("notifications"))
+            .list()
+            .into_iter()
+            .find(|notice| notice.key == format!("task:{task}:recovery-offer"))
+            .expect("refusal notice")
+            .message
+    }
+
+    #[test]
+    fn recovery_offer_preserves_release_watch_hold() {
+        let dir = tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let questions = Questions::at(dir.path().join("questions"));
+        let mut task = task("wait for the release watcher");
+        let mut state = RunState::new(
+            dir.path().into(),
+            "main".into(),
+            "base".into(),
+            task.instruction.clone(),
+            Config::default(),
+        );
+        state.status = crate::run::RunStatus::Merged;
+        state.driver_exited = true;
+        state.save_under(dir.path()).unwrap();
+        task.link_run(&state.id);
+        task.hold_machine(Some("[release] recorded upload failure".into()));
+        queue.put(&mut task).unwrap();
+        let before = std::fs::read(queue.path_of(&task.id)).unwrap();
+
+        apply(
+            &queue,
+            &questions,
+            &maintenance_resume_verdict(&task, &state),
+        )
+        .unwrap();
+
+        assert!(questions.list().is_empty());
+        assert_eq!(std::fs::read(queue.path_of(&task.id)).unwrap(), before);
+        assert!(recovery_offer_notice(dir.path(), &task.id).contains(&state.id));
+    }
+
+    #[test]
+    fn recovery_offer_requires_proof_that_a_legacy_run_is_ownerless() {
+        let home = tempdir().unwrap();
+        let queue = Queue::at(home.path().join("queue"));
+        let questions = Questions::at(home.path().join("questions"));
+        let mut task = task("inspect a retained execution");
+        task.hold_machine(Some("needs investigation".into()));
+        queue.put(&mut task).unwrap();
+        let mut state = RunState::new(
+            task.repo.clone(),
+            "main".into(),
+            "base".into(),
+            task.instruction.clone(),
+            Config::default(),
+        );
+        state.status = crate::run::RunStatus::Blocked;
+        state.driver_exited = true;
+        state.save_under(home.path()).unwrap();
+        let verdict = maintenance_resume_verdict(&task, &state);
+        let broken = queue.root().join("unreadable.json");
+        std::fs::write(&broken, "{").unwrap();
+        apply(&queue, &questions, &verdict).unwrap();
+        assert!(questions.list().is_empty());
+        assert!(recovery_offer_notice(home.path(), &task.id).contains("unknown"));
+
+        std::fs::remove_file(broken).unwrap();
+        apply(&queue, &questions, &verdict).unwrap();
+        let question = questions.list().pop().expect("ownerless resume offer");
+        assert_eq!(
+            question.actions.get("resume"),
+            Some(&ChoiceAction::ResumeRun { run: state.id })
+        );
+    }
+
+    fn maintenance_resume_verdict(task: &Task, state: &RunState) -> Verdict {
+        serde_json::from_value(serde_json::json!({"decisions":[{
+            "id":task.id,"question":"Resume?",
+            "choices":["resume", "hold"],
+            "actions":{"resume":{"do":"resumerun","run":state.id},"hold":{"do":"hold"}},
+        }]}))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn recovery_offer_applies_conflict_grant_only_with_matching_head_and_no_other_blocker() {
+        use crate::repair_budget::{Kind, Receipt, Request};
+        use crate::run::{BaseSync, Origin, RunStatus};
+        use serde_json::json;
+        let dir = tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo_with_branch(&repo, "candidate");
+        let tip = crate::git::rev_parse(&repo, "main").await.unwrap();
+        crate::git::git(&repo, &["update-ref", "refs/remotes/origin/main", &tip])
+            .await
+            .unwrap();
+        let original = crate::git::rev_parse(&repo, "HEAD").await.unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let questions = Questions::at(dir.path().join("questions"));
+        let mut dependency = task("independent prerequisite");
+        queue.put(&mut dependency).unwrap();
+
+        use crate::repair_budget::{Applied, Phase};
+        for change in [
+            "none",
+            "dependency",
+            "reviewing",
+            "gating",
+            "fixing-dirty",
+            "fixing-detached",
+            "head",
+            "repaired-head",
+        ] {
+            let approved = if change == "repaired-head" {
+                crate::git::rev_parse(&repo, "HEAD").await.unwrap()
+            } else {
+                original.clone()
+            };
+            let mut task = task("retain conflict repair");
+            task.repo = repo.clone();
+            let mut state = RunState::new(
+                repo.clone(),
+                "main".into(),
+                tip.clone(),
+                task.instruction.clone(),
+                Config::default(),
+            );
+            state.driver_exited = true;
+            state.status = RunStatus::Blocked;
+            state.origin = Some(Origin::queue(&task.id));
+            state.candidates = serde_json::from_value(json!([
+                {"index":0,"label":"A","agent":"fixture","branch":"candidate","worktree":repo}
+            ]))
+            .unwrap();
+            state.tally = Some(
+                serde_json::from_value(json!({
+                    "first_choice":{},"borda":{},"winner":"A","unanimous_initial":true,
+                    "unanimous_final":true,"deliberated":false,"changed_votes":0,"met_quorum":true,
+                }))
+                .unwrap(),
+            );
+            state.base_sync = Some(BaseSync {
+                tip: tip.clone(),
+                behind: 1,
+                attempts: 1,
+                conflict: Some("candidate conflicts with origin/main and did not rebase".into()),
+                already_in: None,
+            });
+            state.record_base_sync_stop(&approved);
+            state.save_under(dir.path()).unwrap();
+            task.link_run(&state.id);
+            task.hold_machine(Some("retained conflict".into()));
+            task.repair_grants.push(Receipt {
+                request: Request {
+                    task: task.id.clone(),
+                    run: state.id.clone(),
+                    kind: Kind::BaseConflict,
+                    rounds: 1,
+                    head: approved.clone(),
+                    expect_pass: 0,
+                    request: "repair".into(),
+                    reason: "Resolve conflict".into(),
+                    tip: Some(tip.clone()),
+                    instruction: Some("Keep both changes".into()),
+                    replace_request: None,
+                    evidence_digest: None,
+                },
+                at: jiff::Timestamp::now(),
+                decision: task.operator_decided_at,
+                contract: crate::repair_budget::contract(&task, Kind::BaseConflict).unwrap(),
+                stop: state.base_sync_recovery.stop.clone(),
+                legacy: None,
+            });
+            let phase = match change {
+                "reviewing" | "repaired-head" => Some(Phase::Reviewing),
+                "gating" => Some(Phase::Gating),
+                "fixing-dirty" | "fixing-detached" => Some(Phase::Fixing),
+                _ => None,
+            };
+            if let Some(phase) = phase {
+                state.repair_grants.push(Applied {
+                    receipt: task.repair_grants[0].clone(),
+                    spent: 1,
+                    phase,
+                    review_start: 0,
+                    head: if change == "repaired-head" {
+                        crate::git::git(&repo, &["commit", "--allow-empty", "-m", "Repair result"])
+                            .await
+                            .unwrap();
+                        crate::git::rev_parse(&repo, "HEAD").await.unwrap()
+                    } else {
+                        approved.clone()
+                    },
+                    succeeded: false,
+                    conflict: None,
+                });
+                state.save_under(dir.path()).unwrap();
+                let tracking_tip = if phase == Phase::Fixing {
+                    &tip
+                } else {
+                    &approved
+                };
+                crate::git::git(
+                    &repo,
+                    &["update-ref", "refs/remotes/origin/main", tracking_tip],
+                )
+                .await
+                .unwrap();
+            }
+            queue.put(&mut task).unwrap();
+            let verdict = maintenance_resume_verdict(&task, &state);
+            if change == "repaired-head" {
+                check_resume_offer(&queue, &task, &state.id, true).unwrap();
+            }
+            if change == "fixing-dirty" {
+                std::fs::write(repo.join("change.txt"), "interrupted edits\n").unwrap();
+                check_resume_offer(&queue, &task, &state.id, true).unwrap();
+                assert!(crate::resume::pin_queued(&queue, &state.id, None, None).unwrap());
+                assert_eq!(queue.get(&task.id).unwrap().status, TaskStatus::Queued);
+                std::fs::write(repo.join("change.txt"), "x\n").unwrap();
+                continue;
+            }
+            if change == "fixing-detached" {
+                check_resume_offer(&queue, &task, &state.id, true).unwrap();
+                crate::git::git(&repo, &["checkout", "--detach", &approved])
+                    .await
+                    .unwrap();
+                let before = std::fs::read(queue.path_of(&task.id)).unwrap();
+                let error = crate::resume::pin_queued(&queue, &state.id, None, None).unwrap_err();
+                assert!(error.is::<crate::resume::BeforeQueueWrite>(), "{error:#}");
+                assert_eq!(std::fs::read(queue.path_of(&task.id)).unwrap(), before);
+                apply(&queue, &questions, &verdict).unwrap();
+                assert!(!questions.list().iter().any(|q| q.run == task.id));
+                assert!(
+                    recovery_offer_notice(dir.path(), &task.id)
+                        .contains("interrupted fixer branch ownership changed")
+                );
+                crate::git::git(&repo, &["checkout", "candidate"])
+                    .await
+                    .unwrap();
+                continue;
+            }
+            if matches!(change, "head" | "repaired-head") {
+                crate::git::git(&repo, &["commit", "--allow-empty", "-m", "Move winner"])
+                    .await
+                    .unwrap();
+                crate::git::git(&repo, &["update-ref", "refs/remotes/origin/main", &tip])
+                    .await
+                    .unwrap();
+                let before = std::fs::read(queue.path_of(&task.id)).unwrap();
+                let error = crate::resume::pin_queued(&queue, &state.id, None, None).unwrap_err();
+                assert!(error.is::<crate::resume::BeforeQueueWrite>(), "{error:#}");
+                assert_eq!(std::fs::read(queue.path_of(&task.id)).unwrap(), before);
+                apply(&queue, &questions, &verdict).unwrap();
+                assert!(!questions.list().iter().any(|q| q.run == task.id));
+                let facts =
+                    crate::repair_budget::legacy::recovery_facts(&queue, dir.path(), &task, &state);
+                assert_eq!(facts["resume"]["status"], "refused");
+                assert!(
+                    recovery_offer_notice(dir.path(), &task.id)
+                        .contains("winner branch/head changed")
+                );
+                continue;
+            }
+
+            if change == "none" {
+                let obstruction = queue.path_of(&task.id).with_extension("json.tmp");
+                std::fs::create_dir(&obstruction).unwrap();
+                let error = crate::resume::pin_queued(&queue, &state.id, None, None).unwrap_err();
+                assert!(!error.is::<crate::resume::BeforeQueueWrite>(), "{error:#}");
+                std::fs::remove_dir(obstruction).unwrap();
+            }
+            apply(&queue, &questions, &verdict).unwrap();
+            let mut question = questions
+                .list()
+                .into_iter()
+                .find(|q| q.run == task.id)
+                .unwrap();
+            let mut blocked = queue.get(&task.id).unwrap();
+            assert_eq!(blocked.blocked_by, [question.id.clone()]);
+            if change == "dependency" {
+                blocked.blocked_by.push(dependency.id.clone());
+                queue.put(&mut blocked).unwrap();
+            }
+            question
+                .answer(crate::ask::Answer::Choice("resume".into()))
+                .unwrap();
+            questions.put(&mut question).unwrap();
+            crate::daemon::apply_choice_actions(&queue, &questions, dir.path()).await;
+            let after = queue.get(&task.id).unwrap();
+            assert_eq!(after.operator_decided_at, task.operator_decided_at);
+            if change == "dependency" {
+                assert_eq!(after.status, TaskStatus::Blocked);
+                assert_eq!(after.blocked_by, [dependency.id.clone()]);
+                assert!(after.resume_override.is_none());
+            } else {
+                assert_eq!(after.status, TaskStatus::Queued);
+                assert!(after.blocked_by.is_empty());
+                assert_eq!(after.resume_override.unwrap().pinned_run, Some(state.id));
+            }
+        }
     }
 
     fn review_round_with_finding(

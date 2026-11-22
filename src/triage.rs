@@ -1035,7 +1035,9 @@ fn apply_deps_answer(
     if root.triage_applied(&q.id) {
         return false;
     }
-    if root.operator_decided_at.is_some_and(|at| at > q.asked_at)
+    if root
+        .latest_operator_decision_at()
+        .is_some_and(|at| at > q.asked_at)
         || q.triage_generation
             .is_some_and(|g| g != root.resumption.as_ref().map_or(0, |r| r.generation))
     {
@@ -1291,13 +1293,15 @@ pub fn apply_answers(queue: &Queue, questions: &Questions) -> Vec<String> {
         let mut newer_decision = q.triage_generation.is_some_and(|g| g != generation)
             || task.resumption.as_ref().is_some_and(|r| r.at > q.asked_at)
             || task.held_at.is_some_and(|at| at > q.asked_at)
-            || task.operator_decided_at.is_some_and(|at| at > q.asked_at);
+            || task
+                .latest_operator_decision_at()
+                .is_some_and(|at| at > q.asked_at);
         // A later explicit keep-held answer is itself a newer operator
         // decision, even when the question predates the release. Resume and
         // discard still require the question's original scope to match.
         if matches!(action, AnswerAction::KeepHeld)
             && q.answered_at.is_some_and(|at| {
-                task.operator_decided_at
+                task.latest_operator_decision_at()
                     .is_none_or(|decision| at > decision)
                     && task.resumption.as_ref().is_none_or(|r| at > r.at)
             })
@@ -1382,7 +1386,9 @@ fn untouched_disk_question(q: &Question, task: &Task) -> bool {
         && q.routed_task.as_deref().is_none_or(|id| id == task.id)
         && q.triage_generation == Some(task.resumption.as_ref().map_or(0, |r| r.generation))
         && task.held_at.is_some_and(|at| q.asked_at >= at)
-        && task.operator_decided_at.is_none_or(|at| at <= q.asked_at)
+        && task
+            .latest_operator_decision_at()
+            .is_none_or(|at| at <= q.asked_at)
         && q.answer.is_none()
         && q.answered_at.is_none()
         && q.accepted_answer_at.is_none()
@@ -1853,7 +1859,9 @@ fn awaiting_task_chat(q: &Question, task: &Task) -> bool {
         && q.routed_chat.is_some()
         && !already_applied(task, q)
         && task.resumption.as_ref().map_or(0, |r| r.generation) == q.triage_generation.unwrap_or(0)
-        && task.operator_decided_at.is_none_or(|at| at <= q.asked_at)
+        && task
+            .latest_operator_decision_at()
+            .is_none_or(|at| at <= q.asked_at)
 }
 
 /// Is the latest [`DEPS_NODE`] question about `task` still open, or answered
@@ -2796,6 +2804,28 @@ mod tests {
             limit_secs: 10,
         };
         state.save_under(dir.path()).unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let questions = Questions::at(dir.path().join("questions"));
+        queue.put(&mut task).unwrap();
+        let hold_reason = task.hold_reason.clone();
+        let hold_at = task.held_at;
+        let other_run = "20260101-000000-aaaa";
+        let verdict = serde_json::from_value(serde_json::json!({"decisions":[{
+            "id":task.id, "question":"Resume another run?",
+            "choices":["resume","hold"], "actions":{
+                "resume":{"do":"resumerun","run":other_run}, "hold":{"do":"hold"}
+            }
+        }]}))
+        .unwrap();
+        crate::conduct::apply(&queue, &questions, &verdict).unwrap();
+        task = queue.get(&task.id).unwrap();
+        assert_eq!(task.hold_reason, hold_reason);
+        assert_eq!(task.held_at, hold_at);
+        assert!(questions.list().is_empty());
+        let notices = crate::notices::Notices::at(dir.path().join("notifications")).list();
+        assert!(notices.iter().any(|notice| {
+            notice.message.contains(other_run) && notice.message.contains("unreadable")
+        }));
         assert_eq!(
             machine_cause_resolved_under(&task, &cfg, dir.path()),
             Some(true)

@@ -134,6 +134,77 @@ repository, branch, original HEAD, current HEAD, clean tree and recorded picks
 must match the reserved operation. Validation is saved before cleanup; refused
 or incomplete evidence stays intact for inspection and grants no new attempt.
 
+## Read-only recommendations
+
+`magi task inspect-base-stop <task> --run <full-run>` reports the current owner,
+retained branch head, stop classification, interval budget, scratch presence
+and recovery eligibility without fetching or writing records. A local tracking
+ref is not fresh remote evidence. `recover-base` is locally eligible only for
+proven movement exhaustion with a matching clean retained checkout; execution
+still fetches and revalidates under its leases. An unknown stop with unused
+budget and no recovery checkpoint does not admit ordinary resume or a new
+interval. Keep the retained work and diagnose the missing Git or execution
+evidence; do not reset the budget or pick a different spelling of resume.
+
+The conductor removes unavailable typed resume/recovery choices before saving
+new questions. The question detail and deputy brief share the refusal reasons
+and missing prerequisites. An unreadable run record leaves eligibility unknown
+until a valid record can be read. If only a hold remains, the conductor records
+the reason instead of requesting a choice. A previously offered operation can
+still be refused if its target changes before application.
+A pending movement authorization does not make resume eligible if its saved
+head no longer matches the clean retained checkout and winner branch. For a
+standing-control request, the queue must also record its publication and the
+matching owner generation. If publication was interrupted, repeat the original
+`recover-base` request with the same ID and arguments from its receipt; ordinary
+resume cannot complete publication.
+CLI, Web, and chat resumes (including typed choices) preserve an already
+published approval's owner generation and decision timestamp. The resume
+records a separate timestamp so an older, not-yet-applied answer cannot undo
+it. A local tracking ref that no longer matches the approval's scope blocks
+the recommendation.
+An explicit CLI, Web, or chat resume can still queue the existing run: the
+driver fetches and can invalidate the stale approval without spending a new
+synchronization slot. If invalidated, authorize recovery with a new request.
+An unpublished authorization or changed owner binding still refuses resume.
+
+A pending textual-conflict repair is not offered for resume if its approved
+tip differs from the local tracking ref before or during repair, or if an
+unimported grant no longer matches the clean retained checkout, branch and
+approved HEAD. An interrupted fixer may retain uncommitted edits, but its
+checkout must still be attached to the winner branch and match that branch's
+current ref. Once the repair reaches review or gate, the original conflict
+tip no longer blocks continuation, but the retained checkout must match the
+saved repaired HEAD. Execution revalidates the applicable evidence. A
+maintenance resume answer can resolve its own question blocker, but cannot
+bypass an independent dependency.
+When the run retains an operator checkout, that checkout must independently
+pass the same read-only validation used by the driver. A completed conflict
+repair with failed confirmation needs a separate grant for the remaining
+failure, not ordinary resume.
+A native resume decision refused before the queue write can be retried or
+settled; a failed queue write still has an uncertain result.
+Suppressing an unrelated recovery offer keeps existing cache and release holds
+intact and records the refusal separately.
+Ordinary resume and movement-recovery offers both use the dispatcher's saved
+implementer check; restore a mismatched seat selection before requesting either.
+Diagnostic reads do not upgrade saved approval cards.
+An ownerless legacy run can receive a maintenance resume offer only when the
+queue can be read, neither task records nor the run name an owner, and no
+other work is active. An unreadable ownership record is not proof of absence.
+
+Chat refreshes current run evidence for task notices and decision messages.
+The latest review's recorded E2E commands and failure tails are reported with
+both the reviewed and verified heads, even when they do not apply to the target
+head. `applies_to_target` is true only when both heads match the target and E2E
+was recorded without deferral. The `head_e2e` and `gate_repair_e2e` records
+carry their own target SHA and results separately from the review and final
+gate. Neither an older round nor a gate on another head stands in for a
+missing current result.
+Command evidence is capped at 24 entries per result, with failures shown
+first when capped. Totals include all recorded commands, failures and omitted
+entries; a matching head alone does not mean verification passed.
+
 ## Verification
 
 Run `RUSTUP_TOOLCHAIN=stable cargo test --locked --test chat_base_recovery` for

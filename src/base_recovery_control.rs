@@ -161,21 +161,13 @@ impl Transaction {
             ensure!(
                 owner == &task.id
                     && task
-                        .operator_decided_at
+                        .latest_operator_decision_at()
                         .is_none_or(|decision| decision <= *at),
                 "recovery decision has stale task ownership or was superseded"
             );
         }
         if let Some((stop, episode)) = &self.request.expected_stop {
-            ensure!(
-                state.base_sync_recovery.stop.as_ref() == Some(stop)
-                    && state
-                        .base_sync_recovery
-                        .episodes
-                        .last()
-                        .is_some_and(|e| e.id == *episode),
-                "recovery decision names a stale stop or interval"
-            );
+            check_stop_binding(state, stop, *episode)?;
         }
         let binding = serde_json::json!({"task": task, "stop": state.base_sync_recovery.stop, "tip": tip, "episode": state.base_sync_recovery.episodes.last().map(|e| e.id)});
         if let Some(receipt) = &self.receipt {
@@ -240,6 +232,46 @@ impl Transaction {
         receipt.applied = true;
         save(&self.path, receipt)
     }
+}
+
+/// Queue publication and the owner decision are separate from the run save.
+/// Both a read-only recommendation and consumption require this binding.
+pub(crate) fn queue_binding_refusal(
+    authorization: &crate::base_sync_recovery::Authorization,
+    task: &Task,
+) -> Option<&'static str> {
+    if let Some(key) = &authorization.request
+        && !task.base_recovery_requests.contains(key)
+    {
+        return Some("recovery authorization has not been published to the queue");
+    }
+    if authorization
+        .generation
+        .is_some_and(|g| task.resumption.as_ref().is_none_or(|r| r.generation != g))
+    {
+        return Some("owner approval generation changed");
+    }
+    if authorization.request.is_some() && task.operator_decided_at != authorization.decision {
+        return Some("owner decision changed");
+    }
+    None
+}
+
+pub(crate) fn check_stop_binding(
+    state: &RunState,
+    stop: &crate::base_sync_recovery::Stop,
+    episode: usize,
+) -> Result<()> {
+    ensure!(
+        state.base_sync_recovery.stop.as_ref() == Some(stop)
+            && state
+                .base_sync_recovery
+                .episodes
+                .last()
+                .is_some_and(|e| e.id == episode),
+        "recovery decision names a stale stop or interval"
+    );
+    Ok(())
 }
 
 /// Project only the durable authorization-and-queue effect of this exact choice.
@@ -312,7 +344,7 @@ pub(crate) fn decision_current(
     let Some(home) = queue.root().parent() else {
         return false;
     };
-    let Ok(q) = crate::ask::Questions::at(home.join("questions")).get_for_effects(question) else {
+    let Ok(q) = crate::ask::Questions::at(home.join("questions")).read_for_effects(question) else {
         return false;
     };
     let tasks = queue.list();
