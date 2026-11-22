@@ -38,7 +38,7 @@ use tokio::sync::Notify;
 use crate::ask::{self, Questions};
 use crate::clean;
 use crate::conduct::Conductor;
-use crate::config::{Config, MergeMode};
+use crate::config::{BuildCache, Config, MergeMode};
 use crate::graph::Runner;
 use crate::land;
 use crate::notices::{self, Link, Notice};
@@ -3995,6 +3995,9 @@ pub async fn run_service_worker(home: &Path, payload: serde_json::Value) -> Resu
                 if let Err(e) = clean::prune_cache_if_over_limit(&cfg, home) {
                     tracing::warn!("disk pressure cache cleanup failed: {e:#}");
                 }
+                if let Err(e) = crate::build_target::prune_registered(home, &cfg.disk) {
+                    tracing::warn!("disk pressure isolated build cleanup failed: {e:#}");
+                }
                 for current in current_work(home, Timestamp::now()) {
                     if let Ok(state) = RunState::load_under(&current.run, home)
                         && let Some(reason) = disk_gate(&state.repo, &state.config)
@@ -4803,36 +4806,6 @@ async fn attempt(
         task.recovery_admission = Some(crate::queue::RecoveryAdmission { base: head, inputs });
     }
 
-    // The free-space gate, checked *before* anything is minted: a task that
-    // waits out a full disk costs nothing yet, and must not spend an attempt
-    // or start a run the machine cannot finish. Held tasks stay in the list
-    // for the human to see; triage requeues them automatically when capacity
-    // and output reservations permit the same execution to resume. A volume whose free
-    // space cannot be measured closes the gate too: starting a run blind on a
-    // disk that may be full is how the machine ends up with 6.7 GB free.
-    if let Some(reason) = disk_gate(&repo, &config) {
-        task.notice_cause("disk-space", None, None);
-        task.last_error = Some(reason.clone());
-        let disk_checked_at = task.disk_checked_at;
-        task.hold_machine(Some(reason.clone()));
-        task.mark_disk_capacity();
-        task.disk_checked_at = disk_checked_at;
-        record(queue, task);
-        tracing::warn!("holding {} for want of disk space: {reason}", task.short());
-        // Stable wording - the free-space figures live in the task's hold
-        // reason, and changing numbers would relight the bell every poll.
-        notices::raise(
-            Notice::warn(
-                &format!("disk:{}", repo.display()),
-                format!("Task {} is waiting for disk space. It will resume automatically when disk and output admission checks succeed.", task.id),
-            )
-            .link(Link::Task {
-                id: task.id.clone(),
-            }),
-        );
-        return Vec::new();
-    }
-
     // A resumable run of this task is carried on, never re-competed. The
     // candidates are built and paid for, and a fresh competition races a
     // second implementation against them.
@@ -4852,20 +4825,14 @@ async fn attempt(
     // `crate::conduct` is what actually offers a better answer than
     // `Runner::start` here (see `Recovery::Review`), once this task's next
     // failure shows it up as `held`/`failed` with the run state unreadable.
-    // `crate::conduct` chose `Review` for this task on an earlier cycle: its
-    // branch survived, and this reopens exactly that branch as a
-    // review-only pass rather than resuming or competing again. Consumed
-    // (cleared) here whichever way this goes, so it never outlives this one
-    // attempt - see `queue::Task::review_branch`.
-    let review_branch = if previous
+    // Keep a retained review selection intact until disk admission succeeds.
+    let consume_review = !previous
         .as_ref()
-        .is_some_and(|state| crate::repair_budget::pending(task, state))
-    {
-        None
-    } else {
-        take_review_branch(task, previous.as_ref())
-    };
-    let branch_exists = match &review_branch {
+        .is_some_and(|state| crate::repair_budget::pending(task, state));
+    let review_branch = consume_review
+        .then(|| review_branch_for(task, previous.as_ref()))
+        .flatten();
+    let branch_exists = match review_branch {
         Some(branch) => crate::git::branch_exists(&repo, branch)
             .await
             .unwrap_or(false),
@@ -4877,7 +4844,7 @@ async fn attempt(
     let proposed = review_retry_starter(
         task,
         previous.as_ref(),
-        review_branch.as_deref(),
+        review_branch,
         branch_exists,
         unfinished.as_deref(),
     );
@@ -4928,6 +4895,50 @@ async fn attempt(
         }
     } else {
         starter_with_implementers(task, previous.as_ref(), proposed)
+    };
+    // A retained execution still writes to its saved output volume. A newer
+    // repository policy only selects the volume for a fresh run.
+    let disk_reason = match &starter {
+        Starter::Resume(id) => previous.as_ref().filter(|run| &run.id == id).map_or_else(
+            || {
+                RunState::load(id)
+                    .ok()
+                    .and_then(|run| disk_gate(&run.repo, &run.config))
+            },
+            |run| disk_gate(&run.repo, &run.config),
+        ),
+        _ => disk_gate(&repo, &config),
+    };
+    if let Some(reason) = disk_reason {
+        task.notice_cause("disk-space", None, None);
+        task.last_error = Some(reason.clone());
+        let disk_checked_at = task.disk_checked_at;
+        task.hold_machine(Some(reason.clone()));
+        if matches!(starter, Starter::Resume(_)) {
+            task.mark_disk_capacity();
+        } else {
+            task.mark_startup_disk_capacity();
+        }
+        task.disk_checked_at = disk_checked_at;
+        record(queue, task);
+        tracing::warn!("holding {} for want of disk space: {reason}", task.short());
+        notices::raise(
+            Notice::warn(
+                &format!("disk:{}", repo.display()),
+                format!("Task {} is waiting for disk space. It will resume automatically when disk and output admission checks succeed.", task.id),
+            )
+            .link(Link::Task {
+                id: task.id.clone(),
+            }),
+        );
+        return Vec::new();
+    }
+    let review_branch = if consume_review {
+        let valid = review_branch.is_some();
+        task.review_instruction = None;
+        task.review_branch.take().filter(|_| valid)
+    } else {
+        None
     };
     // An explicit resume pin must never degrade into a new competition or
     // takeover, including when its run stops being eligible after the answer.
@@ -5119,12 +5130,25 @@ async fn attempt(
     let mut runner = match started {
         Ok(r) => r,
         Err(e) if e.is::<crate::repo_lock::ResourceBlocked>() => {
-            task.last_error = Some(e.to_string());
+            let detail = format!("{e:#}");
+            task.last_error = Some(detail.clone());
+            if e.is::<crate::build_target::AdmissionDiskWait>()
+                && let Starter::Review(branch) = &starter
+                && review_branch.is_some()
+            {
+                task.review_branch = Some(branch.clone());
+                task.review_instruction = Some(task.instruction.clone());
+            }
             if stop.parking() || interrupt_pause.parked() {
                 let attempts = task.attempts;
                 task.park(e.to_string());
                 // Startup has not spent an attempt to refund.
                 task.attempts = attempts;
+            } else if e.is::<crate::build_target::AdmissionDiskWait>() {
+                let disk_checked_at = task.disk_checked_at;
+                task.hold_machine(Some(detail));
+                task.mark_startup_disk_capacity();
+                task.disk_checked_at = disk_checked_at;
             } else {
                 task.hold_machine(Some(format!("{}{e}", crate::cache::RESOURCE_HOLD)));
             }
@@ -5233,6 +5257,13 @@ async fn attempt(
             return Vec::new();
         }
     };
+    if !matches!(starter, Starter::Resume(_))
+        && let Some((mode, source)) = task.build_cache_override(&runner.state.config)
+    {
+        runner
+            .state
+            .event("build-cache", format!("{mode} selected by {source}"));
+    }
     if task.pr_recovery.is_some() && !matches!(starter, Starter::Resume(_)) {
         runner.state.recovery_config = Some(config_evidence);
     }
@@ -5650,6 +5681,9 @@ fn apply_options(config: &mut Config, opts: &Opts, task: &Task) -> Result<()> {
     if let Some(o) = &task.overrides {
         o.apply(config);
     }
+    if let Some((mode, _)) = task.build_cache_override(config) {
+        config.verify.build_cache = mode;
+    }
     Ok(())
 }
 
@@ -5852,7 +5886,20 @@ async fn triage_held(queue: &Queue, home: &Path, opts: &Opts) {
 /// the operator opted out. A measurement failure is a gate, not a pass: both
 /// sides of "cannot tell" are served by not starting.
 pub(crate) fn disk_gate(repo: &Path, config: &Config) -> Option<String> {
-    disk_gate_with(repo, config, crate::disk::free_bytes)
+    disk_gate_at(repo, config, crate::run::home)
+}
+
+pub(crate) fn disk_gate_at(
+    repo: &Path,
+    config: &Config,
+    home: impl FnOnce() -> PathBuf,
+) -> Option<String> {
+    let measure = if crate::build_target::isolated(config) {
+        crate::disk::managed_free_bytes
+    } else {
+        crate::disk::free_bytes
+    };
+    disk_gate_with(repo, config, home, measure)
 }
 
 /// [`disk_gate`] with its free-space measurement supplied by the caller, so a
@@ -5861,28 +5908,33 @@ pub(crate) fn disk_gate(repo: &Path, config: &Config) -> Option<String> {
 fn disk_gate_with<F: Fn(&Path) -> Result<u64>>(
     repo: &Path,
     config: &Config,
+    home: impl FnOnce() -> PathBuf,
     free_bytes: F,
 ) -> Option<String> {
     let min = config.disk.min_free_bytes;
     if min == 0 {
         return None;
     }
-    let mut paths = vec![repo.to_owned()];
-    if let Some(cache) = config.cache_dir() {
-        paths.push(cache);
-    }
-    paths.push(
-        config
-            .graph
-            .worktree_root
-            .clone()
-            .unwrap_or_else(crate::run::default_worktree_root),
-    );
-    for path in paths {
+    let output = match config.verify.build_cache {
+        BuildCache::Shared => config.cache_dir(),
+        BuildCache::Isolated => Some(home()),
+    };
+    let default_worktree_root;
+    let worktree_root = match config.graph.worktree_root.as_deref() {
+        Some(root) => root,
+        None => {
+            default_worktree_root = crate::run::default_worktree_root();
+            &default_worktree_root
+        }
+    };
+    for path in [Some(repo), output.as_deref(), Some(worktree_root)]
+        .into_iter()
+        .flatten()
+    {
         let probe = if path == repo {
-            path.as_path()
+            path
         } else {
-            path.ancestors().find(|p| p.exists()).unwrap_or(&path)
+            path.ancestors().find(|p| p.exists()).unwrap_or(path)
         };
         let reason = match free_bytes(probe) {
             Ok(free) => crate::disk::gate_in(free, min, &config.graph.language),
@@ -6352,19 +6404,19 @@ fn review_retry_starter(
     }
 }
 
-/// Consume a retained review only while its authored criteria still match.
-fn take_review_branch(task: &mut Task, previous: Option<&RunState>) -> Option<String> {
-    let branch = task.review_branch.take();
-    let instruction = task.review_instruction.take();
-    branch.filter(|branch| match &instruction {
-        Some(authored) => *authored == task.instruction,
-        // Legacy retained branches must agree with their prior run; only an
-        // explicitly pinned review can proceed without recoverable provenance.
-        None => previous.map_or_else(
-            || task.review_of.as_ref() == Some(branch),
-            |run| compatible_run_instruction(run, task),
-        ),
-    })
+/// A retained review is valid only while its authored criteria still match.
+fn review_branch_for<'a>(task: &'a Task, previous: Option<&RunState>) -> Option<&'a str> {
+    task.review_branch
+        .as_deref()
+        .filter(|&branch| match &task.review_instruction {
+            Some(authored) => *authored == task.instruction,
+            // Legacy retained branches must agree with their prior run; only an
+            // explicitly pinned review can proceed without recoverable provenance.
+            None => previous.map_or_else(
+                || task.review_of.as_deref() == Some(branch),
+                |run| compatible_run_instruction(run, task),
+            ),
+        })
 }
 
 /// A current explicit pin can select an otherwise incompatible run. Edits
@@ -7356,19 +7408,15 @@ mod tests {
             "legacy generated review trimmed the original criteria"
         );
         t.hold_for_handover(Some("approved-head".into()), "refused".into());
-        let mut unchanged = t.clone();
-        assert_eq!(
-            take_review_branch(&mut unchanged, Some(&run)).as_deref(),
-            Some("approved-head")
-        );
+        assert_eq!(review_branch_for(&t, Some(&run)), Some("approved-head"));
         t.edit("new plan".into(), "Reuse measured PR head B".into())
             .unwrap();
-        assert!(take_review_branch(&mut t, Some(&run)).is_none());
+        assert!(review_branch_for(&t, Some(&run)).is_none());
         assert!(!compatible_run_instruction(&run, &t));
         t.review_branch = Some("approved-head".into());
         t.review_instruction = None;
         assert!(
-            take_review_branch(&mut t, Some(&run)).is_none(),
+            review_branch_for(&t, Some(&run)).is_none(),
             "legacy retained candidate cannot replace a revised approved head"
         );
     }
@@ -7870,8 +7918,8 @@ mod tests {
         let cfg = Config::default();
         let repo = Path::new("/any/repo/path");
 
-        let reason =
-            disk_gate_with(repo, &cfg, |_| Ok(1024)).expect("must hold below the threshold");
+        let reason = disk_gate_with(repo, &cfg, PathBuf::new, |_| Ok(1024))
+            .expect("must hold below the threshold");
         assert!(reason.contains("1024"), "{reason}");
         assert!(
             reason.contains(&cfg.disk.min_free_bytes.to_string()),
@@ -7879,12 +7927,17 @@ mod tests {
         );
 
         assert_eq!(
-            disk_gate_with(repo, &cfg, |_| Ok(cfg.disk.min_free_bytes)),
+            disk_gate_with(repo, &cfg, PathBuf::new, |_| Ok(cfg.disk.min_free_bytes)),
             None,
             "exactly at the floor is open"
         );
         assert_eq!(
-            disk_gate_with(repo, &cfg, |_| Ok(cfg.disk.min_free_bytes + 1)),
+            disk_gate_with(
+                repo,
+                &cfg,
+                PathBuf::new,
+                |_| Ok(cfg.disk.min_free_bytes + 1)
+            ),
             None,
             "comfortably above the floor is open"
         );
@@ -7908,7 +7961,7 @@ mod tests {
         for blocked in [&cache, &worktrees] {
             for unmeasured in [false, true] {
                 assert!(
-                    disk_gate_with(&repo, &cfg, |path| {
+                    disk_gate_with(&repo, &cfg, PathBuf::new, |path| {
                         if path == blocked {
                             if unmeasured {
                                 Err(anyhow::anyhow!("measurement failed"))
@@ -7924,7 +7977,37 @@ mod tests {
                 );
             }
         }
-        assert!(disk_gate_with(&repo, &cfg, |_| Ok(u64::MAX)).is_none());
+        assert!(disk_gate_with(&repo, &cfg, PathBuf::new, |_| Ok(u64::MAX)).is_none());
+    }
+
+    #[test]
+    fn isolated_admission_measures_the_run_home_instead_of_the_shared_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let cache = dir.path().join("cache");
+        let home_parent = dir.path().join("run-volume");
+        let home = home_parent.join("new-home");
+        for path in [&repo, &cache, &home_parent] {
+            std::fs::create_dir(path).unwrap();
+        }
+        let mut cfg = Config::default();
+        cfg.graph.worktree_root = Some(repo.clone());
+        cfg.verify.gate = vec![format!(
+            "CARGO_TARGET_DIR='{}' cargo build",
+            cache.display()
+        )];
+        cfg.verify.build_cache = BuildCache::Isolated;
+        let denied = |blocked: &Path| {
+            disk_gate_with(
+                &repo,
+                &cfg,
+                || home.clone(),
+                |path| Ok(if path == blocked { 0 } else { u64::MAX }),
+            )
+            .is_some()
+        };
+        assert!(!denied(&cache));
+        assert!(denied(&home_parent));
     }
 
     #[test]
@@ -7933,7 +8016,7 @@ mod tests {
         cfg.disk.min_free_bytes = 0;
         let repo = Path::new("/any/repo/path");
         assert_eq!(
-            disk_gate_with(repo, &cfg, |_| Ok(0)),
+            disk_gate_with(repo, &cfg, PathBuf::new, |_| Ok(0)),
             None,
             "a zero floor never measures at all"
         );
@@ -7943,8 +8026,10 @@ mod tests {
     fn disk_gate_with_closes_rather_than_starts_blind_when_it_cannot_measure() {
         let cfg = Config::default();
         let repo = Path::new("/any/repo/path");
-        let reason = disk_gate_with(repo, &cfg, |_| Err(anyhow::anyhow!("no df on this box")))
-            .expect("a measurement failure must close the gate, not open it");
+        let reason = disk_gate_with(repo, &cfg, PathBuf::new, |_| {
+            Err(anyhow::anyhow!("no df on this box"))
+        })
+        .expect("a measurement failure must close the gate, not open it");
         assert!(reason.contains("could not measure"), "{reason}");
     }
 
@@ -10465,6 +10550,97 @@ mod tests {
             PathBuf::from("/repo"),
             "a task that names a repository keeps it"
         );
+    }
+
+    #[test]
+    fn new_tasks_inherit_the_daemon_build_cache_but_historical_tasks_remain_shared() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let path = repo.join("explicit.toml");
+        std::fs::write(
+            &path,
+            "[verify]\nbuild_cache = 'isolated'\n[graph]\njudges = 1\n",
+        )
+        .unwrap();
+        let opts = Opts {
+            config: Some(path),
+            ..Opts::default()
+        };
+        let queue = Queue::at(repo.join("queue"));
+        let mut new = task();
+        queue.put(&mut new).unwrap();
+        let resolved = |task: &Task| prepare_for(repo, &opts, task).unwrap();
+        assert_eq!(
+            resolved(&queue.get(&new.id).unwrap()).verify.build_cache,
+            BuildCache::Isolated
+        );
+
+        let mut old = task();
+        old.schema = 22;
+        queue.put(&mut old).unwrap();
+        let mut old = queue.get(&old.id).unwrap();
+        let config = resolved(&old);
+        assert_eq!(config.verify.build_cache, BuildCache::Shared);
+        assert_eq!(config.graph.judges, 1, "preserve daemon config inheritance");
+        old.hold_manual(Some("wait".into()));
+        queue.put(&mut old).unwrap();
+
+        let mut saved = queue.get(&old.id).unwrap();
+        assert_eq!(resolved(&saved).verify.build_cache, BuildCache::Shared);
+        saved
+            .overrides
+            .as_mut()
+            .unwrap()
+            .merge_over(&crate::queue::RunOverrides {
+                build_cache: Some(BuildCache::Isolated),
+                ..Default::default()
+            });
+        queue.put(&mut saved).unwrap();
+        assert_eq!(
+            resolved(&queue.get(&saved.id).unwrap()).verify.build_cache,
+            BuildCache::Isolated
+        );
+    }
+
+    #[test]
+    fn urgent_build_cache_precedes_config_but_not_an_explicit_choice() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("explicit.toml");
+        let write = |verify: &str| {
+            std::fs::write(&path, format!("[verify]\nbuild_cache = 'shared'\n{verify}")).unwrap();
+        };
+        write("e2e = [\"CARGO_TARGET_DIR=/tmp/shared-target cargo test\"]\n");
+        let opts = Opts {
+            config: Some(path.clone()),
+            ..Opts::default()
+        };
+        let mut task = task();
+        task.set_urgent(true).unwrap();
+        let resolved = |task: &Task| {
+            prepare_for(dir.path(), &opts, task)
+                .unwrap()
+                .verify
+                .build_cache
+        };
+        assert_eq!(resolved(&task), BuildCache::Isolated);
+        task.change_build_cache(Some(BuildCache::Shared)).unwrap();
+        assert_eq!(resolved(&task), BuildCache::Shared);
+        task.change_build_cache(None).unwrap();
+        assert_eq!(resolved(&task), BuildCache::Isolated);
+        task.set_urgent(false).unwrap();
+        assert_eq!(resolved(&task), BuildCache::Shared);
+
+        // Urgent work must never be the one stopped by isolation: with no
+        // shared cache to wait behind, or with a verification command isolated
+        // mode cannot run, an urgent task keeps the configured mode.
+        task.set_urgent(true).unwrap();
+        write("e2e = [\"npm test\"]\n");
+        assert_eq!(resolved(&task), BuildCache::Shared);
+        write("e2e = [\"CARGO_TARGET_DIR=/tmp/shared-target cargo test | tee log\"]\n");
+        assert_eq!(resolved(&task), BuildCache::Shared);
+        // An explicit choice stays strict and is applied as asked.
+        task.change_build_cache(Some(BuildCache::Isolated)).unwrap();
+        assert_eq!(resolved(&task), BuildCache::Isolated);
     }
 
     #[test]

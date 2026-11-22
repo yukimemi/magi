@@ -30,6 +30,8 @@
 cache = "{{ env.MAGI_CACHE | default(value='/tmp') }}"
 
 [verify]
+# Shared by default. Use --build-cache isolated for a task that needs its own
+# worktree targets without changing these verification commands.
 # `e2e` and `gate` together are exactly `cargo make check` (what CI runs), and
 # each half runs once: the tests in `e2e`, everything else in `gate`.
 #

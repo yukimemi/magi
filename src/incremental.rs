@@ -970,7 +970,11 @@ pub(crate) mod tests {
         let generation = Generation::create(worktree, &parent).unwrap();
         let mut command = std::process::Command::new("cargo");
         command.env_clear();
-        for key in ["PATH", "HOME", "RUSTUP_HOME"] {
+        command.env(
+            "PATH",
+            crate::build_target::command::standalone_fixture_path().unwrap(),
+        );
+        for key in ["HOME", "RUSTUP_HOME"] {
             if let Some(value) = std::env::var_os(key) {
                 command.env(key, value);
             }

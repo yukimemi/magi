@@ -39,11 +39,51 @@ const TAIL: usize = 4000;
 /// A no-op for the default empty list. Idempotent, since a reviewer's worktree
 /// is wiped and set up again every round.
 pub async fn prepare(cfg: &Config, repo: &Path, wt: &Path) -> Result<()> {
+    prepare_with(cfg, repo, wt, crate::build_target::Coordination::Acquire).await
+}
+
+pub(crate) async fn prepare_with(
+    cfg: &Config,
+    repo: &Path,
+    wt: &Path,
+    coordination: crate::build_target::Coordination<'_>,
+) -> Result<()> {
     let steps = &cfg.worktree.setup;
     if steps.is_empty() {
         return Ok(());
     }
     let total = steps.len();
+    let shell = steps
+        .iter()
+        .any(|step| step.run.is_some())
+        .then(|| cfg.shell());
+    // Reserve once, before even a copy step. AdmissionDiskWait must prove
+    // that no setup step has run, so a caller can safely retry from scratch.
+    let build = if let Some(shell) = &shell
+        && crate::build_target::isolated(cfg)
+    {
+        crate::build_target::command::check_shell(shell)?;
+        // Every setup command must fit the isolated grammar, as each did at
+        // its own step before admission moved up here. Checked for all of
+        // them first, so an unsupported one stops setup before anything ran.
+        for (i, step) in steps.iter().enumerate() {
+            if let Some(command) = &step.run {
+                crate::build_target::command::normalize(command).with_context(|| {
+                    format!(
+                        "worktree setup step {}/{total} ({}) failed",
+                        i + 1,
+                        step.describe()
+                    )
+                })?;
+            }
+        }
+        let build = crate::build_target::Operation::admit(cfg, wt, "", "setup", coordination)
+            .await
+            .context("worktree setup admission")?;
+        Some(build)
+    } else {
+        None
+    };
     let mut copied: Vec<String> = Vec::new();
     for (i, step) in steps.iter().enumerate() {
         let n = i + 1;
@@ -59,8 +99,29 @@ pub async fn prepare(cfg: &Config, repo: &Path, wt: &Path) -> Result<()> {
                 let secs = step
                     .timeout_secs
                     .unwrap_or_else(|| cfg.graph.verify_timeout());
-                run_step(&cfg.shell(), command, wt, Duration::from_secs(secs))
-                    .await
+                let shell = shell.as_deref().expect("setup command has a shell");
+                let timeout = Duration::from_secs(secs);
+                let (lease, outputs, target) = if let Some(build) = &build {
+                    let mut outputs: Vec<_> = build
+                        .outputs
+                        .iter()
+                        .map(crate::retention::OutputLease::duplicate)
+                        .collect();
+                    outputs.extend(crate::retention::OutputLease::borrow(wt)?);
+                    (
+                        build
+                            .lease
+                            .as_ref()
+                            .map(crate::repo_lock::SeatLease::share_operation),
+                        outputs,
+                        Some((build.target.as_path(), cfg.disk.min_free_bytes)),
+                    )
+                } else {
+                    (None, Vec::new(), None)
+                };
+                let result =
+                    run_command(shell, command, wt, timeout, lease, outputs, false, target).await;
+                result
                     .with_context(|| format!("worktree setup step {n}/{total} ({what}) failed"))?;
             }
             _ => bail!("worktree setup step {n}/{total} must set exactly one of copy / run"),
@@ -179,11 +240,8 @@ fn tail(s: &str) -> &str {
     &s[at..]
 }
 
-async fn run_step(shell: &[String], command: &str, wt: &Path, timeout: Duration) -> Result<()> {
-    run_command(shell, command, wt, timeout, None, Vec::new(), false).await
-}
-
 /// Shared contained shell runner for setup and pre-clean commands.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_command(
     shell: &[String],
     command: &str,
@@ -192,7 +250,12 @@ pub(crate) async fn run_command(
     lease: Option<crate::repo_lock::SeatLease>,
     outputs: Vec<crate::retention::OutputLease>,
     pre_clean: bool,
+    target: Option<(&Path, u64)>,
 ) -> Result<()> {
+    let script = target
+        .map(|_| crate::build_target::command::normalize(command))
+        .transpose()?
+        .unwrap_or(command);
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let log = std::env::temp_dir().join(format!(
         "magi-setup-{}-{}.out",
@@ -207,7 +270,7 @@ pub(crate) async fn run_command(
     let mut cmd = tokio::process::Command::new(&shell[0]);
     cmd.quiet();
     cmd.args(&shell[1..])
-        .arg(command)
+        .arg(script)
         .current_dir(wt)
         .env_remove("MAGI_RUN")
         .env_remove("MAGI_NODE")
@@ -223,9 +286,32 @@ pub(crate) async fn run_command(
         }
     }
     crate::incremental::configure(&mut cmd, wt)?;
-    let mut running = crate::seat_process::Running::spawn_operation(cmd, lease, outputs)
+    let spawn = if let Some((target, _)) = target {
+        crate::build_target::command::configure(&mut cmd, target)?;
+        crate::seat_process::Running::spawn_build
+    } else {
+        crate::build_target::command::clear(&mut cmd)?;
+        crate::seat_process::Running::spawn_operation
+    };
+    let mut running = spawn(cmd, lease, outputs)
         .with_context(|| format!("spawn `{}` for `{command}`", shell[0]))?;
-    let waited = tokio::time::timeout(timeout, running.child().wait()).await;
+    let pressure = async {
+        match target {
+            Some((target, floor)) => {
+                crate::retention::emergency(vec![wt.to_owned(), target.to_owned()], floor, true)
+                    .await
+            }
+            None => std::future::pending().await,
+        }
+    };
+    let waited = tokio::select! {
+        waited = tokio::time::timeout(timeout, running.child().wait()) => waited,
+        reason = pressure => {
+            running.finish().await;
+            std::fs::remove_file(&log).ok();
+            return Err(crate::repo_lock::ResourceBlocked(reason).into());
+        }
+    };
     // Compiler wrappers supervise their own process groups. Join cleanup of
     // the entire setup tree before returning, on success as well as timeout.
     // Cancellation transfers the same ownership to Running's cleanup thread.
@@ -448,6 +534,56 @@ mod tests {
         // What `prep` and the other callers take before setup runs.
         git::acquire_worktree_config(&repo).await.unwrap();
         (tmp, repo, wt)
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn isolated_setup_runs_under_the_existing_repository_operation() {
+        crate::run::pin_test_home();
+        let (_tmp, repo, wt) = scratch().await;
+        let mut config = cfg(vec![run("touch setup-completed")]);
+        config.verify.build_cache = crate::config::BuildCache::Isolated;
+        config.disk.min_free_bytes = 0;
+        config.coordination = Some(crate::config::Coordination {
+            contract_file: "fixture-contract".into(),
+            contract_token: "fixture-v1".into(),
+            lock_file: "fixture-lock".into(),
+        });
+        std::fs::write(repo.join(".git/fixture-contract"), "fixture-v1").unwrap();
+        let wait = crate::repo_lock::WaitPolicy::new(Duration::from_secs(3), || false);
+        let repository =
+            crate::repo_lock::SeatLease::operation_with(&repo, config.coordination.as_ref(), &wait)
+                .await
+                .unwrap()
+                .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            prepare_with(
+                &config,
+                &repo,
+                &wt,
+                crate::build_target::Coordination::Held(Some(&repository)),
+            ),
+        )
+        .await
+        .expect("setup must not wait for its own repository operation")
+        .unwrap();
+        assert!(wt.join("setup-completed").is_file());
+    }
+
+    #[tokio::test]
+    async fn isolated_setup_reports_disk_admission_without_starting_the_command() {
+        crate::run::pin_test_home();
+        let (_tmp, repo, wt) = scratch().await;
+        let mut config = cfg(vec![run("touch setup-completed")]);
+        config.verify.build_cache = crate::config::BuildCache::Isolated;
+        config.disk.min_free_bytes = u64::MAX;
+        let error = prepare(&config, &repo, &wt).await.unwrap_err();
+        assert!(
+            error.is::<crate::build_target::AdmissionDiskWait>(),
+            "{error:#}"
+        );
+        assert!(error.is::<crate::repo_lock::ResourceBlocked>(), "{error:#}");
+        assert!(!wt.join("setup-completed").exists());
     }
 
     #[tokio::test]

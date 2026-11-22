@@ -435,6 +435,7 @@ default.
 | `magi task show <id>` | one task in full |
 | `magi task urgent <id> [--clear]` | enable or disable urgent on an unclaimed queued or held task |
 | `magi task implementers <id> <count>` | change implementers on a queued or held task (1 = Solo, 2–3 = competition) |
+| `magi task build-cache <id> shared\|isolated\|default` | set or clear the build cache override on an unclaimed queued or held task |
 | `magi task hold` / `release` | park work, or give it a real second chance |
 | `magi task done` | mark it finished, for work that landed by a route the loop did not see |
 | `magi task rm` | delete it |
@@ -1486,6 +1487,7 @@ on_leak = "warn"         # warn | redact | fail
 # seed = 42              # reproduce a run's label assignment
 
 [verify]
+# build_cache = "shared" # default; "isolated" gives each linked checkout its own target
 # Run once per review round in the winner's worktree; failures are fed back to
 # the fixer. This is the "real machine" leg of the review.
 e2e = ["cargo test --locked"]
@@ -1940,6 +1942,65 @@ three levers that matter are:
 
   Only the winner's worktree runs them, one at a time, so nothing contends on
   cargo's lock.
+
+### Isolated Cargo build outputs
+
+Use `magi run --build-cache isolated`, `magi review <branch> --build-cache isolated`,
+or `magi task add --build-cache isolated` to opt in for one task. For new runs,
+magi chooses the mode in this order:
+
+1. An explicit task choice (`shared` or `isolated`), including `shared` on
+   an urgent task.
+2. `isolated` for an urgent task, so its extra slot does not wait on the shared
+   cache. This applies only when the repository has a shared cache and its
+   verification commands are ones isolated mode can run; otherwise the urgent
+   task keeps the configured mode rather than stopping on an unsupported
+   command.
+3. The layered `[verify] build_cache` setting, which defaults to `shared`.
+
+Use `magi task build-cache <id> shared|isolated|default` while the task is
+unclaimed and queued or held. `default` clears the override and restores the
+urgent/config rules. `magi task show <id>` and `--json` show the choice for a
+new run and its source. Historical tasks retain their shared choice until
+changed. A resumed run always uses its saved mode; `magi run --resume` does
+not accept `--build-cache`.
+
+Set `[verify] build_cache = "isolated"` in the machine layer to isolate all new
+work that inherits that default. This suits machines with disk to spare:
+each isolated target holds a full build output.
+
+Each linked checkout generation in isolated mode gets a separate target under
+`MAGI_HOME/isolated-builds`. Editing seats and managed verification in that
+checkout reuse it; reviewers do not get the path. Git's absolute and relative
+linked-worktree registrations are supported.
+No outputs go in the source tree. Inspect the run's build mode with `magi show`.
+Use `magi cache list` for the actual target paths, owners, and leases. The
+usual cache maintenance locks and `[disk] cache_limit_bytes` apply to the isolated
+pool independently of the shared cache. Clearing a registered isolated path
+keeps its ownership record so a resume can rebuild.
+Folding a checkout reclaims its proven, idle isolated outputs under the same
+locks. Busy or unproven targets are not reclaimed by fold.
+
+A literal leading `CARGO_TARGET_DIR=…` on a verification command is replaced
+by the managed target, including quoted paths with spaces. Simple commands and
+`&&` chains made entirely of Cargo invocations are supported through `sh -c`,
+`bash -c` or `dash -c`; invoke Cargo by name in every clause. `cargo make`,
+`cargo nextest`, `cargo clippy` and `cargo fmt` run with the same managed
+Cargo environment. Other compound syntax, dynamic overrides, explicit Cargo
+executables, unknown Cargo aliases and output-affecting flags such as
+`--target-dir` or `--config` are refused. Trusted setup scripts, tool plugins and
+build scripts must not bypass the launcher by replacing `PATH` or invoking
+absolute Cargo executables; this is build isolation, not a sandbox.
+
+Isolation trades less waiting on shared outputs for more rebuilding and more
+concurrent CPU, memory and disk use. Same-target builds still serialize; registry
+and download locks, task/candidate limits, repository coordination, disk
+admission, and the existing incremental policy are unchanged.
+If isolated setup cannot reserve disk headroom, magi holds the task without
+spending an attempt. An archived seat whose setup was refused before it began
+can be restored after recovery; a started setup's failure retains its checkout
+and checkpoint for inspection. Recovery checks the task's selected output
+volume, or the saved run's volume when resuming.
 
 
 ### Disk

@@ -30,6 +30,8 @@ mod base_recovery_control;
 mod base_sync_recovery;
 pub mod blind;
 pub mod blockers;
+#[doc(hidden)]
+pub mod build_target;
 pub mod bump;
 pub mod cache;
 pub mod chat_control;

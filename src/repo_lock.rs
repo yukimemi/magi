@@ -122,7 +122,7 @@ pub(crate) struct SeatLease {
     // Field drop order matters: close the OS lock before waking an editor.
     _lock: Option<Arc<Lease>>,
     _read: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
-    _write: Option<tokio::sync::OwnedRwLockWriteGuard<()>>,
+    _write: Option<Arc<tokio::sync::OwnedRwLockWriteGuard<()>>>,
 }
 
 struct Lease {
@@ -180,6 +180,18 @@ pub(crate) async fn common_dir(cwd: &Path) -> Result<Option<PathBuf>> {
 }
 
 impl SeatLease {
+    /// Keep the launcher's existing exclusive operation alive in child cleanup.
+    pub(crate) fn share_operation(&self) -> Self {
+        assert!(self.delegated && self._write.is_some());
+        Self {
+            path: self.path.clone(),
+            delegated: true,
+            _lock: self._lock.clone(),
+            _read: None,
+            _write: self._write.clone(),
+        }
+    }
+
     /// Launcher-owned VCS/setup work must exclude both seats and external
     /// updaters. Unlike an editing seat, it has no child agent to take the OS
     /// lock. Release this lease before invoking a seat (the gate is not reentrant).
@@ -269,7 +281,7 @@ impl SeatLease {
                 path,
                 delegated: false,
                 _read: None,
-                _write: Some(permit),
+                _write: Some(Arc::new(permit)),
                 _lock: None,
             }));
         }

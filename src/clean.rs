@@ -128,6 +128,13 @@ pub async fn housekeep(
         Ok(None) => {}
         Err(e) => tracing::warn!("housekeep: prune cache: {e:#}"),
     }
+    match crate::build_target::prune_registered(home, &cfg.disk) {
+        Ok(pruned) => {
+            out.cache_files = out.cache_files.saturating_add(pruned.files);
+            out.cache_freed = out.cache_freed.saturating_add(pruned.freed);
+        }
+        Err(e) => tracing::warn!("housekeep: prune isolated builds: {e:#}"),
+    }
     // Unconditional, unlike the two passes above: this is not a disk policy
     // with a cap or an opt-out, it is closing a gap `graph::Runner` itself
     // cannot - a run that reached `Merged`/`Ready`/`Failed` before this

@@ -48,7 +48,13 @@ pub(crate) async fn repair(state: &mut RunState, dispatch: bool) -> Result<()> {
             ],
         )
         .await?;
-        crate::worktree_setup::prepare(&state.config, &state.repo, &scratch).await?;
+        crate::worktree_setup::prepare_with(
+            &state.config,
+            &state.repo,
+            &scratch,
+            crate::build_target::Coordination::Held(_lease.as_ref()),
+        )
+        .await?;
         let merged = git::git_raw(
             &scratch,
             &[

@@ -781,10 +781,32 @@ impl Default for Blind {
     }
 }
 
+/// Where managed Cargo build outputs are stored.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum BuildCache {
+    /// Use the shared cache configured by the repository, if any.
+    #[default]
+    Shared,
+    /// Keep build outputs isolated from other runs and worktrees.
+    Isolated,
+}
+
+impl std::fmt::Display for BuildCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Shared => "shared",
+            Self::Isolated => "isolated",
+        })
+    }
+}
+
 /// Shell commands that gate the winner.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Verify {
+    /// Build output policy for new runs.
+    pub build_cache: BuildCache,
     /// Run in the winner's worktree once per review round. Its output is fed
     /// back to the fixer. This is the "real machine" leg of the review.
     pub e2e: Vec<String>,
@@ -4047,7 +4069,7 @@ lock_file = "{{ vars.bad }}"
         std::fs::write(
             &machine,
             "[[agents]]\nid = \"opus\"\nkind = \"claude\"\nmodel = \"opus\"\n\n\
-             [graph]\ncandidates = 3\nmax_parallel = 8\n",
+             [graph]\ncandidates = 3\nmax_parallel = 8\n[verify]\nbuild_cache = \"shared\"\n",
         )
         .unwrap();
         // ...and the project layer only states what is repo-specific, plus a
@@ -4056,7 +4078,8 @@ lock_file = "{{ vars.bad }}"
             &project,
             "[vars]\ncache = \"/shared\"\n\n\
              [graph]\ncandidates = 2\n\n\
-             [verify]\ngate = [\"CARGO_TARGET_DIR={{ vars.cache }}/t cargo test\"]\n",
+             [verify]\nbuild_cache = \"isolated\"\n\
+             gate = [\"CARGO_TARGET_DIR={{ vars.cache }}/t cargo test\"]\n",
         )
         .unwrap();
 
@@ -4064,12 +4087,19 @@ lock_file = "{{ vars.bad }}"
         assert_eq!(cfg.agents.len(), 1, "roster comes from the machine layer");
         assert_eq!(cfg.graph.implementers, 2, "project layer wins");
         assert_eq!(cfg.graph.max_parallel, 8, "machine layer survives");
+        assert_eq!(cfg.verify.build_cache, BuildCache::Isolated);
         assert_eq!(
             cfg.verify.gate,
             ["CARGO_TARGET_DIR=/shared/t cargo test".to_owned()]
         );
         // The rendered command is where the cache path is read back from.
         assert_eq!(cfg.cache_dir(), Some(PathBuf::from("/shared/t")));
+    }
+
+    #[test]
+    fn saved_config_without_a_build_cache_policy_remains_shared() {
+        let saved: Config = serde_json::from_str(r#"{"verify":{"gate":["cargo test"]}}"#).unwrap();
+        assert_eq!(saved.verify.build_cache, BuildCache::Shared);
     }
 
     #[test]

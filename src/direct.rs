@@ -122,6 +122,9 @@ pub fn config_for(task: &Task, repo: &Path) -> Result<Config> {
     if let Some(o) = &task.overrides {
         o.apply(&mut cfg);
     }
+    if let Some((mode, _)) = task.build_cache_override(&cfg) {
+        cfg.verify.build_cache = mode;
+    }
     if task.solo {
         cfg.graph.implementers = 1;
     }

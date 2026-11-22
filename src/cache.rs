@@ -194,6 +194,9 @@ fn leases_dir(home: &Path) -> PathBuf {
 /// hash suffix (so two paths that sanitize to the same prefix — unlikely,
 /// but not impossible on a long path — never collide).
 fn slug(cache_dir: &Path) -> String {
+    if let Some(id) = crate::build_target::generation(cache_dir) {
+        return format!("isolated-{id}");
+    }
     let norm = normalize(cache_dir);
     let mut readable: String = norm
         .chars()
@@ -382,6 +385,7 @@ pub fn try_acquire_maintenance(
     cache_dir: &Path,
     owner: &Owner,
 ) -> Result<AcquireOutcome> {
+    crate::build_target::check_prune(home, cache_dir)?;
     let Ok(outputs) = crate::retention::OutputLease::cache(home, cache_dir, true) else {
         return Ok(AcquireOutcome::Busy(Busy::Outputs));
     };
@@ -933,6 +937,7 @@ fn refresh_stale_packages(
     worktree: &Path,
     cache_dir: &Path,
     manifests: &[PathBuf],
+    isolated: bool,
 ) -> Result<Option<Vec<String>>> {
     let targets = plan_targets(worktree, manifests, file_exists)?;
     if targets.is_empty() {
@@ -945,7 +950,14 @@ fn refresh_stale_packages(
             Target::Root => None,
             Target::Manifest(m) => Some(m),
         };
-        let mut cmd = std::process::Command::new("cargo");
+        let mut cmd = if isolated {
+            crate::build_target::command::cargo(cache_dir)?
+        } else {
+            std::process::Command::new("cargo")
+        };
+        if !isolated {
+            crate::build_target::command::clear_std(&mut cmd)?;
+        }
         cmd.args(["metadata", "--no-deps", "--format-version", "1"]);
         if let Some(m) = manifest_arg {
             cmd.arg("--manifest-path").arg(m);
@@ -963,14 +975,20 @@ fn refresh_stale_packages(
         }
         let names = parse_workspace_package_names(&String::from_utf8_lossy(&meta.stdout));
         for name in &names {
-            let mut clean = std::process::Command::new("cargo");
+            let mut clean = if isolated {
+                crate::build_target::command::cargo(cache_dir)?
+            } else {
+                std::process::Command::new("cargo")
+            };
             clean.arg("clean").arg("-p").arg(name);
             if let Some(m) = manifest_arg {
                 clean.arg("--manifest-path").arg(m);
             }
+            if !isolated {
+                crate::build_target::command::clear_std(&mut clean)?;
+                clean.arg("--target-dir").arg(cache_dir);
+            }
             let out = clean
-                .arg("--target-dir")
-                .arg(cache_dir)
                 .current_dir(worktree)
                 .quiet()
                 .output()
@@ -1056,6 +1074,16 @@ pub fn ensure_fresh(
     identity: &Identity,
     manifests: &[PathBuf],
 ) -> Result<()> {
+    ensure_fresh_with(home, cache_dir, identity, manifests, false)
+}
+
+pub(crate) fn ensure_fresh_with(
+    home: &Path,
+    cache_dir: &Path,
+    identity: &Identity,
+    manifests: &[PathBuf],
+    isolated: bool,
+) -> Result<()> {
     match restore_cachedir_tag(cache_dir) {
         Ok(true) => tracing::info!(
             cache = %cache_dir.display(),
@@ -1067,7 +1095,7 @@ pub fn ensure_fresh(
     }
     if needs_refresh(home, cache_dir, identity) {
         let worktree = PathBuf::from(&identity.worktree);
-        match refresh_stale_packages(&worktree, cache_dir, manifests)? {
+        match refresh_stale_packages(&worktree, cache_dir, manifests, isolated)? {
             Some(cleaned) => tracing::info!(
                 ?cleaned,
                 cache = %cache_dir.display(),

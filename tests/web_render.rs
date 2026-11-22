@@ -7850,6 +7850,7 @@ async fn task_blocker_actions_are_mobile_read_only_navigation() {
     blocked.hold_machine(magi::disk::gate(2_667_941_888, 3_221_225_472));
     blocked.machine_hold_cause = Some(magi::queue::MachineHoldCause::DiskCapacity {
         reason: blocked.hold_reason.clone().unwrap_or_default(),
+        before_start: false,
     });
     blocked.block(
         vec![

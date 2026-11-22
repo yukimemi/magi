@@ -365,6 +365,12 @@ pub fn run(state: &RunState) -> String {
         }
     }
     let _ = writeln!(s, "  state   {}", state.dir().display());
+    let _ = writeln!(s, "  build cache: {}", state.config.verify.build_cache);
+    if !crate::build_target::isolated(&state.config)
+        && let Some(target) = state.config.cache_dir()
+    {
+        let _ = writeln!(s, "  build target: {}", target.display());
+    }
 
     let _ = writeln!(s, "\n{}", bold("candidates"));
     for c in &state.candidates {

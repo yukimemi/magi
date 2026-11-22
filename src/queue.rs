@@ -44,6 +44,7 @@ use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
 use crate::ask::Questions;
+use crate::config::BuildCache;
 use crate::id_reserve::{IdSource, path_exists};
 
 /// On-disk format for a queued task. Bumped when a field's meaning changes.
@@ -140,7 +141,9 @@ use crate::id_reserve::{IdSource, path_exists};
 /// 20: persist the task decision chat destination, defaulting to absent.
 /// 21: repository assignment history and execution boundaries, empty on old tasks.
 /// 22: typed disk resource waits and a retained execution pin for automatic recovery.
-pub const SCHEMA: u32 = 22;
+/// 23: new tasks inherit `verify.build_cache` unless explicitly overridden.
+/// Older tasks retain shared builds.
+pub const SCHEMA: u32 = 23;
 
 /// Candidate order only: all claims, lanes and eligibility gates still apply.
 /// Upgrade-parked runs retain their pass-start order ahead of ordinary work,
@@ -169,6 +172,9 @@ pub enum MachineHoldCause {
     DiskCapacity {
         /// The exact `hold_reason` the hold was placed with.
         reason: String,
+        /// Admission stopped before a new execution was established.
+        #[serde(default)]
+        before_start: bool,
     },
 }
 
@@ -859,6 +865,9 @@ pub struct RunOverrides {
     /// `--config`, absolute: the daemon's own working directory differs.
     #[serde(default)]
     pub config: Option<PathBuf>,
+    /// `--build-cache`; unset inherits the repository's policy on new tasks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_cache: Option<BuildCache>,
 }
 
 impl RunOverrides {
@@ -878,7 +887,8 @@ impl RunOverrides {
             reviewers,
             review_rounds,
             seed,
-            config
+            config,
+            build_cache
         );
     }
 
@@ -903,6 +913,9 @@ impl RunOverrides {
         }
         if let Some(s) = self.seed {
             config.blind.seed = Some(s);
+        }
+        if let Some(mode) = self.build_cache {
+            config.verify.build_cache = mode;
         }
     }
 }
@@ -1516,16 +1529,27 @@ impl Task {
         self.execution_runs()
     }
 
-    /// Stamp [`Task::held_at`] on the way into [`TaskStatus::Held`]; a task
-    /// that is already held keeps the time its hold began.
+    fn preserve_legacy_build_cache(&mut self) {
+        if self.schema < 23 {
+            let overrides = self.overrides.get_or_insert_with(|| RunOverrides {
+                inherit_daemon_options: true,
+                ..RunOverrides::default()
+            });
+            overrides.build_cache.get_or_insert(BuildCache::Shared);
+        }
+    }
+
     /// A transition this build makes (start, hold, block, done) makes the task
     /// eligible for a chat notice even when it was filed under an older
     /// schema; only records no build has touched since stay silent
     /// ([`Task::chat_notice_due`]).
     fn stamp_schema(&mut self) {
+        self.preserve_legacy_build_cache();
         self.schema = self.schema.max(SCHEMA);
     }
 
+    /// Stamp [`Task::held_at`] on the way into [`TaskStatus::Held`]; a task
+    /// that is already held keeps the time its hold began.
     fn note_held(&mut self) {
         self.stamp_schema();
         let continuing = self.status == TaskStatus::Held
@@ -1603,7 +1627,7 @@ impl Task {
         self.park_reason = Some(why.into());
         // The variant and field are schema 11; stamp it so an older build
         // refuses the record instead of half-reading it.
-        self.schema = self.schema.max(SCHEMA);
+        self.stamp_schema();
     }
 
     /// Record a settled pass whose start time is unknown (see [`Self::record_pass_at`]).
@@ -1648,7 +1672,7 @@ impl Task {
             settled_at: Timestamp::now(),
             parked,
         });
-        self.schema = self.schema.max(SCHEMA);
+        self.stamp_schema();
     }
 
     /// Only the latest pass of the current, resumable upgrade-parked run
@@ -1734,20 +1758,44 @@ impl Task {
     pub(crate) fn mark_disk_capacity(&mut self) {
         self.machine_hold_cause = Some(MachineHoldCause::DiskCapacity {
             reason: self.hold_reason.clone().unwrap_or_default(),
+            before_start: false,
         });
+    }
+
+    pub(crate) fn mark_startup_disk_capacity(&mut self) {
+        self.machine_hold_cause = Some(MachineHoldCause::DiskCapacity {
+            reason: self.hold_reason.clone().unwrap_or_default(),
+            before_start: true,
+        });
+    }
+
+    pub(crate) fn disk_wait_run(&self) -> Option<&String> {
+        if self.has_disk_capacity_cause()
+            && matches!(
+                self.machine_hold_cause,
+                Some(MachineHoldCause::DiskCapacity {
+                    before_start: true,
+                    ..
+                })
+            )
+        {
+            None
+        } else {
+            self.execution_runs().last()
+        }
     }
 
     /// Does the structured disk-capacity cause still match the current hold?
     pub fn has_disk_capacity_cause(&self) -> bool {
         matches!(
             (&self.machine_hold_cause, self.hold_reason.as_deref()),
-            (Some(MachineHoldCause::DiskCapacity { reason }), Some(now)) if reason == now
+            (Some(MachineHoldCause::DiskCapacity { reason, .. }), Some(now)) if reason == now
         )
     }
 
     /// Admission waits preserve all execution and approval evidence on recovery.
     pub(crate) fn resume_disk_wait(&mut self) {
-        let retained = self.execution_runs().last().cloned();
+        let retained = self.disk_wait_run().cloned();
         self.status = TaskStatus::Queued;
         self.held_at = None;
         self.hold_source = None;
@@ -1975,6 +2023,44 @@ impl Task {
         } else {
             self.overrides.as_ref().and_then(|o| o.candidates)
         }
+    }
+
+    /// Task-level policy for a new run in `config`, before falling back to its
+    /// layered value: the explicit per-task choice, else isolated for an urgent
+    /// task where that helps and works (`build_target::urgent_isolation`).
+    pub fn build_cache_override(
+        &self,
+        config: &crate::config::Config,
+    ) -> Option<(BuildCache, &'static str)> {
+        self.overrides
+            .as_ref()
+            .and_then(|o| o.build_cache)
+            .map(|mode| (mode, "task-override"))
+            .or_else(|| {
+                (self.urgent && crate::build_target::urgent_isolation(config))
+                    .then_some((BuildCache::Isolated, "urgent"))
+            })
+    }
+
+    /// Set or clear the policy for new runs without changing any saved run.
+    /// Callers must hold the queue claim and reload the task before calling.
+    pub fn change_build_cache(&mut self, mode: Option<BuildCache>) -> Result<()> {
+        if !matches!(self.status, TaskStatus::Queued | TaskStatus::Held) {
+            bail!(
+                "task {} is {}; only queued or held tasks can change build cache",
+                self.short(),
+                self.status.as_str()
+            );
+        }
+        self.stamp_schema();
+        if self.overrides.is_some() || mode.is_some() {
+            let overrides = self.overrides.get_or_insert_with(|| RunOverrides {
+                inherit_daemon_options: true,
+                ..RunOverrides::default()
+            });
+            overrides.build_cache = mode;
+        }
+        Ok(())
     }
 
     /// Validate against this task's configuration and change only its seat count.
@@ -2808,7 +2894,7 @@ impl Queue {
             serde_json::to_value(self.get(&task.id)?)? == serde_json::to_value(expected)?,
             "task changed during disk monitoring"
         );
-        task.schema = task.schema.max(SCHEMA);
+        task.stamp_schema();
         self.write_record_inner(task, false)
     }
 
@@ -2897,7 +2983,7 @@ impl Queue {
                 task.decision_effects.insert(id, receipt);
             }
             if !task.decision_effects.is_empty() {
-                task.schema = task.schema.max(SCHEMA);
+                task.stamp_schema();
             }
             // The task's message chat is recorded once and never rewound or
             // dropped by a writer holding an older snapshot.
@@ -3684,6 +3770,7 @@ fn read_path(path: &Path) -> Result<Task> {
             task.schema
         );
     }
+    task.preserve_legacy_build_cache();
     if task.schema < 22
         && task.status == TaskStatus::Held
         && task.hold_source == Some(HoldSource::Machine)

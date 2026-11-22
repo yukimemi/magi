@@ -473,11 +473,12 @@ async fn check_filing(
             && filing.priority == 0
             && filing.hold.is_none()
             && filing.implementers.is_none()
+            && filing.build_cache.is_none()
             && filing.attach.is_empty()
             && filing.solo
             && matches!(&filing.source, crate::queue::Source::Agent { run, node }
             if run == &talk.id && node == crate::queue::CHAT_NODE),
-        "standing fix filing requires --solo, this chat's provenance, and no seeds, attachments, hold, priority, or urgent dispatch"
+        "standing fix filing requires --solo, this chat's provenance, and no seeds, attachments, hold, priority, urgent dispatch, or build-cache override"
     );
     let hits = crate::dupes::check(
         queue,

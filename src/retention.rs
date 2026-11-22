@@ -25,8 +25,12 @@ pub(crate) fn has_archived_seats(home: &Path, state: &RunState) -> Result<bool> 
 
 /// Re-materialize evicted read seats before execution can consume their paths.
 /// Caller owns the run's driver/owner leases and repository coordination.
-pub(crate) async fn restore_execution_seats(home: &Path, state: &RunState) -> Result<()> {
-    copies::restore_execution_seats(home, state).await
+pub(crate) async fn restore_execution_seats(
+    home: &Path,
+    state: &RunState,
+    coordination: Option<&crate::repo_lock::SeatLease>,
+) -> Result<()> {
+    copies::restore_execution_seats(home, state, coordination).await
 }
 
 /// Read the binary diff after verifying its independent source archive.
@@ -177,19 +181,36 @@ impl OutputLease {
     /// Reserve headroom once per volume while admitting a managed writer.
     /// These are estimates, not filesystem quotas. The ordinary emergency
     /// monitor remains necessary for writes exceeding the reservation.
-    #[cfg(unix)]
     pub(crate) fn admit(home: &Path, paths: &[PathBuf], min_free: u64) -> Result<Vec<Self>> {
-        Self::admit_with(home, paths, min_free, crate::disk::free_bytes)
+        #[cfg(unix)]
+        return Self::admit_isolated(home, paths, min_free);
+        #[cfg(not(unix))]
+        {
+            let _ = (home, paths, min_free);
+            Ok(Vec::new())
+        }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
+    pub(crate) fn admit_isolated(
+        home: &Path,
+        paths: &[PathBuf],
+        min_free: u64,
+    ) -> Result<Vec<Self>> {
+        Self::admit_with(home, paths, min_free, crate::disk::managed_free_bytes)
+    }
+
+    #[cfg(any(unix, windows))]
     pub(crate) fn admit_with(
         home: &Path,
         paths: &[PathBuf],
         min_free: u64,
         free_bytes: impl Fn(&Path) -> Result<u64>,
     ) -> Result<Vec<Self>> {
+        #[cfg(unix)]
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        #[cfg(windows)]
+        use std::os::windows::fs::OpenOptionsExt;
         if min_free == 0 {
             return Ok(Vec::new());
         }
@@ -208,18 +229,30 @@ impl OutputLease {
                 .ancestors()
                 .find(|p| p.exists())
                 .context("disk admission path missing")?;
+            #[cfg(unix)]
             let device = std::fs::metadata(probe)?.dev();
+            #[cfg(windows)]
+            let device = windows_volume(probe)?;
             if !devices.insert(device) {
                 continue;
             }
             let open = |path: &Path| -> Result<File> {
-                Ok(OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create(true)
-                    .truncate(false)
-                    .custom_flags(libc::O_NOFOLLOW)
-                    .open(path)?)
+                let mut opts = OpenOptions::new();
+                opts.read(true).write(true).create(true).truncate(false);
+                #[cfg(unix)]
+                opts.custom_flags(libc::O_NOFOLLOW);
+                #[cfg(windows)]
+                opts.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+                let file = opts.open(path)?;
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::MetadataExt as _;
+                    ensure!(
+                        file.metadata()?.file_attributes() & 0x400 == 0,
+                        "disk admission lock is a reparse point"
+                    );
+                }
+                Ok(file)
             };
             // Explicitly unlock on return. A concurrent fork can briefly
             // inherit this descriptor before exec closes it; closing only the
@@ -233,10 +266,8 @@ impl OutputLease {
                 match crate::pr_head::try_lock_file(&admission._file) {
                     Ok(()) => break,
                     Err(error)
-                        if matches!(
-                            error.kind(),
-                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
-                        ) && started.elapsed() < std::time::Duration::from_secs(1) =>
+                        if lock_contended(&error)
+                            && started.elapsed() < std::time::Duration::from_secs(1) =>
                     {
                         std::thread::sleep(std::time::Duration::from_millis(5));
                     }
@@ -281,10 +312,13 @@ impl OutputLease {
         Ok(reservations)
     }
 
-    #[cfg(not(unix))]
-    pub(crate) fn admit(_home: &Path, _paths: &[PathBuf], _min_free: u64) -> Result<Vec<Self>> {
-        // Registered seats already fail closed without Unix containment.
-        Ok(Vec::new())
+    #[cfg(not(any(unix, windows)))]
+    pub(crate) fn admit_isolated(
+        _home: &Path,
+        _paths: &[PathBuf],
+        _min_free: u64,
+    ) -> Result<Vec<Self>> {
+        anyhow::bail!("disk admission is unavailable on this platform")
     }
 
     pub(crate) fn take(worktree: &Path, exclusive: bool) -> Result<Self> {
@@ -300,7 +334,7 @@ impl OutputLease {
         let dir = PathBuf::from(String::from_utf8(out.stdout)?.trim());
         Self::lock(&dir.join("magi-output.lock"), exclusive)
     }
-    fn lock(path: &Path, exclusive: bool) -> Result<Self> {
+    pub(crate) fn lock(path: &Path, exclusive: bool) -> Result<Self> {
         let file = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -323,7 +357,16 @@ impl OutputLease {
                 path.display()
             );
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle as _;
+            ensure!(
+                crate::chat_watch::windows::lock_file_mode(file.as_raw_handle(), true, exclusive)?,
+                "output lease: outputs are in use or being reclaimed: {}",
+                path.display()
+            );
+        }
+        #[cfg(not(any(unix, windows)))]
         let _ = exclusive;
         if !exclusive {
             // Empty legacy/maintenance-only leases carry no activity witness.
@@ -337,6 +380,76 @@ impl OutputLease {
         })
     }
 }
+
+#[cfg(any(unix, windows))]
+fn lock_contended(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+    ) || cfg!(windows) && error.raw_os_error() == Some(33)
+}
+
+#[cfg(windows)]
+fn windows_volume(path: &Path) -> Result<u128> {
+    use std::os::windows::ffi::OsStrExt as _;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetVolumePathNameW(path: *const u16, mount: *mut u16, length: u32) -> i32;
+        fn GetVolumeNameForVolumeMountPointW(mount: *const u16, name: *mut u16, length: u32)
+        -> i32;
+    }
+    let path: Vec<_> = path
+        .canonicalize()?
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let mut mount = vec![0u16; 32_768];
+    let mut name = [0u16; 64];
+    // The buffers are valid for these Win32 calls and the input is NUL-terminated.
+    if unsafe { GetVolumePathNameW(path.as_ptr(), mount.as_mut_ptr(), mount.len() as u32) } == 0
+        || unsafe {
+            GetVolumeNameForVolumeMountPointW(mount.as_ptr(), name.as_mut_ptr(), name.len() as u32)
+        } == 0
+    {
+        return Err(std::io::Error::last_os_error()).context("identify disk admission volume");
+    }
+    let end = name
+        .iter()
+        .position(|&c| c == 0)
+        .context("invalid volume name")?;
+    let name = String::from_utf16(&name[..end])?;
+    let id = name
+        .strip_prefix(r"\\?\Volume{")
+        .and_then(|s| s.strip_suffix("}\\"))
+        .context("volume has no stable GUID")?;
+    ensure!(
+        id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-'),
+        "invalid volume GUID"
+    );
+    Ok(u128::from_str_radix(&id.replace('-', ""), 16)?)
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn isolated_windows_reservations_share_the_actual_volume_budget() {
+    let home = tempfile::tempdir().unwrap();
+    let first = home.path().join("first checkout");
+    let second = home.path().join("second 日本語 checkout");
+    std::fs::create_dir(&first).unwrap();
+    std::fs::create_dir(&second).unwrap();
+    let reserve =
+        |paths: &[PathBuf]| OutputLease::admit_with(home.path(), paths, 1, |_| Ok(1 + (1 << 30)));
+    let writer = reserve(&[first, second.clone()]).unwrap();
+    let err = reserve(std::slice::from_ref(&second)).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("active writer reservations 1073741824")
+    );
+    drop(writer);
+    assert!(reserve(&[second]).is_ok());
+}
+
 #[cfg(unix)]
 impl Drop for OutputLease {
     fn drop(&mut self) {
@@ -1962,14 +2075,19 @@ fn commit_retirement(
 /// Wait for the emergency reserve to be exhausted. The normal floor requests
 /// a checkpoint first; half the floor stops owned writers before node completion.
 /// A failed measurement also closes admission rather than allowing blind writes.
-pub(crate) async fn emergency(paths: Vec<PathBuf>, min_free: u64) -> String {
+pub(crate) async fn emergency(paths: Vec<PathBuf>, min_free: u64, isolated: bool) -> String {
+    let measure = if isolated {
+        crate::disk::managed_free_bytes
+    } else {
+        crate::disk::free_bytes
+    };
     if min_free == 0 {
         return std::future::pending().await;
     }
     loop {
         for path in &paths {
             let existing = path.ancestors().find(|p| p.exists()).unwrap_or(path);
-            match crate::disk::free_bytes(existing) {
+            match measure(existing) {
                 Ok(free) if free >= min_free / 2 => {}
                 Ok(free) => {
                     return format!(
@@ -2399,7 +2517,11 @@ mod tests {
         let release = wt.join("release");
         let mut cargo = tokio::process::Command::new("cargo");
         cargo.env_clear();
-        for key in ["PATH", "HOME", "RUSTUP_HOME"] {
+        cargo.env(
+            "PATH",
+            crate::build_target::command::standalone_fixture_path().unwrap(),
+        );
+        for key in ["HOME", "RUSTUP_HOME"] {
             if let Some(value) = std::env::var_os(key) {
                 cargo.env(key, value);
             }
@@ -2609,7 +2731,11 @@ mod tests {
         }
         let mut cargo = std::process::Command::new("cargo");
         cargo.env_clear();
-        for key in ["PATH", "HOME", "RUSTUP_HOME"] {
+        cargo.env(
+            "PATH",
+            crate::build_target::command::standalone_fixture_path().unwrap(),
+        );
+        for key in ["HOME", "RUSTUP_HOME"] {
             if let Some(value) = std::env::var_os(key) {
                 cargo.env(key, value);
             }
@@ -5439,7 +5565,7 @@ mod tests {
         let f = Fx::new().await;
         let reason = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            emergency(vec![f.repo.clone()], u64::MAX),
+            emergency(vec![f.repo.clone()], u64::MAX, false),
         )
         .await
         .unwrap();
@@ -5447,7 +5573,7 @@ mod tests {
         assert!(
             tokio::time::timeout(
                 std::time::Duration::from_millis(10),
-                emergency(vec![f.repo.clone()], 0)
+                emergency(vec![f.repo.clone()], 0, false)
             )
             .await
             .is_err()
@@ -5635,7 +5761,9 @@ mod tests {
             );
             // The execution restoration boundary leaves protected existing
             // seats and their sessions untouched; prep need not recreate them.
-            restore_execution_seats(&f.home, &state).await.unwrap();
+            restore_execution_seats(&f.home, &state, None)
+                .await
+                .unwrap();
             assert_eq!(git::rev_parse(&review, "HEAD").await.unwrap(), f.base);
         }
     }
@@ -5691,6 +5819,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn archived_seat_setup_reuses_repository_coordination() {
+        crate::run::pin_test_home();
+        let f = Fx::new().await;
+        let mut state = inactive_source(&f, "ef07", true).await;
+        let review = reviewer(&f, &state, &f.base).await;
+        let mut report = Report::default();
+        copies::evict(&f.home, &Fx::disk(), Fx::now(), &mut report).await;
+        assert_eq!(report.evicted_copies, 1, "{report:?}");
+        git::acquire_worktree_config(&f.repo).await.unwrap();
+        state.config.verify.build_cache = crate::config::BuildCache::Isolated;
+        state.config.verify.shell = Some(vec!["sh".into(), "-c".into()]);
+        state.config.disk.min_free_bytes = 0;
+        state.config.worktree.setup = vec![crate::config::SetupStep {
+            run: Some("touch setup-completed".into()),
+            ..Default::default()
+        }];
+        std::fs::write(f.repo.join(".git/fixture-contract"), "fixture-v1").unwrap();
+        state.config.coordination = Some(crate::config::Coordination {
+            contract_file: "fixture-contract".into(),
+            contract_token: "fixture-v1".into(),
+            lock_file: "fixture-lock".into(),
+        });
+        let timeout = std::time::Duration::from_secs(15);
+        let wait = crate::repo_lock::WaitPolicy::new(timeout, || false);
+        let lease = crate::repo_lock::SeatLease::operation_with(
+            &f.repo,
+            state.config.coordination.as_ref(),
+            &wait,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        for _ in 0..2 {
+            tokio::time::timeout(
+                timeout,
+                restore_execution_seats(&f.home, &state, Some(&lease)),
+            )
+            .await
+            .expect("restoration must not wait for its own repository operation")
+            .unwrap();
+        }
+        assert!(review.join("setup-completed").is_file());
+    }
+
+    #[tokio::test]
     async fn source_eviction_failed_execution_setup_keeps_its_checkpoint() {
         let f = Fx::new().await;
         let mut state = inactive_source(&f, "ef07", true).await;
@@ -5703,7 +5876,11 @@ mod tests {
             ..Default::default()
         }];
         state.save_under(&f.home).unwrap();
-        assert!(restore_execution_seats(&f.home, &state).await.is_err());
+        assert!(
+            restore_execution_seats(&f.home, &state, None)
+                .await
+                .is_err()
+        );
         let marker = f
             .home
             .join("runs")
@@ -5715,7 +5892,7 @@ mod tests {
             "preserved"
         );
         assert!(
-            restore_execution_seats(&f.home, &state)
+            restore_execution_seats(&f.home, &state, None)
                 .await
                 .unwrap_err()
                 .to_string()
@@ -5886,7 +6063,9 @@ mod tests {
                 _ => {}
             }
             assert!(
-                restore_execution_seats(&f.home, &state).await.is_err(),
+                restore_execution_seats(&f.home, &state, None)
+                    .await
+                    .is_err(),
                 "{kind}"
             );
             assert!(!review.exists());
@@ -5947,7 +6126,9 @@ mod tests {
                 .unwrap(),
             "5001"
         );
-        restore_execution_seats(&f.home, &state).await.unwrap();
+        restore_execution_seats(&f.home, &state, None)
+            .await
+            .unwrap();
         assert_eq!(
             git::git(&review, &["rev-list", "--count", "HEAD"])
                 .await
@@ -6177,7 +6358,9 @@ mod tests {
                 .unwrap()
                 .contains_key(&head)
         );
-        restore_execution_seats(&f.home, &state).await.unwrap();
+        restore_execution_seats(&f.home, &state, None)
+            .await
+            .unwrap();
         assert_eq!(git::rev_parse(&review, "HEAD").await.unwrap(), head);
         assert_eq!(
             git::git(&review, &["log", "--format=%H"]).await.unwrap(),
@@ -6210,13 +6393,19 @@ mod tests {
             "unrelated review checkpoint"
         );
         std::fs::write(review.join("operator-notes"), "keep").unwrap();
-        assert!(restore_execution_seats(&f.home, &state).await.is_err());
+        assert!(
+            restore_execution_seats(&f.home, &state, None)
+                .await
+                .is_err()
+        );
         assert_eq!(
             std::fs::read_to_string(review.join("operator-notes")).unwrap(),
             "keep"
         );
         std::fs::remove_file(review.join("operator-notes")).unwrap();
-        restore_execution_seats(&f.home, &state).await.unwrap();
+        restore_execution_seats(&f.home, &state, None)
+            .await
+            .unwrap();
         let mut second = Report::default();
         copies::evict(&f.home, &Fx::disk(), Fx::now(), &mut second).await;
         assert_eq!(second.evicted_copies, 1, "{second:?}");
@@ -6239,12 +6428,20 @@ mod tests {
         let archive = PathBuf::from(raw["evidence"].as_str().unwrap());
         let patch = std::fs::read(archive.join("change.patch")).unwrap();
         std::fs::write(archive.join("change.patch"), "corrupt").unwrap();
-        assert!(restore_execution_seats(&f.home, &state).await.is_err());
+        assert!(
+            restore_execution_seats(&f.home, &state, None)
+                .await
+                .is_err()
+        );
         assert!(!review.exists());
         std::fs::write(archive.join("change.patch"), patch).unwrap();
         std::fs::create_dir(&review).unwrap();
         std::fs::write(review.join("operator-notes"), "keep").unwrap();
-        assert!(restore_execution_seats(&f.home, &state).await.is_err());
+        assert!(
+            restore_execution_seats(&f.home, &state, None)
+                .await
+                .is_err()
+        );
         assert_eq!(
             std::fs::read_to_string(review.join("operator-notes")).unwrap(),
             "keep"

@@ -168,7 +168,9 @@ pub(crate) async fn rebase_prepared(
             language: &state.config.graph.language,
             github_language: &state.config.graph.github_language,
         });
-        let prompt_text = if state.config.cache_dir().is_some() {
+        let prompt_text = if !crate::build_target::isolated(&state.config)
+            && state.config.cache_dir().is_some()
+        {
             format!("{prompt_text}\n\n{}", prompt::build_cache_note("fix", true))
         } else {
             prompt_text
@@ -277,6 +279,21 @@ pub(crate) async fn rebase_prepared(
                 ));
             }
             Ok(_) => {}
+            Err(e)
+                if e.is::<crate::repo_lock::ResourceBlocked>()
+                    && crate::build_target::isolated(&state.config) =>
+            {
+                if let Some(record) = state.rebase_fixes.last_mut() {
+                    record.infra = Some(format!("{e:#}"));
+                }
+                if let Some(timeout) = e.downcast_ref::<agent::IsolatedSeatWait>() {
+                    state.event("resource", timeout.0.description());
+                    state.resource_block = Some(timeout.0.clone());
+                    state.save()?;
+                    return Err(e);
+                }
+                return Err(block(state, crate::build_target::KIND, format!("{e:#}")));
+            }
             Err(e) => error = Some(format!("{e:#}")),
         }
 
