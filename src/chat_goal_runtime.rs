@@ -1106,7 +1106,7 @@ mod tests {
         let repo = temp.path().join("repo");
         std::fs::create_dir(&repo).unwrap();
         for args in [
-            vec!["init"],
+            vec!["init", "--initial-branch=magi/delivered"],
             vec![
                 "-c",
                 "user.name=Fixture",
@@ -1119,15 +1119,10 @@ mod tests {
                 "-m",
                 "Fixture artifact",
             ],
-            vec!["branch", "magi/delivered"],
         ] {
-            let result = crate::git::git_raw(&repo, &args).await.unwrap();
-            assert!(result.ok(), "{}", result.stderr);
+            crate::git::git(&repo, &args).await.unwrap();
         }
-        let head = crate::git::git_raw(&repo, &["rev-parse", "HEAD"])
-            .await
-            .unwrap()
-            .stdout;
+        let head = crate::git::rev_parse(&repo, "HEAD").await.unwrap();
         assert_eq!(
             git_artifact_head(&repo, "magi/delivered").await.as_deref(),
             Some(head.as_str())
