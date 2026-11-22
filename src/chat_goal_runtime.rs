@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
-use crate::chat_goal::{ArtifactBaseline, Goal};
+use crate::chat_goal::Goal;
 
 /// A current observation is data, never a new owner instruction.
 #[derive(Debug)]
@@ -19,56 +19,78 @@ impl Observation {
     fn apply(mut self, goal: &mut Goal) {
         let complete = satisfied(goal, &self.facts);
         let evidence = self.facts.to_string();
-        let fingerprint = self
-            .fingerprint_against(&goal.artifact_baselines)
-            .unwrap_or_else(|| evidence.clone());
-        self.remember(&mut goal.artifact_baselines);
-        goal.observe(fingerprint, evidence, complete);
-    }
 
-    // Substitute only in the comparison, after capturing fresh evidence.
-    fn fingerprint_against(
-        &mut self,
-        baselines: &BTreeMap<String, ArtifactBaseline>,
-    ) -> Option<String> {
-        let runs = self.facts["runs"].as_array_mut().expect("observed runs");
-        let mut substituted = false;
-        for (index, branch, observed) in &self.artifacts {
-            if *observed != ArtifactHead::Unknown {
-                continue;
-            }
-            let run = &mut runs[*index];
-            let id = run["id"].as_str().expect("observed run id");
-            if let Some(last) = baselines
-                .get(id)
-                .filter(|last| last.repo == self.repo && last.branch == *branch)
-            {
-                run["artifact_head"] = json!(last.head);
-                substituted = true;
+        // Keep provenance inside the existing string so older builds can read the talk.
+        // The first line is the comparison; the optional second line binds its heads.
+        let (previous, bindings) = goal
+            .fingerprint
+            .split_once('\n')
+            .map_or((goal.fingerprint.as_str(), None), |(facts, bindings)| {
+                (facts, Some(bindings))
+            });
+        let bound = bindings.and_then(|data| {
+            serde_json::from_str::<(PathBuf, BTreeMap<String, String>)>(data).ok()
+        });
+        // Legacy records lack ref provenance. Use their last comparison only
+        // for the same run, then bind it to the first observed target.
+        let legacy = bindings.is_none() && previous == goal.evidence;
+        let mut prior_heads = BTreeMap::new();
+        if self
+            .artifacts
+            .iter()
+            .any(|(_, _, head)| *head == ArtifactHead::Unknown)
+            && (legacy || bound.as_ref().is_some_and(|(repo, _)| *repo == self.repo))
+            && let Ok(mut facts) = serde_json::from_str::<Value>(previous)
+            && let Some(runs) = facts["runs"].as_array_mut()
+        {
+            for run in runs {
+                if let Some(id) = run["id"].as_str()
+                    && let Some(head) = run["artifact_head"].as_str()
+                    && matches!(head.len(), 40 | 64)
+                    && head.bytes().all(|byte| byte.is_ascii_hexdigit())
+                {
+                    prior_heads.insert(id.to_owned(), head.to_owned());
+                }
             }
         }
-        substituted.then(|| self.facts.to_string())
-    }
 
-    fn remember(self, baselines: &mut BTreeMap<String, ArtifactBaseline>) {
-        let mut previous = std::mem::take(baselines);
-        let runs = self.facts["runs"].as_array().expect("observed runs");
+        let mut targets = BTreeMap::new();
+        let mut substituted = false;
+        let runs = self.facts["runs"].as_array_mut().expect("observed runs");
         for (index, branch, observed) in self.artifacts {
-            let id = runs[index]["id"].as_str().expect("observed run id");
-            let baseline = match observed {
-                ArtifactHead::Known(head) => Some(ArtifactBaseline {
-                    repo: self.repo.clone(),
-                    branch,
-                    head,
-                }),
-                ArtifactHead::Unknown => previous
-                    .remove(id)
-                    .filter(|last| last.repo == self.repo && last.branch == branch),
-                ArtifactHead::Absent => None,
-            };
-            if let Some(baseline) = baseline {
-                baselines.insert(id.to_owned(), baseline);
+            let run = &mut runs[index];
+            let id = run["id"].as_str().expect("observed run id").to_owned();
+            match observed {
+                ArtifactHead::Known(_) => {}
+                ArtifactHead::Unknown
+                    if legacy
+                        || bound.as_ref().is_some_and(|(repo, branches)| {
+                            *repo == self.repo && branches.get(&id) == Some(&branch)
+                        }) =>
+                {
+                    let Some(head) = prior_heads.remove(&id) else {
+                        continue;
+                    };
+                    run["artifact_head"] = Value::String(head);
+                    substituted = true;
+                }
+                ArtifactHead::Unknown | ArtifactHead::Absent => continue,
             }
+            targets.insert(id, branch);
+        }
+        let comparison = if substituted {
+            self.facts.to_string()
+        } else {
+            evidence.clone()
+        };
+        if let Some((facts, _)) = goal.fingerprint.split_once('\n') {
+            goal.fingerprint.truncate(facts.len());
+        }
+        goal.observe(comparison, evidence, complete);
+        if !targets.is_empty() {
+            goal.fingerprint.push('\n');
+            goal.fingerprint
+                .push_str(&json!([self.repo, targets]).to_string());
         }
     }
 }
@@ -706,8 +728,6 @@ mod tests {
         let mut goal = goal();
         goal.tasks.push(task.id.clone());
         goal.condition.kind = Completion::TasksDone;
-        talk.goals.push(goal);
-        talks.put(&mut talk).unwrap();
         let run_dir = home.join("runs/run");
         std::fs::create_dir_all(&run_dir).unwrap();
         let run_path = run_dir.join("run.json");
@@ -721,9 +741,27 @@ mod tests {
         let known_a = ArtifactHead::Known(a.clone());
         let known_b = ArtifactHead::Known(b.clone());
         let observer = FakeObserver::default();
-        let mut wake = 0;
+        std::fs::write(&run_path, run.to_string()).unwrap();
+        observer
+            .artifact_heads
+            .lock()
+            .unwrap()
+            .insert(branch.into(), known_a.clone());
+        let legacy = observe_with(home, home, &goal.tasks, &goal.runs, &[], &observer).await;
+        // The previous build persisted exactly the raw facts as both strings.
+        goal.evidence = legacy.facts.to_string();
+        goal.fingerprint = goal.evidence.clone();
+        goal.wake = 1;
+        goal.handled = 1;
+        goal.wakes = 1;
+        let legacy_goal = serde_json::to_value(&goal).unwrap();
+        let legacy_fields = legacy_goal.as_object().unwrap();
+        talk.goals.push(goal);
+        talks.put(&mut talk).unwrap();
+
+        let mut wake = 1;
         for (head, gate_passed, expected, state) in [
-            (&known_a, false, Some(1), State::Runnable),
+            (&ArtifactHead::Unknown, false, None, State::Waiting),
             (&ArtifactHead::Unknown, false, None, State::Waiting),
             (&known_a, false, None, State::Waiting),
             (&known_b, false, Some(2), State::Runnable),
@@ -756,6 +794,13 @@ mod tests {
             );
             let saved = reopened.get(chat).unwrap();
             let observed = &saved.goals[0];
+            let encoded = serde_json::to_value(observed).unwrap();
+            assert_eq!(
+                encoded.as_object().unwrap().keys().collect::<Vec<_>>(),
+                legacy_fields.keys().collect::<Vec<_>>(),
+                "a strict legacy Goal decoder must not encounter new fields"
+            );
+            assert!(encoded["fingerprint"].is_string());
             assert_eq!(observed.state, state);
             let evidence: Value = serde_json::from_str(&observed.evidence).unwrap();
             assert_eq!(evidence["tasks"][0]["status"], "queued");

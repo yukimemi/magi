@@ -105,19 +105,9 @@ pub struct Goal {
     pub last_checked: Option<Timestamp>,
     /// Stable event fingerprint, excluding observation time.
     pub fingerprint: String,
-    /// Last verified artifact heads, used only for wake comparison.
-    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub(crate) artifact_baselines: std::collections::BTreeMap<String, ArtifactBaseline>,
     /// Earlier accepted authorizations and their last recorded outcomes.
     #[serde(default)]
     pub history: Vec<Revision>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct ArtifactBaseline {
-    pub(crate) repo: PathBuf,
-    pub(crate) branch: String,
-    pub(crate) head: String,
 }
 
 /// Audit snapshot retained before an owner changes a goal's authorization.
@@ -617,7 +607,6 @@ pub(crate) async fn apply(
                     rechecks: 0,
                     last_checked: None,
                     fingerprint: String::new(),
-                    artifact_baselines: Default::default(),
                     history: Vec::new(),
                 });
                 talk.selected_goal = Some(id.clone());
@@ -728,7 +717,6 @@ pub(crate) async fn apply(
                     goal.wakes = 0;
                     goal.rechecks = 0;
                     goal.fingerprint.clear();
-                    goal.artifact_baselines.clear();
                     goal.evidence.clear();
                     goal.last_checked = None;
                 }
@@ -951,7 +939,6 @@ pub(crate) fn apply_recovery(
                 rechecks: 0,
                 last_checked: None,
                 fingerprint: String::new(),
-                artifact_baselines: Default::default(),
                 history: Vec::new(),
             });
             talk.selected_goal = Some(id);
@@ -979,7 +966,6 @@ pub(crate) fn prompt_goals(goals: &[Goal]) -> serde_json::Result<String> {
     for goal in data.as_array_mut().expect("serialized goal list") {
         let fields = goal.as_object_mut().expect("serialized goal");
         fields.remove("fingerprint");
-        fields.remove("artifact_baselines");
     }
     serde_json::to_string(&data)
 }
@@ -1027,7 +1013,6 @@ mod tests {
             rechecks: 0,
             last_checked: None,
             fingerprint: String::new(),
-            artifact_baselines: Default::default(),
             history: Vec::new(),
         }
     }
