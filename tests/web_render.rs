@@ -4987,6 +4987,35 @@ async fn wait_avatar_status(
     });
 }
 
+async fn avatar_catalog(browser: &mut cdp::Browser, page: &cdp::Page) -> Value {
+    browser
+        .eval(
+            page,
+            r#"(() => {
+              window.avatarCatalogRead = null;
+              fetch('/api/avatar-settings').then(response => {
+                if (!response.ok) throw new Error(`GET avatar settings: ${response.status}`);
+                return response.json();
+              }).then(
+                catalog => { window.avatarCatalogRead = {catalog}; },
+                error => { window.avatarCatalogRead = {error: String(error)}; }
+              );
+            })()"#,
+        )
+        .await
+        .expect("start avatar catalog read");
+    browser
+        .wait_for(page, "window.avatarCatalogRead !== null", AVATAR_WAIT)
+        .await
+        .expect("finish avatar catalog read");
+    let mut read = browser
+        .eval(page, "window.avatarCatalogRead")
+        .await
+        .expect("read avatar catalog result");
+    assert!(read.get("error").is_none(), "avatar catalog: {read}");
+    read["catalog"].take()
+}
+
 const CHOOSE_AVATAR: &str = r#"(async () => {
   const canvas = document.createElement('canvas'); canvas.width = 24; canvas.height = 24;
   canvas.getContext('2d').fillRect(0, 0, 24, 24);
@@ -5024,27 +5053,28 @@ async fn avatar_settings_preview_isolation_reload_and_reset_on_phone() {
         .unwrap();
     browser.wait_for(
         &page,
-        "!!document.querySelector('.avatar-settings option[value=\"persona:rei\"]') && !!document.querySelector('.avatar-settings input:not(:disabled)')",
+        r#"!!document.querySelector('#settings-repo:not(:disabled)') &&
+           !!document.querySelector('.avatar-settings option[value="persona:rei"]') &&
+           !!document.querySelector('.avatar-settings input:not(:disabled)')"#,
         AVATAR_WAIT,
     ).await.expect("load the avatar catalog and file picker");
-    let original = browser.eval(&page, "fetch('/api/avatar-settings').then(r => r.json()).then(catalog => catalog.operator)")
-        .await.expect("read original operator avatar");
+    let original = avatar_catalog(&mut browser, &page).await["operator"].take();
     browser.eval(&page, CHOOSE_AVATAR).await.expect("choose operator image");
     wait_avatar_status(&mut browser, &page, &base, "preview operator image", "Preview ready. Save to apply.").await;
-    browser.eval(&page, &format!(r#"(async () => {{
-      if ((await (await fetch('/api/avatar-settings')).json()).operator !== {original}) throw new Error('preview saved before Save');
+    assert_eq!(avatar_catalog(&mut browser, &page).await["operator"], original, "preview saved before Save");
+    browser.eval(&page, r#"(() => {
       const panel = document.querySelector('.avatar-settings');
       if (!panel.querySelector('img').src.startsWith('data:')) throw new Error('operator preview missing');
       panel.querySelector('button:first-child:not(:disabled)').click();
-    }})()"#)).await.expect("inspect and save operator preview");
+    })()"#).await.expect("inspect and save operator preview");
     wait_avatar_status(&mut browser, &page, &base, "save operator avatar", "Avatar saved.").await;
-    let result = browser.eval(&page, &format!(r#"(async () => {{
-      const saved = (await (await fetch('/api/avatar-settings')).json()).operator;
+    let result = avatar_catalog(&mut browser, &page).await["operator"].take();
+    assert_ne!(result, original, "operator URL unchanged after save");
+    browser.eval(&page, &format!(r#"(() => {{
       const panel = document.querySelector('.avatar-settings');
-      if (saved === {original} || !panel.querySelector('img').getAttribute('src').includes(saved)) throw new Error('saved preview did not refresh');
+      if (!panel.querySelector('img').getAttribute('src').includes({result})) throw new Error('saved preview did not refresh');
       const rect = panel.getBoundingClientRect();
       if (rect.right > document.documentElement.clientWidth + 1 || panel.scrollWidth > panel.clientWidth + 1) throw new Error('phone overflow');
-      return saved;
     }})()"#)).await.expect("check saved operator avatar and phone layout");
     browser.eval(&page, r#"(() => {
       const select = document.querySelector('#avatar-target');
@@ -5060,39 +5090,39 @@ async fn avatar_settings_preview_isolation_reload_and_reset_on_phone() {
       panel.querySelector('button:first-child:not(:disabled)').click();
     })()"#).await.expect("inspect and save persona preview");
     wait_avatar_status(&mut browser, &page, &base, "save persona avatar", "Avatar saved.").await;
-    let rei_url = browser.eval(&page, &r#"(async () => {
-      const saved = __SAVED__;
-      const catalog = await (await fetch('/api/avatar-settings')).json();
-      if (catalog.operator !== saved) throw new Error('persona save changed operator');
-      const rei = catalog.personas.find(p => p.id === 'rei');
-      const asuka = catalog.personas.find(p => p.id === 'asuka');
-      if (!rei || !asuka || rei.avatar === asuka.avatar) throw new Error('persona isolation');
+    let catalog = avatar_catalog(&mut browser, &page).await;
+    assert_eq!(catalog["operator"], result, "persona save changed operator");
+    let avatar = |catalog: &Value, id: &str| {
+        catalog["personas"].as_array().unwrap().iter()
+            .find(|persona| persona["id"] == id).expect("persona in catalog")["avatar"].clone()
+    };
+    let rei_url = avatar(&catalog, "rei");
+    assert_ne!(rei_url, avatar(&catalog, "asuka"), "persona isolation");
+    browser.eval(&page, r#"(() => {
       document.querySelector('.avatar-settings button:nth-child(2):not(:disabled)').click();
-      return rei.avatar;
-    })()"#.replace("__SAVED__", &result.to_string())).await.expect("check persona isolation and reset Rei");
+    })()"#).await.expect("reset Rei avatar");
     wait_avatar_status(&mut browser, &page, &base, "reset persona avatar", "Built-in avatar restored.").await;
-    browser.eval(&page, &r#"(async () => {
-      const reset = await (await fetch('/api/avatar-settings')).json();
-      if (reset.personas.find(p => p.id === 'rei').avatar === __REI_URL__) throw new Error('reset URL unchanged');
+    let reset = avatar_catalog(&mut browser, &page).await;
+    assert_ne!(avatar(&reset, "rei"), rei_url, "reset URL unchanged");
+    browser.eval(&page, r#"(() => {
       const sel = document.querySelector('#avatar-target');
       sel.value = 'operator'; sel.dispatchEvent(new Event('change'));
       const invalid = new DataTransfer(); invalid.items.add(new File(['bad'], 'bad.png', {type:'image/png'}));
       const input = document.querySelector('.avatar-settings input:not(:disabled)');
       input.files = invalid.files; input.dispatchEvent(new Event('change'));
-    })()"#.replace("__REI_URL__", &rei_url.to_string())).await.expect("check reset and choose an invalid operator image");
+    })()"#).await.expect("choose an invalid operator image");
     browser.wait_for(&page, r#"(() => {
       const panel = document.querySelector('.avatar-settings');
       const status = panel.querySelector('[role="status"]:last-child').textContent;
       return !panel.querySelector('input').disabled && status !== '' &&
         status !== 'Avatar saved.' && status !== 'Preparing preview…';
     })()"#, AVATAR_WAIT).await.expect("finish decoding the invalid image");
-    browser.eval(&page, &r#"(async () => {
+    assert_eq!(avatar_catalog(&mut browser, &page).await["operator"], result, "invalid image corrupted save");
+    browser.eval(&page, r#"(() => {
       const panel = document.querySelector('.avatar-settings');
-      const saved = __SAVED__;
       if (!panel.querySelector('button').disabled) throw new Error('invalid image accepted');
-      if ((await (await fetch('/api/avatar-settings')).json()).operator !== saved) throw new Error('invalid image corrupted save');
       for (const button of panel.querySelectorAll('button')) if (button.getBoundingClientRect().height < 44) throw new Error('small touch target');
-    })()"#.replace("__SAVED__", &result.to_string())).await.expect("check invalid upload and touch targets");
+    })()"#).await.expect("check invalid upload and touch targets");
     browser.close_page(&page).await;
     let page = browser
         .open_page(&format!("{base}#/settings"), 390, 844, true)
@@ -5102,7 +5132,7 @@ async fn avatar_settings_preview_isolation_reload_and_reset_on_phone() {
         .wait_for(
             &page,
             &format!(
-                "document.querySelector('.avatar-settings .magi-icon-preview')?.getAttribute('src') === {}",
+                "!!document.querySelector('#settings-repo:not(:disabled)') && document.querySelector('.avatar-settings .magi-icon-preview')?.getAttribute('src') === {}",
                 result
             ),
             AVATAR_WAIT,
@@ -6024,14 +6054,29 @@ printf 'Registered the cross-repository goal.\n'
     let mut browser = cdp::Browser::launch(&chrome).await.unwrap();
     let page = browser.open_page(&format!("{base}#/chat/{}", chat.id), 1280, 900, false).await.unwrap();
     browser.wait_for(&page, "!!window.deck && !!deck.state.talkDetail?.talk && document.getElementById('view-talk')?.hidden === false", Duration::from_secs(30)).await.unwrap();
-    browser.eval(&page, &format!(
-        "(() => {{ const input = document.getElementById('f-talk-say'); input.value = {owner_input:?}; input.dispatchEvent(new Event('input', {{bubbles:true}})); document.getElementById('talk-send').click(); return true; }})()"
+    // Clearing the composer is synchronous admission, not turn completion.
+    let submitted = browser.eval(&page, &format!(
+        "(() => {{ const input = document.getElementById('f-talk-say'); input.value = {owner_input:?}; input.dispatchEvent(new Event('input', {{bubbles:true}})); document.getElementById('talk-send').click(); return input.value === ''; }})()"
     )).await.unwrap();
+    assert_eq!(submitted, true, "goal registration send was not accepted by the composer");
     let page_result = browser.wait_for(&page,
         "document.getElementById('talk-turns')?.textContent.includes('Registered the cross-repository goal.')",
         Duration::from_secs(60)).await;
     chat = Talks::at(home.join("talks")).get(&chat.id).unwrap();
-    assert!(page_result.is_ok(), "goal registration failed: {:?}", chat.turns.iter().map(|t| &t.body).collect::<Vec<_>>());
+    if let Err(error) = page_result {
+        let page_state = browser.eval(&page, r#"({
+          error: document.getElementById('talk-error')?.textContent,
+          pending: document.getElementById('talk-pending')?.textContent,
+          thinking: deck.state.talkDetail?.talk?.thinking,
+          waiting: deck.state.talkWaits.has(deck.state.talkDetail?.id)
+        })"#).await;
+        panic!(
+            "goal registration failed: {error}; turns {:?}; pending {:?} ({} messages); page {page_state:?}",
+            chat.turns.iter().map(|t| &t.body).collect::<Vec<_>>(),
+            chat.pending,
+            chat.pending_messages.len(),
+        );
+    }
     assert_eq!(chat.repo, conversation.canonicalize().unwrap());
     assert_eq!(chat.goals[0].repo, Some(fx.repo.canonicalize().unwrap()));
     assert_eq!(chat.goals[0].tasks, vec![task.id.clone()]);
@@ -6374,7 +6419,9 @@ printf 'Registered the cross-repository goal.\n'
                     Duration::from_secs(30),
                 )
                 .await
-                .unwrap_or_else(|error| panic!("direct Run references at {width}px: {error}"));
+                .unwrap_or_else(|error| {
+                    panic!("direct Run references at {width}px: {error}; runs: {:?}", chat.goals[2].runs)
+                });
         }
         browser
             .eval(&page, "document.getElementById('talk-goal-open').click()")
