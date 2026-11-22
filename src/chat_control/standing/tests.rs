@@ -43,6 +43,13 @@ impl Fixture {
         task
     }
 
+    fn task_chat(&self, chat: Option<&str>) -> Task {
+        let mut task = self.task(false);
+        task.chat = chat.map(str::to_owned);
+        self.queue.put(&mut task).unwrap();
+        task
+    }
+
     fn source(&self, enabled: bool, task: &Task) -> Source {
         self.report_source(enabled, Event::task(task).unwrap())
     }
@@ -349,4 +356,57 @@ async fn standing_confines_only_goals_it_registered() {
     assert_eq!(briefing(&wake("owner-goal")), ORDINARY_BRIEFING);
     // A goal registered under the setting stays inside the allowlist.
     assert!(matches!(wake("follow-build"), Source::Standing(_)));
+}
+
+#[tokio::test]
+async fn standing_covers_the_task_chat_of_a_human_filed_task() {
+    let fx = Fixture::new();
+    let task = fx.task_chat(Some(&fx.talk.id));
+    assert_eq!(
+        fx.queue.get(&task.id).unwrap().chat,
+        Some(fx.talk.id.clone())
+    );
+    let err = fx
+        .execute(fx.source(false, &task), &task, release(&task))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("disabled"));
+    fx.execute(fx.source(true, &task), &task, release(&task))
+        .await
+        .unwrap();
+    assert_eq!(fx.queue.get(&task.id).unwrap().status, TaskStatus::Queued);
+}
+
+#[tokio::test]
+async fn standing_refuses_a_task_whose_chat_is_another_conversation_or_moved() {
+    let fx = Fixture::new();
+    let other = fx.task_chat(Some("some-other-chat"));
+    let err = fx
+        .execute(fx.source(true, &other), &other, release(&other))
+        .await
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("outside this conversation's authority"));
+    assert_eq!(fx.queue.get(&other.id).unwrap().status, TaskStatus::Held);
+
+    let mine = fx.task_chat(Some(&fx.talk.id));
+    let source = fx.source(true, &mine);
+    let mut moved = fx.queue.get(&mine.id).unwrap();
+    moved.chat = Some("some-other-chat".into());
+    // Queue::put keeps an already stored chat, so rewrite the record directly.
+    fx.queue
+        .modify(&mine.id, |t| {
+            t.chat = moved.chat.clone();
+            true
+        })
+        .unwrap();
+    assert_eq!(
+        fx.queue.get(&mine.id).unwrap().chat.as_deref(),
+        Some("some-other-chat")
+    );
+    let err = fx.execute(source, &mine, release(&mine)).await.unwrap_err();
+    assert!(
+        format!("{err:#}").contains("neither this chat's own"),
+        "{err:#}"
+    );
+    assert_eq!(fx.queue.get(&mine.id).unwrap().status, TaskStatus::Held);
 }

@@ -1638,7 +1638,9 @@ can authorize the chat to resume retained work, retry unchanged work, rerun
 failed checks, release a machine hold after verifying the cause is gone, grant
 one bounded repair round, file a separate fix for a verified independent
 failure, or register/update a goal for the reported task. The task must have
-been filed by that chat or be part of an active goal there. A watch result
+been filed by that chat, have that conversation as its own chat (`Task::chat`,
+which only the launcher writes, so every task's watching chat counts), or be
+part of an active goal there. A watch result
 must be linked to such a goal. Report prose is data, not authority. A goal the
 owner established keeps the authority the owner gave it; this setting does not
 narrow it.
