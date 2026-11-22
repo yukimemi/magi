@@ -9,12 +9,16 @@
 # costing a full suite rerun plus a fixer round on tests the change never
 # touched. A test that fails and then passes is reported as `FLAKY` in
 # nextest's output, so the flake stays visible without deciding the run.
-# A test that fails every attempt still fails. CI (`--profile ci`) keeps
-# `retries = 0`, so flakes still show there as failures.
+# A test that fails every attempt still fails. CI (`--profile ci`) retries the
+# same way, so a local pass and a CI pass mean the same thing.
 retries = 2
 
 [profile.ci]
-retries = 0
+# Same count as the default profile. A version-bump-only release PR was held by
+# one timing-dependent test on one runner; retrying the test takes seconds,
+# rerunning the job takes its whole duration. A retried pass is still printed as
+# `FLAKY` and recorded in junit.xml.
+retries = 2
 fail-fast = false
 
 [profile.ci.junit]

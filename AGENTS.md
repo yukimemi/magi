@@ -3766,12 +3766,12 @@ or PR creation. Landing requires fresh confirmed merge of the recorded head.
 The existing Chat task-progress strip adds purpose, state and current step/wait,
 with a validated Run or Task link; detailed execution remains on Run.
 
-### Local integration tests retry; CI's do not
+### Integration tests retry under nextest, locally and in CI
 
-This is the one exception to the `kata:agents:rust:*` statement that the local
-gate runs the tests the way CI does. `[profile.default]` in
-`.config/nextest.toml` (what `cargo make test`, and so `verify.e2e`, uses) sets
-`retries = 2`; `[profile.ci]` keeps `retries = 0`.
+`[profile.default]` in `.config/nextest.toml` (what `cargo make test`, and so
+`verify.e2e`, uses) and `[profile.ci]` (what `ci.yml` uses) both set
+`retries = 2`, so the local gate still runs the tests the way CI does. Keep the
+two counts equal.
 
 - **Why.** The machine runs several magi runs at once, so the suite always runs
   under load. Between 2026-11-12 and 2026-11-22 `verify.e2e` failed 65 of 113
@@ -3782,8 +3782,12 @@ gate runs the tests the way CI does. `[profile.default]` in
   reversed on purpose.
 - **Visibility is kept.** A test that fails and then passes is printed by
   nextest as `FLAKY` (with `TRY n FAIL` lines for the failed attempts) and the
-  command passes. A test that fails every attempt still fails. CI shows flakes
-  as failures.
+  command passes; CI also records it in `junit.xml`. A test that fails every
+  attempt still fails.
+- **CI retries too.** It first kept `retries = 0`, and a release PR whose whole
+  diff was the version number was then held by one timing-dependent test on
+  one runner. Retrying a test takes seconds; rerunning the job takes its whole
+  duration (about 17 minutes on macOS).
 - **Scope.** Lib / bin unit tests stay on `cargo test` (the kata-managed
   `test-targets` task) and are never retried.
 - **Known interaction.** `run::summarize_verify` treats `FAIL [` lines (so
