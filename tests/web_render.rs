@@ -5091,7 +5091,7 @@ async fn avatar_settings_preview_isolation_reload_and_reset_on_phone() {
       const saved = __SAVED__;
       if (!panel.querySelector('button').disabled) throw new Error('invalid image accepted');
       if ((await (await fetch('/api/avatar-settings')).json()).operator !== saved) throw new Error('invalid image corrupted save');
-      for (const button of panel().querySelectorAll('button')) if (button.getBoundingClientRect().height < 44) throw new Error('small touch target');
+      for (const button of panel.querySelectorAll('button')) if (button.getBoundingClientRect().height < 44) throw new Error('small touch target');
     })()"#.replace("__SAVED__", &result.to_string())).await.expect("check invalid upload and touch targets");
     browser.close_page(&page).await;
     let page = browser
