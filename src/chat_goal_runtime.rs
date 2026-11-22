@@ -26,15 +26,45 @@ fn unavailable(error: &anyhow::Error) -> Value {
     json!({"unavailable": format!("{error:#}")})
 }
 
-trait PrObserver: Sync {
-    fn current_pr(&self, repo: &Path, url: &str) -> impl Future<Output = Result<Value>> + Send;
+const ARTIFACT_HEAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+async fn git_artifact_head(repo: &Path, branch: &str) -> Option<String> {
+    let revision = format!("{branch}^{{commit}}");
+    crate::git::git_raw(
+        repo,
+        &["rev-parse", "--verify", "--end-of-options", &revision],
+    )
+    .await
+    .ok()
+    .filter(|output| output.ok())
+    .map(|output| output.stdout)
 }
 
-struct CurrentPr;
+async fn bounded_artifact_head<F>(timeout: std::time::Duration, probe: F) -> Option<String>
+where
+    F: Future<Output = Option<String>>,
+{
+    tokio::time::timeout(timeout, probe).await.ok().flatten()
+}
 
-impl PrObserver for CurrentPr {
+trait EvidenceObserver: Sync {
+    fn current_pr(&self, repo: &Path, url: &str) -> impl Future<Output = Result<Value>> + Send;
+    fn artifact_head(
+        &self,
+        repo: &Path,
+        branch: &str,
+    ) -> impl Future<Output = Option<String>> + Send;
+}
+
+struct LiveObserver;
+
+impl EvidenceObserver for LiveObserver {
     async fn current_pr(&self, repo: &Path, url: &str) -> Result<Value> {
         crate::chat_notify::current_pr(repo, url).await
+    }
+
+    async fn artifact_head(&self, repo: &Path, branch: &str) -> Option<String> {
+        bounded_artifact_head(ARTIFACT_HEAD_TIMEOUT, git_artifact_head(repo, branch)).await
     }
 }
 
@@ -48,16 +78,16 @@ pub(crate) async fn observe(
     runs: &[String],
     watches: &[String],
 ) -> Observation {
-    observe_with_pr(home, repo, tasks, runs, watches, &CurrentPr).await
+    observe_with(home, repo, tasks, runs, watches, &LiveObserver).await
 }
 
-async fn observe_with_pr(
+async fn observe_with(
     home: &Path,
     repo: &Path,
     tasks: &[String],
     runs: &[String],
     watches: &[String],
-    observer: &impl PrObserver,
+    observer: &impl EvidenceObserver,
 ) -> Observation {
     let mut task_facts = Vec::new();
     let mut run_ids = Vec::new();
@@ -111,19 +141,7 @@ async fn observe_with_pr(
                 });
                 let branch = winner.and_then(|candidate| candidate["branch"].as_str());
                 let artifact_head = if let Some(branch) = branch {
-                    let revision = format!("{branch}^{{commit}}");
-                    tokio::time::timeout(
-                        std::time::Duration::from_secs(5),
-                        crate::git::git_raw(
-                            repo,
-                            &["rev-parse", "--verify", "--end-of-options", &revision],
-                        ),
-                    )
-                    .await
-                    .ok()
-                    .and_then(Result::ok)
-                    .filter(|output| output.ok())
-                    .map(|output| output.stdout)
+                    observer.artifact_head(repo, branch).await
                 } else {
                     None
                 };
@@ -285,14 +303,14 @@ pub(crate) async fn sweep(talks: &crate::talk::Talks, parking: bool) {
 }
 
 async fn reconcile(talks: &crate::talk::Talks, chat: &str, id: &str) -> Result<()> {
-    reconcile_with_pr(talks, chat, id, &CurrentPr).await
+    reconcile_with(talks, chat, id, &LiveObserver).await
 }
 
-async fn reconcile_with_pr(
+async fn reconcile_with(
     talks: &crate::talk::Talks,
     chat: &str,
     id: &str,
-    observer: &impl PrObserver,
+    observer: &impl EvidenceObserver,
 ) -> Result<()> {
     use crate::chat_goal::State;
     let talk = talks.get(chat)?;
@@ -335,7 +353,7 @@ async fn reconcile_with_pr(
     {
         return Ok(());
     }
-    let observation = observe_with_pr(
+    let observation = observe_with(
         talks.home(),
         goal.effective_repo(&talk.repo),
         &goal.tasks,
@@ -530,13 +548,15 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct FakePrObserver {
+    struct FakeObserver {
         replies: std::sync::Mutex<std::collections::BTreeMap<String, Value>>,
         calls: std::sync::Mutex<Vec<String>>,
         repos: std::sync::Mutex<Vec<std::path::PathBuf>>,
+        artifact_heads: std::sync::Mutex<std::collections::BTreeMap<String, Option<String>>>,
+        artifact_calls: std::sync::Mutex<Vec<(std::path::PathBuf, String)>>,
     }
 
-    impl PrObserver for FakePrObserver {
+    impl EvidenceObserver for FakeObserver {
         async fn current_pr(&self, repo: &Path, url: &str) -> Result<Value> {
             self.calls.lock().unwrap().push(url.to_owned());
             self.repos.lock().unwrap().push(repo.to_path_buf());
@@ -547,9 +567,22 @@ mod tests {
                 .cloned()
                 .with_context(|| format!("fixture PR unavailable: {url}"))
         }
+
+        async fn artifact_head(&self, repo: &Path, branch: &str) -> Option<String> {
+            self.artifact_calls
+                .lock()
+                .unwrap()
+                .push((repo.to_path_buf(), branch.to_owned()));
+            self.artifact_heads
+                .lock()
+                .unwrap()
+                .get(branch)
+                .cloned()
+                .flatten()
+        }
     }
 
-    impl FakePrObserver {
+    impl FakeObserver {
         fn assert_one_lookup_per_pr(&self, urls: &[String]) {
             let calls = std::mem::take(&mut *self.calls.lock().unwrap());
             for url in urls {
@@ -567,10 +600,10 @@ mod tests {
         }
     }
 
-    fn pr_goal_fixture(home: &Path) -> (Goal, FakePrObserver, Vec<String>) {
+    fn pr_goal_fixture(home: &Path) -> (Goal, FakeObserver, Vec<String>) {
         let mut goal = goal();
         goal.runs.clear();
-        let observer = FakePrObserver::default();
+        let observer = FakeObserver::default();
         let urls: Vec<_> = (1..=5)
             .map(|index| format!("https://example.invalid/pull/{index}"))
             .collect();
@@ -611,8 +644,7 @@ mod tests {
             urls[4].clone(),
             json!({"state":"OPEN","head":head,"merged_at":null,"checks":[{"verdict":"pending"}]}),
         );
-        let pending =
-            observe_with_pr(temp.path(), temp.path(), &[], &goal.runs, &[], &observer).await;
+        let pending = observe_with(temp.path(), temp.path(), &[], &goal.runs, &[], &observer).await;
         assert!(!satisfied(&goal, &pending.facts));
         goal.observe(pending.fingerprint, pending.facts.to_string(), false);
         observer.assert_one_lookup_per_pr(&urls);
@@ -621,8 +653,7 @@ mod tests {
             urls[4].clone(),
             json!({"state":"OPEN","head":head,"merged_at":null,"checks":[{"verdict":"failed"}]}),
         );
-        let failed =
-            observe_with_pr(temp.path(), temp.path(), &[], &goal.runs, &[], &observer).await;
+        let failed = observe_with(temp.path(), temp.path(), &[], &goal.runs, &[], &observer).await;
         assert_ne!(
             failed.fingerprint, goal.fingerprint,
             "CI changes beyond the first four PRs must wake the goal"
@@ -634,8 +665,7 @@ mod tests {
 
         observer.replies.lock().unwrap().insert(urls[4].clone(),
             json!({"state":"MERGED","head":format!("{:040x}",99),"merged_at":"2026-01-01T00:00:00Z"}));
-        let moved =
-            observe_with_pr(temp.path(), temp.path(), &[], &goal.runs, &[], &observer).await;
+        let moved = observe_with(temp.path(), temp.path(), &[], &goal.runs, &[], &observer).await;
         assert!(
             !satisfied(&goal, &moved.facts),
             "the fifth PR must match its saved head too"
@@ -646,8 +676,7 @@ mod tests {
             urls[4].clone(),
             json!({"state":"MERGED","head":head,"merged_at":"2026-01-01T00:00:00Z"}),
         );
-        let merged =
-            observe_with_pr(temp.path(), temp.path(), &[], &goal.runs, &[], &observer).await;
+        let merged = observe_with(temp.path(), temp.path(), &[], &goal.runs, &[], &observer).await;
         assert!(
             satisfied(&goal, &merged.facts),
             "all six run associations must have exact-head merge evidence"
@@ -661,15 +690,13 @@ mod tests {
     async fn unavailable_pull_request_does_not_hide_later_ci_or_reuse_old_merge_evidence() {
         let temp = tempfile::tempdir().unwrap();
         let (goal, observer, urls) = pr_goal_fixture(temp.path());
-        let merged =
-            observe_with_pr(temp.path(), temp.path(), &[], &goal.runs, &[], &observer).await;
+        let merged = observe_with(temp.path(), temp.path(), &[], &goal.runs, &[], &observer).await;
         assert!(satisfied(&goal, &merged.facts));
         observer.assert_one_lookup_per_pr(&urls);
         observer.replies.lock().unwrap().remove(&urls[0]);
         observer.replies.lock().unwrap().insert(urls[4].clone(),
             json!({"state":"OPEN","head":format!("{:040x}",5),"merged_at":null,"checks":[{"verdict":"failed"}]}));
-        let current =
-            observe_with_pr(temp.path(), temp.path(), &[], &goal.runs, &[], &observer).await;
+        let current = observe_with(temp.path(), temp.path(), &[], &goal.runs, &[], &observer).await;
         assert!(
             !satisfied(&goal, &current.facts),
             "previously merged evidence cannot replace a failed fresh lookup"
@@ -739,7 +766,7 @@ mod tests {
         retained.repo = Some(checkout.canonicalize().unwrap());
         retained.tasks = vec![task.id];
         retained.runs = vec![previous.id];
-        let observer = FakePrObserver::default();
+        let observer = FakeObserver::default();
         let url = &target.pr.as_ref().unwrap().url;
         observer
             .replies
@@ -747,7 +774,7 @@ mod tests {
             .unwrap()
             .insert(url.clone(), json!({"state":"OPEN","head":"head"}));
         let repo = retained.effective_repo(&talk.repo);
-        let mixed = observe_with_pr(
+        let mixed = observe_with(
             home,
             repo,
             &retained.tasks,
@@ -764,7 +791,7 @@ mod tests {
         );
         assert_one_target_lookup(&observer, repo, url);
         // Legacy conversations may have stored the filing subdirectory as cwd.
-        let pending = observe_with_pr(
+        let pending = observe_with(
             home,
             &subdir,
             &retained.tasks,
@@ -786,7 +813,7 @@ mod tests {
             json!({"state":"MERGED","head":"head","merged_at":"now"}),
         );
         let reopened = crate::talk::Talks::at(home.join("talks"));
-        reconcile_with_pr(&reopened, &talk.id, "goal", &observer)
+        reconcile_with(&reopened, &talk.id, "goal", &observer)
             .await
             .unwrap();
         let again = reopened.get(&talk.id).unwrap();
@@ -795,7 +822,7 @@ mod tests {
         assert_eq!(again.repo, home);
     }
 
-    fn assert_one_target_lookup(observer: &FakePrObserver, repo: &Path, url: &str) {
+    fn assert_one_target_lookup(observer: &FakeObserver, repo: &Path, url: &str) {
         observer.assert_one_lookup_per_pr(&[url.into()]);
         let repos = std::mem::take(&mut *observer.repos.lock().unwrap());
         assert_eq!(repos, [repo]);
@@ -873,35 +900,17 @@ mod tests {
         let home = temp.path().join("home");
         let repo = temp.path().join("repo");
         std::fs::create_dir(&repo).unwrap();
-        for args in [
-            vec!["init"],
-            vec![
-                "-c",
-                "user.name=Fixture",
-                "-c",
-                "user.email=fixture@example.invalid",
-                "-c",
-                "commit.gpgsign=false",
-                "commit",
-                "--allow-empty",
-                "-m",
-                "Fixture artifact",
-            ],
-        ] {
-            let result = crate::git::git_raw(&repo, &args).await.unwrap();
-            assert!(result.ok(), "{}", result.stderr);
-        }
-        let head = crate::git::git_raw(&repo, &["rev-parse", "HEAD"])
-            .await
-            .unwrap()
-            .stdout;
         let queue = crate::queue::Queue::at(home.join("queue"));
+        let observer = FakeObserver::default();
         let mut goal = goal();
         goal.condition.kind = Completion::TasksDone;
         goal.tasks.clear();
         goal.runs.clear();
+        let mut expected_calls = Vec::new();
         for index in 0..32 {
             let run = format!("run-{index}");
+            let branch = format!("magi/task-{index}");
+            let head = format!("{:040x}", index + 1);
             let path = home.join("runs").join(&run);
             std::fs::create_dir_all(&path).unwrap();
             std::fs::write(
@@ -909,11 +918,17 @@ mod tests {
                 json!({
                     "id":run,"repo":repo,
                     "gate_ran":true,"gate_head":head,"gate":[{"code":0}],
-                    "tally":{"winner":"A"},"candidates":[{"label":"A","branch":"HEAD"}]
+                    "tally":{"winner":"A"},"candidates":[{"label":"A","branch":branch}]
                 })
                 .to_string(),
             )
             .unwrap();
+            observer
+                .artifact_heads
+                .lock()
+                .unwrap()
+                .insert(branch.clone(), Some(head));
+            expected_calls.push((repo.clone(), branch));
             let mut task = crate::queue::Task::new(
                 "Verified patch".into(),
                 "deliver the patch".into(),
@@ -934,7 +949,11 @@ mod tests {
         queue.put(&mut unstarted).unwrap();
         goal.tasks.push(unstarted.id.clone());
         goal.runs.push("missing-run".into());
-        let observation = observe(&home, &repo, &goal.tasks, &goal.runs, &[]).await;
+        let observation = observe_with(&home, &repo, &goal.tasks, &goal.runs, &[], &observer).await;
+        assert_eq!(
+            std::mem::take(&mut *observer.artifact_calls.lock().unwrap()),
+            expected_calls
+        );
         let mut facts = observation.facts;
         assert!(
             !satisfied(&goal, &facts),
@@ -971,6 +990,150 @@ mod tests {
             !satisfied(&goal, &facts),
             "the thirty-third direct run is still unavailable"
         );
+
+        // With only the 32 valid tasks and runs, a single unavailable artifact
+        // head at the tail must still reject completion.
+        goal.tasks.pop();
+        goal.runs.pop();
+        let verified = observe_with(&home, &repo, &goal.tasks, &goal.runs, &[], &observer).await;
+        assert!(satisfied(&goal, &verified.facts));
+        observer
+            .artifact_heads
+            .lock()
+            .unwrap()
+            .insert("magi/task-31".into(), None);
+        let unavailable_tail =
+            observe_with(&home, &repo, &goal.tasks, &goal.runs, &[], &observer).await;
+        assert!(unavailable_tail.facts["runs"][31]["artifact_head"].is_null());
+        assert!(
+            !satisfied(&goal, &unavailable_tail.facts),
+            "an unavailable artifact head must reject completion even without unstarted tasks or missing runs"
+        );
+    }
+
+    #[tokio::test]
+    async fn timed_out_artifact_head_probe_becomes_null_and_blocks_completion() {
+        assert_eq!(
+            bounded_artifact_head(
+                ARTIFACT_HEAD_TIMEOUT,
+                std::future::ready(Some("abc".into())),
+            )
+            .await,
+            Some("abc".into())
+        );
+        assert_eq!(
+            bounded_artifact_head(std::time::Duration::ZERO, std::future::pending()).await,
+            None
+        );
+
+        struct TimedArtifactObserver {
+            fast_branch: String,
+            fast_head: String,
+        }
+
+        impl EvidenceObserver for TimedArtifactObserver {
+            async fn current_pr(&self, _repo: &Path, url: &str) -> Result<Value> {
+                anyhow::bail!("unexpected PR lookup: {url}")
+            }
+
+            async fn artifact_head(&self, _repo: &Path, branch: &str) -> Option<String> {
+                if branch == self.fast_branch {
+                    bounded_artifact_head(
+                        ARTIFACT_HEAD_TIMEOUT,
+                        std::future::ready(Some(self.fast_head.clone())),
+                    )
+                    .await
+                } else {
+                    bounded_artifact_head(std::time::Duration::ZERO, std::future::pending()).await
+                }
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let queue = crate::queue::Queue::at(home.join("queue"));
+        let mut goal = goal();
+        goal.condition.kind = Completion::TasksDone;
+        goal.tasks.clear();
+        goal.runs.clear();
+        for (index, branch) in ["magi/fast", "magi/timed-out"].into_iter().enumerate() {
+            let run = format!("run-{index}");
+            let head = format!("{:040x}", index + 1);
+            let path = home.join("runs").join(&run);
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(
+                path.join("run.json"),
+                json!({
+                    "id":run,"repo":repo,
+                    "gate_ran":true,"gate_head":head,"gate":[{"code":0}],
+                    "tally":{"winner":"A"},"candidates":[{"label":"A","branch":branch}]
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let mut task = crate::queue::Task::new(
+                "Verified patch".into(),
+                "deliver the patch".into(),
+                repo.clone(),
+                crate::queue::Source::Human,
+            );
+            task.runs.push(run.clone());
+            queue.put(&mut task).unwrap();
+            goal.tasks.push(task.id);
+            goal.runs.push(run);
+        }
+        let observer = TimedArtifactObserver {
+            fast_branch: "magi/fast".into(),
+            fast_head: format!("{:040x}", 1),
+        };
+        let observation = observe_with(&home, &repo, &goal.tasks, &goal.runs, &[], &observer).await;
+        assert_eq!(
+            observation.facts["runs"][0]["artifact_head"],
+            format!("{:040x}", 1)
+        );
+        assert!(observation.facts["runs"][1]["artifact_head"].is_null());
+        assert!(
+            !satisfied(&goal, &observation.facts),
+            "a timed-out artifact probe must become null and prevent completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn git_artifact_head_resolves_existing_ref_and_rejects_missing_or_option_like_ref() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        for args in [
+            vec!["init"],
+            vec![
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "Fixture artifact",
+            ],
+            vec!["branch", "magi/delivered"],
+        ] {
+            let result = crate::git::git_raw(&repo, &args).await.unwrap();
+            assert!(result.ok(), "{}", result.stderr);
+        }
+        let head = crate::git::git_raw(&repo, &["rev-parse", "HEAD"])
+            .await
+            .unwrap()
+            .stdout;
+        assert_eq!(
+            git_artifact_head(&repo, "magi/delivered").await.as_deref(),
+            Some(head.as_str())
+        );
+        assert_eq!(git_artifact_head(&repo, "magi/missing").await, None);
+        assert_eq!(git_artifact_head(&repo, "--help").await, None);
     }
 
     #[tokio::test]
