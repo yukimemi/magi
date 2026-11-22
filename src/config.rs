@@ -1562,6 +1562,9 @@ pub struct Talk {
     /// checkout - has nothing to lose by turning this on in its own
     /// `magi.toml`, and a one-line fix stops costing a queued task to get.
     pub allow_write: bool,
+    /// Allow bounded recovery on automatic chat turns; only the machine layer can set it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub standing_authorization: bool,
     /// Extra chat personas, `[[talk.personas]]`. They add to the built-ins in
     /// [`crate::persona`]; an entry with a built-in's id replaces it. Like every
     /// array outside [`array_merge_policy`]'s append list, declaring it in two
@@ -1767,6 +1770,10 @@ impl Config {
     /// there). Picking one file and ignoring the other would force every repo
     /// to restate the roster.
     pub fn load_layers(paths: &[PathBuf]) -> Result<Self> {
+        Self::load_layers_with_machine(paths, Self::machine_layer())
+    }
+
+    fn load_layers_with_machine(paths: &[PathBuf], machine: Option<PathBuf>) -> Result<Self> {
         let mut engine = teravars::Engine::default();
         let ctx = Self::render_ctx(paths);
         if paths.len() > 1 {
@@ -1800,6 +1807,37 @@ impl Config {
             })?;
         let mut table = merged.config;
         Self::normalize_renamed_keys(paths, &mut engine, &ctx, &mut table)?;
+        // Repository templates and explicit execution config cannot supply or
+        // override this authority, including through includes or rendered vars.
+        let standing = table
+            .get_mut("talk")
+            .and_then(toml::Value::as_table_mut)
+            .and_then(|talk| talk.remove("standing_authorization"));
+        let standing = if standing.is_some()
+            && let Some(machine) = machine.filter(|machine| paths.contains(machine))
+        {
+            let machine_paths = [machine];
+            let mut engine = teravars::Engine::default();
+            let layer = teravars::load_merged(
+                &machine_paths,
+                &mut engine,
+                &Self::render_ctx(&machine_paths),
+            )
+            .context("read machine standing authorization")?;
+            layer
+                .config
+                .get("talk")
+                .and_then(|talk| talk.get("standing_authorization"))
+                .map(|value| {
+                    value.as_bool().context(
+                        "[talk] standing_authorization in the machine layer must be a boolean",
+                    )
+                })
+                .transpose()?
+                .unwrap_or(false)
+        } else {
+            false
+        };
         // `[vars]` is teravars' own input, already resolved into the render
         // context; `deny_unknown_fields` must not trip over it.
         table.remove("vars");
@@ -1811,6 +1849,7 @@ impl Config {
             .try_into()
             .context("deserializing magi config")
             .context(ConfigFailure::layers("config-deserialize", paths))?;
+        cfg.talk.standing_authorization = standing;
         if !cfg.graph.question_routing {
             tracing::warn!(
                 "[graph] question_routing is retired and ignored; task inquiries always use their chat"
@@ -2507,6 +2546,7 @@ impl Config {
              # timeout_resource_wait = 1800\n\n\
              # What the chat calls you (persona address and the Chat's turn label).\n\
              # [talk]\n\
+             # standing_authorization = false # machine layer only; bounded chat recovery\n\
              # operator_name = \"Commander\"\n\n\
              # Chat personas (tone only; the web Chat picks one per conversation).\n\
              # Built in: magi, rei, misato, ritsuko, shinji, asuka, kaworu. Entries add to\n\
@@ -2987,6 +3027,26 @@ fn remote_layers(repo: &Path) -> Result<Vec<PathBuf>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn standing_authorization_is_only_from_the_named_machine_layer() {
+        let dir = tempfile::tempdir().unwrap();
+        let machine = dir.path().join("machine.toml");
+        let repo = dir.path().join("magi.toml");
+        std::fs::write(&machine, "[talk]\nstanding_authorization = false\n").unwrap();
+        std::fs::write(&repo, "[talk]\nstanding_authorization = true\n").unwrap();
+        let layers = [machine.clone(), repo.clone()];
+        let load = |paths| Config::load_layers_with_machine(paths, Some(machine.clone())).unwrap();
+        assert!(!load(&layers).talk.standing_authorization);
+        assert!(
+            !load(std::slice::from_ref(&repo))
+                .talk
+                .standing_authorization
+        );
+        std::fs::write(&machine, "[talk]\nstanding_authorization = true\n").unwrap();
+        std::fs::write(&repo, "[talk]\nstanding_authorization = false\n").unwrap();
+        assert!(load(&layers).talk.standing_authorization);
+    }
+
     #[test]
     fn run_records_with_the_retired_editing_network_key_still_load() {
         // Run records from v0.205-v0.207 carry it in their config snapshot.

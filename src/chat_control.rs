@@ -46,11 +46,22 @@ use crate::talk::{Talk, Talks};
 #[cfg(any(unix, windows))]
 pub(crate) mod bridge;
 
+pub(crate) mod standing;
+
 /// Only these operations cross the standing turn's inherited capability.
 /// No shell commands or calling conversation identities are input.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "operation", deny_unknown_fields)]
 pub enum Operation {
+    /// Request a recovery effect using machine-layer standing authorization.
+    Standing {
+        /// Task in the current automatic report.
+        task: String,
+        /// Evidence the chat checked, and why it justifies this action.
+        evidence: String,
+        /// Existing typed command; the launcher admits only the recovery allowlist.
+        command: Box<Operation>,
+    },
     /// Persist owner-authorized follow-through through a turn capability.
     Goal {
         /// Typed lifecycle transition; completion is observer-only.
@@ -270,7 +281,10 @@ pub async fn dispatch(
 ) -> Result<String> {
     if matches!(
         &operation,
-        Operation::Reassign { .. } | Operation::RecoverBase { .. } | Operation::Goal { .. }
+        Operation::Reassign { .. }
+            | Operation::RecoverBase { .. }
+            | Operation::Goal { .. }
+            | Operation::Standing { .. }
     ) {
         #[cfg(unix)]
         {
@@ -284,6 +298,17 @@ pub async fn dispatch(
         {
             bail!("authenticated chat control channel is unavailable on this platform");
         }
+    }
+    if standing_turn() {
+        #[cfg(unix)]
+        return bridge::request(&operation)
+            .context("automatic recovery requires the authenticated chat control channel");
+        #[cfg(windows)]
+        return bridge::request(&operation)
+            .await
+            .context("automatic recovery requires the authenticated chat control channel");
+        #[cfg(not(any(unix, windows)))]
+        bail!("authenticated chat control channel is unavailable on this platform");
     }
     #[cfg(unix)]
     if std::env::var_os(bridge::CHANNEL_ENV).is_some()
@@ -314,7 +339,19 @@ async fn execute_authenticated(
     source: crate::chat_goal::Source,
     operation: Operation,
 ) -> Result<String> {
+    if let crate::chat_goal::Source::Standing(scope) = source {
+        return Box::pin(standing::execute(
+            queue, home, talks, talk, &scope, operation,
+        ))
+        .await;
+    }
     crate::chat_goal::with_source(source, execute(queue, home, talks, talk, operation)).await
+}
+
+/// Whether the launcher restricted this CLI to read-only inspection and typed controls.
+/// The environment marker can only restrict the CLI; it cannot grant bridge authority.
+pub fn standing_turn() -> bool {
+    std::env::var_os(standing::ENV).is_some()
 }
 
 async fn execute(
@@ -328,6 +365,9 @@ async fn execute(
     crate::chat_goal::fence(talks, talk, &crate::chat_goal::current_source())?;
     admit_goal_operation(queue, home, talks, talk, &operation)?;
     Ok(match operation {
+        Operation::Standing { .. } => bail!(
+            "standing authorization is disabled or this turn is not an eligible automatic report"
+        ),
         Operation::Goal { command } => {
             crate::chat_goal::apply(
                 queue,
@@ -416,28 +456,7 @@ async fn execute(
             outbox.settle(&inquiry, talk, &reason, replacement.as_deref())?;
             format!("settled decision {inquiry}: {reason}")
         }
-        Operation::Add { filing } => {
-            let mut task = Task::new(filing.title, filing.instruction, filing.repo, filing.source);
-            task.sources = filing.sources;
-            if let Some(reason) = filing.hold {
-                task.hold_manual(Some(reason));
-            }
-            task.priority = filing.priority;
-            task.solo = filing.solo;
-            task.urgent = filing.urgent;
-            if filing.implementers.is_some() {
-                task.overrides = Some(crate::queue::RunOverrides {
-                    candidates: filing.implementers,
-                    ..Default::default()
-                });
-            }
-            if filing.attach.is_empty() {
-                queue.put(&mut task)?;
-            } else {
-                queue.attach_and_put(&mut task, &filing.attach)?;
-            }
-            serde_json::to_string(&task)?
-        }
+        Operation::Add { filing } => serde_json::to_string(&file_task(queue, *filing)?)?,
         Operation::Done { task } => {
             let t = done_claimed(queue, home, claimed_for_chat(queue, &task, talks, talk)?)?;
             format!("done {} {}", t.short(), t.title)
@@ -606,6 +625,29 @@ async fn execute(
     })
 }
 
+fn file_task(queue: &Queue, filing: Filing) -> Result<Task> {
+    let mut task = Task::new(filing.title, filing.instruction, filing.repo, filing.source);
+    task.sources = filing.sources;
+    if let Some(reason) = filing.hold {
+        task.hold_manual(Some(reason));
+    }
+    task.priority = filing.priority;
+    task.solo = filing.solo;
+    task.urgent = filing.urgent;
+    if filing.implementers.is_some() {
+        task.overrides = Some(crate::queue::RunOverrides {
+            candidates: filing.implementers,
+            ..Default::default()
+        });
+    }
+    if filing.attach.is_empty() {
+        queue.put(&mut task)?;
+    } else {
+        queue.attach_and_put(&mut task, &filing.attach)?;
+    }
+    Ok(task)
+}
+
 /// A goal turn cannot redirect existing effects to unrelated work.
 fn admit_goal_operation(
     queue: &Queue,
@@ -625,6 +667,10 @@ fn admit_goal_operation(
         .find(|goal| goal.id == id)
         .context("unknown goal")?;
     goal.admit(generation)?;
+    ensure!(
+        !goal.owner_input.is_empty(),
+        "this goal was registered under standing authorization; fresh owner input is required with the setting off"
+    );
     let repo = goal.effective_repo(&talk.repo);
     let task_allowed = |reference: &str| -> Result<()> {
         let id = queue.resolve_id(reference)?;
@@ -649,6 +695,7 @@ fn admit_goal_operation(
         Ok(())
     };
     match operation {
+        Operation::Standing { .. } => bail!("standing authorization is disabled for this turn"),
         Operation::Goal { .. } => {}
         Operation::Add { filing } => {
             crate::chat_goal::require_repo("filing", talk_id, &filing.repo, repo)?;

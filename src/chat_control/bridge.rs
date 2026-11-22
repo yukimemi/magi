@@ -37,6 +37,7 @@ pub(crate) const ENVIRONMENT: &[&str] = &[
     "MAGI_CHAT_CONTROL_SOCKET",
     "MAGI_CHAT_CONTROL_PIPE",
     "MAGI_CHAT_CONTROL_CAP",
+    super::standing::ENV,
 ];
 
 pub(crate) fn clear_environment(command: &mut tokio::process::Command) {

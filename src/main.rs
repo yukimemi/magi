@@ -3,7 +3,7 @@ use std::fmt::Write as _;
 use std::io::IsTerminal as _;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result, bail, ensure};
 use clap::{ArgAction, CommandFactory as _, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use magi::config::{Config, MergeMode};
@@ -908,6 +908,29 @@ enum ControlCmd {
     },
 }
 
+#[derive(Debug, Default, clap::Args)]
+struct StandingArgs {
+    /// Recover only this reported task under machine-layer standing authorization.
+    #[arg(long, requires = "evidence")]
+    standing_task: Option<String>,
+    /// What the chat verified and why it justifies this recovery.
+    #[arg(long, requires = "standing_task")]
+    evidence: Option<String>,
+}
+
+impl StandingArgs {
+    fn wrap(self, operation: magi::chat_control::Operation) -> magi::chat_control::Operation {
+        match (self.standing_task, self.evidence) {
+            (Some(task), Some(evidence)) => magi::chat_control::Operation::Standing {
+                task,
+                evidence,
+                command: Box::new(operation),
+            },
+            _ => operation,
+        }
+    }
+}
+
 /// Operations on the queue.
 #[derive(Debug, Subcommand)]
 enum TaskCmd {
@@ -946,12 +969,16 @@ enum TaskCmd {
         /// Link this effect to an inquiry in the task's Pending decisions list.
         #[arg(long)]
         decision: Option<String>,
+        #[command(flatten)]
+        standing: StandingArgs,
         /// What to do.
         #[command(subcommand)]
         op: ControlCmd,
     },
     /// File a task. Text as arguments, or --file, or --issue, or on stdin.
     Add {
+        #[command(flatten)]
+        standing: StandingArgs,
         #[command(flatten)]
         sources: SourceArgs,
         /// The task text.
@@ -1344,6 +1371,7 @@ async fn async_main() -> Result<()> {
         }
     });
     guard_external_chat_command(&command)?;
+    guard_standing_chat_command(&command)?;
 
     // Overlap the release check with the command: a run spends minutes waiting
     // on agent latency, so this is free, and it is drained with a bounded wait
@@ -1364,6 +1392,40 @@ fn guard_external_chat_command(command: &Command) -> Result<()> {
             "external-chat turns have no owner authority; only read-only inspection commands are allowed"
         );
     }
+    Ok(())
+}
+
+fn guard_standing_chat_command(command: &Command) -> Result<()> {
+    if !magi::chat_control::standing_turn() {
+        return Ok(());
+    }
+    ensure!(
+        external_chat_read_only(command)
+            || matches!(
+                command,
+                Command::Task {
+                    command: TaskCmd::InspectBaseStop { .. }
+                        | TaskCmd::Control {
+                            standing: StandingArgs {
+                                standing_task: Some(_),
+                                ..
+                            },
+                            decision: None,
+                            ..
+                        }
+                        | TaskCmd::Add {
+                            standing: StandingArgs {
+                                standing_task: Some(_),
+                                ..
+                            },
+                            force: false,
+                            issue: None,
+                            ..
+                        }
+                }
+            ),
+        "automatic recovery allows read-only inspection or a typed standing request; this command requires fresh owner input"
+    );
     Ok(())
 }
 
@@ -1397,6 +1459,7 @@ fn spawn_update_check(command: &Command) -> Option<updater::Pending> {
     // An external turn must not trigger automatic installation as a side effect.
     if std::env::var_os("MAGI_WORKER_GENERATION").is_some()
         || std::env::var("MAGI_NODE").as_deref() == Ok("external-chat")
+        || magi::chat_control::standing_turn()
     {
         return None;
     }
@@ -3588,6 +3651,7 @@ fn task_cmd_on(
     // run-recovery paths; boxing that frame alone does not bound its stack use.
     match command {
         TaskCmd::Add {
+            standing,
             sources,
             instruction,
             file,
@@ -3603,6 +3667,14 @@ fn task_cmd_on(
             json,
             implementers,
         } => Box::pin(async move {
+            let recovery = standing.standing_task.is_some();
+            ensure!(
+                !recovery
+                    || (!force
+                        && issue.is_none()
+                        && std::env::var("MAGI_NODE").as_deref() == Ok(queue::CHAT_NODE)),
+                "standing fix filing requires a chat turn and cannot use --force or --issue"
+            );
             if let Some(why) = mistyped_command(
                 "magi task add",
                 &instruction,
@@ -3627,8 +3699,12 @@ fn task_cmd_on(
             // human is still looking at the terminal, not two attempts and
             // a `held` later as an opaque OS error from a failed git spawn.
             let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            let repo = resolve_repo(&repo, &cwd, Some(&text)).await?;
-            if !force {
+            let repo = if recovery {
+                resolve_repo_with_clone(&repo, &cwd, Some(&text), false).await?
+            } else {
+                resolve_repo(&repo, &cwd, Some(&text)).await?
+            };
+            if !force && !recovery {
                 let home = q
                     .root()
                     .parent()
@@ -3654,23 +3730,24 @@ fn task_cmd_on(
             } else {
                 Default::default()
             };
-            let task = if chat_has_control_channel() {
-                let response = control_from_chat(magi::chat_control::Operation::Add {
-                    filing: Box::new(magi::chat_control::Filing {
-                        title,
-                        instruction: text,
-                        repo,
-                        source,
-                        sources: selected,
-                        hold,
-                        priority,
-                        solo,
-                        urgent,
-                        implementers,
-                        attach: absolute_paths(&attach, &cwd),
-                    }),
-                })
-                .await?;
+            let task = if recovery || chat_has_control_channel() {
+                let response =
+                    control_from_chat(standing.wrap(magi::chat_control::Operation::Add {
+                        filing: Box::new(magi::chat_control::Filing {
+                            title,
+                            instruction: text,
+                            repo,
+                            source,
+                            sources: selected,
+                            hold,
+                            priority,
+                            solo,
+                            urgent,
+                            implementers,
+                            attach: absolute_paths(&attach, &cwd),
+                        }),
+                    }))
+                    .await?;
                 serde_json::from_str::<Task>(&response)?
             } else {
                 let mut task = Task::new(title, text, repo, source);
@@ -4068,7 +4145,15 @@ async fn task_cmd_inner(command: TaskCmd, q: Queue) -> Result<()> {
             }
             Ok(())
         }
-        TaskCmd::Control { op, decision } => {
+        TaskCmd::Control {
+            op,
+            decision,
+            standing,
+        } => {
+            ensure!(
+                decision.is_none() || standing.standing_task.is_none(),
+                "standing authorization cannot settle an owner decision"
+            );
             let home = magi::run::home();
             let talks = magi::talk::Talks::open();
             let talk = magi::chat_control::authorize(
@@ -4171,7 +4256,7 @@ async fn task_cmd_inner(command: TaskCmd, q: Queue) -> Result<()> {
             };
             println!(
                 "{}",
-                cc::dispatch(&q, &home, &talks, talk_id, operation).await?
+                cc::dispatch(&q, &home, &talks, talk_id, standing.wrap(operation)).await?
             );
             Ok(())
         }
@@ -6342,6 +6427,32 @@ mod tests {
     }
 
     #[test]
+    fn standing_cli_requires_the_task_and_its_evidence_together() {
+        let args = ["magi", "task", "control", "--standing-task", "c9bf"];
+        assert!(Cli::try_parse_from(args.into_iter().chain(["release", "c9bf"])).is_err());
+        let cli = Cli::try_parse_from(args.into_iter().chain([
+            "--evidence",
+            "Cache no longer leased",
+            "release",
+            "c9bf",
+        ]))
+        .unwrap();
+        let Some(Command::Task {
+            command:
+                TaskCmd::Control {
+                    standing,
+                    op: ControlCmd::Release { id },
+                    ..
+                },
+        }) = cli.command
+        else {
+            panic!("expected standing release");
+        };
+        assert_eq!(standing.standing_task.as_deref(), Some(id.as_str()));
+        assert_eq!(standing.evidence.as_deref(), Some("Cache no longer leased"));
+    }
+
+    #[test]
     fn pending_decision_controls_parse_without_owner_quote_evidence() {
         let cli = Cli::try_parse_from([
             "magi",
@@ -6359,6 +6470,7 @@ mod tests {
                 TaskCmd::Control {
                     decision,
                     op: ControlCmd::Hold { id, reason },
+                    ..
                 },
             ..
         }) = cli.command
@@ -6821,6 +6933,7 @@ mod tests {
         std::fs::write(&shot, "pixels").unwrap();
         task_cmd_on(
             TaskCmd::Add {
+                standing: StandingArgs::default(),
                 sources: Default::default(),
                 instruction: vec!["make".to_owned(), "it".to_owned(), "pretty".to_owned()],
                 file: None,
@@ -6968,6 +7081,7 @@ mod tests {
 
         task_cmd_on(
             TaskCmd::Add {
+                standing: StandingArgs::default(),
                 sources: Default::default(),
                 instruction: vec!["do".to_owned(), "the".to_owned(), "thing".to_owned()],
                 file: None,
@@ -6990,6 +7104,7 @@ mod tests {
 
         task_cmd_on(
             TaskCmd::Add {
+                standing: StandingArgs::default(),
                 sources: Default::default(),
                 instruction: vec!["do".to_owned(), "another".to_owned(), "thing".to_owned()],
                 file: None,
@@ -7029,6 +7144,7 @@ mod tests {
 
         task_cmd_on(
             TaskCmd::Add {
+                standing: StandingArgs::default(),
                 sources: Default::default(),
                 instruction: vec!["do".to_owned(), "the".to_owned(), "thing".to_owned()],
                 file: None,
@@ -7051,6 +7167,7 @@ mod tests {
 
         task_cmd_on(
             TaskCmd::Add {
+                standing: StandingArgs::default(),
                 sources: Default::default(),
                 instruction: vec!["do".to_owned(), "another".to_owned(), "thing".to_owned()],
                 file: None,
@@ -7094,6 +7211,7 @@ mod tests {
 
         let err = task_cmd_on(
             TaskCmd::Add {
+                standing: StandingArgs::default(),
                 sources: Default::default(),
                 instruction: vec!["list".to_owned()],
                 file: None,
@@ -7118,6 +7236,7 @@ mod tests {
 
         let err = task_cmd_on(
             TaskCmd::Add {
+                standing: StandingArgs::default(),
                 sources: Default::default(),
                 instruction: vec!["info".to_owned(), "20260912-114326-d3b8".to_owned()],
                 file: None,
@@ -7158,6 +7277,7 @@ mod tests {
 
         task_cmd_on(
             TaskCmd::Add {
+                standing: StandingArgs::default(),
                 sources: Default::default(),
                 instruction: vec![],
                 file: Some(path),
@@ -7748,6 +7868,7 @@ done
 
         let err = task_cmd_on(
             TaskCmd::Add {
+                standing: StandingArgs::default(),
                 sources: Default::default(),
                 instruction: vec!["do".to_owned(), "it".to_owned()],
                 file: None,
@@ -7779,6 +7900,7 @@ done
 
         task_cmd_on(
             TaskCmd::Add {
+                standing: StandingArgs::default(),
                 sources: Default::default(),
                 instruction: vec!["do".to_owned(), "it".to_owned()],
                 file: None,
@@ -7846,6 +7968,7 @@ command = ['sh', '-c', 'cat >/dev/null; printf "%s" "{\"duplicate\":true,\"reaso
         owner.review_branch = Some("magi/ab12/A".to_owned());
         q.put(&mut owner).unwrap();
         let add = |force| TaskCmd::Add {
+            standing: StandingArgs::default(),
             sources: Default::default(),
             instruction: vec!["land".to_owned(), "magi/ab12/A".to_owned()],
             file: None,

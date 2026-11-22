@@ -8931,6 +8931,7 @@ impl TalkView {
                         sender: Some(talk::Sender::Magi),
                         body: original.body.clone(),
                         display: Some(display),
+                        recovery_event: None,
                         attachments: original.attachments.clone(),
                         reply: None,
                     });
@@ -8969,6 +8970,7 @@ impl TalkView {
             talk.pending_messages.push(talk::Message {
                 sender: Some(talk::Sender::Magi),
                 display: Some(display),
+                recovery_event: None,
                 body: talk.pending.clone(),
                 attachments: talk.pending_attachments.clone(),
                 reply: None,
@@ -14988,7 +14990,9 @@ mod tests {
             &body,
             "watch:123",
             &|_| false,
-            None,
+            crate::chat_control::standing::Event::Watch {
+                id: "watch-123".into(),
+            },
             display.clone(),
         )
         .unwrap();
@@ -14999,7 +15003,9 @@ mod tests {
                 &body,
                 "watch:123",
                 &|_| false,
-                None,
+                crate::chat_control::standing::Event::Watch {
+                    id: "watch-123".into()
+                },
                 display.clone()
             )
             .unwrap()

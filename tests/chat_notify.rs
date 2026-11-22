@@ -451,6 +451,7 @@ fn legacy_notice_steps(
         // instead of using the current metadata compaction in put.
         legacy.pending_messages = vec![talk::Message {
             display: None,
+            recovery_event: None,
             sender: None,
             body: legacy.pending.clone(),
             attachments: Vec::new(),

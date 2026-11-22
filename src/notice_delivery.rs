@@ -218,6 +218,8 @@ fn reconcile(n: &Notice, queue: &Queue, talks: &Talks, home: &Path, repo: &Path)
         (
             None,
             crate::notice_semantics::attention(home, task, run_id, n),
+            task.filter(|task| run_id == task.execution_runs().last().map(String::as_str))
+                .and_then(crate::chat_control::standing::Event::task),
         ),
         crate::prompt::NoticeDisplay {
             inquiry: None,

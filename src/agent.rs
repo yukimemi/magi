@@ -612,6 +612,12 @@ pub async fn invoke(
         // Strip inherited and per-agent capabilities for every invocation,
         // including external-chat; only an ordinary owner chat gets a new one.
         bridge::clear_environment(&mut cmd);
+        if matches!(
+            crate::chat_goal::current_source(),
+            crate::chat_goal::Source::Standing(_)
+        ) {
+            cmd.env(crate::chat_control::standing::ENV, "1");
+        }
         let bridge = if inv.node == crate::queue::CHAT_NODE {
             crate::run::try_home().and_then(|home| {
                 match Bridge::start(&home, inv.run, inv.artifacts) {

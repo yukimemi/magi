@@ -186,6 +186,10 @@ pub struct Message {
     /// Notification-time facts for the UI; body remains the agent's authoritative input.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display: Option<crate::prompt::NoticeDisplay>,
+    /// Exact producer event attached to a recovery report; never inferred from prose.
+    #[doc(hidden)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_event: Option<crate::chat_control::standing::Event>,
     /// Display provenance; absent in legacy records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sender: Option<Sender>,
@@ -328,6 +332,7 @@ fn messages_need_no_metadata(messages: &[Message]) -> bool {
     messages.iter().all(|message| {
         message.sender.is_none()
             && message.display.is_none()
+            && message.recovery_event.is_none()
             && message.reply.is_none()
             && message.attachments.is_empty()
     })
@@ -622,6 +627,9 @@ pub struct Talk {
     /// Semantic automatic-delivery receipts; retained for the life of this talk.
     #[serde(default)]
     pub notice_receipts: Vec<String>,
+    /// Launcher-originated recovery actions, indexed by their audit turn.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) standing_actions: Vec<crate::chat_control::standing::Audit>,
     /// Automatic notice references, saved atomically with their draft and key.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub completion_notices: Vec<crate::chat_notify::CompletionReference>,
@@ -1181,6 +1189,7 @@ pub(crate) fn seeded_for_test(id: &str, repo: PathBuf) -> Talk {
         implementers_dirty: false,
         notified: Vec::new(),
         notice_receipts: Vec::new(),
+        standing_actions: Vec::new(),
         completion_notices: Vec::new(),
         external_requests: Vec::new(),
         created_at: Timestamp::now(),
@@ -1716,6 +1725,7 @@ pub(crate) fn begin_with_id(
         implementers_dirty: false,
         notified: Vec::new(),
         notice_receipts: Vec::new(),
+        standing_actions: Vec::new(),
         completion_notices: Vec::new(),
         external_requests: Vec::new(),
         created_at: now,
@@ -1801,6 +1811,7 @@ fn operator_turn(text: &str, attachments: Vec<Attachment>, reply: Option<Reply>)
         at: Timestamp::now(),
         messages: vec![Message {
             display: None,
+            recovery_event: None,
             sender: Some(Sender::Operator),
             body: text.to_owned(),
             attachments: attachments.clone(),
@@ -1858,6 +1869,7 @@ pub(crate) fn restore_recorded_draft(
     {
         fresh.pending_messages.push(Message {
             display: None,
+            recovery_event: None,
             sender: None,
             body: fresh.pending.clone(),
             attachments: fresh.pending_attachments.clone(),
@@ -1868,6 +1880,7 @@ pub(crate) fn restore_recorded_draft(
     if messages.is_empty() {
         messages.push(Message {
             display: None,
+            recovery_event: None,
             sender: Some(Sender::Operator),
             body: recorded.body,
             attachments: recorded.attachments,
@@ -1972,7 +1985,7 @@ pub(crate) fn queue_once_matching(
         store,
         text,
         Vec::new(),
-        Some((key, reference, None)),
+        Some((key, reference, None, None)),
         previous,
         (None, Sender::Magi, None),
     )
@@ -1985,10 +1998,18 @@ pub(crate) fn queue_notice(
     text: &str,
     key: &str,
     previous: &dyn Fn(&str) -> bool,
-    reference: Option<&crate::chat_notify::CompletionReference>,
+    event: crate::chat_control::standing::Event,
     display: crate::prompt::NoticeDisplay,
 ) -> Result<bool> {
-    queue_semantic_notice(talk, store, text, key, previous, (reference, None), display)
+    queue_semantic_notice(
+        talk,
+        store,
+        text,
+        key,
+        previous,
+        (None, None, Some(event)),
+        display,
+    )
 }
 
 /// Persist display facts with the notice, reference and deduplication key under one lock.
@@ -2001,6 +2022,7 @@ pub(crate) fn queue_semantic_notice(
     receipt: (
         Option<&crate::chat_notify::CompletionReference>,
         Option<String>,
+        Option<crate::chat_control::standing::Event>,
     ),
     display: crate::prompt::NoticeDisplay,
 ) -> Result<bool> {
@@ -2009,7 +2031,7 @@ pub(crate) fn queue_semantic_notice(
         store,
         text,
         Vec::new(),
-        Some((key, receipt.0, receipt.1)),
+        Some((key, receipt.0, receipt.1, receipt.2)),
         previous,
         (None, Sender::Magi, Some(display)),
     )
@@ -2043,6 +2065,7 @@ type NoticeKey<'a> = (
     &'a str,
     Option<&'a crate::chat_notify::CompletionReference>,
     Option<String>,
+    Option<crate::chat_control::standing::Event>,
 );
 
 fn queue_keyed(
@@ -2122,7 +2145,9 @@ fn append_pending(
         Option<crate::prompt::NoticeDisplay>,
     ),
 ) -> Result<bool> {
-    if let Some((key, reference, semantic)) = key {
+    let mut recovery_event = None;
+    if let Some((key, reference, semantic, event)) = key {
+        recovery_event = event;
         if fresh.notified.iter().any(|k| k == key || previous(k)) {
             return Ok(false);
         }
@@ -2148,6 +2173,7 @@ fn append_pending(
     {
         fresh.pending_messages.push(Message {
             display: None,
+            recovery_event: None,
             sender: None,
             body: fresh.pending.clone(),
             attachments: fresh.pending_attachments.clone(),
@@ -2156,6 +2182,7 @@ fn append_pending(
     }
     fresh.pending_messages.push(Message {
         display,
+        recovery_event,
         sender: Some(provenance),
         body: text.to_owned(),
         attachments: attachments.clone(),
@@ -2580,6 +2607,7 @@ pub fn edit_pending_message(
         let reply = fresh.pending_messages.first().and_then(|m| m.reply.clone());
         fresh.pending_messages = vec![Message {
             display: None,
+            recovery_event: None,
             sender: Some(Sender::Operator),
             body: text.to_owned(),
             attachments: fresh.pending_attachments.clone(),
@@ -2844,6 +2872,42 @@ async fn turn(
             )
         })?;
 
+    let source = if external_input {
+        crate::chat_goal::Source::External
+    } else if cfg.talk.standing_authorization && crate::chat_goal::automatic_input() {
+        crate::chat_goal::Source::Automatic
+    } else if let Some(index) = input_turn {
+        if input.is_some_and(|turn| {
+            if cfg.talk.standing_authorization {
+                // Only an explicit send can carry owner authority. A legacy
+                // notification draft may have inherited the operator role.
+                return turn
+                    .messages
+                    .iter()
+                    .any(|message| message.sender == Some(Sender::Operator));
+            }
+            if turn.messages.is_empty() {
+                sender(turn, None) == Sender::Operator
+            } else {
+                turn.messages
+                    .iter()
+                    .any(|message| sender(turn, Some(message)) == Sender::Operator)
+            }
+        }) {
+            crate::chat_goal::Source::Input { turn: index }
+        } else {
+            crate::chat_goal::Source::Automatic
+        }
+    } else {
+        crate::chat_goal::current_source()
+    };
+    let source = crate::chat_control::standing::capture(
+        cfg.talk.standing_authorization,
+        store.home(),
+        talk,
+        input,
+        source,
+    );
     // The newest turn is always the operator message this call is answering
     // - `record` appended it before `turn` was ever called - so its own
     // attachments are what belong at the end of *this* prompt.
@@ -3042,6 +3106,14 @@ async fn turn(
         } else {
             format!("{current_approvals}\n\n# Current message\n\n{body}")
         };
+        let body = if cfg.talk.standing_authorization {
+            format!(
+                "{body}\n\n{}",
+                crate::chat_control::standing::briefing(&source)
+            )
+        } else {
+            body
+        };
         let attempt_stem = if n == 0 {
             stem.clone()
         } else {
@@ -3077,25 +3149,7 @@ async fn turn(
             Duration::from_secs(cfg.graph.timeout_resource_wait),
             || false,
         );
-        let source = if external_input {
-            crate::chat_goal::Source::External
-        } else if let Some(index) = input_turn {
-            if input.is_some_and(|turn| {
-                if turn.messages.is_empty() {
-                    sender(turn, None) == Sender::Operator
-                } else {
-                    turn.messages
-                        .iter()
-                        .any(|message| sender(turn, Some(message)) == Sender::Operator)
-                }
-            }) {
-                crate::chat_goal::Source::Input { turn: index }
-            } else {
-                crate::chat_goal::Source::Automatic
-            }
-        } else {
-            crate::chat_goal::current_source()
-        };
+        let source = source.clone();
         let result = crate::chat_goal::with_source(
             source,
             wait.scope(agent::invoke(spec, &mut talk.seat, &inv)),
@@ -3237,13 +3291,19 @@ async fn turn(
         talk.external_requests = fresh.external_requests;
         talk.goals = fresh.goals;
         talk.selected_goal = fresh.selected_goal;
+        talk.standing_actions = fresh.standing_actions;
         // A `magi talk post` landed while the CLI ran: this handle predates it.
         if fresh.turns.len() > talk.turns.len() {
-            let posted: Vec<Turn> = fresh.turns[talk.turns.len()..]
-                .iter()
-                .filter(|t| t.posted_by.is_some())
-                .cloned()
-                .collect();
+            let start = talk.turns.len();
+            let posted = fresh
+                .turns
+                .into_iter()
+                .enumerate()
+                .skip(start)
+                .filter_map(|(i, turn)| {
+                    (turn.posted_by.is_some() || talk.standing_actions.iter().any(|a| a.turn == i))
+                        .then_some(turn)
+                });
             talk.turns.extend(posted);
         }
         if let Some(from) = fell_back_from.filter(|_| failure.is_none()) {
@@ -3806,6 +3866,7 @@ fn plain_messages(body: &str, breaks: Option<&[usize]>) -> Vec<Message> {
             return Vec::new();
         };
         messages.push(Message {
+            recovery_event: None,
             display: None,
             sender: None,
             body: text.to_owned(),
@@ -4011,6 +4072,7 @@ mod tests {
             notified: Vec::new(),
             notice_receipts: Vec::new(),
             completion_notices: Vec::new(),
+            standing_actions: Vec::new(),
             external_requests: Vec::new(),
             created_at: Timestamp::now(),
             updated_at: Timestamp::now(),
@@ -4378,6 +4440,7 @@ mod tests {
             notified: Vec::new(),
             notice_receipts: Vec::new(),
             completion_notices: Vec::new(),
+            standing_actions: Vec::new(),
             external_requests: Vec::new(),
             created_at: Timestamp::now(),
             updated_at: Timestamp::now(),
@@ -4776,6 +4839,7 @@ mod tests {
             .unwrap();
             if with_message {
                 turn.messages.push(Message {
+                    recovery_event: None,
                     sender: Some(Sender::External),
                     body: body.to_owned(),
                     display: None,
@@ -6342,6 +6406,7 @@ mod tests {
                         match input {
                             "text" => fresh.pending = " \t".to_owned(),
                             "messages" => fresh.pending_messages.push(Message {
+                                recovery_event: None,
                                 display: None,
                                 sender: Some(Sender::Magi),
                                 body: "message-only input".to_owned(),
@@ -6731,6 +6796,7 @@ mod tests {
                 notified: Vec::new(),
                 notice_receipts: Vec::new(),
                 completion_notices: Vec::new(),
+                standing_actions: Vec::new(),
                 external_requests: Vec::new(),
                 created_at: Timestamp::now(),
                 updated_at: Timestamp::now(),
@@ -7045,7 +7111,7 @@ mod tests {
                         "same failure",
                         &format!("source-{index}"),
                         &|_| false,
-                        (None, Some("semantic-failure".into())),
+                        (None, Some("semantic-failure".into()), None),
                         crate::prompt::NoticeDisplay {
                             inquiry: None,
                             facts: "failure".into(),
@@ -7082,7 +7148,7 @@ mod tests {
                 "reworded failure",
                 "retry",
                 &|_| false,
-                (None, Some("semantic-failure".into())),
+                (None, Some("semantic-failure".into()), None),
                 crate::prompt::NoticeDisplay {
                     inquiry: None,
                     facts: "failure".into(),
@@ -7103,7 +7169,7 @@ mod tests {
                 "new failure",
                 "new",
                 &|_| false,
-                (None, Some("new-evidence".into())),
+                (None, Some("new-evidence".into()), None),
                 crate::prompt::NoticeDisplay {
                     inquiry: None,
                     facts: "new".into(),
