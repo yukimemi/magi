@@ -480,9 +480,13 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> Browser<S> {
         Ok(r["result"]["value"].clone())
     }
 
-    /// Poll `predicate` (a JS expression) until it is truthy or `within`
-    /// passes. A fixed sleep would be a guess; the SSE stream keeps the
-    /// network busy forever, so "network idle" is not available either.
+    /// Poll a JavaScript predicate until it returns true or the wait expires.
+    /// Wait for the operation's completion or the snapshot's version, not for
+    /// a fixed delay. Read the version and its DOM in the same evaluation.
+    /// Keep predicates synchronous. Start slow server work without awaiting
+    /// its promise in `eval`, then poll for completion here. Chaining requests
+    /// or page-side polling in one evaluation can hit `CALL_TIMEOUT` and make
+    /// a slow operation look like a hung browser.
     pub async fn wait_for(
         &mut self,
         page: &Page,

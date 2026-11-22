@@ -24,6 +24,51 @@ fn asked(state: &RunState, node: &str, seat: &str) -> usize {
         .count()
 }
 
+#[cfg(windows)]
+fn use_native_timeout_mock(fx: &mut common::Fixture, id: &str) {
+    let agent = fx.config.agents.iter_mut().find(|a| a.id == id).unwrap();
+    // A Windows sh shim can leave the actual shell running with inherited
+    // pipes after timeout. Use one real process with no descendants.
+    agent.command = vec![
+        std::env::current_exe()
+            .expect("locate native timeout mock")
+            .to_string_lossy()
+            .into_owned(),
+        "--exact".into(),
+        "native_timeout_mock".into(),
+        "--ignored".into(),
+    ];
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "command subprocess for the implementation timeout tests"]
+fn native_timeout_mock() {
+    use std::{env, fs::OpenOptions, io::Write as _, path::PathBuf, time::Duration};
+
+    let seat = env::var("MAGI_SEAT").unwrap();
+    assert_eq!(env::var("MOCK_HANG_SEAT").unwrap(), seat);
+    let node = env::var("MAGI_NODE").unwrap();
+    assert_eq!(node, "implement");
+    let run = env::var("MAGI_RUN").unwrap();
+    let agent = env::var("MOCK_AGENT_ID").unwrap();
+    let prompt = PathBuf::from(env::var_os("MAGI_PROMPT_FILE").unwrap());
+    let artifacts = prompt.parent().unwrap();
+    for (file, first, second, third) in [
+        ("attribution.log", &run, &node, &seat),
+        ("hangs.log", &node, &seat, &agent),
+    ] {
+        let mut log = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(artifacts.join(file))
+            .unwrap();
+        writeln!(log, "{first} {second} {third}").unwrap();
+    }
+    std::thread::sleep(Duration::from_secs(120));
+    panic!("the invocation should have terminated this process");
+}
+
 fn implement_events(state: &RunState) -> Vec<&str> {
     state
         .events
@@ -70,7 +115,12 @@ async fn a_failed_seat_is_handed_to_the_next_agent_and_recovers() {
 common::e2e! {
 async fn a_timeout_hands_the_seat_over() {
     let _home = common::home_lock().await;
-    let fx = fixture_with_handover_failures(_home, &[], &["alpha"], &["impl-A"]);
+    let mut fx = fixture_with_handover_failures(_home, &[], &["alpha"], &["impl-A"]);
+    // The short cap applies to an agent, not a seat. Keep it off the
+    // review panel so only the implementer is subjected to it.
+    fx.config.roles.reviewers = vec!["beta".into(), "gamma".into()];
+    #[cfg(windows)]
+    use_native_timeout_mock(&mut fx, "alpha");
     let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");
@@ -113,6 +163,12 @@ async fn a_roster_that_runs_out_ends_the_seat_with_each_agent_tried_once() {
     // alpha fails, beta times out (breaking the run of identical failures),
     // gamma fails: three agents, three asks, then nobody is left.
     let fx = fixture_with_handover_failures(_home, &["alpha", "gamma"], &["beta"], &["impl-A"]);
+    #[cfg(windows)]
+    let fx = {
+        let mut fx = fx;
+        use_native_timeout_mock(&mut fx, "beta");
+        fx
+    };
     let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
         .await
         .expect("start");

@@ -4946,6 +4946,85 @@ async fn magi_icon_settings_preview_save_reload_and_reset_on_phone() {
     browser.close_page(&page).await;
 }
 
+const AVATAR_WAIT: Duration = Duration::from_secs(30);
+
+async fn wait_avatar_status(
+    browser: &mut cdp::Browser,
+    page: &cdp::Page,
+    base: &str,
+    label: &str,
+    expected: &str,
+) {
+    let result = browser
+        .wait_for(
+            page,
+            &format!(
+                r#"(() => {{
+                  const panel = document.querySelector('.avatar-settings');
+                  if (!panel || panel.querySelector('input').disabled) return false;
+                  const status = panel.querySelector('[role="status"]:last-child').textContent;
+                  if (status !== {expected:?}) throw new Error(`Avatar status: ${{status}}`);
+                  return true;
+                }})()"#
+            ),
+            AVATAR_WAIT,
+        )
+        .await;
+    result.unwrap_or_else(|error| {
+        let requests = diag::Requests::for_url(base).unwrap().snapshot();
+        let related: Vec<_> = requests
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|request| {
+                matches!(
+                    request["path"].as_str(),
+                    Some("/api/avatar-settings" | "/api/talks")
+                )
+            })
+            .collect();
+        panic!("{label}: {error}; HTTP: {related:?}");
+    });
+}
+
+async fn avatar_catalog(browser: &mut cdp::Browser, page: &cdp::Page) -> Value {
+    browser
+        .eval(
+            page,
+            r#"(() => {
+              window.avatarCatalogRead = null;
+              fetch('/api/avatar-settings').then(response => {
+                if (!response.ok) throw new Error(`GET avatar settings: ${response.status}`);
+                return response.json();
+              }).then(
+                catalog => { window.avatarCatalogRead = {catalog}; },
+                error => { window.avatarCatalogRead = {error: String(error)}; }
+              );
+            })()"#,
+        )
+        .await
+        .expect("start avatar catalog read");
+    browser
+        .wait_for(page, "window.avatarCatalogRead !== null", AVATAR_WAIT)
+        .await
+        .expect("finish avatar catalog read");
+    let mut read = browser
+        .eval(page, "window.avatarCatalogRead")
+        .await
+        .expect("read avatar catalog result");
+    assert!(read.get("error").is_none(), "avatar catalog: {read}");
+    read["catalog"].take()
+}
+
+const CHOOSE_AVATAR: &str = r#"(async () => {
+  const canvas = document.createElement('canvas'); canvas.width = 24; canvas.height = 24;
+  canvas.getContext('2d').fillRect(0, 0, 24, 24);
+  const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
+  const transfer = new DataTransfer(); transfer.items.add(new File([blob], 'phone.png', {type:'image/png'}));
+  const input = document.querySelector('.avatar-settings input:not(:disabled)');
+  input.files = transfer.files; input.dispatchEvent(new Event('change'));
+})()"#;
+
 common::e2e! {
 async fn avatar_settings_preview_isolation_reload_and_reset_on_phone() {
     let Some(chrome) = cdp::find_chrome() else {
@@ -4953,18 +5032,18 @@ async fn avatar_settings_preview_isolation_reload_and_reset_on_phone() {
         eprintln!("SKIP avatar settings: no Chrome");
         return;
     };
-    let guard = common::home_lock().await;
-    let fx = common::fixture(guard, common::Judges::Unanimous, false);
-    // Avatar requests resolve settings repeatedly; use the fixture roster
-    // instead of probing the host's installed agents and repository roots.
-    publish_fixture_roster(&fx).await;
-    let home = fx.tmp.path().join("magi-home");
+    // Avatar storage does not need a Git repository or a remote config layer.
+    let fixture = tempfile::tempdir().unwrap();
+    let repo = fixture.path().join("settings-context");
+    std::fs::create_dir(&repo).unwrap();
+    std::fs::write(repo.join("magi.toml"), "[repos]\nroots = []\n").unwrap();
+    let home = fixture.path().join("magi-home");
     let base = serve(
         &home,
         Queue::at(home.join("queue")),
         Talks::at(home.join("talks")),
         home.join("runs"),
-        &fx.repo,
+        &repo,
     )
     .await;
     let mut browser = cdp::Browser::launch(&chrome).await.unwrap();
@@ -4972,76 +5051,78 @@ async fn avatar_settings_preview_isolation_reload_and_reset_on_phone() {
         .open_page(&format!("{base}#/settings"), 390, 844, true)
         .await
         .unwrap();
-    let timeout = Duration::from_secs(30);
-    browser
-        .wait_for(
-            &page,
-            "!!document.querySelector('.avatar-settings input')",
-            timeout,
-        )
-        .await
-        .unwrap();
-    let result = browser.eval(&page, r#"(async () => {
-      const panel = () => document.querySelector('.avatar-settings');
-      const original = (await (await fetch('/api/avatar-settings')).json()).operator;
-      const canvas = document.createElement('canvas'); canvas.width = 24; canvas.height = 24;
-      canvas.getContext('2d').fillRect(0, 0, 24, 24);
-      const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
-      const input = panel().querySelector('input');
-      const transfer = new DataTransfer(); transfer.items.add(new File([blob], 'phone.png', {type:'image/png'}));
-      input.files = transfer.files; input.dispatchEvent(new Event('change'));
-      const until = async f => { for(let i=0;i<200;i++) { if(f()) return; await new Promise(r=>setTimeout(r,25)); } throw new Error('UI timeout'); };
-      await until(() => panel().querySelector('img').src.startsWith('data:'));
-      if ((await (await fetch('/api/avatar-settings')).json()).operator !== original) throw new Error('preview saved before Save');
-      panel().querySelector('button').click();
-      await until(() => panel().textContent.includes('Avatar saved.'));
-      const saved = (await (await fetch('/api/avatar-settings')).json()).operator;
-      if (saved === original || !panel().querySelector('img').getAttribute('src').includes(saved)) throw new Error('saved preview did not refresh');
-      const rect = panel().getBoundingClientRect();
-      if (rect.right > document.documentElement.clientWidth + 1 || panel().scrollWidth > panel().clientWidth + 1) throw new Error('phone overflow');
-      return saved;
-    })()"#).await.unwrap();
-    browser.eval(&page, &r#"(async () => {
-      const panel = () => document.querySelector('.avatar-settings');
-      const until = async f => { for(let i=0;i<200;i++) { if(f()) return; await new Promise(r=>setTimeout(r,25)); } throw new Error('UI timeout'); };
-      const saved = __SAVED__;
-      const canvas = document.createElement('canvas'); canvas.width = 24; canvas.height = 24;
-      canvas.getContext('2d').fillRect(0, 0, 24, 24);
-      const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
-      const transfer = new DataTransfer(); transfer.items.add(new File([blob], 'phone.png', {type:'image/png'}));
-      const select = panel().querySelector('select');
+    browser.wait_for(
+        &page,
+        r#"!!document.querySelector('#settings-repo:not(:disabled)') &&
+           !!document.querySelector('.avatar-settings option[value="persona:rei"]') &&
+           !!document.querySelector('.avatar-settings input:not(:disabled)')"#,
+        AVATAR_WAIT,
+    ).await.expect("load the avatar catalog and file picker");
+    let original = avatar_catalog(&mut browser, &page).await["operator"].take();
+    browser.eval(&page, CHOOSE_AVATAR).await.expect("choose operator image");
+    wait_avatar_status(&mut browser, &page, &base, "preview operator image", "Preview ready. Save to apply.").await;
+    assert_eq!(avatar_catalog(&mut browser, &page).await["operator"], original, "preview saved before Save");
+    browser.eval(&page, r#"(() => {
+      const panel = document.querySelector('.avatar-settings');
+      if (!panel.querySelector('img').src.startsWith('data:')) throw new Error('operator preview missing');
+      panel.querySelector('button:first-child:not(:disabled)').click();
+    })()"#).await.expect("inspect and save operator preview");
+    wait_avatar_status(&mut browser, &page, &base, "save operator avatar", "Avatar saved.").await;
+    let result = avatar_catalog(&mut browser, &page).await["operator"].take();
+    assert_ne!(result, original, "operator URL unchanged after save");
+    browser.eval(&page, &format!(r#"(() => {{
+      const panel = document.querySelector('.avatar-settings');
+      if (!panel.querySelector('img').getAttribute('src').includes({result})) throw new Error('saved preview did not refresh');
+      const rect = panel.getBoundingClientRect();
+      if (rect.right > document.documentElement.clientWidth + 1 || panel.scrollWidth > panel.clientWidth + 1) throw new Error('phone overflow');
+    }})()"#)).await.expect("check saved operator avatar and phone layout");
+    browser.eval(&page, r#"(() => {
+      const select = document.querySelector('#avatar-target');
       select.value = 'persona:rei'; select.dispatchEvent(new Event('change'));
-      if (!panel().querySelector('button').disabled) throw new Error('operator draft leaked');
-      const personaInput = panel().querySelector('input');
-      personaInput.files = transfer.files; personaInput.dispatchEvent(new Event('change'));
-      await until(() => panel().querySelector('img').src.startsWith('data:'));
-      panel().querySelector('button').click();
-      await until(() => panel().textContent.includes('Avatar saved.'));
-      const catalog = await (await fetch('/api/avatar-settings')).json();
-      if (catalog.operator !== saved) throw new Error('persona save changed operator');
-      const rei = catalog.personas.find(p => p.id === 'rei');
-      const asuka = catalog.personas.find(p => p.id === 'asuka');
-      if (!rei || !asuka || rei.avatar === asuka.avatar) throw new Error('persona isolation');
-      panel().querySelectorAll('button')[1].click();
-      await until(() => panel().textContent.includes('Built-in avatar restored.'));
-      const reset = await (await fetch('/api/avatar-settings')).json();
-      if (reset.personas.find(p => p.id === 'rei').avatar === rei.avatar) throw new Error('reset URL unchanged');
-      return saved;
-    })()"#.replace("__SAVED__", &result.to_string())).await.unwrap();
-    browser.eval(&page, &r#"(async () => {
-      const panel = () => document.querySelector('.avatar-settings');
-      const until = async f => { for(let i=0;i<200;i++) { if(f()) return; await new Promise(r=>setTimeout(r,25)); } throw new Error('UI timeout'); };
-      const saved = __SAVED__;
-      const sel = panel().querySelector('select');
+      const panel = document.querySelector('.avatar-settings');
+      if (!panel.querySelector('button').disabled) throw new Error('operator draft leaked');
+    })()"#).await.expect("switch to persona and check draft isolation");
+    browser.eval(&page, CHOOSE_AVATAR).await.expect("choose persona image");
+    wait_avatar_status(&mut browser, &page, &base, "preview persona image", "Preview ready. Save to apply.").await;
+    browser.eval(&page, r#"(() => {
+      const panel = document.querySelector('.avatar-settings');
+      if (!panel.querySelector('img').src.startsWith('data:')) throw new Error('persona preview missing');
+      panel.querySelector('button:first-child:not(:disabled)').click();
+    })()"#).await.expect("inspect and save persona preview");
+    wait_avatar_status(&mut browser, &page, &base, "save persona avatar", "Avatar saved.").await;
+    let catalog = avatar_catalog(&mut browser, &page).await;
+    assert_eq!(catalog["operator"], result, "persona save changed operator");
+    let avatar = |catalog: &Value, id: &str| {
+        catalog["personas"].as_array().unwrap().iter()
+            .find(|persona| persona["id"] == id).expect("persona in catalog")["avatar"].clone()
+    };
+    let rei_url = avatar(&catalog, "rei");
+    assert_ne!(rei_url, avatar(&catalog, "asuka"), "persona isolation");
+    browser.eval(&page, r#"(() => {
+      document.querySelector('.avatar-settings button:nth-child(2):not(:disabled)').click();
+    })()"#).await.expect("reset Rei avatar");
+    wait_avatar_status(&mut browser, &page, &base, "reset persona avatar", "Built-in avatar restored.").await;
+    let reset = avatar_catalog(&mut browser, &page).await;
+    assert_ne!(avatar(&reset, "rei"), rei_url, "reset URL unchanged");
+    browser.eval(&page, r#"(() => {
+      const sel = document.querySelector('#avatar-target');
       sel.value = 'operator'; sel.dispatchEvent(new Event('change'));
       const invalid = new DataTransfer(); invalid.items.add(new File(['bad'], 'bad.png', {type:'image/png'}));
-      const invalidInput = panel().querySelector('input'); invalidInput.files = invalid.files; invalidInput.dispatchEvent(new Event('change'));
-      await until(() => !panel().querySelector('input').disabled);
-      if (!panel().querySelector('button').disabled) throw new Error('invalid image accepted');
-      if ((await (await fetch('/api/avatar-settings')).json()).operator !== saved) throw new Error('invalid image corrupted save');
-      for (const button of panel().querySelectorAll('button')) if (button.getBoundingClientRect().height < 44) throw new Error('small touch target');
-      return saved;
-    })()"#.replace("__SAVED__", &result.to_string())).await.unwrap();
+      const input = document.querySelector('.avatar-settings input:not(:disabled)');
+      input.files = invalid.files; input.dispatchEvent(new Event('change'));
+    })()"#).await.expect("choose an invalid operator image");
+    browser.wait_for(&page, r#"(() => {
+      const panel = document.querySelector('.avatar-settings');
+      const status = panel.querySelector('[role="status"]:last-child').textContent;
+      return !panel.querySelector('input').disabled && status !== '' &&
+        status !== 'Avatar saved.' && status !== 'Preparing preview…';
+    })()"#, AVATAR_WAIT).await.expect("finish decoding the invalid image");
+    assert_eq!(avatar_catalog(&mut browser, &page).await["operator"], result, "invalid image corrupted save");
+    browser.eval(&page, r#"(() => {
+      const panel = document.querySelector('.avatar-settings');
+      if (!panel.querySelector('button').disabled) throw new Error('invalid image accepted');
+      for (const button of panel.querySelectorAll('button')) if (button.getBoundingClientRect().height < 44) throw new Error('small touch target');
+    })()"#).await.expect("check invalid upload and touch targets");
     browser.close_page(&page).await;
     let page = browser
         .open_page(&format!("{base}#/settings"), 390, 844, true)
@@ -5051,21 +5132,21 @@ async fn avatar_settings_preview_isolation_reload_and_reset_on_phone() {
         .wait_for(
             &page,
             &format!(
-                "document.querySelector('.avatar-settings .magi-icon-preview')?.getAttribute('src') === {}",
+                "!!document.querySelector('#settings-repo:not(:disabled)') && document.querySelector('.avatar-settings .magi-icon-preview')?.getAttribute('src') === {}",
                 result
             ),
-            timeout,
+            AVATAR_WAIT,
         )
         .await
         .unwrap();
     browser
         .eval(
             &page,
-            "document.querySelectorAll('.avatar-settings button')[1].click(); true",
+            "document.querySelector('.avatar-settings button:nth-child(2):not(:disabled)').click()",
         )
         .await
         .unwrap();
-    browser.wait_for(&page, "document.querySelector('.avatar-settings').textContent.includes('Built-in avatar restored.')", timeout).await.unwrap();
+    wait_avatar_status(&mut browser, &page, &base, "reset reloaded operator avatar", "Built-in avatar restored.").await;
     assert!(!home.join("avatars/operator.data").exists());
     browser.close_page(&page).await;
 }
@@ -5973,14 +6054,29 @@ printf 'Registered the cross-repository goal.\n'
     let mut browser = cdp::Browser::launch(&chrome).await.unwrap();
     let page = browser.open_page(&format!("{base}#/chat/{}", chat.id), 1280, 900, false).await.unwrap();
     browser.wait_for(&page, "!!window.deck && !!deck.state.talkDetail?.talk && document.getElementById('view-talk')?.hidden === false", Duration::from_secs(30)).await.unwrap();
-    browser.eval(&page, &format!(
-        "(() => {{ const input = document.getElementById('f-talk-say'); input.value = {owner_input:?}; input.dispatchEvent(new Event('input', {{bubbles:true}})); document.getElementById('talk-send').click(); return true; }})()"
+    // Clearing the composer is synchronous admission, not turn completion.
+    let submitted = browser.eval(&page, &format!(
+        "(() => {{ const input = document.getElementById('f-talk-say'); input.value = {owner_input:?}; input.dispatchEvent(new Event('input', {{bubbles:true}})); document.getElementById('talk-send').click(); return input.value === ''; }})()"
     )).await.unwrap();
+    assert_eq!(submitted, true, "goal registration send was not accepted by the composer");
     let page_result = browser.wait_for(&page,
         "document.getElementById('talk-turns')?.textContent.includes('Registered the cross-repository goal.')",
         Duration::from_secs(60)).await;
     chat = Talks::at(home.join("talks")).get(&chat.id).unwrap();
-    assert!(page_result.is_ok(), "goal registration failed: {:?}", chat.turns.iter().map(|t| &t.body).collect::<Vec<_>>());
+    if let Err(error) = page_result {
+        let page_state = browser.eval(&page, r#"({
+          error: document.getElementById('talk-error')?.textContent,
+          pending: document.getElementById('talk-pending')?.textContent,
+          thinking: deck.state.talkDetail?.talk?.thinking,
+          waiting: deck.state.talkWaits.has(deck.state.talkDetail?.id)
+        })"#).await;
+        panic!(
+            "goal registration failed: {error}; turns {:?}; pending {:?} ({} messages); page {page_state:?}",
+            chat.turns.iter().map(|t| &t.body).collect::<Vec<_>>(),
+            chat.pending,
+            chat.pending_messages.len(),
+        );
+    }
     assert_eq!(chat.repo, conversation.canonicalize().unwrap());
     assert_eq!(chat.goals[0].repo, Some(fx.repo.canonicalize().unwrap()));
     assert_eq!(chat.goals[0].tasks, vec![task.id.clone()]);
@@ -6298,40 +6394,34 @@ printf 'Registered the cross-repository goal.\n'
                 .eval(&page, &format!("deck.loadTalk({:?})", chat.id))
                 .await
                 .unwrap();
-            // Core and sections are fetched independently. Inspect the link
-            // only when both describe this exact saved reference list.
+            let version = chat.updated_at.to_string();
+            let expected =
+                serde_json::to_string(&expected.map(|id| format!("#/runs/{id}"))).unwrap();
             browser
                 .wait_for(
                     &page,
                     &format!(
-                        "(() => {{ const talk = deck.state.talkDetail.talk; return talk?.updated_at === {:?} && talk.goal_link_for === talk.updated_at; }})()",
-                        chat.updated_at.to_string()
+                        r#"(() => {{
+                          const {{talk, sections}} = deck.state.talkDetail;
+                          if (talk?.updated_at !== {version:?} || talk.goal_link_for !== talk.updated_at) return false;
+                          const link = document.getElementById('talk-goal-open');
+                          const expected = {expected};
+                          const {{hidden}} = link;
+                          const href = link.getAttribute('href');
+                          if (expected === null ? !hidden || href !== null : hidden || href !== expected) {{
+                            throw new Error(JSON.stringify({{expected, hidden, href, updated_at: talk.updated_at,
+                              goal_link_for: talk.goal_link_for, goal_link: talk.goal_link,
+                              sections: {{goal_link_for: sections?.goal_link_for, goal_link: sections?.goal_link}}}}));
+                          }}
+                          return true;
+                        }})()"#
                     ),
                     Duration::from_secs(30),
                 )
                 .await
-                .unwrap();
-            let expected =
-                serde_json::to_string(&expected.map(|id| format!("#/runs/{id}"))).unwrap();
-            assert_eq!(
-                browser
-                    .eval(
-                        &page,
-                        &format!(
-                            r##"(() => {{
-                              const link = document.getElementById('talk-goal-open');
-                              const expected = {expected};
-                              return expected === null
-                                ? link.hidden && !link.hasAttribute('href')
-                                : !link.hidden && link.getAttribute('href') === expected;
-                            }})()"##
-                        ),
-                    )
-                    .await
-                    .unwrap(),
-                true,
-                "direct Run references at {width}px"
-            );
+                .unwrap_or_else(|error| {
+                    panic!("direct Run references at {width}px: {error}; runs: {:?}", chat.goals[2].runs)
+                });
         }
         browser
             .eval(&page, "document.getElementById('talk-goal-open').click()")

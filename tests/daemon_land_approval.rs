@@ -125,7 +125,9 @@ async fn serve_once(
     scenario: &str,
     gh: &UnavailableGh,
 ) {
-    const HANG_GUARD: Duration = Duration::from_secs(60);
+    // This bounds a stall, not task latency. The real worker can still be
+    // advancing through review and gate at 60s on a loaded Windows runner.
+    const HANG_GUARD: Duration = Duration::from_secs(120);
 
     let started = Instant::now();
     match tokio::time::timeout(HANG_GUARD, daemon::serve(opts)).await {
