@@ -172,9 +172,14 @@ fn recorded_answered(talk: &Talk, index: usize) -> bool {
         .checked_add(1)
         .and_then(|next| talk.turns.get(next..))
         .is_some_and(|turns| {
-            turns
-                .iter()
-                .any(|turn| turn.who == talk::Who::Agent && turn.posted_by.is_none())
+            turns.iter().enumerate().any(|(offset, turn)| {
+                turn.who == talk::Who::Agent
+                    && turn.posted_by.is_none()
+                    && !talk
+                        .standing_actions
+                        .iter()
+                        .any(|audit| audit.turn == index + 1 + offset)
+            })
         })
 }
 
@@ -314,6 +319,13 @@ pub async fn run_turn_worker(home: &std::path::Path, payload: serde_json::Value)
             // Exactly one invocation per job. A submission accepted by the
             // successor UI already owns a successor-generation reservation;
             // never pull it into this old worker after the current reply.
+            if automatic && cfg.talk.standing_authorization {
+                return crate::chat_goal::with_source(
+                    crate::chat_goal::Source::Automatic,
+                    talk::respond(&lease, &mut fresh, &talks, &cfg, &text),
+                )
+                .await;
+            }
             return talk::respond(&lease, &mut fresh, &talks, &cfg, &text).await;
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;

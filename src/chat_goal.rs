@@ -226,6 +226,9 @@ pub enum Source {
         /// Event generation admitted by the launcher.
         generation: u64,
     },
+    /// Machine-authorized automatic turn; scope is captured by the launcher.
+    #[doc(hidden)]
+    Standing(std::sync::Arc<crate::chat_control::standing::Scope>),
 }
 
 tokio::task_local! { static TURN_SOURCE: Source; }
@@ -237,6 +240,12 @@ pub async fn with_source<T>(source: Source, future: impl Future<Output = T>) -> 
 
 pub(crate) fn current_source() -> Source {
     TURN_SOURCE.try_with(Clone::clone).unwrap_or_default()
+}
+
+pub(crate) fn automatic_input() -> bool {
+    TURN_SOURCE
+        .try_with(|source| matches!(source, Source::Automatic))
+        .unwrap_or(false)
 }
 
 /// Typed CLI goal commands. No command can assert completion.
@@ -800,6 +809,150 @@ pub(crate) fn fence(talks: &Talks, id: &str, source: &Source) -> Result<()> {
         check_source(&talk, source, goal)?;
     }
     Ok(())
+}
+
+// A standing goal never broadens a prior authorization or sets a new target.
+// Its only task and completion predicate are fixed by the admitted report.
+pub(crate) fn recovery_label(
+    talk: &Talk,
+    task: &crate::queue::Task,
+    command: &Command,
+) -> Result<String> {
+    match command {
+        Command::Establish {
+            id,
+            purpose,
+            scope,
+            condition,
+            completion,
+            repo,
+            tasks,
+            runs,
+            watches,
+        } => {
+            ensure!(
+                valid_reference(id)
+                    && id.len() <= 64
+                    && repo.is_none()
+                    && *completion == Completion::TasksDone
+                    && tasks == std::slice::from_ref(&task.id)
+                    && runs.is_empty()
+                    && watches.is_empty(),
+                "standing goal establishment requires --completion tasks-done and only the full reported task ID"
+            );
+            text(purpose, "purpose")?;
+            text(scope, "scope")?;
+            text(condition, "condition")?;
+            ensure!(
+                !talk.goals.iter().any(|goal| goal.id == *id
+                    || (goal.tasks.contains(&task.id)
+                        && (goal.active() || goal.owner_input.is_empty()))),
+                "this task already has a goal or previously used its standing goal"
+            );
+            Ok(format!("register recovery goal `{id}`"))
+        }
+        Command::Update {
+            id,
+            repo,
+            purpose,
+            scope,
+            condition,
+            completion,
+            step,
+            tasks,
+            runs,
+            watches,
+        } => {
+            let goal = talk
+                .goals
+                .iter()
+                .find(|goal| goal.id == *id && goal.active())
+                .context("standing updates require an active goal")?;
+            ensure!(
+                repo.is_none()
+                    && purpose.is_none()
+                    && scope.is_none()
+                    && condition.is_none()
+                    && completion.is_none()
+                    && tasks.is_empty()
+                    && runs.is_empty()
+                    && watches.is_empty()
+                    && goal.tasks.contains(&task.id),
+                "standing goal updates can only record a step for an active goal tracking this task"
+            );
+            require_repo(
+                "task",
+                &task.id,
+                &task.repo,
+                goal.effective_repo(&talk.repo),
+            )?;
+            text(step.as_deref().unwrap_or_default(), "step")?;
+            Ok(format!("update recovery goal `{id}`"))
+        }
+        _ => bail!(
+            "standing recovery can establish or update a goal, not stop it or change its authority"
+        ),
+    }
+}
+
+pub(crate) fn apply_recovery(
+    talk: &mut Talk,
+    task: &crate::queue::Task,
+    command: Command,
+    source_turn: usize,
+) -> Result<String> {
+    let label = recovery_label(talk, task, &command)?;
+    match command {
+        Command::Establish {
+            id,
+            purpose,
+            condition,
+            tasks,
+            ..
+        } => {
+            talk.goals.push(Goal {
+                id: id.clone(),
+                rev: 0,
+                repo: Some(task.repo.clone()),
+                purpose,
+                scope:
+                    "Follow only the reported task under the machine standing recovery allowlist"
+                        .into(),
+                condition: Condition {
+                    description: condition,
+                    kind: Completion::TasksDone,
+                },
+                state: State::Waiting,
+                step: "Wait for independent evidence about the reported task".into(),
+                source_turn,
+                owner_input: String::new(),
+                tasks,
+                runs: Vec::new(),
+                watches: Vec::new(),
+                launch_turns: None,
+                evidence: String::new(),
+                wake: 0,
+                handled: 0,
+                started: None,
+                wakes: 0,
+                rechecks: 0,
+                last_checked: None,
+                fingerprint: String::new(),
+                history: Vec::new(),
+            });
+            talk.selected_goal = Some(id);
+        }
+        Command::Update { id, step, .. } => {
+            talk.goals
+                .iter_mut()
+                .find(|goal| goal.id == id)
+                .expect("checked goal")
+                .step = step.expect("checked step");
+            talk.selected_goal = Some(id);
+        }
+        _ => unreachable!("checked recovery goal operation"),
+    }
+    Ok(label)
 }
 
 /// Instructions are explicit about semantics; the model chooses goals, not a keyword parser.

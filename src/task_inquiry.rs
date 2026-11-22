@@ -482,6 +482,7 @@ impl Outbox {
                         .clone()
                         .unwrap_or_else(|| format!("task-inquiry:{}", inquiry.id)),
                 ),
+                None,
             ),
             crate::prompt::NoticeDisplay {
                 inquiry: Some(inquiry.id.clone()),

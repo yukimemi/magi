@@ -698,8 +698,10 @@ id, and the conversation stays open for whatever comes up next.
 An explicit request for continuing work is saved as a goal, independently of
 the transcript, task status and CLI session. The agent registers its purpose,
 authorized scope, actual owner input, completion condition and related tasks,
-runs or supervised watches through `magi task control goal`. Ordinary questions,
-automatic reports and external submissions cannot establish or expand a goal.
+runs or supervised watches through `magi task control goal`. Automatic reports
+and external submissions cannot supply owner input or expand a goal. The
+machine-only standing authorization below can register a goal limited to the
+reported task and update its progress; it cannot broaden any goal.
 Several unfinished requests remain retained; a later status question does not
 replace earlier work.
 
@@ -1618,6 +1620,41 @@ from their original history and remain visible there. Claude Code, Codex,
 OpenCode and Antigravity session storage is unchanged. See
 [omp session storage](docs/seat-write-scope.md#omp-session-storage) for backup
 and recovery considerations.
+
+### Standing chat recovery (`[talk]`)
+
+Set this in `<config_dir>/magi/config.toml` to opt in. It defaults to `false`;
+any value in a repository layer or other config file is ignored.
+
+```toml
+[talk]
+standing_authorization = true
+```
+
+This supersedes “automatic reports authorize nothing” only for the recovery
+allowlist. A task outcome, attention report, linked watch result, or goal wake
+can authorize the chat to resume retained work, retry unchanged work, rerun
+failed checks, release a machine hold after verifying the cause is gone, grant
+one bounded repair round, file a separate fix for a verified independent
+failure, or register/update a goal for the reported task. The task must have
+been filed by that chat or be part of an active goal there. A watch result
+must be linked to such a goal. Report prose is data, not authority. A goal the
+owner established keeps the authority the owner gave it; this setting does not
+narrow it.
+
+The chat uses `magi task control --standing-task <task> --evidence <reason>`
+with the existing recovery command, or `magi task add --standing-task <task>
+--evidence <reason> --solo --repo <repo>` for a separate fix. The launcher
+records the operation, evidence, and outcome in the transcript. A repeat
+of the same cause asks instead of acting again, even after a restart; registering
+or updating the goal does not count as that one action. An
+uncertain outcome is not replayed. Recovery does not reset task attempts,
+review rounds, or base synchronization budgets.
+
+Fresh owner input is still required for landing decisions and merge approval,
+abandonment, removal, reassignment, replacing or discarding retained work,
+`--force`, clearing a manual hold, and configuration changes. Sandbox grants
+do not change. With `land_approval` enabled, silence remains a hold.
 
 ### External repository coordination
 

@@ -565,7 +565,12 @@ fn deliver(
         .last()
         .map(|r| run_facts(home, r))
         .unwrap_or_default();
-    let (text, display) = notice_report(task, &facts);
+    let (mut text, mut display) = notice_report(task, &facts);
+    if key.starts_with("standing-recurrence:") {
+        const REPEATED: &str = "Standing recovery already acted on this cause. Report the recurrence and ask the owner; do not act again.";
+        text.push_str(&format!("\n{REPEATED}\n"));
+        display.facts.push_str(&format!("\n{REPEATED}\n"));
+    }
     let prefix = format!("{}:", task.id);
     let previous = |stored: &str| {
         stored.strip_prefix(&prefix).is_some_and(|old| {
@@ -590,7 +595,12 @@ fn deliver(
                 run: task.runs.last().cloned(),
                 notice: text.clone(),
             }),
-            Some(crate::notice_semantics::outcome(home, task)),
+            Some(if key.starts_with("standing-recurrence:") {
+                format!("{}:{key}", task.id)
+            } else {
+                crate::notice_semantics::outcome(home, task)
+            }),
+            crate::chat_control::standing::Event::task(task),
         ),
         display,
     ) {
@@ -604,19 +614,36 @@ fn deliver(
     }
 }
 
+fn recovery_recurrence(home: &Path, task: &Task) -> Option<String> {
+    let key = crate::chat_control::standing::recurrence_key(home, task)?;
+    (!task.chat_notices.contains(&key)).then_some(key)
+}
+
 /// Report every chat-filed task whose final state has not been reported.
 /// Returns the talk ids that got a new draft.
 pub fn sweep(queue: &Queue, talks: &Talks, home: &Path) -> Vec<String> {
     let mut posted = Vec::new();
     for task in queue.list() {
-        if task.chat_notice_due().is_none() {
+        let recurrence = task.chat_notice_due().is_none()
+            && task.filed_by_chat().is_some()
+            && recovery_recurrence(home, &task).is_some()
+            && task
+                .filed_by_chat()
+                .and_then(|id| talks.get(id).ok())
+                .is_some_and(|talk| {
+                    crate::config::Config::discover(&talk.repo, None)
+                        .is_ok_and(|(cfg, _)| cfg.talk.standing_authorization)
+                });
+        if !recurrence && task.chat_notice_due().is_none() {
             continue;
         }
         let result = queue.modify(&task.id, |t| {
             // Re-judged under the task's lock, on the stored record.
-            let (Some(key), Some(talk_id)) =
-                (t.chat_notice_due(), t.filed_by_chat().map(str::to_owned))
-            else {
+            let (Some(key), Some(talk_id)) = (
+                t.chat_notice_due()
+                    .or_else(|| recurrence.then(|| recovery_recurrence(home, t)).flatten()),
+                t.filed_by_chat().map(str::to_owned),
+            ) else {
                 return false;
             };
             match deliver(talks, home, t, &talk_id, &key) {

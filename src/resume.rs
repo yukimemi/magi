@@ -147,6 +147,35 @@ pub(crate) fn pin_queued(
     if !crate::repair_budget::queue_resumption(queue, &mut task, run)? {
         task.release_operator(if applied.is_some() { "choice" } else { "chat" }, applied);
     }
+    pin(&mut task, run, applied);
+    if let Some(id) = applied {
+        task.mark_action_applied(id);
+    }
+    queue.put(&mut task)?;
+    Ok(true)
+}
+
+/// Queue the same retained execution without manufacturing an operator release.
+pub(crate) fn pin_standing(
+    queue: &crate::queue::Queue,
+    task: &mut crate::queue::Task,
+    run: &str,
+) -> Result<()> {
+    if !crate::repair_budget::queue_resumption(queue, task, run)? {
+        release_standing(task);
+    }
+    pin(task, run, None);
+    queue.put(task)
+}
+
+/// Reuse the release transition without refilling the task or recovery budgets.
+pub(crate) fn release_standing(task: &mut crate::queue::Task) {
+    let attempts = task.attempts;
+    task.release();
+    task.attempts = attempts;
+}
+
+fn pin(task: &mut crate::queue::Task, run: &str, applied: Option<&str>) {
     task.resume_override = Some(crate::queue::OperatorResume {
         question_id: applied.unwrap_or_default().to_owned(),
         at: jiff::Timestamp::now(),
@@ -154,9 +183,4 @@ pub(crate) fn pin_queued(
         forced: true,
         pinned_run: Some(run.to_owned()),
     });
-    if let Some(id) = applied {
-        task.mark_action_applied(id);
-    }
-    queue.put(&mut task)?;
-    Ok(true)
 }

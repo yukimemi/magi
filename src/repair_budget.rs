@@ -160,7 +160,7 @@ pub(crate) fn contract(task: &Task, kind: Kind) -> Result<String> {
 
 /// Admission-only fence: execution must remain able to consume its own decisions.
 /// Caller holds the task claim, shared with answer recording and effect writers.
-fn owner_effects_settled(home: &Path, task: &Task, state: &RunState) -> Result<()> {
+pub(crate) fn owner_effects_settled(home: &Path, task: &Task, state: &RunState) -> Result<()> {
     let queue = Queue::at(home.join("queue"));
     for q in crate::ask::Questions::at(home.join("questions")).snapshot()? {
         if (q.run == task.id || q.run == state.id || q.routed_task.as_deref() == Some(&task.id))
@@ -403,7 +403,16 @@ fn evidence(state: &RunState, request: &Request) -> Result<()> {
 
 /// Atomically append authorization and queue this exact run. No run JSON is
 /// changed here, so a crash cannot leave an unqueued budget mutation.
-pub async fn grant(queue: &Queue, home: &Path, mut request: Request) -> Result<Receipt> {
+pub async fn grant(queue: &Queue, home: &Path, request: Request) -> Result<Receipt> {
+    grant_with_claim(queue, home, request, None).await
+}
+
+pub(crate) async fn grant_with_claim(
+    queue: &Queue,
+    home: &Path,
+    mut request: Request,
+    claimed: Option<(crate::queue::Claim, Task)>,
+) -> Result<Receipt> {
     ensure!((1..=3).contains(&request.rounds), "rounds must be 1..=3");
     ensure!(
         request.replace_request.is_none() || request.kind == Kind::BaseConflict,
@@ -440,10 +449,18 @@ pub async fn grant(queue: &Queue, home: &Path, mut request: Request) -> Result<R
         );
         return Ok(receipt.clone());
     }
-    let _claim = queue
-        .claim(&request.task)
-        .context("repair grant refused: task queue lease is held")?;
-    let mut task = queue.get(&request.task)?;
+    let (_claim, mut task) = match claimed {
+        Some(claimed) => {
+            ensure!(claimed.1.id == request.task, "repair task changed");
+            claimed
+        }
+        None => {
+            let claim = queue
+                .claim(&request.task)
+                .context("repair grant refused: task queue lease is held")?;
+            (claim, queue.get(&request.task)?)
+        }
+    };
     if let Some(receipt) = task
         .repair_grants
         .iter()

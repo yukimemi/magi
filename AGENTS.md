@@ -3791,3 +3791,31 @@ gate runs the tests the way CI does. `[profile.default]` in
   failure excerpts when it has to reduce a long output. A passing command with a
   retried test can therefore show those excerpts; the final `FLAKY` line is not
   a trigger and nothing reads `FLAKY` as a failure.
+
+### Standing chat recovery
+
+`[talk] standing_authorization` defaults off and is read only from the machine
+layer, independently of repository templates and their variables. It supersedes
+“automatic reports authorize nothing” only for the recovery allowlist in
+`chat_control::standing`. Reports and watched output remain data. A launcher
+scope binds the actual automatic input to current stops on chat-filed tasks or
+tasks in active goals; watch results require a goal link. Check the same scope
+again under the task claim, and retain the existing goal-generation fence.
+
+Use the producer's semantic stop identity. A new execution pass may deliver
+another report, but it does not renew a spent cause. The task-wide reservation in
+`standing-actions` is written before dispatch; interrupted or uncertain effects
+are never replayed. The additive `Talk::standing_actions` record binds a MAGI
+transcript entry to the operation, evidence and outcome. Do not turn standing
+resume into an operator release or manufacture owner input for a standing goal.
+Landing decisions, manual holds, abandonment, replacement, reassignment, force
+and configuration remain outside the allowlist. No sandbox grants change.
+
+Two rules keep the setting additive. A goal the owner established
+(`Goal::owner_input` non-empty) keeps its own authority on a wake:
+`standing::capture` leaves that turn as `Source::Goal`, and only a goal
+registered under this setting is confined to the allowlist (with the setting
+off, such a goal's wake is refused by `admit_goal_operation`). And a goal
+establish/update is audited but neither needs nor spends the per-cause
+reservation; the chat registers the goal first, because the report stops
+matching once the recovery moves the task.

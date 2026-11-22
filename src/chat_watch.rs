@@ -585,7 +585,7 @@ fn reconcile(dir: &Path, talks: &Talks) -> Result<()> {
         &text,
         &format!("watch:{}:finished", job.id),
         &|_| false,
-        None,
+        crate::chat_control::standing::Event::Watch { id: job.id.clone() },
         display,
     ) {
         match talks.get(&job.talk) {
