@@ -3,8 +3,15 @@
 # how the same tests are scheduled (one process per test, binaries in parallel).
 
 [profile.default]
-# Flakes must show, not be retried away.
-retries = 0
+# Local runs (`cargo make test`, the magi `verify.e2e`) retry a failed test
+# twice. The suite always runs under load (several magi runs at once), and
+# integration tests that pass when run again were failing `verify.e2e` and
+# costing a full suite rerun plus a fixer round on tests the change never
+# touched. A test that fails and then passes is reported as `FLAKY` in
+# nextest's output, so the flake stays visible without deciding the run.
+# A test that fails every attempt still fails. CI (`--profile ci`) keeps
+# `retries = 0`, so flakes still show there as failures.
+retries = 2
 
 [profile.ci]
 retries = 0

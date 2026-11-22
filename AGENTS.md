@@ -3765,3 +3765,29 @@ Completion is machine-observed, never inferred from assistant prose, a task flag
 or PR creation. Landing requires fresh confirmed merge of the recorded head.
 The existing Chat task-progress strip adds purpose, state and current step/wait,
 with a validated Run or Task link; detailed execution remains on Run.
+
+### Local integration tests retry; CI's do not
+
+This is the one exception to the `kata:agents:rust:*` statement that the local
+gate runs the tests the way CI does. `[profile.default]` in
+`.config/nextest.toml` (what `cargo make test`, and so `verify.e2e`, uses) sets
+`retries = 2`; `[profile.ci]` keeps `retries = 0`.
+
+- **Why.** The machine runs several magi runs at once, so the suite always runs
+  under load. Between 2026-11-12 and 2026-11-22 `verify.e2e` failed 65 of 113
+  times; the most frequent single failures were integration tests that pass
+  when run again, each costing a
+  ~36 minute suite rerun and often a fixer round on a test the change never
+  touched. The old comment ("flakes must show, not be retried away") is
+  reversed on purpose.
+- **Visibility is kept.** A test that fails and then passes is printed by
+  nextest as `FLAKY` (with `TRY n FAIL` lines for the failed attempts) and the
+  command passes. A test that fails every attempt still fails. CI shows flakes
+  as failures.
+- **Scope.** Lib / bin unit tests stay on `cargo test` (the kata-managed
+  `test-targets` task) and are never retried.
+- **Known interaction.** `run::summarize_verify` treats `FAIL [` lines (so
+  `TRY n FAIL [`) and the failed attempts' `panicked at` / `STDERR` blocks as
+  failure excerpts when it has to reduce a long output. A passing command with a
+  retried test can therefore show those excerpts; the final `FLAKY` line is not
+  a trigger and nothing reads `FLAKY` as a failure.
