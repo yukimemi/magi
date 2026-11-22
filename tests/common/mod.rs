@@ -971,8 +971,9 @@ pub fn fixture_with_failure(home: HomeGuard, failed_seats: &[&str]) -> Fixture {
 
 /// Generous caller budget retained for the successor after a short agent turn.
 pub const HANDOVER_BUDGET: u64 = 20;
-/// Only the hanging roster agent gets this per-turn cap.
-pub const HANG_TURN_SECS: u64 = 2;
+/// Only the hanging roster agent gets this per-turn cap. Allow Windows
+/// process startup under load before requiring the child's hang marker.
+const HANG_TURN_SECS: u64 = if cfg!(windows) { 10 } else { 2 };
 
 /// Assert that the real child entered the hang, rather than timing out during
 /// startup. Include the node so a later-turn test proves the intended turn hung.
