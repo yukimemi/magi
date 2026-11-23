@@ -240,12 +240,195 @@ async fn accepted_grant_survives_restart_but_changed_head_or_decision_prevents_c
     let (_fx, mut task, _runner, request) = stopped(false).await;
     accepted(&request);
     task = Queue::open().get(&task.id).unwrap();
+    let mut stale = task.clone();
     task.hold_manual(Some("new owner decision".into())); Queue::open().put(&mut task).unwrap();
+    Queue::open().put(&mut stale).unwrap();
+    assert_eq!(Queue::open().get(&task.id).unwrap().hold_reason, task.hold_reason);
+    accepted(&request);
+    assert_eq!(Queue::open().get(&task.id).unwrap().status, TaskStatus::Held);
     let mut resumed = Runner::resume(&request.run).unwrap();
     let error = resumed.execute().await.unwrap_err();
     assert!(error.to_string().contains("owner hold"), "{error:#}");
     assert!(RunState::load(&request.run).unwrap().repair_grants.is_empty());
     assert_eq!(Queue::open().get(&task.id).unwrap().repair_grants.len(), 1);
+}
+}
+
+common::e2e! {
+async fn automatic_budget_hold_admits_only_an_explicit_same_run_repair() {
+    let mut fx = fixture(home_lock().await, Judges::Unanimous, true);
+    fx.config.graph.implementers = 1;
+    fx.config.graph.reviewers = 1;
+    fx.config.graph.review_rounds = 1;
+    fx.config.disk.min_free_bytes = 0;
+    fx.config.disk.auto_fold = false;
+    fx.config.verify.e2e = vec!["test -f fixed.txt || { echo 'fixed.txt is missing'; exit 1; }".into()];
+    let config = fx.tmp.path().join("daemon.toml");
+    std::fs::write(&config, toml::to_string(&fx.config).unwrap()).unwrap();
+    let opts = magi::daemon::Opts {
+        repo: fx.repo.clone(), config: Some(config), once: true,
+        worktrees_root: fx.config.graph.worktree_root.clone(),
+        poll: std::time::Duration::from_millis(20), ..Default::default()
+    };
+    let serve = |max_attempts| {
+        let opts = magi::daemon::Opts { max_attempts, ..opts.clone() };
+        async move {
+            tokio::time::timeout(std::time::Duration::from_secs(120), magi::daemon::serve(opts))
+                .await.unwrap().unwrap();
+        }
+    };
+    let queue = Queue::open();
+    let mut task = Task::new("retained review".into(), "create note.txt".into(), fx.repo.clone(), Source::Human);
+    queue.put(&mut task).unwrap();
+    serve(2).await;
+    let failed = queue.get(&task.id).unwrap();
+    assert_eq!(failed.status, TaskStatus::Failed);
+    assert_eq!(failed.attempts, 1);
+    assert_eq!(failed.runs.len(), 1);
+    let run = RunState::load(&failed.runs[0]).unwrap();
+    assert_eq!(run.status, RunStatus::Blocked);
+    let request = Request {
+        task: task.id.clone(), run: run.id.clone(), kind: Kind::Review, rounds: 1,
+        head: magi::git::rev_parse(&run.winner().unwrap().worktree, "HEAD").await.unwrap(),
+        expect_pass: run.passes.last().unwrap().index, request: "budget-review-1".into(),
+        reason: "Repair the retained review once".into(), tip: None, instruction: None,
+        replace_request: None, evidence_digest: None,
+    };
+    // Launch a fixture chat seat so the control bridge, not the CLI environment,
+    // distinguishes an automatic report from the owner's current request.
+    let store = magi::talk::Talks::open();
+    let mut chat_config = fx.config.clone();
+    let spec = &mut chat_config.agents[0];
+    spec.env.extend(common::magi_cli_env(&magi::run::home(), "GRANT_BIN"));
+    spec.env.extend([
+        ("GRANT_TASK".into(), request.task.clone()),
+        ("GRANT_RUN".into(), request.run.clone()),
+        ("GRANT_HEAD".into(), request.head.clone()),
+        ("GRANT_PASS".into(), request.expect_pass.to_string()),
+    ]);
+    spec.command = vec![
+        "sh".into(), "-c".into(),
+        r#"cat >/dev/null
+        "$GRANT_BIN" task control grant-repair "$GRANT_TASK" --run "$GRANT_RUN" --kind review --rounds 1 --head "$GRANT_HEAD" --expect-pass "$GRANT_PASS" --request budget-review-1 --reason 'Repair the retained review once' 2>&1 || :"#.into(),
+    ];
+    let agent = spec.id.clone();
+    let mut talk = magi::talk::begin(&store, &chat_config, fx.repo.clone(), Some(&agent)).unwrap();
+    let prior_instruction = magi::talk::record(
+        &mut talk, &store, "Repair the retained review once.", Vec::new(),
+    ).unwrap();
+    let lease = store.claim_turn(&talk.id).unwrap().unwrap();
+    // Model an automatic requeue, not an operator release. Neither a requeue
+    // nor another scheduler launch can replenish the recovery budget.
+    queue.modify(&task.id, |task| {
+        let attempts = task.attempts;
+        task.release();
+        task.attempts = attempts;
+        true
+    }).unwrap();
+    serve(1).await;
+    let held = queue.get(&task.id).unwrap();
+    assert_eq!(held.status, TaskStatus::Held);
+    assert!(held.hold_reason.as_deref().unwrap().starts_with("[recovery-budget]"));
+    assert_eq!(held.operator_decided_at, None);
+    assert_eq!(held.runs, failed.runs);
+    assert_eq!(RunState::load(&run.id).unwrap().passes, run.passes);
+
+    let path = queue.path_of(&task.id);
+    let original = std::fs::read(&path).unwrap();
+    let mut fixture_record: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    let write_fixture = |value: &serde_json::Value| {
+        std::fs::write(&path, serde_json::to_vec(value).unwrap()).unwrap();
+    };
+    fixture_record.as_object_mut().unwrap().remove("recovery_budget_hold");
+    write_fixture(&fixture_record);
+    refused(&request, "owner hold"); // Missing modern provenance, even with the exact text.
+    fixture_record["schema"] = 23.into();
+    fixture_record["hold_reason"] = "[recovery-budget] fabricated".into();
+    write_fixture(&fixture_record);
+    refused(&request, "owner hold");
+    fixture_record["hold_reason"] = held.hold_reason.clone().unwrap().into();
+    let settled = fixture_record["passes"].clone();
+    fixture_record["passes"] = serde_json::json!([]);
+    write_fixture(&fixture_record);
+    refused(&request, "owner hold"); // Exact legacy text without a settled pass.
+    fixture_record["passes"] = settled;
+    write_fixture(&fixture_record);
+    let legacy = accepted(&request);
+    assert_eq!(legacy["request"]["run"], run.id);
+
+    // Restore the isolated modern fixture to exercise publication failure and
+    // the worker path independently of the successful legacy admission.
+    std::fs::write(&path, original).unwrap();
+    let _claim = queue.claim(&task.id).unwrap();
+    refused(&request, "queue lease is held");
+    drop(_claim);
+    let tmp_write = path.with_extension("json.tmp");
+    std::fs::create_dir(&tmp_write).unwrap();
+    refused(&request, "publication could not be confirmed");
+    std::fs::remove_dir(&tmp_write).unwrap();
+    let mut unknown = run.clone();
+    unknown.driver_exited = false;
+    unknown.driver_pid = None;
+    unknown.driver_started_at = None;
+    unknown.save().unwrap();
+    refused(&request, "live or unknown");
+    let mut stopped = run.clone();
+    stopped.save().unwrap();
+    let mut wrong = request.clone();
+    wrong.expect_pass += 1;
+    refused(&wrong, "pass changed");
+    queue.modify(&task.id, |task| {
+        task.blocked_by.push("unresolved-dependency".into());
+        true
+    }).unwrap();
+    refused(&request, "dependency");
+    queue.modify(&task.id, |task| {
+        task.blocked_by.clear();
+        true
+    }).unwrap();
+
+    magi::talk::respond(&lease, &mut talk, &store, &chat_config, &prior_instruction)
+        .await.unwrap();
+    assert!(talk.turns.last().unwrap().body.contains("owner hold"), "{:?}", talk.turns.last());
+    assert!(queue.get(&task.id).unwrap().repair_grants.is_empty());
+    magi::talk::queue_magi(&mut talk, &store, "Automatic report: the task is held.").unwrap();
+    let text = magi::talk::drain(&mut talk, &store).unwrap().unwrap();
+    magi::talk::respond(&lease, &mut talk, &store, &chat_config, &text).await.unwrap();
+    assert!(talk.turns.last().unwrap().body.contains("owner hold"), "{:?}", talk.turns.last());
+    assert!(queue.get(&task.id).unwrap().repair_grants.is_empty());
+    magi::talk::say(&lease, &mut talk, &store, &chat_config, "Repair the retained review once.", Vec::new())
+        .await.unwrap();
+    assert!(talk.turns.last().unwrap().body.contains("budget-review-1"), "{:?}", talk.turns.last());
+    assert_eq!(queue.get(&task.id).unwrap().repair_grants.len(), 1, "the bridge accepted the grant");
+    drop(lease);
+
+    let receipt = accepted(&request);
+    assert_eq!(accepted(&request), receipt);
+    let queued = queue.get(&task.id).unwrap();
+    assert_eq!(queued.status, TaskStatus::Queued);
+    assert_eq!(queued.hold_reason, None);
+    assert_eq!(queued.attempts, held.attempts);
+    assert_eq!(queued.runs, held.runs);
+    assert_eq!(queued.repair_grants.len(), 1);
+    assert_eq!(queued.resume_override.as_ref().unwrap().pinned_run.as_deref(), Some(run.id.as_str()));
+    assert!(RunState::load(&run.id).unwrap().repair_grants.is_empty());
+    let duplicate = request.clone();
+    let (_, replay) = tokio::join!(serve(1), tokio::task::spawn_blocking(move || accepted(&duplicate)));
+    assert_eq!(replay.unwrap(), receipt);
+    let repaired = RunState::load(&run.id).unwrap();
+    assert_eq!(repaired.passes.len(), run.passes.len() + 1);
+    assert_eq!(repaired.repair_grants.len(), 1);
+    assert_eq!(repaired.repair_grants[0].spent, 1);
+    assert_eq!(repaired.repair_grants[0].phase, Phase::Complete);
+    assert!(repaired.repair_grants[0].succeeded);
+    assert!(repaired.winner().unwrap().worktree.join("fixed.txt").is_file());
+    let mut stale_queued = queued;
+    queue.put(&mut stale_queued).unwrap();
+    assert_eq!(accepted(&request), receipt);
+    let finished = queue.get(&task.id).unwrap();
+    assert_eq!(finished.status, TaskStatus::Done);
+    assert_eq!(finished.runs, held.runs);
+    assert!(finished.resume_override.is_none());
 }
 }
 
@@ -764,7 +947,8 @@ async fn historical_unspent_receipt_recovers_only_the_exact_original_answer_once
     assert!(RunState::load(&request.run).unwrap().repair_grants.is_empty());
     // Restore the fixture's original application state solely to test the
     // independent source/contract fences; no production recovery does this.
-    let mut restore = saved.clone(); queue.put(&mut restore).unwrap();
+    let task_path = queue.path_of(&task.id);
+    std::fs::write(&task_path, serde_json::to_vec(&saved).unwrap()).unwrap();
     let mut changed = magi::ask::Questions::open().get(&q.id).unwrap();
     changed.summary.push_str(" changed source");
     magi::ask::Questions::open().put(&mut changed).unwrap();
@@ -772,11 +956,14 @@ async fn historical_unspent_receipt_recovers_only_the_exact_original_answer_once
     assert!(blocked.execute().await.is_err());
     assert!(RunState::load(&request.run).unwrap().repair_grants.is_empty());
     let mut original_q = q.clone(); magi::ask::Questions::open().put(&mut original_q).unwrap();
-    let mut changed = saved.clone(); changed.instruction.push_str(" changed contract"); queue.put(&mut changed).unwrap();
+    queue.modify(&task.id, |t| {
+        t.instruction.push_str(" changed contract");
+        true
+    }).unwrap();
     let mut blocked = Runner::resume(&request.run).unwrap();
     assert!(blocked.execute().await.is_err());
     assert!(RunState::load(&request.run).unwrap().repair_grants.is_empty());
-    let mut restore = saved.clone(); queue.put(&mut restore).unwrap();
+    std::fs::write(&task_path, serde_json::to_vec(&saved).unwrap()).unwrap();
     assert_eq!(serde_json::to_value(&RunState::load(&request.run).unwrap().reviews).unwrap(), reviews_before);
     let mut resumed = Runner::resume(&request.run).unwrap(); resumed.execute().await.unwrap();
     assert_eq!(resumed.state.repair_grants[0].spent, 1);

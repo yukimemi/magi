@@ -193,6 +193,7 @@ pub(crate) fn owner_effects_settled(home: &Path, task: &Task, state: &RunState) 
 fn controls(home: &Path, task: &Task, state: &RunState, kind: Kind) -> Result<()> {
     ensure!(
         task.execution_runs().last() == Some(&state.id)
+            && task.assignment_accepts(state)
             && state.origin.as_ref().and_then(|o| o.task.as_deref()) == Some(task.id.as_str()),
         "repair grant refused: run task ownership changed"
     );
@@ -223,7 +224,12 @@ fn controls(home: &Path, task: &Task, state: &RunState, kind: Kind) -> Result<()
                         || state
                             .winner()
                             .is_some_and(|winner| &winner.branch == branch))))
-            && task.replacement.is_none(),
+            && task.replacement.is_none()
+            && task
+                .resume_override
+                .as_ref()
+                .and_then(|pin| pin.pinned_run.as_ref())
+                .is_none_or(|run| run == &state.id),
         "repair grant refused: task has a different continuation selected"
     );
     ensure!(
@@ -401,10 +407,16 @@ fn evidence(state: &RunState, request: &Request) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "repair grant publication could not be confirmed; check the task or repeat the identical request ID and arguments"
+)]
+pub(crate) struct PublicationUnknown;
+
 /// Atomically append authorization and queue this exact run. No run JSON is
 /// changed here, so a crash cannot leave an unqueued budget mutation.
 pub async fn grant(queue: &Queue, home: &Path, request: Request) -> Result<Receipt> {
-    grant_with_claim(queue, home, request, None).await
+    grant_with_claim(queue, home, request, None, Some(jiff::Timestamp::now())).await
 }
 
 pub(crate) async fn grant_with_claim(
@@ -412,6 +424,7 @@ pub(crate) async fn grant_with_claim(
     home: &Path,
     mut request: Request,
     claimed: Option<(crate::queue::Claim, Task)>,
+    owner_requested_at: Option<jiff::Timestamp>,
 ) -> Result<Receipt> {
     ensure!((1..=3).contains(&request.rounds), "rounds must be 1..=3");
     ensure!(
@@ -472,8 +485,19 @@ pub(crate) async fn grant_with_claim(
         );
         return Ok(receipt.clone());
     }
+    let expected = serde_json::to_value(&task)?;
     let _owner = crate::pr_head::owner_lock(home, &request.run)?;
     let state = RunState::load_under(&request.run, home)?;
+    if task.operator_held()
+        && matches!(request.kind, Kind::Review | Kind::Gate)
+        && owner_requested_at.is_some_and(|at| task.held_at.is_some_and(|held| at >= held))
+        && task.held_for_recovery_budget(&state)
+    {
+        // Stage only the hold change. Every other guard still sees the same
+        // task, and the original snapshot must match at publication.
+        task.hold_source = None;
+        task.status = TaskStatus::Queued;
+    }
     controls(home, &task, &state, request.kind)?;
     owner_effects_settled(home, &task, &state)?;
     unique_owner(queue, &task, &state)?;
@@ -581,19 +605,9 @@ pub(crate) async fn grant_with_claim(
         decision: task.operator_decided_at,
         contract: task_contract,
     };
-    task.repair_grants.push(receipt.clone());
-    task.status = TaskStatus::Queued;
-    task.hold_source = None;
-    task.hold_reason = None;
-    task.held_at = None;
-    task.resume_override = Some(crate::queue::OperatorResume {
-        question_id: String::new(),
-        at: receipt.at,
-        conductor_rehold: None,
-        forced: true,
-        pinned_run: Some(state.id),
-    });
-    queue.put(&mut task)?;
+    task.queue_repair(&receipt);
+    queue.commit_repair_grant(&mut task, &expected)?;
+    // The receipt proves publication, not that a driver or fixer started.
     Ok(receipt)
 }
 
@@ -652,12 +666,7 @@ pub(crate) async fn apply(home: &Path, state: &mut RunState, disk: &RunState) ->
         Err(_) if state.repair_grants.is_empty() && !queue.path_of(owner).exists() => return Ok(()),
         Err(error) => return Err(error).context("repair task record unavailable"),
     };
-    if pending(&task, disk)
-        && task
-            .repair_grants
-            .last()
-            .is_some_and(|r| r.request.kind == Kind::BaseConflict)
-    {
+    if pending(&task, disk) {
         unique_owner(&queue, &task, disk)?;
     }
     if !state.repair_grants.is_empty() || pending(&task, disk) {
