@@ -84,6 +84,374 @@ fn land_on_origin(sideline: &std::path::Path, file: &str, content: &str) {
     run_git(sideline, &["push", "-q", "origin", "main"]);
 }
 
+async fn sync_only_fixture(fx: &mut common::Fixture) -> (magi::queue::Task, magi::run::RunState) {
+    use magi::queue::{Queue, Source, Task};
+
+    fx.config.graph.reviewers = 1;
+    fx.config.graph.implementers = 1;
+    let records = fx.tmp.path().join("verification");
+    let command = |step: &str| {
+        format!(
+            "printf '{step} ' >> '{}' && git rev-parse HEAD >> '{}'",
+            records.display(),
+            records.display()
+        )
+    };
+    fx.config.verify.e2e = vec![command("e2e")];
+    fx.config.verify.gate = vec![command("gate")];
+    fx.config.verify.pre_gate = vec![command("pre-gate")];
+    let config = fx.tmp.path().join("config.toml");
+    std::fs::write(&config, toml::to_string(&fx.config).unwrap()).unwrap();
+    run_git(&fx.repo, &["switch", "-c", "fix/retained"]);
+    std::fs::write(fx.repo.join("note.txt"), "retained change\n").unwrap();
+    run_git(&fx.repo, &["add", "note.txt"]);
+    run_git(&fx.repo, &["commit", "-m", "retained change"]);
+    run_git(&fx.repo, &["switch", "main"]);
+    let queue = Queue::open();
+    let mut task = Task::new(
+        "retained".into(),
+        "retain this change".into(),
+        fx.repo.clone(),
+        Source::Human,
+    );
+    task.overrides = Some(magi::queue::RunOverrides {
+        config: Some(config),
+        ..Default::default()
+    });
+    task.hold_manual(Some("resume required".into()));
+    task.attempts = 2;
+    queue.put(&mut task).unwrap();
+    let mut state = Runner::review(
+        &fx.repo,
+        "fix/retained",
+        fx.config.clone(),
+        magi::run::Origin::queue(&task.id),
+    )
+    .await
+    .expect("prepare the retained winner without executing review")
+    .state;
+    state.status = RunStatus::Blocked;
+    state.driver_exited = true;
+    state.save().unwrap();
+    task.link_run(&state.id);
+    queue.put(&mut task).unwrap();
+    (task, state)
+}
+
+fn sync_only_cli(fx: &common::Fixture, id: &str, sync_only: bool) -> std::process::Output {
+    let mut cli = common::magi_cli(&magi::run::home());
+    cli.current_dir(&fx.repo).args(["run", "--resume", id]);
+    if sync_only {
+        cli.arg("--sync-base-only");
+    }
+    cli.output().expect("run resume CLI")
+}
+
+fn assert_sync_only_held(fx: &common::Fixture, id: &str, run: &magi::run::RunState) {
+    let task = magi::queue::Queue::open().get(id).unwrap();
+    assert_eq!(task.status, magi::queue::TaskStatus::Held);
+    assert_eq!(task.attempts, 2);
+    assert_eq!(task.runs.as_slice(), std::slice::from_ref(&run.id));
+    assert!(!fx.tmp.path().join("verification").exists());
+    assert!(!run.dir().join("artifacts/prompts.log").exists());
+    assert_eq!(run.status, RunStatus::Blocked);
+    assert!(!run.sync_only_passes.last().unwrap().verification_allowed);
+    assert!(run.pr.is_none());
+}
+
+common::e2e! {
+async fn sync_base_only_holds_then_explicit_resume_verifies_the_synchronized_head() {
+    let mut fx = fixture(home_lock().await, Judges::Unanimous, false);
+    let origin = wire_origin(&fx);
+    let (task, before) = sync_only_fixture(&mut fx).await;
+    let worktree = &before.winner().unwrap().worktree;
+    let old_head = magi::git::rev_parse(worktree, "HEAD").await.unwrap();
+    land_on_origin(&origin.sideline, "upstream.txt", "new upstream change\n");
+    let tip = magi::git::rev_parse(&origin.sideline, "HEAD").await.unwrap();
+
+    let out = sync_only_cli(&fx, &before.id, true);
+    assert!(out.status.success(), "{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    let run = magi::run::RunState::load(&before.id).unwrap();
+    assert_sync_only_held(&fx, &task.id, &run);
+    let head = magi::git::rev_parse(worktree, "HEAD").await.unwrap();
+    assert!(is_ancestor(worktree, &old_head, &head));
+    assert!(is_ancestor(worktree, &tip, &head));
+    let pass = run.sync_only_passes.last().unwrap();
+    assert_eq!(pass.tip.as_deref(), Some(tip.as_str()));
+    assert_eq!(pass.head_before.as_deref(), Some(old_head.as_str()));
+    assert_eq!(pass.head_after.as_deref(), Some(head.as_str()));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("verification was not allowed"));
+
+    let out = sync_only_cli(&fx, &before.id, false);
+    assert!(out.status.success(), "{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    let records = std::fs::read_to_string(fx.tmp.path().join("verification")).unwrap();
+    for step in ["e2e", "pre-gate", "gate"] {
+        assert!(records.lines().any(|line| line == format!("{step} {head}")), "{records}");
+    }
+    assert_eq!(magi::run::RunState::load(&before.id).unwrap().status, RunStatus::Ready);
+}
+}
+
+common::e2e! {
+async fn sync_base_only_leaves_an_ordinary_base_reservation_resumable() {
+    let mut fx = fixture(home_lock().await, Judges::Unanimous, false);
+    let origin = wire_origin(&fx);
+    let (task, mut run) = sync_only_fixture(&mut fx).await;
+    let head = magi::git::rev_parse(&run.winner().unwrap().worktree, "HEAD").await.unwrap();
+    land_on_origin(&origin.sideline, "upstream.txt", "new upstream change\n");
+    let tip = magi::git::rev_parse(&origin.sideline, "HEAD").await.unwrap();
+    run.base_sync = Some(magi::run::BaseSync {
+        tip: tip.clone(), behind: 1, attempts: 1, conflict: None, already_in: None,
+    });
+    run.base_sync_recovery = serde_json::from_value(serde_json::json!({
+        "episodes": [{"id": 0, "reason": "initial", "used": 1}],
+        "authorizations": [],
+        "operations": [{"id": 0, "episode": 0, "head": head, "tip": tip, "finished": false}]
+    })).unwrap();
+    run.save().unwrap();
+
+    let out = sync_only_cli(&fx, &run.id, true);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("unfinished ordinary base sync"));
+    let saved = magi::run::RunState::load(&run.id).unwrap();
+    assert!(saved.sync_only_passes.is_empty());
+    assert!(!saved.base_sync_recovery.operations[0].finished);
+    assert_eq!(magi::queue::Queue::open().get(&task.id).unwrap().attempts, 2);
+    assert!(!fx.tmp.path().join("verification").exists());
+
+    let out = sync_only_cli(&fx, &run.id, false);
+    assert!(out.status.success(), "{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    let saved = magi::run::RunState::load(&run.id).unwrap();
+    assert_eq!(saved.status, RunStatus::Ready);
+    assert!(saved.base_sync_recovery.operations[0].finished);
+}
+}
+
+common::e2e! {
+async fn sync_base_only_preserves_an_already_current_gating_checkpoint() {
+    let mut fx = fixture(home_lock().await, Judges::Unanimous, false);
+    let (task, mut run) = sync_only_fixture(&mut fx).await;
+    let worktree = &run.winner().unwrap().worktree;
+    let head = magi::git::rev_parse(worktree, "HEAD").await.unwrap();
+    run.status = RunStatus::Gating;
+    run.config.graph.review_rounds = 0;
+    run.gate_ran = true;
+    run.gate_head = Some(head.clone());
+    run.save().unwrap();
+
+    let out = sync_only_cli(&fx, &run.id, true);
+    assert!(out.status.success(), "{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    let saved = magi::run::RunState::load(&run.id).unwrap();
+    assert_eq!(saved.status, RunStatus::Gating);
+    assert!(saved.gate_ran);
+    assert_eq!(saved.gate_head.as_deref(), Some(head.as_str()));
+    assert_eq!(magi::queue::Queue::open().get(&task.id).unwrap().status, magi::queue::TaskStatus::Held);
+    assert!(!fx.tmp.path().join("verification").exists());
+    assert!(!saved.dir().join("artifacts/prompts.log").exists());
+
+    let out = sync_only_cli(&fx, &run.id, false);
+    assert!(out.status.success(), "{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert_eq!(magi::run::RunState::load(&run.id).unwrap().status, RunStatus::Ready);
+}
+}
+
+common::e2e! {
+async fn sync_base_only_detects_squashed_work_without_creating_a_merge_commit() {
+    let mut fx = fixture(home_lock().await, Judges::Unanimous, false);
+    let origin = wire_origin(&fx);
+    let (task, run) = sync_only_fixture(&mut fx).await;
+    let worktree = &run.winner().unwrap().worktree;
+    let head = magi::git::rev_parse(worktree, "HEAD").await.unwrap();
+    land_on_origin(&origin.sideline, "note.txt", "retained change\n");
+    land_on_origin(&origin.sideline, "upstream.txt", "additional upstream change\n");
+    let tip = magi::git::rev_parse(&origin.sideline, "HEAD").await.unwrap();
+    assert!(!is_ancestor(&origin.sideline, &head, &tip));
+
+    let out = sync_only_cli(&fx, &run.id, true);
+    assert!(out.status.success(), "{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    let saved = magi::run::RunState::load(&run.id).unwrap();
+    assert_eq!(saved.status, RunStatus::AlreadyInBase);
+    assert_eq!(saved.base_sync.as_ref().unwrap().already_in.as_ref().unwrap().tip, tip);
+    assert_eq!(magi::git::rev_parse(worktree, "HEAD").await.unwrap(), head);
+    let task = magi::queue::Queue::open().get(&task.id).unwrap();
+    assert_eq!(task.status, magi::queue::TaskStatus::Done);
+    assert_eq!(task.attempts, 2);
+    assert!(!fx.tmp.path().join("verification").exists());
+    assert!(!saved.dir().join("artifacts/prompts.log").exists());
+    assert!(saved.pr.is_none());
+}
+}
+
+common::e2e! {
+async fn sync_base_only_stops_on_fetch_failure_and_conflict_without_running_any_seat() {
+    let mut fx = fixture(home_lock().await, Judges::Unanimous, false);
+    let origin = wire_origin(&fx);
+    let (task, before) = sync_only_fixture(&mut fx).await;
+    let worktree = &before.winner().unwrap().worktree;
+    let old_head = magi::git::rev_parse(worktree, "HEAD").await.unwrap();
+    land_on_origin(&origin.sideline, "note.txt", "conflicting upstream change\n");
+    let tip = magi::git::rev_parse(&origin.sideline, "HEAD").await.unwrap();
+    let origin_url = magi::git::git(&fx.repo, &["remote", "get-url", "origin"]).await.unwrap();
+    let missing = fx.tmp.path().join("missing.git");
+    run_git(&fx.repo, &["remote", "set-url", "origin", missing.to_str().unwrap()]);
+    let out = sync_only_cli(&fx, &before.id, true);
+    assert!(!out.status.success());
+    let run = magi::run::RunState::load(&before.id).unwrap();
+    assert_sync_only_held(&fx, &task.id, &run);
+    assert_eq!(run.sync_only_passes.last().unwrap().tip, None, "a stale tracking ref is not evidence of a successful fetch");
+    let refused = sync_only_cli(&fx, &before.id, false);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("--sync-base-only"));
+    assert_sync_only_held(&fx, &task.id, &magi::run::RunState::load(&before.id).unwrap());
+
+    run_git(&fx.repo, &["remote", "set-url", "origin", &origin_url]);
+    let out = sync_only_cli(&fx, &before.id, true);
+    assert!(!out.status.success());
+    let run = magi::run::RunState::load(&before.id).unwrap();
+    assert_sync_only_held(&fx, &task.id, &run);
+    assert_eq!(run.sync_only_passes.last().unwrap().tip.as_deref(), Some(tip.as_str()));
+    assert_eq!(magi::git::rev_parse(worktree, "HEAD").await.unwrap(), old_head);
+    assert!(magi::git::is_clean(worktree).await.unwrap());
+    assert!(run.base_sync.as_ref().unwrap().conflict.is_some());
+
+    let out = sync_only_cli(&fx, &before.id, true);
+    assert!(!out.status.success());
+    let refused = magi::run::RunState::load(&before.id).unwrap();
+    assert_eq!(refused.sync_only_passes, run.sync_only_passes);
+    assert_eq!(
+        refused.base_sync.unwrap().conflict,
+        run.base_sync.unwrap().conflict
+    );
+    assert!(!fx.tmp.path().join("verification").exists());
+}
+}
+
+common::e2e! {
+async fn sync_base_only_recovers_a_running_standalone_task_with_no_claim() {
+    use magi::base_sync_only::{Outcome, Request};
+
+    let mut fx = fixture(home_lock().await, Judges::Unanimous, false);
+    let (mut task, mut run) = sync_only_fixture(&mut fx).await;
+    let request = Request { run: run.id.clone(), at: jiff::Timestamp::now() };
+    let pass_index = run.passes.len();
+    run.begin_pass();
+    run.sync_only_passes.push(serde_json::from_value(serde_json::json!({
+        "request": request, "pass_index": pass_index, "required_base": "origin/main",
+        "result": "incomplete", "verification_allowed": false
+    })).unwrap());
+    run.save().unwrap();
+    task.status = magi::queue::TaskStatus::Running;
+    task.sync_only = Some(request.clone());
+    magi::queue::Queue::open().put(&mut task).unwrap();
+
+    let out = sync_only_cli(&fx, &run.id, false);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--sync-base-only"));
+    let out = sync_only_cli(&fx, &run.id, true);
+    assert!(out.status.success(), "{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    let run = magi::run::RunState::load(&run.id).unwrap();
+    assert_sync_only_held(&fx, &task.id, &run);
+    assert_eq!(run.sync_only_passes.len(), 1);
+    let pass = &run.sync_only_passes[0];
+    assert_eq!(pass.request, request);
+    assert_eq!(pass.result, Outcome::AlreadyCurrent);
+    assert_eq!(pass.head_before, pass.head_after);
+}
+}
+
+common::e2e! {
+async fn sync_base_only_reuses_the_last_budget_slot_and_keeps_the_fetched_tip() {
+    use magi::base_sync_only::{Outcome, Request};
+
+    let mut fx = fixture(home_lock().await, Judges::Unanimous, false);
+    let origin = wire_origin(&fx);
+    let (task, mut run) = sync_only_fixture(&mut fx).await;
+    let worktree = run.winner().unwrap().worktree.clone();
+    let head = magi::git::rev_parse(&worktree, "HEAD").await.unwrap();
+    land_on_origin(&origin.sideline, "upstream.txt", "retained fetched base\n");
+    let tip = magi::git::rev_parse(&origin.sideline, "HEAD").await.unwrap();
+    run_git(&fx.repo, &["fetch", "origin", "main"]);
+    let tree = magi::git::git(&worktree, &["merge-tree", "--write-tree", &head, &tip])
+        .await.unwrap();
+    let prepared = magi::git::git(&worktree, &[
+        "commit-tree", &tree, "-p", &head, "-p", &tip, "-m", "Prepared base merge",
+    ]).await.unwrap();
+    let request = Request { run: run.id.clone(), at: jiff::Timestamp::now() };
+    let pass_index = run.passes.len();
+    run.begin_pass();
+    run.base_sync = Some(magi::run::BaseSync {
+        tip: tip.clone(), behind: 1, attempts: 4, conflict: None, already_in: None,
+    });
+    run.base_sync_recovery = serde_json::from_value(serde_json::json!({
+        "episodes": [{"id": 0, "reason": "initial", "used": 4}],
+        "authorizations": [],
+        "operations": [{"id": 0, "episode": 0, "head": head, "tip": tip, "finished": true}]
+    })).unwrap();
+    run.sync_only_passes.push(serde_json::from_value(serde_json::json!({
+        "request": request, "pass_index": pass_index, "required_base": "origin/main",
+        "head_before": head, "head_after": head, "tip": tip,
+        "reservation": 0, "prepared_head": prepared,
+        "result": "incomplete", "verification_allowed": false
+    })).unwrap());
+    run.save().unwrap();
+
+    let missing = fx.tmp.path().join("missing.git");
+    run_git(&fx.repo, &["remote", "set-url", "origin", missing.to_str().unwrap()]);
+    let out = sync_only_cli(&fx, &run.id, true);
+    assert!(out.status.success(), "{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    let run = magi::run::RunState::load(&run.id).unwrap();
+    assert_sync_only_held(&fx, &task.id, &run);
+    assert_eq!(run.base_sync_recovery.episodes[0].used, 4);
+    assert_eq!(run.base_sync_recovery.operations.len(), 1);
+    assert_eq!(run.base_sync.unwrap().attempts, 4);
+    let pass = &run.sync_only_passes[0];
+    assert_eq!(pass.request, request);
+    assert_eq!(pass.result, Outcome::Synchronized);
+    assert_eq!(pass.tip.as_deref(), Some(tip.as_str()));
+    assert_eq!(magi::git::rev_parse(&worktree, "HEAD").await.unwrap(), prepared);
+}
+}
+
+common::e2e! {
+async fn sync_base_only_is_admitted_through_authenticated_owner_chat() {
+    use magi::talk::{self, Talks};
+
+    let mut fx = fixture(home_lock().await, Judges::Unanimous, false);
+    let (task, run) = sync_only_fixture(&mut fx).await;
+    let home = magi::run::home();
+    let talks = Talks::at(home.join("talks"));
+    let spec = &mut fx.config.agents[0];
+    spec.env.extend(common::magi_cli_env(&home, "TEST_BINARY"));
+    spec.env.insert("TEST_RUN".into(), run.id.clone());
+    spec.command = vec![
+        "sh".into(),
+        "-c".into(),
+        r#"cat >/dev/null
+"$TEST_BINARY" task control resume "$TEST_RUN" --sync-base-only || exit $?
+echo 'Queued base synchronization only.'"#.into(),
+    ];
+    let mut chat = talk::begin(&talks, &fx.config, fx.repo.clone(), Some(&fx.config.agents[0].id)).unwrap();
+    let args = ["task", "control", "resume", &run.id, "--sync-base-only"];
+    let denied = common::magi_cli(&home)
+        .args(args)
+        .env("MAGI_NODE", "chat")
+        .env("MAGI_RUN", &chat.id)
+        .output().unwrap();
+    assert!(!denied.status.success());
+    let queue = magi::queue::Queue::open();
+    assert_eq!(queue.get(&task.id).unwrap().status, magi::queue::TaskStatus::Held);
+
+    let lease = talks.claim_turn(&chat.id).unwrap().unwrap();
+    talk::say(&lease, &mut chat, &talks, &fx.config, "Synchronize to base only.", vec![])
+        .await.unwrap();
+    let queued = queue.get(&task.id).unwrap();
+    assert_eq!(queued.status, magi::queue::TaskStatus::Queued);
+    assert_eq!(queued.sync_only.as_ref().unwrap().run, run.id);
+    assert_eq!(queued.attempts, 2);
+    assert_eq!(magi::run::RunState::load(&run.id).unwrap().passes.len(), run.passes.len());
+}
+}
+
 common::e2e! {
 async fn the_gate_runs_on_a_tree_that_contains_what_landed_while_the_run_was_thinking() {
     let _home = home_lock().await;

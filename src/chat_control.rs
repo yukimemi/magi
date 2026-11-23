@@ -147,6 +147,11 @@ pub enum Operation {
         /// 完全な run ID。
         run: String,
     },
+    /// Queue a Git-only pass over the retained winner.
+    SyncBaseOnly {
+        /// Exact retained run ID.
+        run: String,
+    },
     /// task を手動保留する。
     Hold {
         /// task ID または一意な接頭辞。
@@ -286,6 +291,7 @@ pub async fn dispatch(
         &operation,
         Operation::Reassign { .. }
             | Operation::RecoverBase { .. }
+            | Operation::SyncBaseOnly { .. }
             | Operation::Goal { .. }
             | Operation::Standing { .. }
     ) {
@@ -560,6 +566,21 @@ async fn execute(
                 describe(&t, "resume queued for")
             )
         }
+        Operation::SyncBaseOnly { run } => {
+            ensure!(
+                matches!(
+                    crate::chat_goal::current_source(),
+                    crate::chat_goal::Source::Input { .. }
+                ),
+                "sync-base-only requires an explicit owner request in this chat turn"
+            );
+            let owner = run_task(queue, &run)?;
+            let _claim = queue.claim(&owner.id)?;
+            let mut task = queue.get(&owner.id)?;
+            crate::base_sync_only::queue(&mut task, home, &run)?;
+            queue.put(&mut task)?;
+            describe(&task, "base synchronization only queued for")
+        }
         Operation::Hold { task, reason } => describe(
             &hold_claimed(queue, claimed_for_chat(queue, &task, talks, talk)?, &reason)?,
             "held",
@@ -746,6 +767,7 @@ fn admit_goal_operation(
             run_allowed(&request.run)?;
         }
         Operation::Resume { run }
+        | Operation::SyncBaseOnly { run }
         | Operation::RecoverBase { run, .. }
         | Operation::Abandon { run }
         | Operation::RerunChecks { run, .. } => run_allowed(run)?,

@@ -31,6 +31,14 @@ impl GitOut {
 /// Run `git` in `cwd` with `args`, returning the captured output regardless of
 /// exit status.
 pub async fn git_raw(cwd: &Path, args: &[&str]) -> Result<GitOut> {
+    git_raw_command(cwd, args, false).await
+}
+
+pub(crate) async fn git_raw_command(
+    cwd: &Path,
+    args: &[&str],
+    kill_on_drop: bool,
+) -> Result<GitOut> {
     #[cfg(test)]
     crate::web::request_cost::git();
     let out = Command::new("git")
@@ -42,6 +50,7 @@ pub async fn git_raw(cwd: &Path, args: &[&str]) -> Result<GitOut> {
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_EDITOR", "true")
         .stdin(Stdio::null())
+        .kill_on_drop(kill_on_drop)
         .output()
         .await
         .with_context(|| format!("spawn git {}", args.join(" ")))?;

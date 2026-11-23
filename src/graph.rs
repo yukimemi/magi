@@ -1586,10 +1586,20 @@ impl Runner {
     pub fn execute(&mut self) -> impl std::future::Future<Output = Result<()>> + '_ {
         // Allocate before polling: boxing inside an async wrapper would still
         // retain its construction frame while the nested graph is polled.
-        Box::pin(self.execute_inner())
+        Box::pin(self.execute_inner(None))
     }
 
-    async fn execute_inner(&mut self) -> Result<()> {
+    pub(crate) async fn execute_sync_only(
+        &mut self,
+        request: crate::base_sync_only::Request,
+    ) -> Result<()> {
+        Box::pin(self.execute_inner(Some(request))).await
+    }
+
+    async fn execute_inner(
+        &mut self,
+        sync_only: Option<crate::base_sync_only::Request>,
+    ) -> Result<()> {
         anyhow::ensure!(
             self.state.startup.as_ref().is_none_or(|s| s.complete),
             "startup incomplete; inspect retained evidence before explicit recovery"
@@ -1630,12 +1640,37 @@ impl Runner {
         } else {
             None
         };
-        let mut execution = self.claim_driver().await?;
+        let base_only = sync_only.is_some();
+        let mut execution = self.claim_driver(sync_only).await?;
         let runner = &mut *execution.runner;
         let wait = runner.repository_wait();
         // Keep the graph's large future off the callers' stack, including
         // standalone task attempts running on a default-sized test thread.
-        let result = wait.scope(Box::pin(runner.execute_graph())).await;
+        let result = if base_only {
+            wait.scope(Box::pin(async {
+                let repo = runner.state.repo.clone();
+                let result = async {
+                    let _coordination = runner.coordinate(&repo).await?;
+                    anyhow::ensure!(
+                        !runner.pause.parked() && !runner.interrupt.parked(),
+                        "paused before base synchronization"
+                    );
+                    crate::base_sync_only::sync(&mut runner.state).await
+                }
+                .await;
+                let pass = runner.state.sync_only_passes.last_mut().unwrap();
+                pass.result = match result {
+                    Ok(outcome) => outcome,
+                    Err(error) => crate::base_sync_only::Outcome::Stopped(format!("{error:#}")),
+                };
+                let summary = pass.summary();
+                runner.state.event("base-sync-only", summary);
+                runner.state.save()
+            }))
+            .await
+        } else {
+            wait.scope(Box::pin(runner.execute_graph())).await
+        };
         let result = match result {
             Err(e) if e.is::<crate::repo_lock::ResourceBlocked>() => {
                 record_repository_block(&mut runner.state, &e);
@@ -1676,7 +1711,10 @@ impl Runner {
     }
 
     /// Validate ownership and persist the driver claim in one critical section.
-    async fn claim_driver(&mut self) -> Result<DriverExecution<'_>> {
+    async fn claim_driver(
+        &mut self,
+        sync_only: Option<crate::base_sync_only::Request>,
+    ) -> Result<DriverExecution<'_>> {
         let owner = match crate::pr_head::owner_lock_wait(
             &crate::run::home(),
             &self.state.id,
@@ -1724,6 +1762,10 @@ impl Runner {
                 == serde_json::to_value(&self.state.base_sync_recovery)?,
             "base recovery changed since this run was loaded; reload the saved run"
         );
+        anyhow::ensure!(
+            disk.sync_only_passes == self.state.sync_only_passes,
+            "base-only synchronization changed since this run was loaded; reload the saved run"
+        );
         let driver = crate::driver::DriverGuard::acquire(&crate::run::home(), &disk)?;
         let mut execution = DriverExecution {
             runner: self,
@@ -1732,8 +1774,39 @@ impl Runner {
         // Declare after the execution guard: on any claim error this short
         // lock must drop before that guard reloads and releases ownership.
         let _owner = owner;
-        crate::repair_budget::apply(&crate::run::home(), &mut execution.runner.state, &disk)
-            .await?;
+        if let Some(request) = sync_only {
+            crate::base_sync_only::validate_run(&disk, &crate::run::home())?;
+            anyhow::ensure!(
+                request.run == disk.id,
+                "sync-base-only request targets a different run"
+            );
+            let state = &mut execution.runner.state;
+            let task_entry = state.next_pass_task_entry;
+            *state = disk;
+            state.next_pass_task_entry = task_entry;
+            if state.pending_sync_only().is_some() {
+                let pass_index = state.passes.len();
+                let pass = state.sync_only_passes.last_mut().unwrap();
+                anyhow::ensure!(
+                    pass.request == request,
+                    "interrupted base-only synchronization belongs to a different request"
+                );
+                pass.pass_index = pass_index;
+            } else {
+                let pass = crate::base_sync_only::Pass::new(request, state);
+                state.sync_only_passes.push(pass);
+            }
+            if state.status == RunStatus::Failed {
+                state.status = RunStatus::Blocked;
+            }
+        } else {
+            anyhow::ensure!(
+                disk.pending_sync_only().is_none(),
+                "base-only synchronization has not succeeded; resume with --sync-base-only before verifying"
+            );
+            crate::repair_budget::apply(&crate::run::home(), &mut execution.runner.state, &disk)
+                .await?;
+        }
         let state = &mut execution.runner.state;
         // Moving again, so it is no longer parked. Set before the walk rather
         // than in `resume`, so every way of re-entering the graph clears it
@@ -19428,7 +19501,7 @@ esac
         let id = runner.state.id.clone();
         let passes = runner.state.passes.len();
         let owner = crate::pr_head::owner_lock(&crate::run::home(), &id).unwrap();
-        let mut claiming = Box::pin(runner.claim_driver());
+        let mut claiming = Box::pin(runner.claim_driver(None));
         std::future::poll_fn(|cx| {
             assert!(std::future::Future::poll(claiming.as_mut(), cx).is_pending());
             std::task::Poll::Ready(())
@@ -19458,7 +19531,7 @@ esac
         // run.json can commit, but the subsequent lease metadata write fails.
         // Cleanup must run after releasing the short ownership lock.
         std::fs::create_dir(runner.state.dir().join("driver.json.tmp")).unwrap();
-        assert!(runner.claim_driver().await.is_err());
+        assert!(runner.claim_driver(None).await.is_err());
         assert!(runner.state.driver_exited);
         assert_eq!(runner.state.driver_pid, None);
         let disk = RunState::load(&runner.state.id).unwrap();
@@ -19644,7 +19717,7 @@ esac
         crate::run::pin_test_home();
         let mut runner = runner_at(RunStatus::Reviewing);
         runner.state.save().unwrap();
-        let mut execution = runner.claim_driver().await.expect("first execution");
+        let mut execution = runner.claim_driver(None).await.expect("first execution");
         assert_eq!(execution.runner.state.passes.len(), 1);
         execution
             .driver
@@ -19662,7 +19735,7 @@ esac
         runner.state.save().unwrap();
         let id = runner.state.id.clone();
         let owner = crate::pr_head::owner_lock(&crate::run::home(), &id).unwrap();
-        assert!(runner.claim_driver().await.is_err());
+        assert!(runner.claim_driver(None).await.is_err());
         drop(owner);
         drop(runner);
         let mut resumed = Runner::resume(&id).unwrap();
@@ -19670,7 +19743,7 @@ esac
         assert_eq!(resumed.state.liveness(false), crate::run::Liveness::Dead);
         assert_eq!(resumed.state.liveness(true), crate::run::Liveness::Live);
         let mut execution = resumed
-            .claim_driver()
+            .claim_driver(None)
             .await
             .expect("retry initial claim after reload");
         assert_eq!(execution.runner.state.driver_claimed, Some(true));
@@ -19692,10 +19765,10 @@ esac
         let lease = crate::driver::maintenance(&crate::run::home(), &id).unwrap();
         let mut resumed = Runner::resume(&id).unwrap();
         assert_eq!(resumed.state.liveness(false), crate::run::Liveness::Live);
-        assert!(resumed.claim_driver().await.is_err());
+        assert!(resumed.claim_driver(None).await.is_err());
         assert!(RunState::load(&id).unwrap().passes.is_empty());
         drop(lease);
-        let mut execution = resumed.claim_driver().await.unwrap();
+        let mut execution = resumed.claim_driver(None).await.unwrap();
         execution
             .driver
             .finish(&mut execution.runner.state)
@@ -19730,7 +19803,7 @@ esac
         let mut resumed = Runner::resume(&state.id).unwrap();
         assert!(!resumed.state.driver_exited);
         let mut execution = resumed
-            .claim_driver()
+            .claim_driver(None)
             .await
             .expect("lease proves previous execution ended");
         assert_eq!(execution.runner.state.passes.len(), 2);
@@ -19751,7 +19824,7 @@ esac
         assert_eq!(runner.state.driver_claimed, None);
         runner.state.save().unwrap();
         let mut execution = runner
-            .claim_driver()
+            .claim_driver(None)
             .await
             .expect("the execution lease, not a missing marker, excludes a second driver");
         assert_eq!(execution.runner.state.passes.len(), 1);
@@ -19772,7 +19845,7 @@ esac
         assert!(runner.state.driver_started_at.is_some());
         runner.state.save().unwrap();
         let error = runner
-            .claim_driver()
+            .claim_driver(None)
             .await
             .err()
             .expect("a live driver must refuse");

@@ -46,6 +46,10 @@ async fn reassign_inner(
         task.status.as_str()
     );
     ensure!(
+        task.sync_only.is_none(),
+        "task has a pending base-only pass; finish it or hold the task before reassigning"
+    );
+    ensure!(
         task.review_of.is_none()
             && task.pr_recovery.is_none()
             && task.replacement.is_none()

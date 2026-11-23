@@ -1447,6 +1447,17 @@ pub fn build_with(
         });
     }
 
+    sections.extend(notes(
+        "sync_only",
+        "base synchronization only",
+        Tone::Neutral,
+        state
+            .sync_only_passes
+            .iter()
+            .map(crate::base_sync_only::Pass::report_line)
+            .collect(),
+    ));
+
     if !state.verify_flakes.is_empty() {
         let lines: Vec<String> = state
             .verify_flakes

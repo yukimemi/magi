@@ -2641,6 +2641,10 @@ pub struct RunState {
     /// Stable stop identity and single-use owner authorizations, with prior evidence.
     #[serde(default)]
     pub base_sync_recovery: crate::base_sync_recovery::Recovery,
+    /// Owner-requested base-only execution and its verification refusal.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sync_only_passes: Vec<crate::base_sync_only::Pass>,
+
     /// The design-deliberation stage's output, when `[graph] advise` ran it:
     /// one record per advisor seat, plus the synthesis blended into the
     /// implementer's prompt. `None` when the stage is off, has not run yet,
@@ -2951,6 +2955,7 @@ impl RunState {
             bump_decision_attempts: Vec::new(),
             base_sync: None,
             base_sync_recovery: Default::default(),
+            sync_only_passes: Vec::new(),
             advice: None,
             advise_attempted: false,
             attachments: Vec::new(),
@@ -3291,8 +3296,23 @@ impl RunState {
         }
     }
 
+    /// A saved Git-only request that must settle before ordinary execution.
+    pub fn pending_sync_only(&self) -> Option<&crate::base_sync_only::Pass> {
+        self.sync_only_passes
+            .last()
+            .filter(|pass| !self.base_sync_blocked() && !pass.result.succeeded())
+    }
+
     /// Structured current failures take precedence over successful progress events.
     pub fn verification_blocking_cause(&self) -> Option<String> {
+        if let Some(pass) = self.sync_only_passes.last()
+            && self
+                .passes
+                .last()
+                .is_some_and(|p| p.index == pass.pass_index)
+        {
+            return Some(pass.summary());
+        }
         if self.base_sync_blocked() {
             return self
                 .base_sync
