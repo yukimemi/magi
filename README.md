@@ -986,7 +986,10 @@ setup, reviewers, fixers or verification, and does not publish or approve a
 merge. `magi show <run>` and the Web run report show the required base,
 observed HEADs and outcome. After a successful sync, use an ordinary explicit
 resume to verify the updated tree. The sync-only pass consumes no task attempt
-and grants no additional base-sync or repair budget.
+and grants no additional base-sync or repair budget. An existing base-sync
+stop must be handled through its normal recovery path. If a process exits
+with a Git-only request still armed, repeat `--sync-base-only` to finish that
+request before an ordinary resume can verify.
 
 Windows の実 sandbox の限定チェックは認証済み CLI が必要。PowerShell で
 `$env:RUSTUP_TOOLCHAIN = "stable"` を設定し、

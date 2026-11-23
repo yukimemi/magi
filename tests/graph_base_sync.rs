@@ -219,6 +219,47 @@ async fn sync_base_only_stops_on_fetch_failure_and_conflict_without_running_any_
     assert_eq!(magi::git::rev_parse(worktree, "HEAD").await.unwrap(), old_head);
     assert!(magi::git::is_clean(worktree).await.unwrap());
     assert!(run.base_sync.as_ref().unwrap().conflict.is_some());
+
+    let out = sync_only_cli(&fx, &before.id, true);
+    assert!(!out.status.success());
+    let refused = magi::run::RunState::load(&before.id).unwrap();
+    assert_eq!(refused.sync_only_passes, run.sync_only_passes);
+    assert_eq!(
+        refused.base_sync.unwrap().conflict,
+        run.base_sync.unwrap().conflict
+    );
+    assert!(!fx.tmp.path().join("verification").exists());
+}
+}
+
+common::e2e! {
+async fn sync_base_only_resumes_an_armed_request_after_the_queue_pin_is_gone() {
+    use magi::base_sync_only::{Outcome, Request};
+
+    let mut fx = fixture(home_lock().await, Judges::Unanimous, false);
+    let (task, mut run) = sync_only_fixture(&mut fx).await;
+    assert!(task.resume_override.is_none() && task.sync_only.is_none());
+    let request = Request { run: run.id.clone(), at: jiff::Timestamp::now() };
+    let pass_index = run.passes.len();
+    run.begin_pass();
+    run.sync_only_passes.push(serde_json::from_value(serde_json::json!({
+        "request": request, "pass_index": pass_index, "required_base": "origin/main",
+        "result": "incomplete", "verification_allowed": false
+    })).unwrap());
+    run.save().unwrap();
+
+    let out = sync_only_cli(&fx, &run.id, false);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--sync-base-only"));
+    let out = sync_only_cli(&fx, &run.id, true);
+    assert!(out.status.success(), "{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    let run = magi::run::RunState::load(&run.id).unwrap();
+    assert_sync_only_held(&fx, &task.id, &run);
+    assert_eq!(run.sync_only_passes.len(), 1);
+    let pass = &run.sync_only_passes[0];
+    assert_eq!(pass.request, request);
+    assert_eq!(pass.result, Outcome::AlreadyCurrent);
+    assert_eq!(pass.head_before, pass.head_after);
 }
 }
 

@@ -10240,6 +10240,35 @@ mod tests {
     }
 
     #[test]
+    fn sync_base_only_completed_orphan_holds_without_charging_or_double_refunding() {
+        use crate::base_sync_only::{Outcome, Pass, Request};
+
+        let mut state = run_state(RunStatus::Blocked);
+        let mut task = task();
+        let request = Request {
+            run: state.id.clone(),
+            at: Timestamp::now(),
+        };
+        task.start(state.id.clone());
+        task.sync_only = Some(request.clone());
+        // Dedicated dispatch saves Running with the pre-pass attempt count.
+        task.attempts = 2;
+        let mut pass = Pass::new(request, &state);
+        pass.result = Outcome::AlreadyCurrent;
+        state.sync_only_passes.push(pass);
+        state.begin_pass();
+
+        reclaim(&mut task, Some(state), 3, "en");
+
+        assert_eq!(task.status, TaskStatus::Held);
+        assert_eq!(task.attempts, 2);
+        assert!(task.sync_only.is_none());
+        let detail = task.hold_reason.unwrap();
+        assert!(detail.contains("HEAD already contains the base"));
+        assert!(detail.contains("verification was not allowed"));
+    }
+
+    #[test]
     fn orphaned_running_tasks_are_reclaimed_but_live_ones_are_left_alone() {
         let dir = tempfile::tempdir().unwrap();
         let queue = Queue::at(dir.path().to_path_buf());

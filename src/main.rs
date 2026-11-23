@@ -5283,6 +5283,10 @@ async fn resume_run(
         println!("\ndry run: stopping before the first agent call");
         return Ok(());
     }
+    ensure!(
+        sync_base_only || runner.state.pending_sync_only().is_none(),
+        "base-only synchronization was interrupted; resume with --sync-base-only before verifying"
+    );
     // Find-or-create of the owner is serialised per run: two `--resume` of an
     // ownerless run must not each file a task and then drive one run twice.
     let guard = queue.claim(&format!("resume-{run_id}")).with_context(|| {
@@ -5366,7 +5370,11 @@ async fn resume_run(
                 .sync_only_passes
                 .iter()
                 .any(|pass| pass.request == request
-                    && matches!(pass.result, magi::base_sync_only::Outcome::Synchronized)),
+                    && matches!(
+                        pass.result,
+                        magi::base_sync_only::Outcome::Synchronized
+                            | magi::base_sync_only::Outcome::AlreadyCurrent
+                    )),
             "{}",
             task.last_error
                 .as_deref()

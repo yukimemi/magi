@@ -34,6 +34,7 @@ pub struct Pass {
 #[serde(rename_all = "snake_case")]
 pub enum Outcome {
     Incomplete,
+    AlreadyCurrent,
     Synchronized,
     Stopped(String),
 }
@@ -56,7 +57,11 @@ impl Pass {
     pub fn summary(&self) -> String {
         match &self.result {
             Outcome::Incomplete => {
-                "Base synchronization only: incomplete; verification was not allowed".into()
+                "Base synchronization only: incomplete; verification was not allowed. Resume with --sync-base-only to finish".into()
+            }
+            Outcome::AlreadyCurrent => {
+                "HEAD already contains the base; verification was not allowed. Explicitly resume to continue"
+                    .into()
             }
             Outcome::Synchronized => {
                 "Base synchronized; verification was not allowed. Explicitly resume to continue"
@@ -66,6 +71,18 @@ impl Pass {
                 format!("Base synchronization only: {why}; verification was not allowed")
             }
         }
+    }
+
+    pub(crate) fn report_line(&self) -> String {
+        format!(
+            "{} — {} @ {}; HEAD {} → {}; {}",
+            self.request.at,
+            self.required_base,
+            self.tip.as_deref().unwrap_or("not fetched"),
+            self.head_before.as_deref().unwrap_or("unknown"),
+            self.head_after.as_deref().unwrap_or("unknown"),
+            self.summary(),
+        )
     }
 }
 
@@ -84,6 +101,11 @@ pub(crate) fn validate_run(state: &RunState) -> Result<()> {
                 .is_some_and(|winner| winner.viable() && !winner.folded)
             && state.prep_failure.is_none(),
         "sync-base-only requires a stopped run with a decided, retained winner"
+    );
+    ensure!(
+        !state.base_sync_blocked(),
+        "sync-base-only cannot replace an existing base synchronization stop. {}",
+        state.base_sync_next_action()
     );
     ensure!(
         state.pr.is_none()
@@ -107,16 +129,8 @@ pub(crate) fn validate_run(state: &RunState) -> Result<()> {
 }
 
 pub fn queue(task: &mut Task, home: &Path, run: &str) -> Result<()> {
-    ensure!(crate::run::is_run_id(run), "invalid run id");
-    let _owner = crate::pr_head::owner_lock(home, run)?;
-    let state = RunState::load_under(run, home)?;
+    let state = crate::resume::validate(home, run)?;
     crate::pr_head::ensure_owner_record(&state, None)?;
-    ensure!(!state.released(), "the winner was released to another run");
-    let claimed = crate::daemon::is_working_on(home, run, Timestamp::now());
-    ensure!(
-        state.liveness_under(home, claimed) != crate::run::Liveness::Live,
-        "run already has a live driver"
-    );
     validate_run(&state)?;
     ensure!(
         task.execution_runs().last() == Some(&state.id)
@@ -129,20 +143,24 @@ pub fn queue(task: &mut Task, home: &Path, run: &str) -> Result<()> {
             && !crate::repair_budget::pending(task, &state),
         "sync-base-only requires the task's latest held execution with no pending replacement or repair"
     );
+    let request = state
+        .pending_sync_only()
+        .map(|pass| pass.request.clone())
+        .unwrap_or_else(|| Request {
+            run: state.id.clone(),
+            at: Timestamp::now(),
+        });
     let at = Timestamp::now();
     crate::resume::release_standing(task);
     task.operator_decided_at = Some(at);
     task.resume_override = Some(OperatorResume {
         question_id: String::new(),
-        at,
+        at: request.at,
         conductor_rehold: None,
         forced: true,
         pinned_run: Some(state.id.clone()),
     });
-    task.sync_only = Some(Request {
-        run: state.id.clone(),
-        at,
-    });
+    task.sync_only = Some(request);
     Ok(())
 }
 
@@ -304,8 +322,29 @@ pub(crate) async fn check_interruption(state: &mut RunState) -> Result<()> {
     Ok(())
 }
 
-pub(crate) async fn sync(state: &mut RunState) -> Result<()> {
+pub(crate) async fn sync(state: &mut RunState) -> Result<Outcome> {
+    let interrupted_install = state
+        .pending_sync_only()
+        .and_then(|pass| pass.prepared_head.clone());
     check_interruption(state).await?;
+    if let Some(installed) = interrupted_install
+        && state.sync_only_passes.last().unwrap().head_after.as_ref() == Some(&installed)
+    {
+        let tip = state
+            .sync_only_passes
+            .last()
+            .and_then(|pass| pass.tip.clone())
+            .context("interrupted synchronization does not record the fetched base")?;
+        let attempts = state.base_sync.as_ref().map_or(0, |sync| sync.attempts);
+        state.base_sync = Some(BaseSync {
+            tip,
+            behind: 0,
+            attempts: attempts + 1,
+            conflict: None,
+            already_in: None,
+        });
+        return Ok(Outcome::Synchronized);
+    }
     let checkout = checkout(state).await?;
     let _outputs = crate::retention::OutputLease::take(&checkout.path, true)?;
     let head = checkout.git(&["rev-parse", "HEAD"]).await?;
@@ -469,7 +508,11 @@ pub(crate) async fn sync(state: &mut RunState) -> Result<()> {
         already_in: None,
     });
     state.base_sync_recovery.stop = None;
-    Ok(())
+    Ok(if behind == 0 {
+        Outcome::AlreadyCurrent
+    } else {
+        Outcome::Synchronized
+    })
 }
 
 fn stop(

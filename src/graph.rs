@@ -1660,7 +1660,7 @@ impl Runner {
                 .await;
                 let pass = runner.state.sync_only_passes.last_mut().unwrap();
                 pass.result = match result {
-                    Ok(()) => crate::base_sync_only::Outcome::Synchronized,
+                    Ok(outcome) => outcome,
                     Err(error) => crate::base_sync_only::Outcome::Stopped(format!("{error:#}")),
                 };
                 let summary = pass.summary();
@@ -1784,10 +1784,24 @@ impl Runner {
             let task_entry = state.next_pass_task_entry;
             *state = disk;
             state.next_pass_task_entry = task_entry;
-            let pass = crate::base_sync_only::Pass::new(request, state);
-            state.sync_only_passes.push(pass);
+            if let Some(pass) = state.sync_only_passes.last_mut()
+                && pass.result == crate::base_sync_only::Outcome::Incomplete
+            {
+                anyhow::ensure!(
+                    pass.request == request,
+                    "interrupted base-only synchronization belongs to a different request"
+                );
+                pass.pass_index = state.passes.len();
+            } else {
+                let pass = crate::base_sync_only::Pass::new(request, state);
+                state.sync_only_passes.push(pass);
+            }
             state.status = RunStatus::Blocked;
         } else {
+            anyhow::ensure!(
+                disk.pending_sync_only().is_none(),
+                "base-only synchronization was interrupted; resume with --sync-base-only before verifying"
+            );
             crate::base_sync_only::check_interruption(&mut execution.runner.state).await?;
             crate::repair_budget::apply(&crate::run::home(), &mut execution.runner.state, &disk)
                 .await?;

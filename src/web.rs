@@ -20879,6 +20879,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sync_base_only_report_json_names_the_required_base_heads_and_verification() {
+        crate::run::pin_test_home();
+        let f = Fixture::start().await;
+        let id = "20260902-140501-a1b2";
+        write_run(&f.runs(), id, RunStatus::Blocked);
+        let path = f.runs().join(id).join("run.json");
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        v["sync_only_passes"] = serde_json::json!([{
+            "request": {"run": id, "at": "2026-09-02T14:05:01Z"},
+            "pass_index": 0, "required_base": "origin/main", "tip": "base-sha",
+            "head_before": "before-sha", "head_after": "after-sha",
+            "result": "synchronized", "verification_allowed": false
+        }]);
+        std::fs::write(&path, v.to_string()).unwrap();
+
+        let res = f.get(&format!("/api/runs/{id}/report.json")).await;
+        assert_eq!(res.status, 200, "{}", res.body);
+        let json = res.json();
+        let section = json["sections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["key"] == "sync_only")
+            .expect("base-only report section");
+        let line = section["lines"][0].as_str().unwrap();
+        assert!(line.contains("origin/main @ base-sha"), "{line}");
+        assert!(line.contains("HEAD before-sha → after-sha"), "{line}");
+        assert!(line.contains("verification was not allowed"), "{line}");
+    }
+
+    #[tokio::test]
     async fn the_report_json_route_preserves_recovery_repair_release_and_final_review_facts() {
         crate::run::pin_test_home();
         let f = Fixture::start().await;

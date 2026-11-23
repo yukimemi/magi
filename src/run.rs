@@ -3296,6 +3296,13 @@ impl RunState {
         }
     }
 
+    /// A saved Git-only request that must settle before ordinary execution.
+    pub fn pending_sync_only(&self) -> Option<&crate::base_sync_only::Pass> {
+        self.sync_only_passes
+            .last()
+            .filter(|pass| pass.result == crate::base_sync_only::Outcome::Incomplete)
+    }
+
     /// Structured current failures take precedence over successful progress events.
     pub fn verification_blocking_cause(&self) -> Option<String> {
         if let Some(pass) = self.sync_only_passes.last()
