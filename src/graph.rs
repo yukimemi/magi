@@ -1775,7 +1775,7 @@ impl Runner {
         // lock must drop before that guard reloads and releases ownership.
         let _owner = owner;
         if let Some(request) = sync_only {
-            crate::base_sync_only::validate_run(&disk)?;
+            crate::base_sync_only::validate_run(&disk, &crate::run::home())?;
             anyhow::ensure!(
                 request.run == disk.id,
                 "sync-base-only request targets a different run"
@@ -1796,7 +1796,9 @@ impl Runner {
                 let pass = crate::base_sync_only::Pass::new(request, state);
                 state.sync_only_passes.push(pass);
             }
-            state.status = RunStatus::Blocked;
+            if state.status == RunStatus::Failed {
+                state.status = RunStatus::Blocked;
+            }
         } else {
             anyhow::ensure!(
                 disk.pending_sync_only().is_none(),

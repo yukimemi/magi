@@ -38,12 +38,16 @@ pub enum Outcome {
     Incomplete,
     AlreadyCurrent,
     Synchronized,
+    AlreadyInBase,
     Stopped(String),
 }
 
 impl Outcome {
     pub(crate) fn succeeded(&self) -> bool {
-        matches!(self, Self::AlreadyCurrent | Self::Synchronized)
+        matches!(
+            self,
+            Self::AlreadyCurrent | Self::Synchronized | Self::AlreadyInBase
+        )
     }
 }
 
@@ -76,6 +80,9 @@ impl Pass {
                 "Base synchronized; verification was not allowed. Explicitly resume to continue"
                     .into()
             }
+            Outcome::AlreadyInBase => {
+                "Winner already integrated into the base; verification was not allowed".into()
+            }
             Outcome::Stopped(why) => {
                 format!("Base synchronization only: {why}; verification was not allowed")
             }
@@ -95,7 +102,7 @@ impl Pass {
     }
 }
 
-pub(crate) fn validate_run(state: &RunState) -> Result<()> {
+pub(crate) fn validate_run(state: &RunState, home: &Path) -> Result<()> {
     ensure!(
         matches!(
             state.status,
@@ -134,6 +141,19 @@ pub(crate) fn validate_run(state: &RunState) -> Result<()> {
                 .is_none_or(|grant| grant.phase == crate::repair_budget::Phase::Complete),
         "sync-base-only cannot change a publication, landing or repair checkpoint"
     );
+    ensure!(
+        state
+            .base_sync_recovery
+            .operations
+            .last()
+            .is_none_or(|op| op.finished)
+            && !home
+                .join("runs")
+                .join(&state.id)
+                .join("base-sync")
+                .try_exists()?,
+        "an unfinished ordinary base sync requires its existing recovery path"
+    );
     Ok(())
 }
 
@@ -141,7 +161,7 @@ pub(crate) fn validate_run(state: &RunState) -> Result<()> {
 pub fn queue(task: &mut Task, home: &Path, run: &str) -> Result<()> {
     let state = crate::resume::validate(home, run)?;
     crate::pr_head::ensure_owner_record(&state, None)?;
-    validate_run(&state)?;
+    validate_run(&state, home)?;
     let orphan = task
         .sync_only
         .as_ref()
@@ -222,6 +242,13 @@ pub(crate) fn settle(
         });
     task.sync_only = None;
     task.resume_override = None;
+    if state.is_some_and(|state| state.status == RunStatus::AlreadyInBase)
+        && pass.is_some_and(|pass| pass.result == Outcome::AlreadyInBase)
+    {
+        task.succeed();
+        task.last_error = Some(reason);
+        return;
+    }
     task.last_error = Some(reason.clone());
     task.hold_after_sync_only(reason);
 }
@@ -370,15 +397,6 @@ pub(crate) async fn sync(state: &mut RunState) -> Result<Outcome> {
     let checkout = checkout(state).await?;
     let _outputs = crate::retention::OutputLease::take(&checkout.path, true)?;
     let head = checkout.git(&["rev-parse", "HEAD"]).await?;
-    ensure!(
-        state
-            .base_sync_recovery
-            .operations
-            .last()
-            .is_none_or(|op| op.finished)
-            && !state.dir().join("base-sync").try_exists()?,
-        "an unfinished ordinary base sync requires its existing recovery path"
-    );
     let pass = state.sync_only_passes.last_mut().unwrap();
     pass.head_after = Some(head.clone());
     let saved = pass.reservation.is_some() || pass.prepared_head.is_some();
@@ -467,6 +485,14 @@ pub(crate) async fn sync(state: &mut RunState) -> Result<Outcome> {
                     bail!("{why}");
                 }
                 ensure!(tree.ok(), "Git merge-tree failed: {}", tree.stderr);
+                if head != state.base_commit
+                    && tree.stdout
+                        == checkout
+                            .git(&["rev-parse", &format!("{tip}^{{tree}}")])
+                            .await?
+                {
+                    return Ok(already_integrated(state, tip, behind));
+                }
                 let prepared = checkout
                     .git(&[
                         "-c",
@@ -520,6 +546,18 @@ pub(crate) async fn sync(state: &mut RunState) -> Result<Outcome> {
         git::is_ancestor(&checkout.path, &tip, &head).await,
         "winner does not contain the fetched base"
     );
+    if head != state.base_commit
+        && (head == tip
+            || saved
+                && checkout
+                    .git(&["rev-parse", &format!("{tip}^{{tree}}")])
+                    .await?
+                    == checkout
+                        .git(&["rev-parse", &format!("{head}^{{tree}}")])
+                        .await?)
+    {
+        return Ok(already_integrated(state, tip, behind));
+    }
     state.sync_only_passes.last_mut().unwrap().prepared_head = None;
     if saved || behind != 0 {
         state.finish_base_operation(Some(&head));
@@ -539,6 +577,24 @@ pub(crate) async fn sync(state: &mut RunState) -> Result<Outcome> {
     } else {
         Outcome::Synchronized
     })
+}
+
+fn already_integrated(state: &mut RunState, tip: String, behind: usize) -> Outcome {
+    state.sync_only_passes.last_mut().unwrap().prepared_head = None;
+    state.status = RunStatus::AlreadyInBase;
+    state.base_sync_recovery.stop = None;
+    state.base_sync = Some(BaseSync {
+        already_in: Some(crate::already::Evidence {
+            proof: crate::already::Proof::Tree,
+            tip: tip.clone(),
+            commits: Vec::new(),
+        }),
+        tip,
+        behind,
+        attempts: state.base_sync.as_ref().map_or(0, |sync| sync.attempts),
+        conflict: None,
+    });
+    Outcome::AlreadyInBase
 }
 
 fn stop(

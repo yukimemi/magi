@@ -982,11 +982,13 @@ Unix のチャット席では継承 FD、Windows ではローカル名前付き�
 From a terminal, use `magi run --resume <run> --sync-base-only`. A new sync
 requires a fresh fetch. An interrupted sync with a saved reservation reuses
 its recorded base without spending another slot. Neither rewrites the
-winner's commits. The pass stops on conflict without changing the checkout, runs no
-setup, reviewers, fixers or verification, and does not publish or approve a
-merge. `magi show <run>` and the Web run report show the required base,
-observed HEADs and outcome. After a successful sync, use an ordinary explicit
-resume to verify the updated tree. The sync-only pass consumes no task attempt
+winner's commits. A conflict leaves the checkout unchanged. If the base
+already contains the winner's changes, the pass reports `AlreadyInBase`.
+The pass runs no setup, reviewers, fixers, or verification. It does not
+publish or approve a merge. `magi show <run>` and the Web run report show the
+required base, observed HEADs, and outcome. If work remains after a successful
+sync, use an ordinary explicit resume to verify the updated tree.
+The sync-only pass consumes no task attempt
 and grants no additional base-sync or repair budget. An existing base-sync
 stop must be handled through its normal recovery path. After a fetch failure,
 retry with `--sync-base-only` before ordinary resume can verify. If a worker

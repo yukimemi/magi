@@ -5374,6 +5374,7 @@ async fn resume_run(
                         pass.result,
                         magi::base_sync_only::Outcome::Synchronized
                             | magi::base_sync_only::Outcome::AlreadyCurrent
+                            | magi::base_sync_only::Outcome::AlreadyInBase
                     )),
             "{}",
             task.last_error
