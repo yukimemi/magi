@@ -7456,13 +7456,16 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
                 .as_ref()
                 .is_none_or(|sync| sync.conflict.is_none())
         );
+        let block = state.resource_block.as_ref().unwrap();
+        assert_eq!(block.kind, crate::rebase::SEQUENCER_INFRASTRUCTURE);
         assert!(
-            state
-                .resource_block
-                .as_ref()
-                .unwrap()
-                .detail
-                .contains("worktree add")
+            block.detail.contains("inspect scratch Git backlink"),
+            "{}",
+            block.detail
+        );
+        assert_eq!(
+            std::fs::read_to_string(scratch.join("obstruction")).unwrap(),
+            "keep"
         );
         assert_eq!(git::rev_parse(&state.repo, "winner").await.unwrap(), head);
         std::fs::remove_dir_all(&scratch).unwrap();

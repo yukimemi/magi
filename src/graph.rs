@@ -17782,10 +17782,14 @@ mod tests {
 
     #[tokio::test]
     async fn rebase_legacy_sequencer_stop_reuses_the_original_reservation() {
-        let (_tmp, mut runner, head, _task) = exhausted_base_fixture().await;
+        let (tmp, mut runner, head, owner) = exhausted_base_fixture().await;
         let tip = runner.state.base_sync.as_ref().unwrap().tip.clone();
         runner.state.base_sync_recovery = Default::default();
         runner.state.task_instruction = Some("fixture".into());
+        runner.state.config.agents = vec![spec("fixture")];
+        runner.state.config.graph.review_rounds = 0;
+        runner.state.config.merge.mode = MergeMode::None;
+        runner.state.driver_exited = true;
         let sync = runner.state.base_sync.as_mut().unwrap();
         sync.conflict = None;
         sync.attempts = 0;
@@ -17829,8 +17833,22 @@ mod tests {
         assert!(runner.state.base_sync_blocked());
         std::fs::remove_file(dirty).unwrap();
 
-        runner.state = RunState::load(&runner.state.id).unwrap();
-        runner.sync_to_base().await.unwrap();
+        let queue = crate::queue::Queue::open();
+        let id = runner.state.id.clone();
+        assert!(crate::resume::pin_queued(&queue, &id, None, None).unwrap());
+        let _claim = queue.claim(&owner).unwrap();
+        let mut task = queue.get(&owner).unwrap();
+        let config = tmp.path().join("test-config.toml");
+        std::fs::write(&config, "[disk]\nmin_free_bytes = 0\n").unwrap();
+        let opts = crate::daemon::Opts {
+            repo: task.repo.clone(),
+            config: Some(config),
+            ..Default::default()
+        };
+        crate::daemon::run_claimed(&opts, &queue, &mut task).await;
+        let task = queue.get(&owner).unwrap();
+        assert_eq!(task.runs, [id.clone()], "{:?}", task.hold_reason);
+        runner.state = RunState::load(&id).unwrap();
         assert!(!runner.state.base_sync_blocked());
         assert_eq!(runner.state.base_sync.as_ref().unwrap().attempts, 1);
         assert_eq!(runner.state.base_sync_recovery.operations.len(), 1);

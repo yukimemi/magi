@@ -4708,9 +4708,20 @@ async fn attempt(
         && !task.fresh_start
         && task.pr_recovery.is_none()
     {
-        // Authorization still takes the owner lock and execution lease and
-        // rechecks liveness, retained HEAD and ownership before saving.
-        let authorized = if crate::repair_budget::conflict_pending(task, &held) {
+        // A pinned infrastructure resume continues the saved reservation;
+        // it does not authorize another base-sync interval.
+        let sequencer_resume = crate::repair_budget::legacy::resumable_sequencer_stop(&held)
+            && task.review_branch.is_none()
+            && task.assignment_accepts(&held)
+            && compatible_run_instruction(&held, task)
+            && task
+                .resume_override
+                .as_ref()
+                .is_some_and(|pin| pin.pinned_run.as_ref() == Some(&held.id));
+        // Exhaustion authorization still takes the owner lock and execution
+        // lease and rechecks liveness, retained HEAD and ownership.
+        let authorized = if sequencer_resume || crate::repair_budget::conflict_pending(task, &held)
+        {
             true
         } else if task.resumption.is_some() && compatible_run_instruction(&held, task) {
             let home = queue.root().parent().expect("queue has a home");

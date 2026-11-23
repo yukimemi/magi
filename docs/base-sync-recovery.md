@@ -35,10 +35,10 @@ ordinary resume finish capturing the ledger after the write problem is fixed.
 Magi clears the marker before allowing any fixer to run; it never reconstructs
 a missing ledger after that boundary.
 
-Historical conflict records are not rewritten. Repair inspection identifies
-a failed recording exec when the saved Git diagnostic and matching empty-path
-fixer records establish it. That diagnosis does not authorize textual repair
-or reopen an already finished synchronization reservation.
+保存済みの Git 診断と空の競合パス記録が一致すれば、旧形式でも
+記録用 exec の失敗と判定します。通常の再開で同じ実行がキューに指定され、
+実行側がタスクの命令、保持された HEAD、作業ツリーを確認できた場合だけ、
+元の同期予約を再開します。停止履歴は保持し、同期枠の追加や競合修復の承認は行いません。
 
 A successful synchronization or an actually executed gate/current-head E2E check
 records progress. Saving a structured resource stop after progress atomically

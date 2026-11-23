@@ -1650,7 +1650,10 @@ pub(crate) async fn checked_rebase_in_progress(worktree: &Path) -> Result<bool> 
         ),
     }
     // Do not let Git search a parent checkout if the scratch backlink is gone.
-    worktree.join(".git").symlink_metadata()?;
+    let backlink = worktree.join(".git");
+    backlink
+        .symlink_metadata()
+        .with_context(|| format!("inspect scratch Git backlink {}", backlink.display()))?;
     for name in ["rebase-merge", "rebase-apply"] {
         let path = rebase_file(worktree, name).await?;
         match path.symlink_metadata() {
