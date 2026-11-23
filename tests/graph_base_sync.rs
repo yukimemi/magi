@@ -151,7 +151,7 @@ fn assert_sync_only_held(fx: &common::Fixture, id: &str, run: &magi::run::RunSta
     let task = magi::queue::Queue::open().get(id).unwrap();
     assert_eq!(task.status, magi::queue::TaskStatus::Held);
     assert_eq!(task.attempts, 2);
-    assert_eq!(task.runs, [run.id.clone()]);
+    assert_eq!(task.runs.as_slice(), std::slice::from_ref(&run.id));
     assert!(!fx.tmp.path().join("verification").exists());
     assert!(!run.dir().join("artifacts/prompts.log").exists());
     assert_eq!(run.status, RunStatus::Blocked);
