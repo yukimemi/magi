@@ -352,6 +352,18 @@ async fn automatic_budget_hold_admits_only_an_explicit_same_run_repair() {
     refused(&request, "owner hold"); // Exact legacy text without a settled pass.
     fixture_record["passes"] = settled;
     write_fixture(&fixture_record);
+    let raise_attempt_limit = || {
+        let _claim = queue.claim(&task.id).unwrap();
+        queue.modify(&task.id, |t| {
+            t.change_attempt_limit(std::num::NonZeroUsize::new(3)).unwrap();
+            true
+        }).unwrap();
+        let saved = queue.get(&task.id).unwrap();
+        assert_eq!(saved.attempt_limit.map(std::num::NonZeroUsize::get), Some(3));
+        assert_eq!(saved.status, TaskStatus::Held);
+        assert_eq!(saved.hold_reason, held.hold_reason);
+        assert_eq!(saved.attempts, held.attempts);
+    };
     let changed = magi_cli(&magi::run::home())
         .args(["task", "build-cache", &task.id, "isolated"])
         .output().unwrap();
@@ -359,12 +371,14 @@ async fn automatic_budget_hold_admits_only_an_explicit_same_run_repair() {
     let upgraded = queue.get(&task.id).unwrap();
     assert_eq!(upgraded.status, TaskStatus::Held);
     assert_eq!(upgraded.hold_reason, held.hold_reason);
+    raise_attempt_limit();
     let legacy = accepted(&request);
     assert_eq!(legacy["request"]["run"], run.id);
 
     // Restore the isolated modern fixture to exercise publication failure and
     // the worker path independently of the successful legacy admission.
     std::fs::write(&path, original).unwrap();
+    raise_attempt_limit();
     let _claim = queue.claim(&task.id).unwrap();
     refused(&request, "queue lease is held");
     drop(_claim);

@@ -27,7 +27,8 @@ original acceptance time, even if the chat processes it later. Automatic reports
 and goal wakes cannot clear the hold. Older records qualify only if the saved
 input generation, settled run and pass, and exact diagnostic agree without a
 later owner decision. Updating task settings does not discard this evidence.
-A matching reason prefix alone is not evidence.
+A matching reason prefix alone is not evidence. The current attempt limit
+controls future automatic retries, not admission to repair an existing stop.
 
 `gate` grants repair of an ordinary nonzero gate failure with diagnostic output,
 including a failed landing gate. `review` grants repair of the final unfixed

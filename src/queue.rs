@@ -2334,7 +2334,7 @@ impl Task {
                     && budget.base == admission.base
                     && budget.inputs == admission.inputs
                     && budget.stage == "execution"
-                    && budget.failures >= self.attempt_limit.map_or(1, std::num::NonZeroUsize::get)
+                    && budget.failures > 0
                     && self
                         .hold_reason
                         .as_ref()
