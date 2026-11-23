@@ -734,6 +734,15 @@ pub struct RecoveryBudget {
     pub progress: Option<String>,
 }
 
+impl RecoveryBudget {
+    fn budget_reason(&self) -> String {
+        format!(
+            "[recovery-budget] {} failed passes against unchanged inputs ({}). Inspect the retained recovery sources and correct the cause, change the inputs, or explicitly release the task to approve another generation. Automatic requeue does not reset this budget.",
+            self.failures, self.stage
+        )
+    }
+}
+
 fn recovery_progress(state: &crate::run::RunState) -> Option<String> {
     use crate::proc::Quiet as _;
     use std::hash::{Hash, Hasher};
@@ -2292,10 +2301,7 @@ impl Task {
             .as_ref()
             .filter(same_input)
             .or_else(|| self.recovery_generations.iter().rev().find(same_input))?;
-        (budget.instruction == self.instruction && budget.base == base && budget.inputs == inputs
-            && budget.failures >= limit.max(1)).then(|| format!(
-                "[recovery-budget] {} failed passes against unchanged inputs ({}). Inspect the retained recovery sources and correct the cause, change the inputs, or explicitly release the task to approve another generation. Automatic requeue does not reset this budget.",
-                budget.failures, budget.stage))
+        (budget.failures >= limit.max(1)).then(|| budget.budget_reason())
     }
 
     pub(crate) fn hold_recovery_budget(&mut self, reason: String, admission: RecoveryAdmission) {
@@ -2338,17 +2344,13 @@ impl Task {
                     && budget.base == admission.base
                     && budget.inputs == admission.inputs
                     && budget.stage == "execution"
+                    && budget.failures >= self.attempt_limit.map_or(1, std::num::NonZeroUsize::get)
+                    && self
+                        .hold_reason
+                        .as_ref()
+                        .is_some_and(|reason| *reason == budget.budget_reason())
             })
             || !crate::daemon::compatible_run_instruction(run, self)
-            || self.hold_reason.as_ref().is_none_or(|reason| {
-                self.recovery_exhausted(
-                    &admission.base,
-                    &admission.inputs,
-                    self.attempt_limit.map_or(1, std::num::NonZeroUsize::get),
-                )
-                .as_ref()
-                    != Some(reason)
-            })
         {
             return false;
         }

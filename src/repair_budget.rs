@@ -190,7 +190,13 @@ pub(crate) fn owner_effects_settled(home: &Path, task: &Task, state: &RunState) 
     Ok(())
 }
 
-fn controls(home: &Path, task: &Task, state: &RunState, kind: Kind) -> Result<()> {
+fn controls(
+    home: &Path,
+    task: &Task,
+    state: &RunState,
+    kind: Kind,
+    explicit_budget_override: bool,
+) -> Result<()> {
     ensure!(
         task.execution_runs().last() == Some(&state.id)
             && task.assignment_accepts(state)
@@ -233,7 +239,7 @@ fn controls(home: &Path, task: &Task, state: &RunState, kind: Kind) -> Result<()
         "repair grant refused: task has a different continuation selected"
     );
     ensure!(
-        !task.operator_held() && task.blocked_by.is_empty(),
+        (!task.operator_held() || explicit_budget_override) && task.blocked_by.is_empty(),
         "repair grant refused: unresolved owner hold or dependency; resolve it explicitly first"
     );
     ensure!(
@@ -419,6 +425,8 @@ pub async fn grant(queue: &Queue, home: &Path, request: Request) -> Result<Recei
     grant_with_claim(queue, home, request, None, Some(jiff::Timestamp::now())).await
 }
 
+/// Only a current owner request carries a timestamp. Standing recovery and
+/// goal wakes cannot use the automatic budget hold exception.
 pub(crate) async fn grant_with_claim(
     queue: &Queue,
     home: &Path,
@@ -488,17 +496,11 @@ pub(crate) async fn grant_with_claim(
     let expected = serde_json::to_value(&task)?;
     let _owner = crate::pr_head::owner_lock(home, &request.run)?;
     let state = RunState::load_under(&request.run, home)?;
-    if task.operator_held()
+    let explicit_budget_override = task.operator_held()
         && matches!(request.kind, Kind::Review | Kind::Gate)
         && owner_requested_at.is_some_and(|at| task.held_at.is_some_and(|held| at >= held))
-        && task.held_for_recovery_budget(&state)
-    {
-        // Stage only the hold change. Every other guard still sees the same
-        // task, and the original snapshot must match at publication.
-        task.hold_source = None;
-        task.status = TaskStatus::Queued;
-    }
-    controls(home, &task, &state, request.kind)?;
+        && task.held_for_recovery_budget(&state);
+    controls(home, &task, &state, request.kind, explicit_budget_override)?;
     owner_effects_settled(home, &task, &state)?;
     unique_owner(queue, &task, &state)?;
     ensure!(
@@ -680,7 +682,7 @@ pub(crate) async fn apply(home: &Path, state: &mut RunState, disk: &RunState) ->
         .last()
         .filter(|g| g.phase != Phase::Complete)
     {
-        controls(home, &task, disk, active.receipt.request.kind)?;
+        controls(home, &task, disk, active.receipt.request.kind, false)?;
         ensure!(
             reconcile::decision_matches(home, &task, &active.receipt)?
                 && contract(&task, active.receipt.request.kind)? == active.receipt.contract,
@@ -709,7 +711,7 @@ pub(crate) async fn apply(home: &Path, state: &mut RunState, disk: &RunState) ->
         if superseded(&task, receipt) || state.repair_grants.iter().any(|g| g.receipt == *receipt) {
             continue;
         }
-        controls(home, &task, disk, receipt.request.kind)?;
+        controls(home, &task, disk, receipt.request.kind, false)?;
         ensure!(
             reconcile::decision_matches(home, &task, receipt)?
                 && contract(&task, receipt.request.kind)? == receipt.contract,
@@ -794,7 +796,7 @@ pub fn queue_resumption(queue: &Queue, task: &mut Task, run: &str) -> Result<boo
         return Ok(false);
     }
     let receipt = task.repair_grants.last().expect("pending receipt");
-    controls(home, task, &state, receipt.request.kind)?;
+    controls(home, task, &state, receipt.request.kind, false)?;
     ensure!(
         reconcile::decision_matches(home, task, receipt)?
             && contract(task, receipt.request.kind)? == receipt.contract,
@@ -892,7 +894,7 @@ pub(crate) fn conflict_pending(task: &Task, state: &RunState) -> bool {
 pub(crate) async fn recheck_conflict_delivery(state: &RunState, request: &Request) -> Result<()> {
     let home = crate::run::home();
     let task = Queue::at(home.join("queue")).get(&request.task)?;
-    controls(&home, &task, state, request.kind)?;
+    controls(&home, &task, state, request.kind, false)?;
     unique_owner(&Queue::at(home.join("queue")), &task, state)?;
     ensure!(
         git::toplevel(&task.repo).await?.canonicalize()?

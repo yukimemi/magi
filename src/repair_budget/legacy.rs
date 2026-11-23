@@ -309,7 +309,7 @@ pub async fn inspect(
     if let Ok((stop, evidence)) = assessment.textual() {
         let checks = async {
                 ensure!(!state.passes.is_empty(), "missing stopped pass checkpoint; inspect retained run provenance before recovery");
-                super::controls(home, &task, &state, super::Kind::BaseConflict)?;
+                super::controls(home, &task, &state, super::Kind::BaseConflict, false)?;
                 super::owner_effects_settled(home, &task, &state)?;
                 super::unique_owner(queue, &task, &state)?;
                 ensure!(task.status != crate::queue::TaskStatus::Running, "task driver is running");
