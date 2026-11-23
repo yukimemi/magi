@@ -5285,7 +5285,7 @@ async fn resume_run(
     }
     ensure!(
         sync_base_only || runner.state.pending_sync_only().is_none(),
-        "base-only synchronization was interrupted; resume with --sync-base-only before verifying"
+        "base-only synchronization has not succeeded; resume with --sync-base-only before verifying"
     );
     // Find-or-create of the owner is serialised per run: two `--resume` of an
     // ownerless run must not each file a task and then drive one run twice.

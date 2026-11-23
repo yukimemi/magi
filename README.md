@@ -979,17 +979,18 @@ Unix のチャット席では継承 FD、Windows ではローカル名前付き�
 | `magi task control decide <question id> <option> [--title "<replacement>"]` | records the owner's decision on publication (github-text), branch divergence, release recovery or merge approval awaiting a chat decision. This includes repair, dismissal, withdrawal and replacement when available. No extra evidence is required. `use my text` requires the literal replacement title as `--title` data, which the existing publication gate vets. The calling chat, open record and offered choice are checked; existing consumers and transition checks apply the answer. |
 | `magi task control abandon <full run id>` | terminal, on the owner's request: the shared liveness judge runs under the owner lock and only a proven-dead driver is abandoned; a Live or Unknown driver is refused |
 
-From a terminal, use `magi run --resume <run> --sync-base-only`. The pass
-requires a fresh fetch and integrates that exact base without rewriting the
-winner's commits. It stops on conflict without changing the checkout, runs no
+From a terminal, use `magi run --resume <run> --sync-base-only`. A new sync
+requires a fresh fetch. An interrupted sync with a saved reservation reuses
+its recorded base without spending another slot. Neither rewrites the
+winner's commits. The pass stops on conflict without changing the checkout, runs no
 setup, reviewers, fixers or verification, and does not publish or approve a
 merge. `magi show <run>` and the Web run report show the required base,
 observed HEADs and outcome. After a successful sync, use an ordinary explicit
 resume to verify the updated tree. The sync-only pass consumes no task attempt
 and grants no additional base-sync or repair budget. An existing base-sync
-stop must be handled through its normal recovery path. If a process exits
-with a Git-only request still armed, repeat `--sync-base-only` to finish that
-request before an ordinary resume can verify.
+stop must be handled through its normal recovery path. After a fetch failure,
+retry with `--sync-base-only` before ordinary resume can verify. If a worker
+exits mid-pass, repeat `--sync-base-only` once the task claim is free.
 
 Windows の実 sandbox の限定チェックは認証済み CLI が必要。PowerShell で
 `$env:RUSTUP_TOOLCHAIN = "stable"` を設定し、

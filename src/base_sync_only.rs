@@ -26,6 +26,8 @@ pub struct Pass {
     pub head_after: Option<String>,
     pub result: Outcome,
     pub verification_allowed: bool,
+    #[serde(default)]
+    reservation: Option<usize>,
     // Only this exact commit may have been installed by an interrupted pass.
     prepared_head: Option<String>,
 }
@@ -39,6 +41,12 @@ pub enum Outcome {
     Stopped(String),
 }
 
+impl Outcome {
+    pub(crate) fn succeeded(&self) -> bool {
+        matches!(self, Self::AlreadyCurrent | Self::Synchronized)
+    }
+}
+
 impl Pass {
     pub(crate) fn new(request: Request, state: &RunState) -> Self {
         Self {
@@ -49,6 +57,7 @@ impl Pass {
             head_before: None,
             head_after: None,
             result: Outcome::Incomplete,
+            reservation: None,
             verification_allowed: false,
             prepared_head: None,
         }
@@ -128,16 +137,38 @@ pub(crate) fn validate_run(state: &RunState) -> Result<()> {
     Ok(())
 }
 
+/// Queue under the owning task's claim, including explicit recovery of a dead worker.
 pub fn queue(task: &mut Task, home: &Path, run: &str) -> Result<()> {
     let state = crate::resume::validate(home, run)?;
     crate::pr_head::ensure_owner_record(&state, None)?;
     validate_run(&state)?;
+    let orphan = task
+        .sync_only
+        .as_ref()
+        .filter(|request| task.status == TaskStatus::Running && request.run == run);
+    let _ownership = if orphan.is_some() {
+        let owner = crate::pr_head::owner_lock(home, run)?;
+        let disk = RunState::load_under(run, home)?;
+        ensure!(
+            state.sync_only_passes == disk.sync_only_passes,
+            "sync-only state changed during admission"
+        );
+        let claimed = crate::daemon::is_working_on_other(home, run, Timestamp::now())?;
+        ensure!(
+            disk.liveness_under(home, claimed) == crate::run::Liveness::Dead,
+            "the recorded sync-only driver is live or its exit is unproven"
+        );
+        Some((owner, crate::driver::maintenance(home, run)?))
+    } else {
+        None
+    };
     ensure!(
         task.execution_runs().last() == Some(&state.id)
-            && matches!(
-                task.status,
-                TaskStatus::Held | TaskStatus::Parked | TaskStatus::Failed
-            )
+            && (orphan.is_some()
+                || matches!(
+                    task.status,
+                    TaskStatus::Held | TaskStatus::Parked | TaskStatus::Failed
+                ))
             && !task.fresh_start
             && task.pr_recovery.is_none()
             && !crate::repair_budget::pending(task, &state),
@@ -146,6 +177,16 @@ pub fn queue(task: &mut Task, home: &Path, run: &str) -> Result<()> {
     let request = state
         .pending_sync_only()
         .map(|pass| pass.request.clone())
+        .or_else(|| {
+            orphan
+                .filter(|request| {
+                    !state
+                        .sync_only_passes
+                        .iter()
+                        .any(|pass| &pass.request == *request)
+                })
+                .cloned()
+        })
         .unwrap_or_else(|| Request {
             run: state.id.clone(),
             at: Timestamp::now(),
@@ -298,70 +339,7 @@ async fn checkout(state: &RunState) -> Result<Checkout> {
     Ok(git)
 }
 
-pub(crate) async fn check_interruption(state: &mut RunState) -> Result<()> {
-    let Some(index) = state
-        .sync_only_passes
-        .iter()
-        .rposition(|pass| pass.prepared_head.is_some())
-    else {
-        return Ok(());
-    };
-    let checkout = checkout(state).await?;
-    let head = checkout.git(&["rev-parse", "HEAD"]).await?;
-    let pass = &mut state.sync_only_passes[index];
-    ensure!(
-        pass.head_before.as_ref() == Some(&head) || pass.prepared_head.as_ref() == Some(&head),
-        "interrupted base synchronization left an unrecognized HEAD; inspect the retained checkout before resuming"
-    );
-    let installed = pass.prepared_head.as_ref() == Some(&head);
-    pass.head_after = Some(head.clone());
-    pass.prepared_head = None;
-    if installed {
-        state.finish_base_operation(Some(&head));
-    }
-    Ok(())
-}
-
-pub(crate) async fn sync(state: &mut RunState) -> Result<Outcome> {
-    let interrupted_install = state
-        .pending_sync_only()
-        .and_then(|pass| pass.prepared_head.clone());
-    check_interruption(state).await?;
-    if let Some(installed) = interrupted_install
-        && state.sync_only_passes.last().unwrap().head_after.as_ref() == Some(&installed)
-    {
-        let tip = state
-            .sync_only_passes
-            .last()
-            .and_then(|pass| pass.tip.clone())
-            .context("interrupted synchronization does not record the fetched base")?;
-        let attempts = state.base_sync.as_ref().map_or(0, |sync| sync.attempts);
-        state.base_sync = Some(BaseSync {
-            tip,
-            behind: 0,
-            attempts: attempts + 1,
-            conflict: None,
-            already_in: None,
-        });
-        return Ok(Outcome::Synchronized);
-    }
-    let checkout = checkout(state).await?;
-    let _outputs = crate::retention::OutputLease::take(&checkout.path, true)?;
-    let head = checkout.git(&["rev-parse", "HEAD"]).await?;
-    let pass = state.sync_only_passes.last_mut().unwrap();
-    pass.head_before = Some(head.clone());
-    pass.head_after = Some(head.clone());
-    state.save()?;
-
-    ensure!(
-        state
-            .base_sync_recovery
-            .operations
-            .last()
-            .is_none_or(|op| op.finished)
-            && !state.dir().join("base-sync").try_exists()?,
-        "an unfinished ordinary base sync requires its existing recovery path"
-    );
+async fn fetch_base(checkout: &Checkout, state: &RunState) -> Result<String> {
     let remote = &state.config.merge.remote;
     let branch = &state.base_branch;
     let refspec = format!("+refs/heads/{branch}:refs/remotes/{remote}/{branch}");
@@ -383,14 +361,53 @@ pub(crate) async fn sync(state: &mut RunState) -> Result<Outcome> {
         .context("fetching the required base timed out")??;
     // FETCH_HEAD belongs to the linked checkout, unlike the tracking ref which
     // the scheduler can move independently of this fetch.
-    let tip = checkout
+    checkout
         .git(&["rev-parse", "--verify", "FETCH_HEAD^{commit}"])
-        .await?;
-    state.sync_only_passes.last_mut().unwrap().tip = Some(tip.clone());
-    state.save()?;
+        .await
+}
+
+pub(crate) async fn sync(state: &mut RunState) -> Result<Outcome> {
+    let checkout = checkout(state).await?;
+    let _outputs = crate::retention::OutputLease::take(&checkout.path, true)?;
+    let head = checkout.git(&["rev-parse", "HEAD"]).await?;
+    ensure!(
+        state
+            .base_sync_recovery
+            .operations
+            .last()
+            .is_none_or(|op| op.finished)
+            && !state.dir().join("base-sync").try_exists()?,
+        "an unfinished ordinary base sync requires its existing recovery path"
+    );
+    let pass = state.sync_only_passes.last_mut().unwrap();
+    pass.head_after = Some(head.clone());
+    let saved = pass.reservation.is_some() || pass.prepared_head.is_some();
+    let tip = if saved {
+        let op = state
+            .base_sync_recovery
+            .operations
+            .last()
+            .context("interrupted synchronization has no budget reservation")?;
+        ensure!(
+            pass.reservation.is_none_or(|id| id == op.id)
+                && pass.head_before.as_ref() == Some(&op.head)
+                && pass.tip.as_ref() == Some(&op.tip)
+                && (op.head == head || pass.prepared_head.as_ref() == Some(&head)),
+            "interrupted synchronization has unrecognized reservation or HEAD; inspect the retained checkout"
+        );
+        op.tip.clone()
+    } else {
+        pass.head_before = Some(head.clone());
+        pass.tip = None;
+        state.save()?;
+        let tip = fetch_base(&checkout, state).await?;
+        state.sync_only_passes.last_mut().unwrap().tip = Some(tip.clone());
+        state.save()?;
+        tip
+    };
     let behind = git::commits_ahead(&checkout.path, &head, &tip).await?;
     let attempts = state.base_sync.as_ref().map_or(0, |sync| sync.attempts);
-    if behind != 0 {
+    if behind != 0 && !saved {
         state.ensure_base_episode();
         if state.base_episode_used() >= crate::graph::BASE_SYNC_ROUNDS {
             let why = "base synchronization budget is exhausted";
@@ -413,56 +430,65 @@ pub(crate) async fn sync(state: &mut RunState) -> Result<Outcome> {
             already_in: None,
         });
         state.reserve_base_operation(&head, &tip);
-        // Spend before Git, but do not leave an ordinary scratch-rebase
-        // reservation. This operation never modifies the winner until the
-        // complete merge commit has been recorded below.
+        // There is no scratch rebase. The pass itself owns replay of this
+        // spent reservation; record both together before building the merge.
+        state.sync_only_passes.last_mut().unwrap().reservation =
+            state.base_sync_recovery.operations.last().map(|op| op.id);
         state.finish_base_operation(None);
         state.save()?;
-        let tree = checkout
-            .raw(&["merge-tree", "--write-tree", &head, &tip])
-            .await?;
-        if tree.code == Some(1) {
-            let why = format!(
-                "base merge conflicted; winner left unchanged ({})",
-                tree.stdout
-                    .lines()
-                    .skip(1)
-                    .take(5)
-                    .collect::<Vec<_>>()
-                    .join("; ")
-            );
-            stop(
-                state,
-                tip,
-                behind,
-                attempts + 1,
-                &head,
-                &why,
-                crate::base_sync_recovery::StopKind::Conflict,
-            );
-            bail!("{why}");
-        }
-        ensure!(tree.ok(), "Git merge-tree failed: {}", tree.stderr);
-        let prepared = checkout
-            .git(&[
-                "-c",
-                "user.name=magi candidate",
-                "-c",
-                "user.email=magi@localhost",
-                "-c",
-                "commit.gpgSign=false",
-                "commit-tree",
-                &tree.stdout,
-                "-p",
-                &head,
-                "-p",
-                &tip,
-                "-m",
-                "Merge base before verification",
-            ])
-            .await?;
-        state.sync_only_passes.last_mut().unwrap().prepared_head = Some(prepared.clone());
-        state.save()?;
+    }
+    if behind != 0 {
+        let prepared =
+            if let Some(commit) = state.sync_only_passes.last().unwrap().prepared_head.clone() {
+                commit
+            } else {
+                let tree = checkout
+                    .raw(&["merge-tree", "--write-tree", &head, &tip])
+                    .await?;
+                if tree.code == Some(1) {
+                    let why = format!(
+                        "base merge conflicted; winner left unchanged ({})",
+                        tree.stdout
+                            .lines()
+                            .skip(1)
+                            .take(5)
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    );
+                    stop(
+                        state,
+                        tip,
+                        behind,
+                        state.base_sync.as_ref().unwrap().attempts,
+                        &head,
+                        &why,
+                        crate::base_sync_recovery::StopKind::Conflict,
+                    );
+                    bail!("{why}");
+                }
+                ensure!(tree.ok(), "Git merge-tree failed: {}", tree.stderr);
+                let prepared = checkout
+                    .git(&[
+                        "-c",
+                        "user.name=magi candidate",
+                        "-c",
+                        "user.email=magi@localhost",
+                        "-c",
+                        "commit.gpgSign=false",
+                        "commit-tree",
+                        &tree.stdout,
+                        "-p",
+                        &head,
+                        "-p",
+                        &tip,
+                        "-m",
+                        "Merge base before verification",
+                    ])
+                    .await?;
+                state.sync_only_passes.last_mut().unwrap().prepared_head = Some(prepared.clone());
+                state.save()?;
+                prepared
+            };
         ensure!(
             checkout.git(&["rev-parse", "HEAD"]).await? == head,
             "winner HEAD moved during base synchronization"
@@ -495,7 +521,7 @@ pub(crate) async fn sync(state: &mut RunState) -> Result<Outcome> {
         "winner does not contain the fetched base"
     );
     state.sync_only_passes.last_mut().unwrap().prepared_head = None;
-    if behind != 0 {
+    if saved || behind != 0 {
         state.finish_base_operation(Some(&head));
     } else {
         state.reconcile_verification_head(&head);
@@ -503,12 +529,12 @@ pub(crate) async fn sync(state: &mut RunState) -> Result<Outcome> {
     state.base_sync = Some(BaseSync {
         tip,
         behind: 0,
-        attempts: attempts + usize::from(behind != 0),
+        attempts: state.base_sync.as_ref().map_or(0, |sync| sync.attempts),
         conflict: None,
         already_in: None,
     });
     state.base_sync_recovery.stop = None;
-    Ok(if behind == 0 {
+    Ok(if !saved && behind == 0 {
         Outcome::AlreadyCurrent
     } else {
         Outcome::Synchronized

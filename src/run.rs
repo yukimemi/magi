@@ -3300,7 +3300,7 @@ impl RunState {
     pub fn pending_sync_only(&self) -> Option<&crate::base_sync_only::Pass> {
         self.sync_only_passes
             .last()
-            .filter(|pass| pass.result == crate::base_sync_only::Outcome::Incomplete)
+            .filter(|pass| !self.base_sync_blocked() && !pass.result.succeeded())
     }
 
     /// Structured current failures take precedence over successful progress events.
