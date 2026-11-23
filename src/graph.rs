@@ -1786,6 +1786,10 @@ impl Runner {
         // Declare after the execution guard: on any claim error this short
         // lock must drop before that guard reloads and releases ownership.
         let _owner = owner;
+        anyhow::ensure!(
+            sync_only.is_some() || disk.pending_sync_only().is_none(),
+            "base-only synchronization has not succeeded; resume with --sync-base-only before verifying"
+        );
         if let Some(request) = sync_only {
             crate::base_sync_only::validate_run(&disk, &crate::run::home())?;
             anyhow::ensure!(
@@ -1811,10 +1815,26 @@ impl Runner {
             if state.status == RunStatus::Failed {
                 state.status = RunStatus::Blocked;
             }
+        } else if let Some(retry) = &execution.runner.state.next_gate_repair_retry {
+            let task = crate::queue::Queue::open().get(
+                disk.origin
+                    .as_ref()
+                    .and_then(|origin| origin.task.as_deref())
+                    .context("post-repair E2E retry has no task owner")?,
+            )?;
+            anyhow::ensure!(
+                task.status == crate::queue::TaskStatus::Running
+                    && task.resume_override.is_none()
+                    && task.gate_repair_retry.as_ref() == Some(retry),
+                "post-repair E2E retry was not dispatched by the owning task"
+            );
+            retry.check(&task, &disk)?;
+            retry.check(&task, &execution.runner.state)?;
+            retry.check_head(&disk).await?;
         } else {
             anyhow::ensure!(
-                disk.pending_sync_only().is_none(),
-                "base-only synchronization has not succeeded; resume with --sync-base-only before verifying"
+                !crate::handover::gate_repair_stop(&disk),
+                "post-repair E2E failure requires explicit owner resume"
             );
             crate::repair_budget::apply(&crate::run::home(), &mut execution.runner.state, &disk)
                 .await?;
@@ -2152,6 +2172,15 @@ impl Runner {
             .await?;
         }
         self.state.configure_recovery_resume()?;
+        if let Some(retry) = self.state.next_gate_repair_retry.take() {
+            if self.park_here()? || !self.retry_post_repair_e2e(&retry).await? {
+                self.resource_halt()?;
+                return Ok(());
+            }
+            self.finish_after_tally().await?;
+            self.settle_questions();
+            return Ok(());
+        }
         if self
             .state
             .repair_grants
@@ -2503,6 +2532,77 @@ impl Runner {
         if let Err(e) = ask::Questions::open().settle_run(&self.state.id, self.state.status) {
             tracing::warn!("abandon questions for {}: {e:#}", self.state.id);
         }
+    }
+
+    async fn retry_post_repair_e2e(
+        &mut self,
+        retry: &crate::resume::GateRepairRetry,
+    ) -> Result<bool> {
+        // Retry on the retained commit before synchronization can archive the
+        // original gate. Any later sync must independently verify its new head.
+        retry.check_head(&self.state).await?;
+        let winner = self
+            .state
+            .winner()
+            .context("missing retained winner")?
+            .clone();
+        self.state.gate_repair_retry_pass = Some(
+            self.state
+                .passes
+                .last()
+                .context("retry has no execution pass")?
+                .index,
+        );
+        self.state.event(
+            "gate",
+            format!("owner resumed post-repair E2E on {}", retry.head),
+        );
+        self.state.save()?;
+
+        let wait = self.repository_wait();
+        let outcomes = match run_gate_repair_e2e(&mut self.state, &winner, &retry.head, &wait).await
+        {
+            Err(error) if error.is::<crate::repo_lock::ResourceBlocked>() => {
+                self.state.gate_repair_retry_pass = None;
+                self.state.save()?;
+                return Err(error);
+            }
+            result => result?,
+        };
+        if verify_inconclusive(&outcomes) {
+            self.state.gate_repair_retry_pass = None;
+            self.state.save()?;
+            return Ok(false);
+        }
+        retry.check_head(&self.state).await?;
+        let passed = outcomes.iter().all(CommandOutcome::ok);
+        let previous = self
+            .state
+            .gate_repair_e2e
+            .replace(crate::run::GateRepairE2e {
+                head: retry.head.clone(),
+                passed,
+                outcomes,
+            });
+        self.state
+            .verification_history
+            .push(crate::run::VerificationEvidence {
+                superseded_by: Some(retry.head.clone()),
+                archived_at: Some(Timestamp::now()),
+                fixes_spent: Some(self.state.gate_fixes.len()),
+                gate_head: None,
+                gate_ran: false,
+                gate: Vec::new(),
+                e2e: previous,
+            });
+        if passed {
+            self.state.reconcile_verification_head(&retry.head);
+        } else {
+            self.state
+                .event("gate", "post-repair E2E retry failed; nothing published");
+        }
+        self.state.save()?;
+        Ok(passed)
     }
 
     /// The tail of the graph after a trustworthy tally: fold losers, review,
@@ -6123,7 +6223,9 @@ impl Runner {
                 self.state.finish_base_operation(Some(&fresh));
                 refresh_reviewed_commits(&mut self.state, &winner.branch).await;
                 let mut conflict = None;
-                if let Some(pinned) = &remote_tip {
+                if let Some(pinned) = &remote_tip
+                    && (self.state.gate_repair_retry_pass.is_none() || self.state.pr.is_some())
+                {
                     let pushed = git::push_pinned(&repo, &remote, &winner.branch, pinned).await;
                     match pushed {
                         Ok(o) if o.ok() => self.state.event(
@@ -6237,6 +6339,10 @@ impl Runner {
                  them",
                 short(&theirs)
             ));
+        }
+        // An owner retry has not earned publication until the synced head's gate passes.
+        if self.state.gate_repair_retry_pass.is_some() && self.state.pr.is_none() {
+            return None;
         }
         match git::push_pinned(&repo, &remote, branch, &theirs).await {
             Ok(o) if o.ok() => {
@@ -13291,41 +13397,10 @@ pub(crate) async fn check_gate_repair_e2e(
         outcomes: Vec::new(),
     });
     state.save()?;
-    let commands = state.config.verify.e2e.clone();
-    let outcomes = if commands.is_empty() {
-        Vec::new()
-    } else {
-        let shell = state.config.shell();
-        let timeout = Duration::from_secs(state.config.graph.verify_timeout());
-        let cache_dir = state.config.cache_dir();
-        let (outcomes, _) = with_cache_lease(
-            state,
-            cache_dir.as_deref(),
-            "e2e",
-            "e2e",
-            &winner.worktree,
-            &head,
-            timeout,
-            "gate repair e2e",
-            wait,
-            |state, budget| async move {
-                run_e2e_with_retry(
-                    state,
-                    &shell,
-                    &commands,
-                    &winner.worktree,
-                    budget,
-                    "gate repair e2e",
-                    None,
-                )
-                .await
-            },
-        )
-        .await?;
-        outcomes
-    };
+    let outcomes = run_gate_repair_e2e(state, winner, &head, wait).await?;
     let deferred = verify_inconclusive(&outcomes);
-    let passed = outcomes.iter().all(CommandOutcome::ok)
+    let passed = !deferred
+        && outcomes.iter().all(CommandOutcome::ok)
         && git::rev_parse(&winner.worktree, "HEAD").await? == head;
     state.gate_repair_e2e = Some(crate::run::GateRepairE2e {
         head,
@@ -13350,6 +13425,48 @@ pub(crate) async fn check_gate_repair_e2e(
     } else {
         Ok(GateFix::Retry)
     }
+}
+
+async fn run_gate_repair_e2e(
+    state: &mut RunState,
+    winner: &Candidate,
+    head: &str,
+    wait: &crate::repo_lock::WaitPolicy,
+) -> Result<Vec<CommandOutcome>> {
+    let commands = state.config.verify.e2e.clone();
+    let outcomes = if commands.is_empty() {
+        Vec::new()
+    } else {
+        let shell = state.config.shell();
+        let timeout = Duration::from_secs(state.config.graph.verify_timeout());
+        let cache_dir = state.config.cache_dir();
+        let (outcomes, _) = with_cache_lease(
+            state,
+            cache_dir.as_deref(),
+            "e2e",
+            "e2e",
+            &winner.worktree,
+            head,
+            timeout,
+            "gate repair e2e",
+            wait,
+            |state, budget| async move {
+                run_e2e_with_retry(
+                    state,
+                    &shell,
+                    &commands,
+                    &winner.worktree,
+                    budget,
+                    "gate repair e2e",
+                    None,
+                )
+                .await
+            },
+        )
+        .await?;
+        outcomes
+    };
+    Ok(outcomes)
 }
 
 /// Run the same configured gate for a landing head and a fresh graph.

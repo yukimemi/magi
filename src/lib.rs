@@ -128,7 +128,7 @@ mod worktree_clean;
 pub mod worktree_setup;
 
 pub mod choice_effect;
-mod resume;
+pub mod resume;
 
 // Run environment-sensitive unit fixtures as ordinary standalone invocations,
 // without mutating the concurrent test harness or inheriting worker ownership.

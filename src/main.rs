@@ -5370,6 +5370,9 @@ async fn resume_run(
         sync_base_only || runner.state.pending_sync_only().is_none(),
         "base-only synchronization has not succeeded; resume with --sync-base-only before verifying"
     );
+    if !recover_base && !sync_base_only {
+        magi::resume::validate(&home, &run_id)?;
+    }
     // Find-or-create of the owner is serialised per run: two `--resume` of an
     // ownerless run must not each file a task and then drive one run twice.
     let guard = queue.claim(&format!("resume-{run_id}")).with_context(|| {
@@ -5397,34 +5400,25 @@ async fn resume_run(
     if recover_base {
         Runner::authorize_base_recovery(&home, &run_id, &task.id).await?;
     }
+    if sync_base_only {
+        magi::base_sync_only::queue(&mut task, &home, &run_id)?;
+    } else {
+        task.sync_only = None;
+        magi::resume::prepare_owner_pin(&queue, &mut task, &run_id, "cli-run-resume", None)?;
+    }
+    let sync_request = task.sync_only.clone();
     // The loop picks `task.execution_runs().last()`, so it only resumes *this* run when it
     // is that one and nothing else steers the attempt elsewhere.
     let loop_resumes = task.execution_runs().last() == Some(&run_id)
         && !task.fresh_start
         && task.review_branch.is_none()
-        && magi::daemon::loop_would_resume(&run_id);
+        && (magi::resume::has_post_repair_pin(&task) || magi::daemon::loop_would_resume(&run_id));
     let hand_to_loop = live_loop(&home) && (sync_base_only || loop_resumes);
     println!(
         "task {} (open it with `magi task show {}`)",
         task.short(),
         task.short()
     );
-    if sync_base_only {
-        magi::base_sync_only::queue(&mut task, &home, &run_id)?;
-    } else {
-        task.sync_only = None;
-        if !magi::repair_budget::queue_resumption(&queue, &mut task, &run_id)? {
-            task.release_operator("cli-run-resume", None);
-        }
-        task.resume_override = Some(queue::OperatorResume {
-            question_id: String::new(),
-            at: jiff::Timestamp::now(),
-            conductor_rehold: None,
-            forced: true,
-            pinned_run: Some(run_id.clone()),
-        });
-    }
-    let sync_request = task.sync_only.clone();
     if hand_to_loop {
         // The loop resumes it: an attempt at a task whose newest run is
         // unfinished resumes that run (`Runner::resume`), never competes again.

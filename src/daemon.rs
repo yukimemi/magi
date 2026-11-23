@@ -1056,7 +1056,7 @@ where
                 Ok(s) if s.liveness_under(home, false) == Liveness::Live => {
                     ActionDecision::Refuse("run already has a live driver".into())
                 }
-                Ok(s) => match crate::handover::resume_refusal_under(&s, Some(home)) {
+                Ok(s) => match crate::resume::owner_refusal(&s, home) {
                     None => ActionDecision::Resume(run.clone()),
                     Some(reason) => ActionDecision::Refuse((p.resume_cannot_progress)(
                         q.short(),
@@ -1682,14 +1682,27 @@ pub(crate) fn apply_task_choice_actions(queue: &Queue, questions: &Questions, ho
         match decision {
             ActionDecision::Skip => continue,
             ActionDecision::Resume(run) => {
-                task.release_operator("choice", Some(&q.id));
-                task.resume_override = Some(crate::queue::OperatorResume {
-                    question_id: q.id.clone(),
-                    at: Timestamp::now(),
-                    conductor_rehold: None,
-                    forced: true,
-                    pinned_run: Some(run),
-                });
+                if let Ok(state) = RunState::load_under(&run, home)
+                    && crate::handover::gate_repair_stop(&state)
+                {
+                    if let Err(error) =
+                        crate::resume::prepare_pin(&state, &mut task, queue, "choice", Some(&q.id))
+                    {
+                        let why = format!("Cannot retry post-repair E2E: {error:#}");
+                        let _ = crate::task_inquiry::Outbox::at(home)
+                            .update_decision(&q.id, |d| d.fail(&why));
+                        task.hold_unrequested_retry(Some(why));
+                    }
+                } else {
+                    task.release_operator("choice", Some(&q.id));
+                    task.resume_override = Some(crate::queue::OperatorResume {
+                        question_id: q.id.clone(),
+                        at: Timestamp::now(),
+                        conductor_rehold: None,
+                        forced: true,
+                        pinned_run: Some(run),
+                    });
+                }
             }
             ActionDecision::Stale => {}
             ActionDecision::Requeue => {
@@ -2199,7 +2212,13 @@ fn settle_and_diagnose(
         task.last_error = Some(detail.to_owned());
         task.diagnostic = None;
         task.attempts = task.attempts.saturating_sub(1);
-        if block.kind == "agent authentication" {
+        let post_repair = crate::handover::gate_repair_stop(state);
+        if post_repair {
+            task.hold_unrequested_retry(Some(format!(
+                "{}; no attempt was spent; explicitly resume to retry post-repair E2E",
+                block.description()
+            )));
+        } else if block.kind == "agent authentication" {
             task.hold_machine(Some(format!(
                 "[authentication] {}; no attempt was spent",
                 block.detail
@@ -2225,7 +2244,8 @@ fn settle_and_diagnose(
                 block.description()
             )));
         }
-        if matches!(block.kind.as_str(), "disk pressure" | "disk admission")
+        if !post_repair
+            && matches!(block.kind.as_str(), "disk pressure" | "disk admission")
             && matches!(block.cause, crate::run::ResourceBlockCause::Other)
         {
             task.mark_disk_capacity();
@@ -2280,6 +2300,9 @@ fn settle_and_diagnose(
     if state.base_sync_blocked() {
         // No automatic retry may turn a retained sync stop into a new competition.
         task.hold_machine(Some(detail.to_owned()));
+        task.last_error = Some(detail.to_owned());
+    } else if !verdict.parked && post_repair_held(state) {
+        task.hold_unrequested_retry(Some(detail.to_owned()));
         task.last_error = Some(detail.to_owned());
     } else if !verdict.parked
         && task
@@ -4650,6 +4673,32 @@ async fn attempt(
         .as_ref()
         .map(|s| vec![s.id.clone()])
         .unwrap_or_else(|| task.execution_runs().to_vec());
+    let mut previous = resume_runs.last().and_then(|id| RunState::load(id).ok());
+    let repair_retry = crate::resume::GateRepairRetry::queued(task).cloned();
+    let retry_task = repair_retry.as_ref().map(|_| task.clone());
+    if let Some(retry) = &repair_retry {
+        let admitted = (|| -> Result<()> {
+            anyhow::ensure!(public_owner.is_none(), "another run owns publication");
+            anyhow::ensure!(
+                task.attempts < task.effective_attempt_limit(opts.max_attempts),
+                "task attempt limit already reached"
+            );
+            retry.check(task, previous.as_ref().context("missing retained run")?)
+        })();
+        if let Err(error) = admitted {
+            task.hold_unrequested_retry(Some(format!(
+                "Cannot retry post-repair E2E: {error:#}; no replacement was started."
+            )));
+            record(queue, task);
+            return Vec::new();
+        }
+    } else if previous.as_ref().is_some_and(post_repair_held) {
+        task.hold_unrequested_retry(Some(
+            "Post-repair verification is stopped; inspect the retained run. No replacement was started.".into(),
+        ));
+        record(queue, task);
+        return Vec::new();
+    }
 
     // A stop spends no agent resources and uses the saved landing owner.
     // Current roster edits, missing attachments or a failed config fetch must
@@ -4774,12 +4823,12 @@ async fn attempt(
             record(queue, task);
             return Vec::new();
         }
+        previous = resume_runs.last().and_then(|id| RunState::load(id).ok());
     }
     let unfinished = (!task.fresh_start)
         .then(|| unfinished_run(&resume_runs, task.short()))
         .flatten()
         .filter(|id| RunState::load(id).is_ok_and(|run| may_resume_run(&run, task)));
-    let previous = resume_runs.last().and_then(|id| RunState::load(id).ok());
     if task.repair_grants.last().is_some_and(|receipt| {
         task.execution_runs().last() == Some(&receipt.request.run)
             && task.operator_decided_at == receipt.decision
@@ -4795,6 +4844,7 @@ async fn attempt(
     }
     if let Some(id) = &task.disk_resume_run
         && unfinished.as_ref() != Some(id)
+        && !repair_retry.as_ref().is_some_and(|retry| &retry.run == id)
     {
         task.hold_manual(Some("Automatic disk recovery cannot resume the retained execution safely. Inspect its state and recovery approvals; no replacement competition was started.".into()));
         record(queue, task);
@@ -4834,7 +4884,9 @@ async fn attempt(
         Some(_) => opts.config.as_deref(),
         None => opts.config.as_deref(),
     };
-    let (mut config, layers) = if let Some(run) = saved_recovery {
+    let (mut config, layers) = if repair_retry.is_some() {
+        (previous.as_ref().unwrap().config.clone(), Vec::new())
+    } else if let Some(run) = saved_recovery {
         // A matching resume owns its resolved configuration and evidence;
         // current layers and inherited overrides only configure new work.
         let mut saved = run.clone();
@@ -5029,7 +5081,9 @@ async fn attempt(
         let state = RunState::load(&receipt.request.run).ok()?;
         crate::repair_budget::pending(task, &state).then(|| receipt.request.run.clone())
     });
-    let starter = if let Some(run) = granted_run {
+    let starter = if let Some(retry) = &repair_retry {
+        Starter::Resume(retry.run.clone())
+    } else if let Some(run) = granted_run {
         Starter::Resume(run)
     } else if let Some(owner) = &public_owner {
         Starter::Resume(owner.id.clone())
@@ -5068,6 +5122,11 @@ async fn attempt(
         task.notice_cause("disk-space", None, None);
         task.last_error = Some(reason.clone());
         let disk_checked_at = task.disk_checked_at;
+        if repair_retry.is_some() {
+            task.hold_unrequested_retry(Some(reason));
+            record(queue, task);
+            return Vec::new();
+        }
         task.hold_machine(Some(reason.clone()));
         if matches!(starter, Starter::Resume(_)) {
             task.mark_disk_capacity();
@@ -5207,6 +5266,11 @@ async fn attempt(
         Starter::Resume(id) => {
             tracing::info!("resuming run {id} rather than competing again");
             Runner::resume(id).and_then(|mut r| {
+                if let Some(retry) = &repair_retry {
+                    retry.check(task, &r.state)?;
+                    r.state.next_gate_repair_retry = Some(retry.clone());
+                    return Ok(r);
+                }
                 if retry_selected {
                     // The explicit queue release retries this same pinned
                     // implementation, preserving the attempt and worktrees.
@@ -5422,7 +5486,9 @@ async fn attempt(
     if task.pr_recovery.is_some() && !matches!(starter, Starter::Resume(_)) {
         runner.state.recovery_config = Some(config_evidence);
     }
-    if let Some(replacement) = &task.replacement {
+    if repair_retry.is_none()
+        && let Some(replacement) = &task.replacement
+    {
         if matches!(starter, Starter::Start) {
             runner.state.instruction.push_str(&format!(
                 "\n\n# Replacement review context\n{}",
@@ -5474,7 +5540,17 @@ async fn attempt(
     let run = runner.state.id.clone();
     let before_start = task.clone();
     task.start(run.clone());
-    if let Err(error) = queue.put(task) {
+    let started = if let Some(expected) = &retry_task {
+        if let Err(error) = queue.commit_gate_repair_start(task, expected) {
+            tracing::warn!(run, %error, "post-repair retry did not start");
+            *task = queue.get(&task.id).unwrap_or(before_start);
+            return Vec::new();
+        }
+        Ok(())
+    } else {
+        queue.put(task)
+    };
+    if let Err(error) = started {
         *task = before_start;
         let error = runner.fail_startup("task-start", error);
         if let Some(failure) = error.downcast_ref::<crate::run::StartupFailure>() {
@@ -5568,6 +5644,13 @@ async fn attempt_sync_only(
         crate::base_sync_only::settle(task, &request, saved.as_ref(), detail);
         record(queue, task);
     }
+}
+
+fn post_repair_held(state: &RunState) -> bool {
+    crate::handover::gate_repair_stop(state)
+        || (state.status == RunStatus::Blocked
+            && state.gate_repair_retry_pass.is_some()
+            && !crate::handover::can_resume(state))
 }
 
 /// Settle `task` after its run executed: the verdict, the diagnosis, the

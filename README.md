@@ -215,6 +215,22 @@ by resume: magi preserves the recorded command output, reports the run as
 follow-up run instead; this avoids presenting an old failed command as a new
 verification attempt.
 
+A failed **E2E after a gate repair** is different: the failed gate belongs
+to the older commit, and the repaired winner has not reached its final gate.
+The owner can use `magi run --resume <full-run-id>`, the run's **Resume** action,
+or `magi task control resume <full-run-id>` in chat. The request pins the
+existing task and run and requires an attempt to remain. It does not refill
+attempts or grant new fixer rounds. The worker checks ownership, the saved
+failure, and the clean retained winner before running `verify.e2e` on the
+repaired commit. A pass archives the old failure and continues through normal
+base synchronization, head-specific verification, and `verify.gate`. If
+synchronization changes the commit, the new head needs its own verification
+before publication. Existing merge approvals still apply.
+A repeated failure or mismatched checkpoint leaves the task held without
+publishing or starting a replacement. A resource wait refunds the attempt.
+Explicitly resume again when the resource is available. A retry interrupted
+with an unknown result is not replayed.
+
 **Every run is a task.** `magi run` and `magi review` first file a task in the
 queue (the same path as `magi task add`) and print its id - open it with
 `magi task show <id>`. If a `magi serve` / `magi web` loop is alive on this

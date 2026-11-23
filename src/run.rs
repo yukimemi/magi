@@ -2405,6 +2405,9 @@ pub struct RunState {
     /// Publication after gate repair requires successful e2e on the final SHA.
     #[serde(default)]
     pub gate_repair_e2e: Option<GateRepairE2e>,
+    /// Pass that spent the explicit post-repair E2E retry, saved before commands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) gate_repair_retry_pass: Option<usize>,
     /// Fixer rounds spent on a rebase conflict (base sync and land share one
     /// budget, `graph.review_rounds`), oldest first. Persisted right before
     /// each fixer call, so a resumed run spends only what is left.
@@ -2520,6 +2523,8 @@ pub struct RunState {
     /// and cleared by the next [`RunState::begin_pass`]. Never persisted.
     #[serde(skip)]
     pub next_pass_task_entry: bool,
+    #[serde(skip)]
+    pub(crate) next_gate_repair_retry: Option<crate::resume::GateRepairRetry>,
     /// Parked at a node boundary, waiting to be resumed.
     ///
     /// A run that is neither finished nor being worked on is otherwise
@@ -2921,6 +2926,7 @@ impl RunState {
             land_rebase_from: None,
             gate_fixes: Vec::new(),
             gate_repair_e2e: None,
+            gate_repair_retry_pass: None,
             rebase_fixes: Vec::new(),
             graft: None,
             recovery: None,
@@ -2949,6 +2955,7 @@ impl RunState {
             decision_starts: BTreeMap::new(),
             next_pass_inquiries: Vec::new(),
             next_pass_task_entry: false,
+            next_gate_repair_retry: None,
             parked: false,
             resource_wait: None,
             resource_block: None,

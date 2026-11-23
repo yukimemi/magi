@@ -700,6 +700,9 @@ pub struct Task {
     /// The sync-only fence survives consumption of the ordinary dispatch pin.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sync_only: Option<crate::base_sync_only::Request>,
+    /// Owner authorization bound to the exact resume pin and saved checkpoint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) gate_repair_retry: Option<crate::resume::GateRepairRetry>,
     /// Immutable repair receipts, saved atomically with the exact-run queue pin.
     #[serde(default)]
     pub repair_grants: Vec<crate::repair_budget::Receipt>,
@@ -1260,6 +1263,7 @@ impl Task {
             base_recovery_requests: Vec::new(),
             resume_override: None,
             sync_only: None,
+            gate_repair_retry: None,
             repair_grants: Vec::new(),
             repair_reconciliations: Vec::new(),
             resumption: None,
@@ -3319,6 +3323,15 @@ impl Queue {
         );
         self.write_record(task)
             .context(crate::repair_budget::PublicationUnknown)
+    }
+
+    pub(crate) fn commit_gate_repair_start(&self, task: &mut Task, before: &Task) -> Result<()> {
+        let _lock = self.lock_task(&task.id)?;
+        anyhow::ensure!(
+            serde_json::to_value(self.get(&task.id)?)? == serde_json::to_value(before)?,
+            "task changed before the post-repair E2E retry could start"
+        );
+        self.put_unlocked(task)
     }
 
     /// Save a disk monitor transition only while its complete task snapshot matches.

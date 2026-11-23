@@ -255,6 +255,12 @@ pub fn claim_resume_owner(
         anyhow::ensure!(task.execution_run(run), "run queue owner changed");
         return Ok((task, claim));
     }
+    if let Some(home) = queue.root().parent()
+        && crate::run::RunState::load_under(run, home)
+            .is_ok_and(|state| crate::handover::gate_repair_stop(&state))
+    {
+        anyhow::bail!("post-repair E2E retry requires the existing owning task");
+    }
     let mut task = Task::new(
         crate::queue::title_from(instruction, 72),
         instruction.to_owned(),

@@ -444,6 +444,8 @@ pub(crate) enum ResumeRefusal {
     ReviewBudget { used: usize, limit: usize },
     ReviewDisabled,
     CleanReviewGateRan,
+    GateRepairE2eOwnerResume,
+    GateRepairRetryExhausted,
     BaseSyncStop,
 }
 
@@ -465,6 +467,8 @@ impl ResumeRefusal {
             Self::OwnershipTransferred(_) => "PR ownership was transferred".into(),
             Self::ReviewBudget { used, limit } => format!("review budget exhausted ({used}/{limit} rounds used)"),
             Self::CleanReviewGateRan => "review already has a clean round and the gate already ran; no retryable checkpoint remains".into(),
+            Self::GateRepairE2eOwnerResume => "E2E failed after the gate repair; use an explicit owner resume on this exact run".into(),
+            Self::GateRepairRetryExhausted => "the post-repair E2E retry was already spent and verification is still blocked".into(),
             Self::ReviewDisabled => "review is disabled (review_rounds = 0) and no retryable checkpoint or pending gate remains".into(),
         };
         let mut detail = format!("run {} cannot resume: {reason}.", state.short());
@@ -548,6 +552,22 @@ pub(crate) fn resume_refusal_under(state: &RunState, home: Option<&Path>) -> Opt
             Some(ResumeRefusal::BaseSyncStop)
         };
     }
+    if gate_repair_stop(state) {
+        return Some(if state.gate_repair_retry_pass.is_none() {
+            ResumeRefusal::GateRepairE2eOwnerResume
+        } else {
+            ResumeRefusal::GateRepairRetryExhausted
+        });
+    }
+    if state.status == RunStatus::Blocked
+        && state.gate_repair_retry_pass.is_some()
+        && !resume_checkpoint(state)
+        && state.head_e2e.as_ref().is_some_and(|e| {
+            !e.passed && !e.outcomes.is_empty() && e.outcomes.iter().all(|o| !o.resource_blocked)
+        })
+    {
+        return Some(ResumeRefusal::GateRepairRetryExhausted);
+    }
     let review = crate::graph::review_conclusion(&state.reviews, state.config.graph.review_rounds);
     let allowed = resume_checkpoint(state)
         || state
@@ -562,7 +582,7 @@ pub(crate) fn resume_refusal_under(state: &RunState, home: Option<&Path>) -> Opt
                 .and_then(|id| crate::queue::Queue::at(home.join("queue")).get(id).ok())
                 .is_some_and(|task| crate::repair_budget::pending(&task, state))
         })
-        || home.is_some_and(|home| has_resume_checkpoint(state, home))
+        || home.is_some_and(|home| has_open_question(state, home))
         || ((state.config.graph.review_rounds == 0
             || state.reviews.iter().any(|round| round.clean))
             && (!state.gate_ran || state.resource_block.is_some()))
@@ -573,7 +593,10 @@ pub(crate) fn resume_refusal_under(state: &RunState, home: Option<&Path>) -> Opt
                 .last()
                 .is_some_and(|round| round.e2e_status() == crate::run::E2eStatus::ResourceBlocked))
         || !(state.status == RunStatus::Blocked
-            && state.reviews.len() >= state.config.graph.review_rounds);
+            && (state.reviews.len() >= state.config.graph.review_rounds
+                || (state.gate_repair_retry_pass.is_some()
+                    && state.gate_ran
+                    && state.gate.iter().any(|o| !o.ok()))));
     if allowed {
         None
     } else if state.config.graph.review_rounds == 0 {
@@ -598,16 +621,59 @@ fn resume_checkpoint(state: &RunState) -> bool {
         || !state.merge_repairs.is_empty()
 }
 
+/// A definitive pre-publication failure after a gate fixer moved the winner.
+/// This is retained evidence, not automatic permission to rerun verification.
+pub(crate) fn gate_repair_stop(state: &RunState) -> bool {
+    fn failed(outcomes: &[crate::run::CommandOutcome]) -> bool {
+        outcomes.iter().all(|o| !o.resource_blocked)
+            && outcomes
+                .iter()
+                .any(|o| matches!(o.code, Some(code) if !matches!(code, 0 | 126 | 127)))
+    }
+    state.status == RunStatus::Blocked
+        && !state.base_sync_blocked()
+        && !resume_checkpoint(state)
+        && state.pr.is_none()
+        && state.pr_pushed_head.is_none()
+        && state.merge.is_none()
+        && state.github_text.is_none()
+        && state.land_rebase_from.is_none()
+        && !state.released()
+        && state.retired_to.is_none()
+        && state.pr_taken_over_by.is_none()
+        && state.reviews.last().is_some_and(|r| r.clean)
+        && state.gate_fixes.last().is_some_and(|f| f.committed)
+        && state.gate_ran
+        && failed(&state.gate)
+        && !state.config.verify.e2e.is_empty()
+        && state.gate_repair_e2e.as_ref().is_some_and(|e| {
+            !e.passed
+                && !e.head.is_empty()
+                && failed(&e.outcomes)
+                && state
+                    .gate_head
+                    .as_ref()
+                    .is_some_and(|h| !h.is_empty() && h != &e.head)
+                && state
+                    .head_e2e
+                    .as_ref()
+                    .is_none_or(|other| other.head != e.head)
+        })
+}
+
 /// A resumable publication, landing or owner decision must keep its existing
 /// graph and worktree. Call under the owner lock before releasing or retiring
 /// a predecessor; completed runs may retain these fields as historical evidence.
 pub(crate) fn has_resume_checkpoint(state: &RunState, home: &Path) -> bool {
     state.status.resumable()
-        && (resume_checkpoint(state)
-            || crate::ask::Questions::at(home.join("questions"))
-                .list_for_effects()
-                .iter()
-                .any(|q| q.run == state.id && q.status.open()))
+        && (resume_checkpoint(state) || gate_repair_stop(state) || has_open_question(state, home))
+}
+
+fn has_open_question(state: &RunState, home: &Path) -> bool {
+    crate::ask::Questions::at(home.join("questions"))
+        .list_for_effects()
+        .iter()
+        .any(|q| q.run == state.id && q.status.open())
 }
 
 /// The scan only finds a possible holder. Driver claims share this lock, so
