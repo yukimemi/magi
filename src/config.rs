@@ -1134,7 +1134,7 @@ pub struct Update {
     pub mode: UpdateMode,
     /// Minimum time between checks, e.g. `24h`. kaishin's default when unset.
     pub interval: Option<String>,
-    /// Opt in to idle-only update and restart in `magi web`.
+    /// Opt in to automatic update and restart in `magi web`.
     pub auto_restart: bool,
 }
 
@@ -2635,10 +2635,12 @@ impl Config {
              # off | notify | install — checked in the background, throttled.\n\
              mode = \"notify\"\n\
              # interval = \"24h\"\n\n\
-             # Opt-in: magi web updates and restarts only after runs/chats finish.\n\
+             # Opt-in: magi web updates and restarts automatically when a newer release is found.\n\
              # auto_restart = false\n\
              # Uses interval above; off / MAGI_NO_AUTOUPDATE disable it.\n\
-             # Standalone magi serve cannot restart. Busy work waits indefinitely.\n\
+             # Handover drains only short admission transactions; active workers continue\n\
+             # on their original executable generation while new work uses the new one.\n\
+             # Standalone magi serve cannot restart.\n\
              # Failed tags are skipped until process restart or a different tag.\n\
              # Older binaries reject auto_restart: upgrade before adding the key.\n\n\
              [daemon]\n\

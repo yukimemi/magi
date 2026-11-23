@@ -1536,7 +1536,7 @@ mode = "none"            # none | local | pr
 [update]
 mode = "notify"          # off | notify | install
 # interval = "24h"
-# auto_restart = false     # magi web only: update and restart when idle
+# auto_restart = false     # magi web only: automatic update and restart
 
 [repos]
 # Where `magi repos` (and `GET /api/repos`) look for other local checkouts.
@@ -1605,15 +1605,19 @@ on each poll (every 30 seconds to 15 minutes). Cached releases can trigger an
 update without another network check. `mode = "off"` and `MAGI_NO_AUTOUPDATE`
 disable it. `mode = "install"` keeps its existing CLI startup behavior.
 
-Automatic requests wait indefinitely for no active runs, resumes, in-process
-chat turns, or on-disk chat leases. They do not park active runs. If work races
-the idle check, the handover waits for the run to finish and for chats without
-a timeout before releasing the listener and starting the successor. A loop
-owned by another process prevents the update. Standalone `magi serve` cannot
+Both manual and automatic handovers proceed without waiting for idle task, chat,
+or service workers and without parking active runs. Handover briefly closes new
+admissions to drain in-flight persistence and reservation transactions, then
+restarts the detached scheduler, releases the web listener, and starts the
+successor. Active workers and pinned helpers continue uninterrupted on their
+original executable generation while newly dispatched work uses the new
+generation, so old and new generations may temporarily coexist until in-flight
+workers finish. A legacy embedded scheduler owned by another process still
+prevents the update until finished or parked. Standalone `magi serve` cannot
 perform this restart; run `magi web` and start its loop from the UI instead.
 
-Deferrals and automatic triggers appear as `auto-upgrade:` entries in the
-upgrade log; `/api/health` includes the progress `trigger` (`manual` or `auto`).
+Skips and automatic triggers appear as `auto-upgrade:` entries in the upgrade
+log; `/api/health` includes the progress `trigger` (`manual` or `auto`).
 A failed automatic release tag is skipped for this process's lifetime; a
 different tag or a process restart allows another attempt. Failed-tag memory
 is not persisted. Config errors defer automatic updates. Older binaries reject
