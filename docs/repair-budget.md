@@ -264,8 +264,10 @@ The launcher fetches the prepared base.
 resource stop, restore the resource and resume the retained run. Inspection
 also recognizes historical stops when Git reported a failed recording exec and
 the matching fixer records list no conflicted paths or stopped pick. Inspection
-leaves those records and their existing synchronization budget unchanged. It
-does not reopen a historical operation that already ended.
+is read-only. Ordinary resume can reopen the original reservation, without
+spending another synchronization attempt, after revalidating task ownership,
+the retained branch and the scratch Git state. If there is no matching
+reservation or the retained state cannot be verified, the stop stays blocked.
 
 Legacy compatibility requires the exact known terminal conflict diagnostic,
 matching terminal land event, saved base reservation, and a complete unambiguous

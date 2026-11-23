@@ -535,6 +535,7 @@ pub(crate) fn resume_refusal_under(state: &RunState, home: Option<&Path>) -> Opt
     if state.base_sync_blocked() {
         return if state.base_recovery_pending()
             || state.base_sync_closure_pending()
+            || crate::repair_budget::legacy::resumable_sequencer_stop(state)
             || home.is_some_and(|home| {
                 state
                     .origin

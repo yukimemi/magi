@@ -4052,7 +4052,7 @@ async fn rebase_landing_worktree(
         }
         // Older records lack the target checkpoint, but Git retains the
         // exact target of an interrupted operation. It is a continuation too.
-        None if git::rebase_in_progress(&scratch).await => {
+        None if crate::rebase::checked_progress(state, &scratch, "").await? => {
             crate::rebase::rebase_target(&scratch).await?
         }
         None => {
@@ -4118,9 +4118,10 @@ async fn resume_landing_head<F: Forge>(
     restore_landing_worktree(state).await?;
     // Recover a rebase that finished before its completion checkpoint was
     // saved. Restoration above has already reconciled its files and ancestry.
-    if let Some(target) = &state.land_sync_target
-        && !git::rebase_in_progress(&state.dir().join("rebase")).await
-        && git::ancestry(&winner.worktree, target, &local).await?
+    let scratch = state.dir().join("rebase");
+    if let Some(target) = state.land_sync_target.clone()
+        && !crate::rebase::checked_progress(state, &scratch, "").await?
+        && git::ancestry(&winner.worktree, &target, &local).await?
     {
         state.land_sync_target = None;
         state.save()?;
@@ -7709,6 +7710,63 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             max_turn_secs: None,
         }];
         state.candidates[0].agent = "mock".into();
+    }
+
+    #[tokio::test]
+    async fn rebase_fixer_invocation_cap_survives_fallback_and_reload() {
+        let (tmp, mut state, original) = landing_git_fixture().await;
+        git::git(&state.repo, &["checkout", "main"]).await.unwrap();
+        std::fs::write(state.repo.join("change"), "conflicting base change").unwrap();
+        git::commit_all(&state.repo, "conflicting base")
+            .await
+            .unwrap();
+        let target = git::rev_parse(&state.repo, "HEAD").await.unwrap();
+        git::git(&state.repo, &["checkout", "winner"])
+            .await
+            .unwrap();
+        let scratch = state.dir().join("rebase");
+        let counter = tmp.path().join("calls");
+        landing_gate_fixer(
+            &mut state,
+            "echo \"$REBASE_AGENT\" >> \"$REBASE_COUNTER\"; exit 1",
+        );
+        let template = state.config.agents[0].clone();
+        let ids = ["mock", "fallback1", "fallback2", "fallback3"].map(str::to_owned);
+        state.config.agents = ids
+            .iter()
+            .map(|id| {
+                let mut spec = template.clone();
+                spec.id.clone_from(id);
+                spec.env.insert("REBASE_AGENT".into(), id.clone());
+                spec.env
+                    .insert("REBASE_COUNTER".into(), git::path_arg(&counter));
+                spec
+            })
+            .collect();
+        state.config.roles.fixer = Some(crate::config::AgentChoice::Chain(ids.to_vec()));
+        state.config.graph.review_rounds = 3;
+        for _ in 0..2 {
+            let crate::rebase::Rebased::Stopped(why) =
+                crate::rebase::rebase_with_fixer(&mut state, &scratch, "winner", &target)
+                    .await
+                    .unwrap()
+            else {
+                panic!("the unresolved conflict must stop");
+            };
+            assert!(why.contains("after 3 of 3 fixer round(s)"), "{why}");
+            assert_eq!(
+                std::fs::read_to_string(&counter)
+                    .unwrap()
+                    .lines()
+                    .collect::<Vec<_>>(),
+                ["mock", "fallback1", "fallback2"]
+            );
+            assert_eq!(
+                git::rev_parse(&state.repo, "winner").await.unwrap(),
+                original
+            );
+            state = RunState::load(&state.id).unwrap();
+        }
     }
 
     #[tokio::test]

@@ -77,7 +77,7 @@ impl Assessment {
 }
 
 const NO_PATHS: &str = "; remaining conflicted path(s): none recorded";
-pub(crate) const LEGACY_EXEC_ACTION: &str = "The saved Git output and empty conflict paths identify a failed recording exec. Keep the run and branch for inspection. This historical stop is not migrated; neither conflict-repair authorization nor movement recovery applies.";
+pub(crate) const LEGACY_EXEC_ACTION: &str = "The saved Git output and empty conflict paths identify a failed recording exec. Restore Git and explicitly resume the retained run. Resume can reopen the original reservation only if ownership and Git state still match; neither conflict repair nor movement recovery applies.";
 
 /// Older versions clipped Git's output to 250 characters. Accept a clipped
 /// command only after the known Git-for-Windows shell crash, at that boundary.
@@ -141,6 +141,16 @@ pub(crate) fn legacy_sequencer_head(state: &RunState) -> Option<&str> {
         return None;
     }
     Some(head)
+}
+
+pub(crate) fn resumable_sequencer_stop(state: &RunState) -> bool {
+    state.foreign_checkout.is_none()
+        && state
+            .base_sync_recovery
+            .operations
+            .last()
+            .is_some_and(|op| op.finished)
+        && legacy_sequencer_head(state).is_some()
 }
 
 /// Match both historical and current movement diagnostics exactly. Leftover

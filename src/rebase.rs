@@ -98,13 +98,23 @@ pub(crate) async fn rebase_prepared(
     branch: &str,
     onto: &str,
 ) -> Result<Rebased> {
+    rebase_prepared_with_exec(state, scratch, branch, onto, git::REBASE_EXEC).await
+}
+
+pub(crate) async fn rebase_prepared_with_exec(
+    state: &mut RunState,
+    scratch: &Path,
+    branch: &str,
+    onto: &str,
+    exec: &str,
+) -> Result<Rebased> {
     let repo = state.repo.clone();
     let cap = state.config.graph.review_rounds;
     let orig = git::rev_parse(&repo, &format!("refs/heads/{branch}")).await?;
 
     let mut said = String::new();
-    if !git::rebase_in_progress(scratch).await {
-        match git::rebase_execute(&repo, scratch, onto)
+    if !checked_progress(state, scratch, &said).await? {
+        match git::rebase_execute(&repo, scratch, onto, exec)
             .await
             .map_err(|e| sequencer_block(state, "", e))?
         {
@@ -126,7 +136,7 @@ pub(crate) async fn rebase_prepared(
     let mut touched: Vec<String> = Vec::new();
 
     loop {
-        if !git::rebase_in_progress(scratch).await {
+        if !checked_progress(state, scratch, &said).await? {
             let result = finish(state, scratch, branch, &orig, &onto_sha, &touched, &said).await?;
             if result == Rebased::Applied && git::rev_parse(&repo, onto).await? != onto_sha {
                 state.event("rebase", "saved rebase completed; syncing the newer base");
@@ -168,7 +178,8 @@ pub(crate) async fn rebase_prepared(
             {
                 said.clone_from(&s.output);
             }
-            match retry_recording(state, scratch, branch, &orig, &onto_sha, owner_retry).await {
+            match retry_recording(state, scratch, branch, &orig, &onto_sha, owner_retry, exec).await
+            {
                 Ok(output) => said = output,
                 Err(error) => {
                     state.sequencer_stop = Some(SequencerStop {
@@ -351,7 +362,7 @@ pub(crate) async fn rebase_prepared(
             Launch::Paused(output) => said = output,
             Launch::Advanced => {}
         }
-        let finished = !git::rebase_in_progress(scratch).await;
+        let finished = !checked_progress(state, scratch, &said).await?;
         if let Some(r) = state.rebase_fixes.last_mut() {
             r.finished = finished;
         }
@@ -380,6 +391,16 @@ async fn rebase_head(scratch: &Path) -> Option<String> {
 
 pub(crate) const SEQUENCER_INFRASTRUCTURE: &str = "sequencer-infrastructure";
 
+pub(crate) async fn checked_progress(
+    state: &mut RunState,
+    scratch: &Path,
+    said: &str,
+) -> Result<bool> {
+    git::checked_rebase_in_progress(scratch)
+        .await
+        .map_err(|e| sequencer_block(state, said, e))
+}
+
 fn sequencer_block(state: &mut RunState, said: &str, error: anyhow::Error) -> anyhow::Error {
     let detail = if said.is_empty() {
         format!("{error:#}")
@@ -406,6 +427,7 @@ async fn retry_recording(
     original: &str,
     onto: &str,
     owner_retry: Option<u64>,
+    exec: &str,
 ) -> Result<String> {
     let wait = crate::repo_lock::WaitPolicy::current();
     let lease = crate::repo_lock::SeatLease::operation_with(
@@ -414,7 +436,16 @@ async fn retry_recording(
         &wait,
     )
     .await?;
-    git::claim_recording_retry(&state.repo, scratch, branch, original, onto, owner_retry).await?;
+    git::claim_recording_retry(
+        &state.repo,
+        scratch,
+        branch,
+        original,
+        onto,
+        owner_retry,
+        exec,
+    )
+    .await?;
     state.sequencer_stop = None;
     state.event(
         "rebase",
@@ -427,7 +458,13 @@ async fn retry_recording(
     state.save()?;
     let out = mutate(scratch, &["rebase", "--continue"], lease).await?;
     let said = git::rebase_said(&format!("{}{}", out.stdout, out.stderr));
-    anyhow::ensure!(out.ok() || git::rebase_in_progress(scratch).await, "{said}");
+    anyhow::ensure!(
+        out.ok()
+            || git::checked_rebase_in_progress(scratch)
+                .await
+                .with_context(|| said.clone())?,
+        "{said}"
+    );
     Ok(said)
 }
 
@@ -562,7 +599,8 @@ fn stop_records(state: &RunState) -> &[RebaseFixRecord] {
 fn stop_rounds(state: &RunState, original: &str, onto: &str, pick: &str) -> Result<usize> {
     let mut spent = 0;
     for record in &state.rebase_fixes {
-        if record.from.as_deref().is_some_and(|from| from != original)
+        if record.paths.is_empty()
+            || record.from.as_deref().is_some_and(|from| from != original)
             || record.onto.as_deref().is_some_and(|target| target != onto)
         {
             continue;
@@ -778,7 +816,7 @@ async fn launcher_stage(
     original: &str,
     onto: &str,
 ) -> Result<Launch> {
-    if !git::rebase_in_progress(scratch).await {
+    if !checked_progress(state, scratch, "").await? {
         return Ok(Launch::Nothing("no rebase in progress".into()));
     }
     if !same_stop(state, scratch).await {
@@ -816,7 +854,7 @@ async fn launcher_stage(
 
     // Re-validated under the lease: the seat is gone, but an external
     // updater is not.
-    if !git::rebase_in_progress(scratch).await || !same_stop(state, scratch).await {
+    if !checked_progress(state, scratch, "").await? || !same_stop(state, scratch).await {
         return Ok(Launch::Nothing("the stop point changed".into()));
     }
     if let Err(e) = stop_identity(scratch, original, onto).await {
@@ -997,7 +1035,7 @@ async fn launcher_stage(
         Ok(o) => o,
         Err(e) => return Err(infra_stop(state, format!("{e:#}"))),
     };
-    if !out.ok() && git::rebase_in_progress(scratch).await {
+    if !out.ok() && checked_progress(state, scratch, &out.stderr).await? {
         let again = git::unmerged_paths(scratch)
             .await
             .map_err(|e| sequencer_block(state, &out.stderr, e))?;
@@ -1122,7 +1160,7 @@ pub(crate) async fn recover_completed_base(
         "unexpected scratch location"
     );
     anyhow::ensure!(
-        !git::rebase_in_progress(scratch).await,
+        !git::checked_rebase_in_progress(scratch).await?,
         "scratch rebase is still active"
     );
     for (path, revision, expected) in [
