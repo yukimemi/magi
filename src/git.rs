@@ -1201,7 +1201,8 @@ pub struct RebaseRecord {
     pub heads: Vec<String>,
 }
 
-const REBASE_EXEC: &str = "git rev-parse HEAD >> \"$(git rev-parse --git-path magi-rebase-heads)\"";
+pub(crate) const REBASE_EXEC: &str =
+    "git rev-parse HEAD >> \"$(git rev-parse --git-path magi-rebase-heads)\"";
 
 async fn rebase_file(scratch: &Path, name: &str) -> Result<PathBuf> {
     let path = git(scratch, &["rev-parse", "--git-path", name]).await?;
@@ -1221,28 +1222,65 @@ async fn full_commit(scratch: &Path, sha: &str) -> Result<String> {
     rev_parse(scratch, &format!("{sha}^{{commit}}")).await
 }
 
+enum Instruction<'a> {
+    Pick(&'a str),
+    Record,
+}
+
+fn instructions(text: &str) -> impl DoubleEndedIterator<Item = Result<Instruction<'_>>> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|line| match line.split_once(' ') {
+            Some(("pick" | "p", args)) => Ok(Instruction::Pick(
+                args.split_whitespace()
+                    .next()
+                    .context("pick without commit")?,
+            )),
+            Some(("exec" | "x", REBASE_EXEC)) => Ok(Instruction::Record),
+            _ => bail!("unexpected rebase instruction: {line}"),
+        })
+}
+
+/// Only a pick at the end of `done` can own a textual conflict. REBASE_HEAD
+/// alone can still name the previous pick after a subsequent exec stopped.
+pub(crate) async fn stopped_pick(scratch: &Path) -> Result<Option<String>> {
+    let done = std::fs::read_to_string(rebase_file(scratch, "rebase-merge/done").await?)?;
+    let mut steps = instructions(&done);
+    let Some(Instruction::Pick(id)) = steps.next_back().transpose()? else {
+        return Ok(None);
+    };
+    let pick = full_commit(scratch, id).await?;
+    ensure!(
+        rev_parse(scratch, "REBASE_HEAD^{commit}").await? == pick,
+        "REBASE_HEAD does not match the stopped pick"
+    );
+    let saved = std::fs::read_to_string(rebase_file(scratch, "magi-rebase-picks").await?)?;
+    let mut picks = saved.lines();
+    for step in steps {
+        if let Instruction::Pick(id) = step? {
+            ensure!(
+                picks.next().is_some_and(|sha| sha.starts_with(id)),
+                "completed picks do not match the saved replay"
+            );
+        }
+    }
+    ensure!(
+        picks.next() == Some(pick.as_str()),
+        "stopped pick does not match its position in the saved replay"
+    );
+    Ok(Some(pick))
+}
+
 /// Save Git's exact picks before a fixer can change its todo list. Resolve
 /// abbreviations while the sequencer still exists; ambiguity is an error.
 async fn save_rebase_picks(scratch: &Path) -> Result<()> {
     let mut picks = Vec::new();
     for name in ["rebase-merge/done", "rebase-merge/git-rebase-todo"] {
         let text = std::fs::read_to_string(rebase_file(scratch, name).await?)?;
-        for line in text.lines().map(str::trim) {
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            let mut words = line.split_whitespace();
-            match words.next() {
-                Some("pick" | "p") => {
-                    picks.push(
-                        full_commit(scratch, words.next().context("pick without commit")?).await?,
-                    );
-                }
-                Some("exec" | "x")
-                    if line
-                        .split_once(' ')
-                        .is_some_and(|(_, cmd)| cmd == REBASE_EXEC) => {}
-                _ => bail!("unexpected rebase instruction: {line}"),
+        for step in instructions(&text) {
+            if let Instruction::Pick(id) = step? {
+                picks.push(full_commit(scratch, id).await?);
             }
         }
     }
@@ -1250,6 +1288,145 @@ async fn save_rebase_picks(scratch: &Path) -> Result<()> {
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, picks.join("\n") + "\n")?;
     std::fs::rename(tmp, path)?;
+    Ok(())
+}
+
+/// Under the caller's repository lease, prove that the next `--continue`
+/// retries our unrecorded exec, then spend the retry *before* running Git.
+/// Only a separate owner resumption can authorize another attempt.
+pub(crate) async fn claim_recording_retry(
+    repo: &Path,
+    scratch: &Path,
+    branch: &str,
+    original: &str,
+    onto_sha: &str,
+    owner_retry: Option<u64>,
+) -> Result<()> {
+    let common = crate::repo_lock::common_dir(repo)
+        .await?
+        .context("not a repository")?;
+    let admin = std::fs::canonicalize(git(scratch, &["rev-parse", "--absolute-git-dir"]).await?)?;
+    let backlink = std::fs::read_to_string(admin.join("gitdir"))?;
+    ensure!(
+        admin.parent() == Some(common.join("worktrees").as_path())
+            && admin.join(backlink.trim_end()).canonicalize()?
+                == scratch.join(".git").canonicalize()?,
+        "recording retry is not in this repository's scratch worktree"
+    );
+    let seq = admin.join("rebase-merge");
+    let read = |path: PathBuf| -> Result<String> {
+        ensure!(
+            path.symlink_metadata()?.is_file(),
+            "not a regular file: {}",
+            path.display()
+        );
+        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))
+    };
+    let branch_ref = format!("refs/heads/{branch}");
+    ensure!(
+        seq.symlink_metadata()?.is_dir()
+            && seq
+                .join("reschedule-failed-exec")
+                .symlink_metadata()?
+                .is_file()
+            && read(seq.join("head-name"))?.trim_end() == branch_ref
+            && read(seq.join("orig-head"))?.trim_end() == original
+            && read(seq.join("onto"))?.trim_end() == onto_sha
+            && rev_parse(repo, &branch_ref).await? == original
+            && git_raw(scratch, &["symbolic-ref", "-q", "HEAD"])
+                .await?
+                .code
+                == Some(1),
+        "scratch rebase does not match the reserved operation"
+    );
+    let automatic = admin.join("magi-rebase-recording-retry");
+    let (marker, previously_retried) = match owner_retry {
+        Some(generation) => match automatic.symlink_metadata() {
+            Ok(meta) => {
+                ensure!(meta.is_file(), "invalid automatic retry marker");
+                (
+                    admin.join(format!("magi-rebase-recording-retry-{generation}")),
+                    true,
+                )
+            }
+            // The first stop may have failed validation before any claim.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (automatic, false),
+            Err(e) => return Err(e).context("inspect automatic retry marker"),
+        },
+        None => (automatic, false),
+    };
+    ensure!(!marker.try_exists()?, "recording retry already spent");
+    ensure!(
+        git(scratch, &["status", "--porcelain", "--untracked-files=all"])
+            .await?
+            .is_empty(),
+        "scratch has uncommitted changes"
+    );
+
+    let saved = read(admin.join("magi-rebase-picks"))?;
+    ensure!(saved.ends_with('\n'), "incomplete saved pick ledger");
+    let mut picks = saved.lines();
+    let mut done_picks = 0;
+    for (file, done) in [("done", true), ("git-rebase-todo", false)] {
+        let text = read(seq.join(file))?;
+        let mut steps = instructions(&text).peekable();
+        // Git appends the failed exec to `done` AND puts it back first in the
+        // todo. A previous retry adds another identical exec in `done`.
+        if !done {
+            ensure!(
+                matches!(steps.next().transpose()?, Some(Instruction::Record)),
+                "the recording exec was not rescheduled"
+            );
+        }
+        while let Some(step) = steps.next() {
+            let Instruction::Pick(sha) = step? else {
+                bail!("expected a pick in {file}");
+            };
+            let pick = full_commit(scratch, sha).await?;
+            ensure!(
+                picks.next() == Some(pick.as_str())
+                    && is_ancestor(repo, &pick, original).await
+                    && matches!(steps.next().transpose()?, Some(Instruction::Record)),
+                "{file} does not match the saved pick/exec sequence"
+            );
+            done_picks += usize::from(done);
+            if done && previously_retried {
+                while steps
+                    .next_if(|step| matches!(step, Ok(Instruction::Record)))
+                    .is_some()
+                {}
+            }
+        }
+    }
+    ensure!(
+        picks.next().is_none() && done_picks > 0,
+        "incomplete pick sequence"
+    );
+
+    let heads = read(admin.join("magi-rebase-heads"))?;
+    ensure!(
+        (heads.is_empty() || heads.ends_with('\n')) && heads.lines().count() == done_picks - 1,
+        "cannot prove the failed exec has not already recorded a HEAD"
+    );
+    let head = rev_parse(scratch, "HEAD^{commit}").await?;
+    let mut previous = onto_sha;
+    for sha in heads.lines().chain(std::iter::once(head.as_str())) {
+        ensure!(
+            sha.len() == head.len() && sha.bytes().all(|b| b.is_ascii_hexdigit()),
+            "partial or invalid recorded HEAD"
+        );
+        if sha != previous {
+            ensure!(
+                git(scratch, &["rev-list", "--parents", "-1", sha]).await?
+                    == format!("{sha} {previous}"),
+                "recorded HEADs and scratch HEAD are not a replay onto the reserved target"
+            );
+        }
+        previous = sha;
+    }
+    std::fs::File::create_new(marker)
+        .context("cannot claim recording retry (already spent or scratch unwritable)")?
+        .sync_all()?;
     Ok(())
 }
 
@@ -1294,6 +1471,9 @@ pub enum RebaseStart {
     /// It stopped on a conflict and the throwaway worktree was **kept**
     /// mid-rebase, for someone to resolve. Carries what git said.
     Conflicted(String),
+    /// The sequencer stopped without a verified textual conflict. The scratch
+    /// and Git output are retained for infrastructure recovery.
+    Sequencer(String),
     /// It failed without leaving a rebase in progress; the worktree is gone
     /// and the branch is untouched. Carries what git said.
     Failed(String),
@@ -1374,26 +1554,38 @@ pub(crate) async fn rebase_prepare(repo: &Path, scratch: &Path, branch: &str) ->
 pub(crate) async fn rebase_execute(repo: &Path, scratch: &Path, onto: &str) -> Result<RebaseStart> {
     let out = git_raw(
         scratch,
-        &["rebase", "--empty=drop", "--exec", REBASE_EXEC, onto],
+        &[
+            "rebase",
+            "--empty=drop",
+            "--reschedule-failed-exec",
+            "--exec",
+            REBASE_EXEC,
+            onto,
+        ],
     )
     .await?;
     if out.ok() {
         worktree_remove(repo, scratch).await.ok();
         return Ok(RebaseStart::Applied);
     }
-    let why = rebase_said(&if out.stderr.trim().is_empty() {
-        out.stdout.trim().to_owned()
-    } else {
-        out.stderr.trim().to_owned()
-    });
+    let why = rebase_said(&format!("{}\n{}", out.stderr, out.stdout));
     if rebase_in_progress(scratch).await {
         if let Err(error) = save_rebase_picks(scratch).await {
-            rebase_abort(repo, scratch).await;
-            return Ok(RebaseStart::Failed(format!(
-                "cannot record rebase picks: {error:#}"
+            return Ok(RebaseStart::Sequencer(format!(
+                "{why}\ncannot record rebase picks: {error:#}"
             )));
         }
-        return Ok(RebaseStart::Conflicted(why));
+        return Ok(match unmerged_paths(scratch).await {
+            Ok(paths) if paths.is_empty() => RebaseStart::Sequencer(why),
+            Err(e) => RebaseStart::Sequencer(format!("{why}\ncannot read unmerged paths: {e:#}")),
+            Ok(_) => match stopped_pick(scratch).await {
+                Ok(Some(_)) => RebaseStart::Conflicted(why),
+                Ok(None) => RebaseStart::Sequencer(why),
+                Err(e) => {
+                    RebaseStart::Sequencer(format!("{why}\ncannot identify stopped pick: {e:#}"))
+                }
+            },
+        });
     }
     worktree_remove(repo, scratch).await.ok();
     Ok(RebaseStart::Failed(why))
@@ -1451,7 +1643,7 @@ pub async fn rebase_branch_in_temp(
     match rebase_start(repo, scratch, branch, onto).await? {
         RebaseStart::Applied => Ok(None),
         RebaseStart::Failed(why) => Ok(Some(why)),
-        RebaseStart::Conflicted(why) => {
+        RebaseStart::Conflicted(why) | RebaseStart::Sequencer(why) => {
             rebase_abort(repo, scratch).await;
             Ok(Some(why))
         }
@@ -1720,6 +1912,186 @@ mod tests {
     }
 
     use super::*;
+
+    #[tokio::test]
+    async fn recording_exec_transient_failure() {
+        recording_exec_fixture("recording_exec_transient_failure", false).await;
+    }
+
+    #[tokio::test]
+    async fn recording_exec_persistent_failure() {
+        recording_exec_fixture("recording_exec_persistent_failure", true).await;
+    }
+
+    fn shell_script(path: &Path, body: &str) {
+        std::fs::write(path, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    async fn recording_exec_fixture(test: &str, persistent: bool) {
+        use crate::queue::{Queue, Source, Task};
+        use crate::rebase::{Rebased, SEQUENCER_INFRASTRUCTURE, rebase_prepared};
+        use crate::run::{Origin, RunState};
+
+        // Only Git's child shell sees the shim at the front of PATH. Run the
+        // fixture in a subprocess so no concurrent test inherits its environment.
+        const ROOT: &str = "MAGI_TEST_RECORDING_ROOT";
+        let Some(root) = std::env::var_os(ROOT).map(PathBuf::from) else {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path();
+            let shim = root.join("git-exec");
+            std::fs::create_dir(&shim).unwrap();
+            shell_script(
+                &shim.join("git"),
+                r#"#!/bin/sh
+if test "$#" = 2 && test "$1" = rev-parse && test "$2" = HEAD; then
+    root=$MAGI_TEST_RECORDING_ROOT
+    if test ! -f "$root/attempts" || test -f "$root/fault"; then
+        echo failed >> "$root/attempts"
+        echo 'fixture recording exec failed' >&2
+        exit 1
+    fi
+    echo recorded >> "$root/attempts"
+fi
+exec "$MAGI_TEST_REAL_GIT" "$@"
+"#,
+            );
+            let path = std::env::var_os("PATH").unwrap();
+            let git_name = if cfg!(windows) { "git.exe" } else { "git" };
+            let real = std::env::split_paths(&path)
+                .map(|dir| dir.join(git_name))
+                .find(|git| git.is_file())
+                .unwrap();
+            let helpers = git(root, &["--exec-path"]).await.unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &format!("git::tests::{test}"), "--nocapture"])
+                .env(ROOT, path_arg(root))
+                .env("MAGI_HOME", root.join("home"))
+                .env("MAGI_TEST_REAL_GIT", path_arg(&real))
+                .env("GIT_EXEC_PATH", path_arg(&shim))
+                .env(
+                    "PATH",
+                    std::env::join_paths(
+                        std::env::split_paths(&path).chain(std::iter::once(helpers.into())),
+                    )
+                    .unwrap(),
+                )
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(root.join("attempts").is_file(), "fixture test did not run");
+            return;
+        };
+        crate::run::set_home(root.join("home"));
+        let (_temp, repo) = scratch().await;
+        let base = rev_parse(&repo, "main").await.unwrap();
+        sh(&repo, &["checkout", "-qb", "topic"]);
+        track(&repo, "one", "one").await;
+        track(&repo, "two", "two").await;
+        let picks = git(&repo, &["rev-list", "--reverse", "main..topic"])
+            .await
+            .unwrap();
+        sh(&repo, &["checkout", "-q", "main"]);
+        track(&repo, "upstream", "upstream").await;
+        let hooks = root.join("hooks");
+        std::fs::create_dir(&hooks).unwrap();
+        shell_script(
+            &hooks.join("post-rewrite"),
+            r#"#!/bin/sh
+test "$1" = rebase || exit 0
+for name in picks heads; do
+    cp "$(git rev-parse --git-path magi-rebase-$name)" "$MAGI_TEST_RECORDING_ROOT/$name" || exit 1
+done
+"#,
+        );
+        sh(&repo, &["config", "core.hooksPath", &path_arg(&hooks)]);
+        let mut state = RunState::new(
+            repo.clone(),
+            "main".into(),
+            base,
+            "sync".into(),
+            crate::config::Config::default(),
+        );
+        let queue = Queue::open();
+        let mut task = Task::new("sync".into(), "sync".into(), repo.clone(), Source::Human);
+        state.origin = Some(Origin::queue(&task.id));
+        state.task_instruction = Some(task.instruction.clone());
+        task.start(state.id.clone());
+        queue.put(&mut task).unwrap();
+        let work = root.join("scratch");
+        rebase_prepare(&repo, &work, "topic").await.unwrap();
+        let attempts = || std::fs::read_to_string(root.join("attempts")).unwrap();
+        if persistent {
+            std::fs::write(root.join("fault"), "").unwrap();
+            // Neither the failed retry nor a restart can spend another slot.
+            for _ in 0..2 {
+                let error = rebase_prepared(&mut state, &work, "topic", "main")
+                    .await
+                    .unwrap_err();
+                assert!(error.is::<crate::repo_lock::ResourceBlocked>(), "{error:#}");
+                state = RunState::load(&state.id).unwrap();
+                let block = state.resource_block.as_ref().unwrap();
+                assert_eq!(block.kind, SEQUENCER_INFRASTRUCTURE);
+                assert!(
+                    block.detail.contains("fixture recording exec failed"),
+                    "{block:?}"
+                );
+                assert!(state.rebase_fixes.is_empty());
+                assert_eq!(attempts().lines().collect::<Vec<_>>(), ["failed", "failed"]);
+                assert!(rebase_in_progress(&work).await);
+            }
+            // A complete append reported as failed, a torn append, or an
+            // edited todo cannot be repaired by retrying an exec.
+            let heads_file = rebase_file(&work, "magi-rebase-heads").await.unwrap();
+            let todo_file = rebase_file(&work, "rebase-merge/git-rebase-todo")
+                .await
+                .unwrap();
+            let original = rev_parse(&repo, "topic").await.unwrap();
+            let target = rev_parse(&repo, "main").await.unwrap();
+            let claim =
+                || claim_recording_retry(&repo, &work, "topic", &original, &target, Some(1));
+            let head = rev_parse(&work, "HEAD").await.unwrap();
+            for invalid in [format!("{head}\n"), head[..12].to_string()] {
+                std::fs::write(&heads_file, invalid).unwrap();
+                assert!(claim().await.is_err());
+            }
+            std::fs::write(&heads_file, "").unwrap();
+            let todo = std::fs::read_to_string(&todo_file).unwrap();
+            std::fs::write(&todo_file, format!("exec true\n{todo}")).unwrap();
+            assert!(claim().await.is_err());
+            std::fs::write(todo_file, todo).unwrap();
+            std::fs::remove_file(root.join("fault")).unwrap();
+            task.release_operator("resume", None);
+            queue.put(&mut task).unwrap();
+        }
+        let result = rebase_prepared(&mut state, &work, "topic", "main")
+            .await
+            .unwrap();
+        assert_eq!(result, Rebased::Applied);
+        assert!(state.rebase_fixes.is_empty());
+        assert_eq!(attempts().lines().count(), if persistent { 4 } else { 3 });
+        let heads = git(&repo, &["rev-list", "--reverse", "main..topic"])
+            .await
+            .unwrap();
+        assert_eq!(heads.lines().count(), 2);
+        assert_eq!(
+            std::fs::read_to_string(root.join("picks")).unwrap().trim(),
+            picks
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("heads")).unwrap().trim(),
+            heads
+        );
+    }
 
     #[test]
     fn worktree_holder_is_read_from_the_porcelain_listing() {

@@ -591,6 +591,7 @@ pub(crate) fn resume_refusal_under(state: &RunState, home: Option<&Path>) -> Opt
 fn resume_checkpoint(state: &RunState) -> bool {
     state.status == RunStatus::Landing
         || landing_checkpoint(state)
+        || state.pending_base_operation().is_some()
         || state.pr_publication_pending
         || state.land_approval.is_some()
         || state.merge_decision.is_some()

@@ -601,6 +601,9 @@ async fn a_fixer_that_never_resolves_the_conflict_blocks_the_run_and_says_what_w
     let mut fx = fixture(_home, Judges::Unanimous, false);
     fx.config.graph.implementers = 1;
     set_agent_env(&mut fx, "MOCK_REBASE_FIX_NOOP");
+    fx.config.roles.fixer = Some(magi::config::AgentChoice::Chain(vec!["beta".into(), "gamma".into()]));
+    fx.config.agents.iter_mut().find(|a| a.id == "beta").unwrap()
+        .env.insert("MOCK_REBASE_AUTH".into(), "1".into());
     let origin = wire_origin(&fx);
 
     let mut runner = Runner::start(&fx.repo, "create note.txt".to_owned(), fx.config.clone(), magi::run::Origin::operator())
@@ -625,6 +628,7 @@ async fn a_fixer_that_never_resolves_the_conflict_blocks_the_run_and_says_what_w
     assert!(sync.behind > 0, "the lag was recorded before the attempt");
     assert_eq!(state.rebase_fixes.len(), 3);
     assert_eq!(rebase_fix_calls(state), 3);
+    assert_eq!(state.rebase_fixes.iter().map(|r| r.agent.as_str()).collect::<Vec<_>>(), ["beta", "gamma", "gamma"]);
 
     // Nothing past the base sync ran.
     assert!(state.reviews.is_empty(), "{:?}", state.reviews);
@@ -719,6 +723,7 @@ async fn the_conflict_round_bound_is_counted_in_state_and_survives_a_resume() {
             agent: "mock".to_owned(),
             paths: vec!["note.txt".to_owned()],
             from: None,
+            onto: None,
             finished: false,
             error: None,
             stop: None,
@@ -764,6 +769,7 @@ async fn legacy_conflict_records_recover_the_baseline_and_retain_the_resume_budg
             agent: "mock".to_owned(),
             paths: vec!["note.txt".to_owned()],
             from: None,
+            onto: None,
             finished: false,
             error: None,
             stop: None,
@@ -811,6 +817,7 @@ async fn legacy_baseline_mismatch_blocks_without_spending_a_conflict_round() {
             agent: "mock".to_owned(),
             paths: vec!["unexpected.txt".to_owned()],
             from: None,
+            onto: None,
             finished: false,
             error: None,
             stop: None,
@@ -1199,7 +1206,7 @@ async fn rebase_authentication_outages_keep_the_conflict_resumable_and_refund_at
     let home = home_lock().await;
     let mut fx = fixture(home, Judges::Unanimous, false);
     fx.config.graph.implementers = 1;
-    fx.config.graph.review_rounds = 1;
+    fx.config.graph.review_rounds = 3;
     fx.config.roles.fixer = Some(magi::config::AgentChoice::Chain(vec!["beta".into(), "gamma".into()]));
     for agent in &mut fx.config.agents { agent.env.insert("MOCK_REBASE_AUTH".into(), "1".into()); }
     let origin = wire_origin(&fx);
@@ -1211,8 +1218,9 @@ async fn rebase_authentication_outages_keep_the_conflict_resumable_and_refund_at
     assert!(runner.state.base_sync.as_ref().is_none_or(|sync| sync.conflict.is_none()));
     assert_eq!(runner.state.resource_block.as_ref().unwrap().kind, "agent authentication");
     assert!(magi::git::rebase_in_progress(&runner.state.dir().join("base-sync")).await);
-    assert_eq!(runner.state.rebase_fixes.len(), 1);
-    assert_eq!(runner.state.rebase_fixes[0].outage, Some(magi::agent::QuotaCause::Authentication));
+    assert_eq!(rebase_fix_calls(&runner.state), 2);
+    assert_eq!(runner.state.rebase_fixes.len(), 2);
+    assert_eq!(runner.state.rebase_fixes[1].outage, Some(magi::agent::QuotaCause::Authentication));
     assert!(runner.state.rebase_fixes[0].index_outside.is_some());
     let mut task = magi::queue::Task::new("Rebase authentication outage".into(), "create note.txt".into(), fx.repo.clone(), magi::queue::Source::Human);
     task.start(runner.state.id.clone());
@@ -1231,5 +1239,6 @@ async fn rebase_authentication_outages_keep_the_conflict_resumable_and_refund_at
     assert_eq!(resumed.state.status, RunStatus::Ready, "{}", magi::report::run(&resumed.state));
     assert!(resumed.state.base_sync.as_ref().unwrap().conflict.is_none());
     assert!(resumed.state.rebase_fixes.last().unwrap().finished);
+    assert_eq!(rebase_fix_calls(&resumed.state), 3);
 }
 }

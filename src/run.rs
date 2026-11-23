@@ -960,8 +960,7 @@ pub struct GateFixRecord {
 /// round back.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RebaseFixRecord {
-    /// A machine outage deferred this call without spending a conflict round.
-    /// The record retains the original index baseline for safe resumption.
+    /// The fixer reported a machine outage. Its invocation still counts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outage: Option<crate::agent::QuotaCause>,
     /// Agent asked to resolve the conflict.
@@ -972,6 +971,9 @@ pub struct RebaseFixRecord {
     /// worktree still holding those files from one with edits of its own.
     #[serde(default)]
     pub from: Option<String>,
+    /// The pinned target, absent on older records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub onto: Option<String>,
     /// Did git report the rebase finished after the round?
     #[serde(default)]
     pub finished: bool,
@@ -2388,6 +2390,9 @@ pub struct RunState {
     /// Publication after gate repair requires successful e2e on the final SHA.
     #[serde(default)]
     pub gate_repair_e2e: Option<GateRepairE2e>,
+    /// Retained Git diagnostic and retry boundary for the interrupted sequencer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequencer_stop: Option<crate::rebase::SequencerStop>,
     /// Fixer rounds spent on a rebase conflict (base sync and land share one
     /// budget, `graph.review_rounds`), oldest first. Persisted right before
     /// each fixer call, so a resumed run spends only what is left.
@@ -2904,6 +2909,7 @@ impl RunState {
             land_rebase_from: None,
             gate_fixes: Vec::new(),
             gate_repair_e2e: None,
+            sequencer_stop: None,
             rebase_fixes: Vec::new(),
             graft: None,
             recovery: None,
@@ -3318,7 +3324,15 @@ impl RunState {
                 .base_sync
                 .as_ref()
                 .and_then(|s| s.conflict.as_ref())
-                .map(|detail| format!("Base-sync conflict: {detail}"));
+                .map(|detail| {
+                    let cause = if crate::repair_budget::legacy::legacy_sequencer_head(self).is_some()
+                    {
+                        "Rebase sequencer infrastructure failure"
+                    } else {
+                        "Base-sync conflict"
+                    };
+                    format!("{cause}: {detail}")
+                });
         }
         if let Some(resource) = &self.resource_block {
             return Some(resource.detail.clone());

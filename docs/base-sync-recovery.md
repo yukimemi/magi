@@ -10,6 +10,26 @@ textual conflicts.
 
 ## Infrastructure interruptions
 
+Only a stopped pick with unmerged index entries can start a conflict fixer.
+`graph.review_rounds` limits actual fixer calls for that pick, including
+fallback agents and calls that report a quota or authentication failure.
+Staging or continuing an already resolved pick does not spend a call.
+
+If Git stops with no unmerged paths, magi checks whether Git rescheduled its
+recording exec. When the scratch identity, todo and pick/HEAD records agree,
+magi lets Git retry the exec once and continue. It does not restart the rebase
+or write the missing HEAD itself: either could lose or misrepresent an earlier
+resolution. If the proof or retry fails, the scratch checkout, reservation
+and Git diagnostic remain available. Fix the infrastructure problem and
+resume the owning run normally. A later explicit task resumption can retry
+the verified exec once; restarting the daemon does not renew the retry.
+Neither `--recover-base` nor a base-conflict repair grant is needed.
+
+Historical conflict records are not rewritten. Repair inspection identifies
+a failed recording exec when the saved Git diagnostic and matching empty-path
+fixer records establish it. That diagnosis does not authorize textual repair
+or reopen an already finished synchronization reservation.
+
 A successful synchronization or an actually executed gate/current-head E2E check
 records progress. Saving a structured resource stop after progress atomically
 records an interruption boundary (including pass ordinal, head and time). Only a

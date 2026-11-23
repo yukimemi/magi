@@ -709,6 +709,7 @@ fn legacy_stop(runner: &mut Runner, head: &str, typed: bool) {
             agent: "fixture".into(),
             paths: vec!["README.md".into()],
             from: Some(head.into()),
+            onto: None,
             finished: false,
             error: None,
             stop: None,
@@ -914,6 +915,61 @@ async fn legacy_scratch_descendant_and_owner_hold_refuse_without_losing_dirty_co
 }
 
 common::e2e! {
+async fn historical_recording_exec_failure_refuses_textual_repair_without_migration() {
+    let (_fx, task, mut runner, request) = stopped().await;
+    let op = runner.state.base_sync_recovery.operations[0].clone();
+    legacy_stop(&mut runner, &request.head, true);
+    runner.state.base_sync_recovery.operations.push(op);
+    let mut round = runner.state.rebase_fixes[0].clone();
+    round.paths.clear();
+    round.index_outside = Some(String::new());
+    runner.state.rebase_fixes = vec![round; 28];
+    runner.state.rebase_fixes[27].finished = true; // Scratch was aborted.
+
+    let command = r#"git rev-parse HEAD >> "$(git rev-parse --git-path magi-rebase-heads)""#;
+    let complete = format!("warning: execution failed: {command}");
+    let crash = "sh.exe: *** fatal error - add_item failed, errno 1\nwarning: execution failed: git re";
+    let clipped = format!("{}{}", "x".repeat(250 - crash.len()), crash);
+    let branch = &runner.state.winner().unwrap().branch;
+    let message = format!("{branch} conflicts with origin/main and did not rebase: conflict not resolved after 28 of 3 fixer round(s) (the rebase ended without the base in the result (abandoned or skipped)); remaining conflicted path(s): none recorded; git said: ");
+    for (said, expected) in [
+        (complete.as_str(), "sequencer-infrastructure"),
+        (clipped.as_str(), "sequencer-infrastructure"),
+        ("warning: execution failed: git reset HEAD", "insufficient-evidence"),
+        ("warning: execution failed: git re", "insufficient-evidence"),
+    ] {
+        let detail = format!("{message}{said}");
+        runner.state.base_sync.as_mut().unwrap().conflict = Some(detail.clone());
+        runner.state.base_sync_recovery.stop.as_mut().unwrap().detail = detail.clone();
+        runner.state.event("land", detail);
+        runner.state.save().unwrap();
+        let run_path = runner.state.dir().join("run.json");
+        let task_path = Queue::open().path_of(&task.id);
+        let before = std::fs::read(&run_path).unwrap();
+        let owner_before = std::fs::read(&task_path).unwrap();
+        let report = inspect(&request).await;
+        assert_eq!(report["classification"], expected);
+        assert!(!report["next_step"].as_str().unwrap().contains("grant-repair"));
+        let refused = grant_output(&request);
+        assert!(!refused.status.success());
+        if expected == "sequencer-infrastructure" {
+            assert!(String::from_utf8_lossy(&refused.stderr).contains("without a textual conflict"));
+            assert!(!runner.state.base_sync_next_action().contains("base-conflict"));
+        }
+        assert_eq!(std::fs::read(&run_path).unwrap(), before);
+        assert_eq!(std::fs::read(&task_path).unwrap(), owner_before);
+    }
+    let detail = format!("{message}{complete}");
+    runner.state.base_sync.as_mut().unwrap().conflict = Some(detail.clone());
+    runner.state.base_sync_recovery.stop.as_mut().unwrap().detail = detail;
+    runner.state.rebase_fixes[12].paths.push("changed.txt".into());
+    runner.state.save().unwrap();
+    assert_eq!(inspect(&request).await["classification"], "insufficient-evidence");
+    assert!(!grant_output(&request).status.success());
+}
+}
+
+common::e2e! {
 async fn legacy_movement_diagnostics_use_recover_base_without_mutation() {
     let (_fx, task, mut runner, request) = stopped().await;
     legacy_stop(&mut runner, &request.head, false);
@@ -951,6 +1007,7 @@ async fn modern_conflict_operation_ignores_legacy_history_on_grant_and_restart()
     let old = magi::run::RebaseFixRecord {
         agent: "fixture".into(), paths: vec!["historical.txt".into()],
         from: Some(runner.state.base_commit.clone()), finished: true,
+        onto: None,
         error: None, stop: None, index_outside: None, launcher: None,
         infra: None, outage: None,
     };
@@ -989,6 +1046,7 @@ async fn modern_conflict_sequencer_proof_ignores_unrelated_legacy_rounds() {
     let old = magi::run::RebaseFixRecord {
         agent: "fixture".into(), paths: vec!["README.md".into()],
         from: Some(runner.state.base_commit.clone()), finished: true,
+        onto: None,
         error: None, stop: None, index_outside: None, launcher: None,
         infra: None, outage: None,
     };

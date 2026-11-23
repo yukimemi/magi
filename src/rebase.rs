@@ -37,6 +37,17 @@ use crate::land::seat_of;
 use crate::prompt;
 use crate::run::{QuotaLoss, RebaseFixRecord, RunState};
 
+/// Git output and operation identity retained across ordinary resource-stop resumes.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SequencerStop {
+    scratch: std::path::PathBuf,
+    branch: String,
+    original: String,
+    target: String,
+    at: Timestamp,
+    output: String,
+}
+
 /// How [`rebase_with_fixer`] ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Rebased {
@@ -93,16 +104,23 @@ pub(crate) async fn rebase_prepared(
 
     let mut said = String::new();
     if !git::rebase_in_progress(scratch).await {
-        match git::rebase_execute(&repo, scratch, onto).await? {
+        match git::rebase_execute(&repo, scratch, onto)
+            .await
+            .map_err(|e| sequencer_block(state, "", e))?
+        {
             git::RebaseStart::Applied => return Ok(Rebased::Applied),
-            git::RebaseStart::Failed(why) => return Ok(Rebased::Stopped(why)),
-            git::RebaseStart::Conflicted(why) => said = why,
+            git::RebaseStart::Failed(why) => {
+                return Err(block(state, SEQUENCER_INFRASTRUCTURE, why));
+            }
+            git::RebaseStart::Conflicted(why) | git::RebaseStart::Sequencer(why) => said = why,
         }
     }
     // A tracking ref may have advanced while this rebase was parked. Finish
     // the saved operation against its own target, then start an ordinary
     // base sync if the requested target has moved.
-    let onto_sha = rebase_target(scratch).await?;
+    let onto_sha = rebase_target(scratch)
+        .await
+        .map_err(|e| sequencer_block(state, &said, e))?;
     // Every path that was ever unmerged: the marker check on the finished
     // tree looks at exactly these.
     let mut touched: Vec<String> = Vec::new();
@@ -117,20 +135,61 @@ pub(crate) async fn rebase_prepared(
             }
             return Ok(result);
         }
-        let paths = git::unmerged_paths(scratch).await.unwrap_or_default();
+        // A fixer that already worked on *this* stop point may have left the
+        // contents resolved with only the staging undone (a run killed between
+        // the steps). Finish that before the budget is looked at:
+        // re-confirming resolved files is not a conflict round.
+        match launcher_stage(state, scratch, &orig, &onto_sha).await? {
+            Launch::Advanced => continue,
+            Launch::Paused(output) => {
+                said = output;
+                continue;
+            }
+            Launch::Nothing(_) => {}
+        }
+        let paths = git::unmerged_paths(scratch)
+            .await
+            .map_err(|e| sequencer_block(state, &said, e))?;
         for p in &paths {
             if !touched.contains(p) {
                 touched.push(p.clone());
             }
         }
-        // A fixer that already worked on *this* stop point may have left the
-        // contents resolved with only the staging undone (a run killed between
-        // the steps). Finish that before the budget is looked at:
-        // re-confirming resolved files is not a conflict round.
-        if let Launch::Advanced = launcher_stage(state, scratch, &orig, &onto_sha).await? {
+        if paths.is_empty() {
+            let previous = state.sequencer_stop.as_ref().filter(|s| {
+                s.scratch == scratch
+                    && s.branch == branch
+                    && s.original == orig
+                    && s.target == onto_sha
+            });
+            let owner_retry = previous.and_then(|s| resume_generation(state, s.at));
+            if said.is_empty()
+                && let Some(s) = previous
+            {
+                said.clone_from(&s.output);
+            }
+            match retry_recording(state, scratch, branch, &orig, &onto_sha, owner_retry).await {
+                Ok(output) => said = output,
+                Err(error) => {
+                    state.sequencer_stop = Some(SequencerStop {
+                        scratch: scratch.to_owned(),
+                        branch: branch.to_owned(),
+                        original: orig.clone(),
+                        target: onto_sha.clone(),
+                        at: Timestamp::now(),
+                        output: said.clone(),
+                    });
+                    return Err(sequencer_block(state, &said, error));
+                }
+            }
             continue;
         }
-        let spent = stop_rounds(state, scratch).await;
+        let stop = git::stopped_pick(scratch)
+            .await
+            .and_then(|pick| pick.context("unmerged index without a verified stopped pick"))
+            .map_err(|e| sequencer_block(state, &said, e))?;
+        let spent = stop_rounds(state, &orig, &onto_sha, &stop)
+            .map_err(|e| sequencer_block(state, &said, e))?;
         if spent >= cap {
             let why = reason(spent, cap, &paths, &said, "the rounds are spent");
             abandon(&repo, scratch, branch, &orig).await;
@@ -145,9 +204,8 @@ pub(crate) async fn rebase_prepared(
             .config
             .resolve_roles()
             .context("resolve the roster for the rebase fix")?;
-        // The chain (`crate::fixer`): one round however many agents it takes.
-        let attempts = crate::fixer::attempts(state, &roles, &winner);
-        let ids: Vec<String> = attempts.iter().map(|(s, _)| s.id.clone()).collect();
+        let mut attempts = crate::fixer::attempts(state, &roles, &winner).into_iter();
+        let (spec, seat_key) = attempts.next().context("no rebase fixer")?;
 
         let round = spent + 1;
         let artifact_round = state.rebase_fixes.len() + 1;
@@ -178,16 +236,19 @@ pub(crate) async fn rebase_prepared(
 
         // Spent before the call, on disk: a run killed mid-round must not
         // get the round back.
-        let stop = rebase_head(scratch).await;
+        stop_identity(scratch, &orig, &onto_sha)
+            .await
+            .map_err(|e| sequencer_block(state, &said, e))?;
         let index_outside = Some(round_baseline(state, scratch, &paths).await?);
         state.rebase_fixes.push(RebaseFixRecord {
             outage: None,
-            agent: ids[0].clone(),
+            agent: spec.id.clone(),
             paths: paths.clone(),
             from: Some(orig.clone()),
+            onto: Some(onto_sha.clone()),
             finished: false,
             error: None,
-            stop,
+            stop: Some(stop),
             index_outside,
             launcher: None,
             infra: None,
@@ -201,61 +262,42 @@ pub(crate) async fn rebase_prepared(
         );
         state.save()?;
 
-        // Each id at most once, forward only. The round was spent and saved
-        // above, so a chain advance inside it spends nothing further and a
-        // crash cannot hand it back; only the record's `agent` follows the
-        // asked agent (saved before its call, like the round itself).
         let artifacts = agent::artifacts_dir(&state.dir());
-        let mut last = None;
-        for (i, (spec, seat_key)) in attempts.into_iter().enumerate() {
-            if i > 0 {
-                if let Some(r) = state.rebase_fixes.last_mut() {
-                    r.agent = spec.id.clone();
-                }
-                state.save()?;
-            }
-            let mut seat = seat_of(state, &seat_key, &spec.id);
-            let stem = if i == 0 {
-                format!("rebase-fix-{artifact_round}")
-            } else {
-                format!("rebase-fix-{artifact_round}-{}", spec.id)
-            };
-            let out = agent::invoke(
-                &spec,
-                &mut seat,
-                &Invocation {
-                    coordination: state.config.coordination.as_ref(),
-                    fetched_base: state.fetched_base.as_ref(),
-                    cwd: scratch,
-                    prompt: &prompt_text,
-                    timeout: Duration::from_secs(state.config.graph.timeout_fix),
-                    allow_write: true,
-                    sessions: state.config.graph.sessions,
-                    artifacts: &artifacts,
-                    stem: &stem,
-                    run: &state.id,
-                    node: "rebase",
-                    cache_dir: state.config.cache_dir().as_deref(),
-                    attachments: &[],
-                    writable: &[],
-                },
-            )
-            .await;
-            let seat_name = seat.key.clone();
-            state.seats.insert(seat.key.clone(), seat);
-            if let Some(next) = ids.get(i + 1)
-                && agent::chain_advances(&out)
-            {
-                let (class, why) = crate::fixer::failure_of(&out);
-                crate::graph::record_handover(
-                    state, "rebase", &seat_name, &spec.id, next, &class, &why,
-                );
-                continue;
-            }
-            last = Some((out, seat_name));
-            break;
+        let mut seat = seat_of(state, &seat_key, &spec.id);
+        let out = agent::invoke(
+            &spec,
+            &mut seat,
+            &Invocation {
+                coordination: state.config.coordination.as_ref(),
+                fetched_base: state.fetched_base.as_ref(),
+                cwd: scratch,
+                prompt: &prompt_text,
+                timeout: Duration::from_secs(state.config.graph.timeout_fix),
+                allow_write: true,
+                sessions: state.config.graph.sessions,
+                artifacts: &artifacts,
+                stem: &format!("rebase-fix-{artifact_round}"),
+                run: &state.id,
+                node: "rebase",
+                cache_dir: state.config.cache_dir().as_deref(),
+                attachments: &[],
+                writable: &[],
+            },
+        )
+        .await;
+        let seat_name = seat.key.clone();
+        state.seats.insert(seat.key.clone(), seat);
+        if round < cap
+            && agent::chain_advances(&out)
+            && let Some((next, _)) = attempts.next()
+        {
+            let (class, why) = crate::fixer::failure_of(&out);
+            crate::graph::record_handover(
+                state, "rebase", &seat_name, &spec.id, &next.id, &class, &why,
+            );
+            state.save()?;
+            continue;
         }
-        let (out, seat_name) = last.expect("the fixer chain always has an entry");
 
         let mut error = None;
         match out {
@@ -302,8 +344,12 @@ pub(crate) async fn rebase_prepared(
         }
         // The seat resolved contents; the launcher owns Git's metadata.
         // A denied write is a resumable stop with no further round.
-        if let Launch::Nothing(why) = launcher_stage(state, scratch, &orig, &onto_sha).await? {
-            state.event("rebase", format!("launcher staging skipped: {why}"));
+        match launcher_stage(state, scratch, &orig, &onto_sha).await? {
+            Launch::Nothing(why) => {
+                state.event("rebase", format!("launcher staging skipped: {why}"))
+            }
+            Launch::Paused(output) => said = output,
+            Launch::Advanced => {}
         }
         let finished = !git::rebase_in_progress(scratch).await;
         if let Some(r) = state.rebase_fixes.last_mut() {
@@ -320,6 +366,8 @@ enum Launch {
     Nothing(String),
     /// The sequencer moved (continued to the end or to the next stop).
     Advanced,
+    /// Continuing stopped again; retain Git's diagnostic for classification.
+    Paused(String),
 }
 
 /// The commit the sequencer is replaying right now.
@@ -328,6 +376,59 @@ async fn rebase_head(scratch: &Path) -> Option<String> {
         .await
         .ok()
         .filter(|s| !s.is_empty())
+}
+
+pub(crate) const SEQUENCER_INFRASTRUCTURE: &str = "sequencer-infrastructure";
+
+fn sequencer_block(state: &mut RunState, said: &str, error: anyhow::Error) -> anyhow::Error {
+    let detail = if said.is_empty() {
+        format!("{error:#}")
+    } else {
+        format!("{said}\n{error:#}")
+    };
+    block(state, SEQUENCER_INFRASTRUCTURE, detail)
+}
+
+fn resume_generation(state: &RunState, stopped_at: Timestamp) -> Option<u64> {
+    let task = state.origin.as_ref()?.task.as_deref()?;
+    let task = crate::queue::Queue::open().get(task).ok()?;
+    if task.execution_runs().last() != Some(&state.id) || task.fresh_start {
+        return None;
+    }
+    let resume = task.resumption.as_ref()?;
+    (resume.at > stopped_at && resume.instruction == task.instruction).then_some(resume.generation)
+}
+
+async fn retry_recording(
+    state: &mut RunState,
+    scratch: &Path,
+    branch: &str,
+    original: &str,
+    onto: &str,
+    owner_retry: Option<u64>,
+) -> Result<String> {
+    let wait = crate::repo_lock::WaitPolicy::current();
+    let lease = crate::repo_lock::SeatLease::operation_with(
+        scratch,
+        state.config.coordination.as_ref(),
+        &wait,
+    )
+    .await?;
+    git::claim_recording_retry(&state.repo, scratch, branch, original, onto, owner_retry).await?;
+    state.sequencer_stop = None;
+    state.event(
+        "rebase",
+        if owner_retry.is_some() {
+            "explicit resumption: retrying the recording exec"
+        } else {
+            "retrying the rescheduled recording exec once"
+        },
+    );
+    state.save()?;
+    let out = mutate(scratch, &["rebase", "--continue"], lease).await?;
+    let said = git::rebase_said(&format!("{}{}", out.stdout, out.stderr));
+    anyhow::ensure!(out.ok() || git::rebase_in_progress(scratch).await, "{said}");
+    Ok(said)
 }
 
 /// A denied or failed Git write is infrastructure: record it on the round,
@@ -415,15 +516,23 @@ async fn same_stop(state: &RunState, scratch: &Path) -> bool {
     let Some(last) = state.rebase_fixes.last() else {
         return false;
     };
+    if last.paths.is_empty() {
+        return false;
+    }
+    if let (Some(from), Some(onto)) = (&last.from, &last.onto)
+        && stop_identity(scratch, from, onto).await.is_err()
+    {
+        return false;
+    }
+    let Ok(Some(pick)) = git::stopped_pick(scratch).await else {
+        return false;
+    };
     match &last.stop {
-        Some(stop) => rebase_head(scratch).await.as_deref() == Some(stop.as_str()),
-        None => {
-            !last.paths.is_empty()
-                && state
-                    .rebase_fixes
-                    .iter()
-                    .all(|r| r.stop.is_none() && r.paths == last.paths)
-        }
+        Some(stop) => *stop == pick,
+        None => state
+            .rebase_fixes
+            .iter()
+            .all(|r| r.stop.is_none() && r.paths == last.paths),
     }
 }
 
@@ -436,20 +545,41 @@ fn stop_records(state: &RunState) -> &[RebaseFixRecord] {
     let start = state
         .rebase_fixes
         .iter()
-        .rposition(|r| r.stop != last.stop || (r.stop.is_none() && r.paths != last.paths))
+        .rposition(|r| {
+            r.stop != last.stop
+                || r.from
+                    .as_ref()
+                    .is_some_and(|from| Some(from) != last.from.as_ref())
+                || r.onto
+                    .as_ref()
+                    .is_some_and(|onto| Some(onto) != last.onto.as_ref())
+                || (r.stop.is_none() && r.paths != last.paths)
+        })
         .map_or(0, |i| i + 1);
     &state.rebase_fixes[start..]
 }
 
-async fn stop_rounds(state: &RunState, scratch: &Path) -> usize {
-    if same_stop(state, scratch).await {
-        stop_records(state)
-            .iter()
-            .filter(|record| record.outage.is_none())
-            .count()
-    } else {
-        0
+fn stop_rounds(state: &RunState, original: &str, onto: &str, pick: &str) -> Result<usize> {
+    let mut spent = 0;
+    for record in &state.rebase_fixes {
+        if record.from.as_deref().is_some_and(|from| from != original)
+            || record.onto.as_deref().is_some_and(|target| target != onto)
+        {
+            continue;
+        }
+        let stop = record
+            .stop
+            .as_deref()
+            .context("cannot attribute a previous fixer invocation to a pick")?;
+        if stop == pick {
+            anyhow::ensure!(
+                record.onto.is_some() || !state.handovers.iter().any(|h| h.node == "rebase"),
+                "legacy rebase handovers do not identify which pick spent the invocation"
+            );
+            spent += 1;
+        }
     }
+    Ok(spent)
 }
 
 async fn round_baseline(state: &mut RunState, scratch: &Path, paths: &[String]) -> Result<String> {
@@ -868,10 +998,19 @@ async fn launcher_stage(
         Err(e) => return Err(infra_stop(state, format!("{e:#}"))),
     };
     if !out.ok() && git::rebase_in_progress(scratch).await {
-        let again = git::unmerged_paths(scratch).await.unwrap_or_default();
-        // A new conflict is the next stop point, not a failure; the same
-        // stop with nothing unmerged is git unable to write.
-        if again.is_empty() || rebase_head(scratch).await == before {
+        let again = git::unmerged_paths(scratch)
+            .await
+            .map_err(|e| sequencer_block(state, &out.stderr, e))?;
+        let pick = git::stopped_pick(scratch)
+            .await
+            .map_err(|e| sequencer_block(state, &out.stderr, e))?;
+        if again.is_empty() && pick.is_none() {
+            return Ok(Launch::Paused(git::rebase_said(&format!(
+                "{}{}",
+                out.stdout, out.stderr
+            ))));
+        }
+        if again.is_empty() || pick == before {
             let said = git::rebase_said(&if out.stderr.is_empty() {
                 out.stdout
             } else {
@@ -1060,11 +1199,15 @@ pub(crate) async fn finish(
     said: &str,
 ) -> Result<Rebased> {
     let repo = state.repo.clone();
-    let spent = state.rebase_fixes.len();
+    let operation_rounds = state.rebase_fixes.iter().filter(|r| {
+        r.from.as_deref().is_none_or(|from| from == orig)
+            && r.onto.as_deref().is_none_or(|target| target == onto_sha)
+    });
     let cap = state.config.graph.review_rounds;
     let (head, problem) = completed_result(&repo, scratch, orig, onto_sha, touched).await?;
     match problem {
         None => {
+            let spent = operation_rounds.count();
             // The validated result may legitimately have different patch IDs
             // after conflict resolution. Persist its exact identity before
             // deleting the Git evidence needed to validate it again.
@@ -1087,6 +1230,9 @@ pub(crate) async fn finish(
             Ok(Rebased::Applied)
         }
         Some((what, paths)) => {
+            let spent = operation_rounds.clone().next_back().map_or(0, |last| {
+                operation_rounds.filter(|r| r.stop == last.stop).count()
+            });
             let why = reason(spent, cap, &paths, said, what);
             abandon(&repo, scratch, branch, orig).await;
             Ok(Rebased::Stopped(why))
@@ -2284,6 +2430,7 @@ mod tests {
             },
             paths,
             from: None,
+            onto: None,
             finished: false,
             error: None,
             launcher: None,
@@ -2497,11 +2644,15 @@ mod tests {
     async fn successful_progression_gets_a_budget_for_the_next_conflicting_commit() {
         let mut f = fixture_stops(true, "f.txt", 2, true).await;
         f.state.config.graph.review_rounds = 1;
-        assert_eq!(stop_rounds(&f.state, &f.scratch).await, 1);
+        let original = git::rev_parse(&f.state.repo, "topic").await.unwrap();
+        let onto = rebase_target(&f.scratch).await.unwrap();
+        let pick = rebase_head(&f.scratch).await.unwrap();
+        assert_eq!(stop_rounds(&f.state, &original, &onto, &pick).unwrap(), 1);
         std::fs::write(f.scratch.join("f.txt"), BOTH).unwrap();
         assert!(matches!(stage(&mut f).await.unwrap(), Launch::Advanced));
         assert_eq!(git::unmerged_paths(&f.scratch).await.unwrap(), ["g.txt"]);
-        assert_eq!(stop_rounds(&f.state, &f.scratch).await, 0);
+        let pick = rebase_head(&f.scratch).await.unwrap();
+        assert_eq!(stop_rounds(&f.state, &original, &onto, &pick).unwrap(), 0);
         let paths = git::unmerged_paths(&f.scratch).await.unwrap();
         let mut round = f.state.rebase_fixes[0].clone();
         round.index_outside = Some(
@@ -2512,7 +2663,7 @@ mod tests {
         round.paths = paths;
         round.stop = rebase_head(&f.scratch).await;
         f.state.rebase_fixes.push(round);
-        assert_eq!(stop_rounds(&f.state, &f.scratch).await, 1);
+        assert_eq!(stop_rounds(&f.state, &original, &onto, &pick).unwrap(), 1);
         std::fs::write(f.scratch.join("g.txt"), "upstream g\ng\n").unwrap();
         assert_eq!(
             rebase_with_fixer(&mut f.state, &f.scratch, "topic", "main")

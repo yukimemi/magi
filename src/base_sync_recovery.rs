@@ -200,15 +200,14 @@ impl RunState {
         {
             return format!("Approval invalidated: {reason}");
         }
+        if crate::repair_budget::legacy::legacy_sequencer_head(self).is_some() {
+            return crate::repair_budget::legacy::LEGACY_EXEC_ACTION.into();
+        }
         if self.resource_block.is_some() {
             return "Restore the required resource, then explicitly resume the retained run; automatic retries retain the synchronization budget".into();
         }
         if self.base_sync_recovery.stop.is_none()
-            && let Some(op) = self
-                .base_sync_recovery
-                .operations
-                .last()
-                .filter(|o| !o.finished)
+            && let Some(op) = self.pending_base_operation()
         {
             return format!(
                 "Resume reserved synchronization {} against base {}; inspect retained Git state if reconciliation is refused",
@@ -376,15 +375,17 @@ impl RunState {
         true
     }
 
+    pub(crate) fn pending_base_operation(&self) -> Option<&Operation> {
+        self.base_sync_recovery
+            .operations
+            .last()
+            .filter(|op| !op.finished)
+    }
+
     /// Reserve once before Git; retrying an unfinished operation spends nothing more.
     pub(crate) fn reserve_base_operation(&mut self, head: &str, tip: &str) {
         self.ensure_base_episode();
-        if self
-            .base_sync_recovery
-            .operations
-            .last()
-            .is_some_and(|o| !o.finished)
-        {
+        if self.pending_base_operation().is_some() {
             return;
         }
         let e = self.base_sync_recovery.episodes.last_mut().unwrap();
@@ -699,7 +700,7 @@ pub fn ensure_generic_release(
         && !crate::repair_budget::conflict_pending(task, &state)
     {
         anyhow::bail!(
-            "generic release cannot authorize textual conflict editing. {}",
+            "generic release cannot authorize this stopped synchronization. {}",
             state.base_sync_next_action()
         );
     }

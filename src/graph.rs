@@ -1445,6 +1445,11 @@ impl Runner {
                 "retained HEAD differs from the recorded stop head; inspect it first"
             );
         }
+        anyhow::ensure!(
+            crate::repair_budget::legacy::legacy_sequencer_head(&state).is_none(),
+            "{}",
+            crate::repair_budget::legacy::LEGACY_EXEC_ACTION
+        );
         state.ensure_base_episode();
         state.record_base_sync_stop(&head);
         anyhow::ensure!(
@@ -2295,6 +2300,11 @@ impl Runner {
             }
             self.state.save()?;
             return Ok(());
+        }
+        // A resource stop left the reserved synchronization unfinished. Reconcile
+        // its exact HEAD and base before starting any earlier graph stage.
+        if self.state.pending_base_operation().is_some() {
+            return self.finish_after_tally().await;
         }
         if let Err(e) = self.prep().await {
             if e.is::<crate::repo_lock::ResourceBlocked>() {
@@ -5594,13 +5604,7 @@ impl Runner {
 
         let head = git::rev_parse(&winner.worktree, "HEAD").await?;
         self.state.ensure_base_episode();
-        let mut pending = self
-            .state
-            .base_sync_recovery
-            .operations
-            .last()
-            .filter(|o| !o.finished)
-            .cloned();
+        let mut pending = self.state.pending_base_operation().cloned();
         let scratch = self.state.dir().join("base-sync");
         if git::rebase_in_progress(&scratch).await {
             // Older resource stops predate operation reservations. Import the
@@ -18623,6 +18627,7 @@ esac
             agent: "fixture".into(),
             paths: vec!["retained".into()],
             from: Some(head.clone()),
+            onto: None,
             stop: Some(git::rev_parse(&scratch, "REBASE_HEAD").await.unwrap()),
             index_outside: None,
             finished: false,

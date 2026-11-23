@@ -13272,6 +13272,50 @@ mod tests {
     }
 
     #[test]
+    fn sequencer_resource_resume_keeps_the_reserved_run_after_review_exhaustion() {
+        let home = tempfile::tempdir().unwrap();
+        let mut state = run_state(RunStatus::Blocked);
+        state.config.graph.review_rounds = 1;
+        let mut unresolved = review_round(1);
+        unresolved.blocking = 1;
+        unresolved.e2e.push(crate::run::CommandOutcome {
+            command: "verify".into(),
+            code: Some(1),
+            output_tail: "previous verification failed".into(),
+            duration_ms: 0,
+            resource_blocked: false,
+        });
+        state.reviews.push(unresolved);
+        state.base_sync = Some(crate::run::BaseSync {
+            tip: "base".into(),
+            behind: 1,
+            attempts: 0,
+            conflict: None,
+            already_in: None,
+        });
+        state.reserve_base_operation("winner", "base");
+        state.resource_block = Some(crate::run::ResourceBlock {
+            cause: crate::run::ResourceBlockCause::Other,
+            node: "rebase".into(),
+            kind: crate::rebase::SEQUENCER_INFRASTRUCTURE.into(),
+            detail: "recording exec failed".into(),
+            at: jiff::Timestamp::now(),
+        });
+        state.save_under(home.path()).unwrap();
+        assert_eq!(
+            crate::resume::validate(home.path(), &state.id).unwrap().id,
+            state.id
+        );
+        assert_eq!(
+            crate::repair_budget::legacy::classify(&state, "winner", "base").class,
+            crate::repair_budget::legacy::Class::SequencerInfrastructure
+        );
+        state.finish_base_operation(None);
+        state.save_under(home.path()).unwrap();
+        assert!(crate::resume::validate(home.path(), &state.id).is_err());
+    }
+
+    #[test]
     fn resource_blocked_verification_resumes_the_same_run() {
         for (kind, stage) in [
             ("cache", "clean"),
