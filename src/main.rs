@@ -5400,20 +5400,30 @@ async fn resume_run(
     if recover_base {
         Runner::authorize_base_recovery(&home, &run_id, &task.id).await?;
     }
-    if sync_base_only {
+    let hand_to_loop = if sync_base_only {
         magi::base_sync_only::queue(&mut task, &home, &run_id)?;
+        let hand_to_loop = live_loop(&home);
+        if hand_to_loop {
+            task.urgent = true;
+        }
+        queue.put(&mut task)?;
+        hand_to_loop
     } else {
         task.sync_only = None;
-        magi::resume::prepare_owner_pin(&queue, &mut task, &run_id, "cli-run-resume", None)?;
-    }
+        magi::resume::publish_owner_pin(&queue, &mut task, &run_id, "cli-run-resume", |task| {
+            let hand_to_loop = live_loop(&home)
+                && task.execution_runs().last() == Some(&run_id)
+                && !task.fresh_start
+                && task.review_branch.is_none()
+                && (magi::resume::has_post_repair_pin(task)
+                    || magi::daemon::loop_would_resume(&run_id));
+            if hand_to_loop {
+                task.urgent = true;
+            }
+            hand_to_loop
+        })?
+    };
     let sync_request = task.sync_only.clone();
-    // The loop picks `task.execution_runs().last()`, so it only resumes *this* run when it
-    // is that one and nothing else steers the attempt elsewhere.
-    let loop_resumes = task.execution_runs().last() == Some(&run_id)
-        && !task.fresh_start
-        && task.review_branch.is_none()
-        && (magi::resume::has_post_repair_pin(&task) || magi::daemon::loop_would_resume(&run_id));
-    let hand_to_loop = live_loop(&home) && (sync_base_only || loop_resumes);
     println!(
         "task {} (open it with `magi task show {}`)",
         task.short(),
@@ -5423,8 +5433,6 @@ async fn resume_run(
         // The loop resumes it: an attempt at a task whose newest run is
         // unfinished resumes that run (`Runner::resume`), never competes again.
         // The same pinned request is used by the standalone worker below.
-        task.urgent = true;
-        queue.put(&mut task)?;
         drop(guard);
         drop(claim);
         println!(
@@ -5433,7 +5441,6 @@ async fn resume_run(
         );
         task = follow_task_record(&queue, &home, &task.id).await?;
     } else {
-        queue.put(&mut task)?;
         drop(guard);
         let opts = standalone_opts(&task);
         drop(runner);

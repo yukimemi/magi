@@ -41,6 +41,14 @@ impl GateRepairRetry {
         .then_some(retry)
     }
 
+    pub(crate) fn dispatched(task: &Task) -> Option<&Self> {
+        task.gate_repair_retry.as_ref().filter(|retry| {
+            task.status == TaskStatus::Running
+                && task.resume_override.is_none()
+                && task.operator_decided_at == Some(retry.at)
+        })
+    }
+
     fn check_owner(task: &Task, state: &RunState) -> Result<()> {
         ensure!(
             task.execution_runs().last() == Some(&state.id)
@@ -64,19 +72,16 @@ impl GateRepairRetry {
         ensure!(
             self.run == state.id
                 && task.operator_decided_at == Some(self.at)
-                && crate::handover::gate_repair_stop(state)
-                && state.gate_repair_retry_pass.is_none()
-                && state
-                    .gate_repair_e2e
-                    .as_ref()
+                && crate::handover::failed_gate_repair_e2e(state)
                     .is_some_and(|e| e.head == self.head)
+                && state.gate_repair_retry_pass.is_none()
                 && self.evidence == Self::evidence(state)?,
             "saved post-repair E2E checkpoint changed or its retry was already spent"
         );
         Ok(())
     }
 
-    pub(crate) async fn check_head(&self, state: &RunState) -> Result<()> {
+    pub(crate) async fn retained_head(&self, state: &RunState) -> Result<String> {
         let winner = state
             .winner()
             .context("post-repair E2E retry has no retained winner")?;
@@ -84,6 +89,7 @@ impl GateRepairRetry {
             .await?
             .context("retained winner branch has no worktree")?;
         let path = winner.worktree.canonicalize()?;
+        let head = crate::git::rev_parse(&path, "HEAD").await?;
         ensure!(
             !winner.folded
                 && path.parent() == Some(state.worktree_root().canonicalize()?.as_path())
@@ -92,12 +98,15 @@ impl GateRepairRetry {
                     == Some(winner.branch.as_str())
                 && crate::git::rev_parse(&state.repo, &format!("refs/heads/{}", winner.branch))
                     .await?
-                    == self.head
-                && crate::git::rev_parse(&path, "HEAD").await? == self.head
+                    == head
                 && crate::git::is_clean(&path).await?,
-            "post-repair E2E retry does not match the clean retained winner worktree and head"
+            "post-repair E2E retry requires the clean owned winner worktree and branch tip"
         );
-        Ok(())
+        ensure!(
+            head == self.head || crate::git::is_ancestor(&path, &self.head, &head).await,
+            "the retained winner no longer descends from the authorized post-repair head"
+        );
+        Ok(head)
     }
 }
 
@@ -124,6 +133,10 @@ pub fn validate(home: &Path, id: &str) -> Result<RunState> {
     ensure!(crate::run::is_run_id(id), "invalid run id");
     crate::task_reassign::ensure_current(&crate::queue::Queue::at(home.join("queue")), id)?;
     let _owner = crate::pr_head::owner_lock(home, id)?;
+    validate_locked(home, id)
+}
+
+fn validate_locked(home: &Path, id: &str) -> Result<RunState> {
     let state = crate::run::RunState::load_under(id, home)?;
     ensure!(
         state.pending_sync_only().is_none(),
@@ -183,12 +196,7 @@ pub(crate) async fn spawn_detached(home: &Path, id: &str) -> Result<crate::worke
     // and execution lease. Preflight checked run liveness, and the task claim
     // acquired above excludes a concurrent queue driver; no scheduler reclaim
     // is required before this explicit resume.
-    ensure!(
-        task.sync_only.is_none(),
-        "the task has a pending base-only pass"
-    );
-    prepare_owner_pin(&queue, &mut task, id, "resume", None)?;
-    queue.put(&mut task)?;
+    publish_owner_pin(&queue, &mut task, id, "resume", |_| ())?;
     let opts = crate::daemon::Opts {
         repo: task.repo.clone(),
         config: task
@@ -259,8 +267,9 @@ pub(crate) fn pin_queued(
         .parent()
         .context("queue has no home")
         .map_err(BeforeQueueWrite)?;
-    let state = validate(home, run).map_err(BeforeQueueWrite)?;
-    let post_repair = crate::handover::gate_repair_stop(&state);
+    let _owner = crate::pr_head::owner_lock(home, run).map_err(BeforeQueueWrite)?;
+    let state = validate_locked(home, run).map_err(BeforeQueueWrite)?;
+    let post_repair = crate::handover::failed_gate_repair_e2e(&state).is_some();
     if applied.is_none()
         && task.status == TaskStatus::Queued
         && task
@@ -286,18 +295,23 @@ pub(crate) fn pin_queued(
     Ok(true)
 }
 
-/// Prepare a manual pin while the caller holds the owning task's claim. The
-/// caller saves the task and pin together before handing it to a worker.
-pub fn prepare_owner_pin(
+/// Save a manual pin under the owner's task claim and the run ownership lock.
+/// Handover must observe either the saved request or the earlier run state.
+pub fn publish_owner_pin<T>(
     queue: &Queue,
     task: &mut Task,
     run: &str,
     source: &str,
-    applied: Option<&str>,
-) -> Result<()> {
+    configure: impl FnOnce(&mut Task) -> T,
+) -> Result<T> {
     let home = queue.root().parent().context("queue has no home")?;
-    let state = validate(home, run)?;
-    prepare_pin(&state, task, queue, source, applied)
+    crate::task_reassign::ensure_current(queue, run)?;
+    let _owner = crate::pr_head::owner_lock(home, run)?;
+    let state = validate_locked(home, run)?;
+    prepare_pin(&state, task, queue, source, None)?;
+    let result = configure(task);
+    queue.put(task)?;
+    Ok(result)
 }
 
 pub(crate) fn prepare_pin(
@@ -316,11 +330,15 @@ pub(crate) fn prepare_pin(
         "base-only synchronization has not succeeded; resume with --sync-base-only before verifying"
     );
     let run = &state.id;
-    if crate::handover::gate_repair_stop(state) {
+    if let Some(e2e) = crate::handover::failed_gate_repair_e2e(state) {
         GateRepairRetry::check_owner(task, state)?;
         ensure!(task.status != TaskStatus::Done, "the owning task is done");
+        ensure!(
+            state.gate_repair_retry_pass.is_none(),
+            "post-repair E2E retry was already spent"
+        );
         let evidence = GateRepairRetry::evidence(state)?;
-        let head = state.gate_repair_e2e.as_ref().unwrap().head.clone();
+        let head = e2e.head.clone();
         release_standing(task);
         pin(task, run, applied);
         let at = task.resume_override.as_ref().unwrap().at;

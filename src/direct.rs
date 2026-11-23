@@ -257,7 +257,7 @@ pub fn claim_resume_owner(
     }
     if let Some(home) = queue.root().parent()
         && crate::run::RunState::load_under(run, home)
-            .is_ok_and(|state| crate::handover::gate_repair_stop(&state))
+            .is_ok_and(|state| crate::handover::failed_gate_repair_e2e(&state).is_some())
     {
         anyhow::bail!("post-repair E2E retry requires the existing owning task");
     }

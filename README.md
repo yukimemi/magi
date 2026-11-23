@@ -222,12 +222,15 @@ or `magi task control resume <full-run-id>` in chat. The request pins the
 existing task and run and requires an attempt to remain. It does not refill
 attempts or grant new fixer rounds. The worker checks ownership, the saved
 failure, and the clean retained winner before running `verify.e2e` on the
-repaired commit. A pass archives the old failure and continues through normal
-base synchronization, head-specific verification, and `verify.gate`. If
-synchronization changes the commit, the new head needs its own verification
-before publication. Existing merge approvals still apply.
+repaired commit. If the owned branch has advanced from that commit, magi
+spends the retry without using the old E2E result and resumes through normal
+base synchronization and verification of the actual head. A divergent or
+dirty checkout instead stops. On either path, the head being published needs
+its own E2E and gate results, and existing merge approvals still apply.
 A repeated failure or mismatched checkpoint leaves the task held without
-publishing or starting a replacement. A resource wait refunds the attempt.
+publishing or starting a replacement. Only an unspent, matching owner request
+protects this checkpoint from worktree handover; the old failure alone does
+not. A resource wait during the direct E2E recheck refunds the attempt.
 Explicitly resume again when the resource is available. A retry interrupted
 with an unknown result is not replayed.
 

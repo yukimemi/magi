@@ -1823,17 +1823,15 @@ impl Runner {
                     .context("post-repair E2E retry has no task owner")?,
             )?;
             anyhow::ensure!(
-                task.status == crate::queue::TaskStatus::Running
-                    && task.resume_override.is_none()
-                    && task.gate_repair_retry.as_ref() == Some(retry),
+                crate::resume::GateRepairRetry::dispatched(&task) == Some(retry),
                 "post-repair E2E retry was not dispatched by the owning task"
             );
             retry.check(&task, &disk)?;
             retry.check(&task, &execution.runner.state)?;
-            retry.check_head(&disk).await?;
+            retry.retained_head(&disk).await?;
         } else {
             anyhow::ensure!(
-                !crate::handover::gate_repair_stop(&disk),
+                crate::handover::failed_gate_repair_e2e(&disk).is_none(),
                 "post-repair E2E failure requires explicit owner resume"
             );
             crate::repair_budget::apply(&crate::run::home(), &mut execution.runner.state, &disk)
@@ -2538,14 +2536,7 @@ impl Runner {
         &mut self,
         retry: &crate::resume::GateRepairRetry,
     ) -> Result<bool> {
-        // Retry on the retained commit before synchronization can archive the
-        // original gate. Any later sync must independently verify its new head.
-        retry.check_head(&self.state).await?;
-        let winner = self
-            .state
-            .winner()
-            .context("missing retained winner")?
-            .clone();
+        let head = retry.retained_head(&self.state).await?;
         self.state.gate_repair_retry_pass = Some(
             self.state
                 .passes
@@ -2553,6 +2544,26 @@ impl Runner {
                 .context("retry has no execution pass")?
                 .index,
         );
+        if head != retry.head {
+            self.state.event(
+                "gate",
+                format!(
+                    "owner retry for {} consumed after winner advanced to {head}; ordinary head-bound verification follows",
+                    retry.head
+                ),
+            );
+            let previous = self.state.gate_repair_e2e.take();
+            self.archive_repair_e2e(&head, previous);
+            self.state.reconcile_verification_head(&head);
+            self.state.save()?;
+            return Ok(true);
+        }
+        // Retry before synchronization can archive the original gate.
+        let winner = self
+            .state
+            .winner()
+            .context("missing retained winner")?
+            .clone();
         self.state.event(
             "gate",
             format!("owner resumed post-repair E2E on {}", retry.head),
@@ -2574,7 +2585,10 @@ impl Runner {
             self.state.save()?;
             return Ok(false);
         }
-        retry.check_head(&self.state).await?;
+        anyhow::ensure!(
+            retry.retained_head(&self.state).await? == head,
+            "winner advanced during the authorized post-repair E2E; its result cannot be reused"
+        );
         let passed = outcomes.iter().all(CommandOutcome::ok);
         let previous = self
             .state
@@ -2584,10 +2598,22 @@ impl Runner {
                 passed,
                 outcomes,
             });
+        self.archive_repair_e2e(&head, previous);
+        if passed {
+            self.state.reconcile_verification_head(&head);
+        } else {
+            self.state
+                .event("gate", "post-repair E2E retry failed; nothing published");
+        }
+        self.state.save()?;
+        Ok(passed)
+    }
+
+    fn archive_repair_e2e(&mut self, head: &str, previous: Option<crate::run::GateRepairE2e>) {
         self.state
             .verification_history
             .push(crate::run::VerificationEvidence {
-                superseded_by: Some(retry.head.clone()),
+                superseded_by: Some(head.to_owned()),
                 archived_at: Some(Timestamp::now()),
                 fixes_spent: Some(self.state.gate_fixes.len()),
                 gate_head: None,
@@ -2595,14 +2621,6 @@ impl Runner {
                 gate: Vec::new(),
                 e2e: previous,
             });
-        if passed {
-            self.state.reconcile_verification_head(&retry.head);
-        } else {
-            self.state
-                .event("gate", "post-repair E2E retry failed; nothing published");
-        }
-        self.state.save()?;
-        Ok(passed)
     }
 
     /// The tail of the graph after a trustworthy tally: fold losers, review,

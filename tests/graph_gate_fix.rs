@@ -144,7 +144,7 @@ async fn owner_resume_rechecks_the_retained_gate_repair_before_publication() {
     let queue = Queue::open();
     let opts = magi::daemon::Opts { repo: fx.repo.clone(), ..Default::default() };
 
-    for scenario in ["success", "repeated-failure", "moved-head", "changed-checkpoint", "attempt-limit", "final-gate", "base-moved"] {
+    for scenario in ["success", "repeated-failure", "moved-head", "moved-head-fails", "changed-checkpoint", "attempt-limit", "final-gate", "base-moved"] {
         let _ = std::fs::remove_file(&fixed);
         let mut task = Task::new("create note.txt".into(), "create note.txt".into(), fx.repo.clone(), Source::Human);
         let claim = queue.file_claimed(&mut task).unwrap();
@@ -218,10 +218,10 @@ async fn owner_resume_rechecks_the_retained_gate_repair_before_publication() {
         task = magi::chat_control::resume(&queue, &magi::run::home(), &run).unwrap();
         let claim = queue.claim(&task.id).unwrap();
         assert_eq!(task.attempts, 1, "a resume pin does not refill attempts");
-        if scenario != "repeated-failure" {
+        if !matches!(scenario, "repeated-failure" | "moved-head-fails") {
             std::fs::write(&fixed, "").unwrap();
         }
-        if scenario == "moved-head" {
+        if matches!(scenario, "moved-head" | "moved-head-fails") {
             git(&winner, &["commit", "--allow-empty", "-m", "External head movement"]).await.unwrap();
         } else if scenario == "changed-checkpoint" {
             stopped.gate_repair_e2e.as_mut().unwrap().outcomes[0].output_tail = "different failure".into();
@@ -252,6 +252,24 @@ async fn owner_resume_rechecks_the_retained_gate_repair_before_publication() {
             assert_eq!(observed, format!("e2e {repaired}\ne2e {synced}\ngate {synced}\n"));
             assert_eq!(saved.gate_head.as_deref(), Some(synced.as_str()));
             assert_eq!(task.status, TaskStatus::Done);
+            continue;
+        }
+        if matches!(scenario, "moved-head" | "moved-head-fails") {
+            let moved = rev_parse(&winner, "HEAD").await.unwrap();
+            assert_ne!(moved, repaired);
+            assert!(saved.verification_history.iter().any(|record| {
+                record.e2e.as_ref().is_some_and(|e2e| e2e.head == repaired && !e2e.passed)
+            }));
+            if scenario == "moved-head" {
+                assert_eq!(observed, format!("e2e {moved}\ngate {moved}\n"));
+                assert_eq!(saved.gate_head.as_deref(), Some(moved.as_str()));
+                assert_eq!(task.status, TaskStatus::Done);
+            } else {
+                assert_eq!(observed, format!("e2e {moved}\n"));
+                assert_eq!(task.status, TaskStatus::Held);
+                assert!(saved.merge.is_none() && saved.pr.is_none());
+                assert!(magi::chat_control::resume(&queue, &magi::run::home(), &run).is_err());
+            }
             continue;
         }
         let expected = match scenario {

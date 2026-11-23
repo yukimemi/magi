@@ -1679,11 +1679,16 @@ pub(crate) fn apply_task_choice_actions(queue: &Queue, questions: &Questions, ho
             decision,
             ActionDecision::Requeue | ActionDecision::Hold | ActionDecision::Done
         );
+        let mut resume_owner = None;
         match decision {
             ActionDecision::Skip => continue,
             ActionDecision::Resume(run) => {
+                let Ok(owner) = crate::pr_head::owner_lock(home, &run) else {
+                    continue;
+                };
+                resume_owner = Some(owner);
                 if let Ok(state) = RunState::load_under(&run, home)
-                    && crate::handover::gate_repair_stop(&state)
+                    && crate::handover::failed_gate_repair_e2e(&state).is_some()
                 {
                     if let Err(error) =
                         crate::resume::prepare_pin(&state, &mut task, queue, "choice", Some(&q.id))
@@ -1748,6 +1753,7 @@ pub(crate) fn apply_task_choice_actions(queue: &Queue, questions: &Questions, ho
         // The applied id travels with the transition, so a failed save loses
         // neither and the answer is acted on at the next poll.
         record(queue, &mut task);
+        drop(resume_owner);
         if done && queue.get(&task.id).is_ok_and(|t| t.action_applied(&q.id)) {
             supersede_prior_runs(&task, home);
         }
@@ -2212,7 +2218,7 @@ fn settle_and_diagnose(
         task.last_error = Some(detail.to_owned());
         task.diagnostic = None;
         task.attempts = task.attempts.saturating_sub(1);
-        let post_repair = crate::handover::gate_repair_stop(state);
+        let post_repair = crate::handover::failed_gate_repair_e2e(state).is_some();
         if post_repair {
             task.hold_unrequested_retry(Some(format!(
                 "{}; no attempt was spent; explicitly resume to retry post-repair E2E",
@@ -5647,7 +5653,7 @@ async fn attempt_sync_only(
 }
 
 fn post_repair_held(state: &RunState) -> bool {
-    crate::handover::gate_repair_stop(state)
+    crate::handover::failed_gate_repair_e2e(state).is_some()
         || (state.status == RunStatus::Blocked
             && state.gate_repair_retry_pass.is_some()
             && !crate::handover::can_resume(state))
@@ -13371,6 +13377,90 @@ mod tests {
             );
             assert_eq!(resumed.attempts, 0);
         }
+    }
+
+    #[test]
+    fn post_repair_handover_protects_only_the_unspent_owner_request() {
+        let home = tempfile::tempdir().unwrap();
+        let queue = Queue::at(home.path().join("queue"));
+        let mut state = run_state(RunStatus::Blocked);
+        state.repo = home.path().to_owned();
+        state.config.graph.review_rounds = 1;
+        state.config.verify.e2e = vec!["verify".into()];
+        let mut review = review_round(1);
+        review.clean = true;
+        state.reviews.push(review);
+        let red = crate::run::CommandOutcome {
+            command: "verify".into(),
+            code: Some(1),
+            output_tail: "verification failed".into(),
+            duration_ms: 0,
+            resource_blocked: false,
+        };
+        state.gate_ran = true;
+        state.gate_head = Some("1".repeat(40));
+        state.gate.push(red.clone());
+        state.gate_fixes.push(crate::run::GateFixRecord {
+            agent: "fixture".into(),
+            failed: vec![red.clone()],
+            notes: String::new(),
+            committed: true,
+            error: None,
+        });
+        let repaired = "2".repeat(40);
+        state.gate_repair_e2e = Some(crate::run::GateRepairE2e {
+            head: repaired.clone(),
+            passed: false,
+            outcomes: vec![red],
+        });
+        let mut task = Task::new(
+            "resume gate".into(),
+            state.instruction.clone(),
+            state.repo.clone(),
+            Source::Human,
+        );
+        task.start(state.id.clone());
+        task.hold_machine(Some("post-repair verification failed".into()));
+        state.origin = Some(crate::run::Origin::queue(&task.id));
+        queue.put(&mut task).unwrap();
+
+        let protects =
+            |state: &RunState| crate::handover::has_resume_checkpoint(state, home.path());
+        assert!(
+            !protects(&state),
+            "failure alone does not reserve the worktree"
+        );
+        let reason = crate::handover::resume_refusal_under(&state, Some(home.path())).unwrap();
+        let diagnostic = reason.diagnostic(&state);
+        assert!(diagnostic.contains(&repaired));
+        assert!(diagnostic.contains(&format!("magi run --resume {}", state.id)));
+        crate::resume::prepare_pin(&state, &mut task, &queue, "chat", None).unwrap();
+        queue.put(&mut task).unwrap();
+        assert!(
+            protects(&state),
+            "queued explicit pin must survive handover"
+        );
+
+        let mut changed = state.clone();
+        changed.gate_repair_e2e.as_mut().unwrap().outcomes[0].output_tail =
+            "different failure".into();
+        assert!(!protects(&changed), "a stale pin protects no checkpoint");
+
+        task.start(state.id.clone());
+        queue.put(&mut task).unwrap();
+        assert!(
+            protects(&state),
+            "dispatch has not spent the authorization yet"
+        );
+        state.gate_repair_retry_pass = Some(2);
+        assert!(
+            !protects(&state),
+            "a consumed retry cannot block a successor"
+        );
+        assert_eq!(
+            crate::handover::resume_refusal_under(&state, Some(home.path())),
+            Some(crate::handover::ResumeRefusal::GateRepairRetryExhausted)
+        );
     }
 
     #[test]

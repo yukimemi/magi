@@ -503,6 +503,13 @@ impl ResumeRefusal {
         ));
         if matches!(self, Self::BaseSyncStop) {
             detail.push_str(&format!(" {}", state.base_sync_next_action()));
+        } else if matches!(self, Self::GateRepairE2eOwnerResume)
+            && let Some(e2e) = failed_gate_repair_e2e(state)
+        {
+            detail.push_str(&format!(
+                " Mandatory E2E failed on retained head {}. Use `magi run --resume {}`, the run's Web Resume action, or `magi task control resume {}` in chat. This pins the same run for E2E and the ordinary gate without refilling attempts or granting fixer rounds.",
+                e2e.head, state.id, state.id
+            ));
         }
         if matches!(self, Self::ReviewBudget { .. } | Self::ReviewDisabled) {
             detail.push_str(" To continue the retained implementation, first confirm its saved candidate branch and owning task with `magi task show <task-id>`. When the task is eligible and no driver is live, explicitly use `magi review <saved-branch> --task <task-id> --merge none --review-rounds <positive-rounds>`. This creates a review-only successor with a new review budget; it does not resume this run or start a new implementation competition. Existing ownership and checkpoint checks still apply.");
@@ -552,7 +559,7 @@ pub(crate) fn resume_refusal_under(state: &RunState, home: Option<&Path>) -> Opt
             Some(ResumeRefusal::BaseSyncStop)
         };
     }
-    if gate_repair_stop(state) {
+    if failed_gate_repair_e2e(state).is_some() {
         return Some(if state.gate_repair_retry_pass.is_none() {
             ResumeRefusal::GateRepairE2eOwnerResume
         } else {
@@ -623,14 +630,15 @@ fn resume_checkpoint(state: &RunState) -> bool {
 
 /// A definitive pre-publication failure after a gate fixer moved the winner.
 /// This is retained evidence, not automatic permission to rerun verification.
-pub(crate) fn gate_repair_stop(state: &RunState) -> bool {
+pub(crate) fn failed_gate_repair_e2e(state: &RunState) -> Option<&crate::run::GateRepairE2e> {
     fn failed(outcomes: &[crate::run::CommandOutcome]) -> bool {
         outcomes.iter().all(|o| !o.resource_blocked)
             && outcomes
                 .iter()
                 .any(|o| matches!(o.code, Some(code) if !matches!(code, 0 | 126 | 127)))
     }
-    state.status == RunStatus::Blocked
+    let e = state.gate_repair_e2e.as_ref()?;
+    (state.status == RunStatus::Blocked
         && !state.base_sync_blocked()
         && !resume_checkpoint(state)
         && state.pr.is_none()
@@ -646,19 +654,18 @@ pub(crate) fn gate_repair_stop(state: &RunState) -> bool {
         && state.gate_ran
         && failed(&state.gate)
         && !state.config.verify.e2e.is_empty()
-        && state.gate_repair_e2e.as_ref().is_some_and(|e| {
-            !e.passed
-                && !e.head.is_empty()
-                && failed(&e.outcomes)
-                && state
-                    .gate_head
-                    .as_ref()
-                    .is_some_and(|h| !h.is_empty() && h != &e.head)
-                && state
-                    .head_e2e
-                    .as_ref()
-                    .is_none_or(|other| other.head != e.head)
-        })
+        && !e.passed
+        && !e.head.is_empty()
+        && failed(&e.outcomes)
+        && state
+            .gate_head
+            .as_ref()
+            .is_some_and(|h| !h.is_empty() && h != &e.head)
+        && state
+            .head_e2e
+            .as_ref()
+            .is_none_or(|other| other.head != e.head))
+    .then_some(e)
 }
 
 /// A resumable publication, landing or owner decision must keep its existing
@@ -666,7 +673,28 @@ pub(crate) fn gate_repair_stop(state: &RunState) -> bool {
 /// a predecessor; completed runs may retain these fields as historical evidence.
 pub(crate) fn has_resume_checkpoint(state: &RunState, home: &Path) -> bool {
     state.status.resumable()
-        && (resume_checkpoint(state) || gate_repair_stop(state) || has_open_question(state, home))
+        && (resume_checkpoint(state)
+            || gate_repair_retry_pending(state, home)
+            || has_open_question(state, home))
+}
+
+fn gate_repair_retry_pending(state: &RunState, home: &Path) -> bool {
+    let Some(id) = state
+        .origin
+        .as_ref()
+        .and_then(|origin| origin.task.as_deref())
+    else {
+        return false;
+    };
+    state.gate_repair_retry_pass.is_none()
+        && failed_gate_repair_e2e(state).is_some()
+        && crate::queue::Queue::at(home.join("queue"))
+            .get(id)
+            .is_ok_and(|task| {
+                crate::resume::GateRepairRetry::queued(&task)
+                    .or_else(|| crate::resume::GateRepairRetry::dispatched(&task))
+                    .is_some_and(|retry| retry.check(&task, state).is_ok())
+            })
 }
 
 fn has_open_question(state: &RunState, home: &Path) -> bool {
@@ -765,7 +793,7 @@ pub async fn release(
         return Err(Refused::Unsafe {
             branch: branch.to_owned(),
             path: path.display().to_string(),
-            why: format!("run {} has a resumable publication, landing or decision checkpoint; resume that run instead of releasing its worktree", state.short()),
+            why: format!("run {} has a resumable verification, publication, landing or decision checkpoint; resume that run instead of releasing its worktree", state.short()),
         }.into());
     }
     let holder = inspect(repo, branch, &path, &state, &takeover.home).await?;
