@@ -3546,19 +3546,21 @@ async fn begin_upgrade(
         let Some(latest) = latest else {
             return StatusCode::NO_CONTENT.into_response();
         };
-        let failed = ui
-            .auto_failed_tag
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
-        let decision = auto_upgrade_decision(
-            &cfg.update,
-            updater::disabled_by_env(),
-            ui.upgrade_spawned.load(std::sync::atomic::Ordering::SeqCst)
-                || upgrade_in_motion(updater::read_progress(&ui.home).as_ref()).is_some(),
-            &latest.tag_name,
-            failed.as_deref(),
-        );
+        let in_motion = ui.upgrade_spawned.load(std::sync::atomic::Ordering::SeqCst)
+            || upgrade_in_motion(updater::read_progress(&ui.home).as_ref()).is_some();
+        let decision = {
+            let failed = ui
+                .auto_failed_tag
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            auto_upgrade_decision(
+                &cfg.update,
+                updater::disabled_by_env(),
+                in_motion,
+                &latest.tag_name,
+                failed.as_deref(),
+            )
+        };
         if let AutoUpgradeDecision::Skip(reason) = decision {
             updater::log_step(&ui.home, &format!("auto-upgrade: {reason}"));
             return StatusCode::NO_CONTENT.into_response();
@@ -24069,6 +24071,12 @@ mod tests {
         let progress = updater::read_progress(home.path()).unwrap();
         assert_eq!(progress.trigger, updater::UpgradeTrigger::Auto);
         assert_eq!(progress.stage, updater::Stage::Downloading);
+        assert_eq!(
+            begin_upgrade(&ui, updater::UpgradeTrigger::Manual, None)
+                .await
+                .status(),
+            StatusCode::CONFLICT
+        );
         assert!(progress.parked_run.is_none());
         assert!(ui.start_detached_loop().await.is_err());
         assert!(ui.start_loop(None).is_err());
@@ -24154,7 +24162,7 @@ mod tests {
             (
                 "333333",
                 3_u64,
-                "service",
+                "daemon-service",
                 "service:maintenance",
                 41_003_u32,
             ),
@@ -24200,7 +24208,7 @@ mod tests {
             .begin_talk_turn("active-chat-turn")
             .expect("claim chat turn")
             .expect("free chat turn");
-        assert_eq!(crate::worker::active(home.path()).unwrap().len(), 3);
+        assert_eq!(crate::worker::observe_active(home.path()).unwrap().len(), 3);
 
         let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
@@ -24266,7 +24274,7 @@ mod tests {
         assert!(restarting.parked_run.is_none());
         assert!(restarting.parked_talks.is_empty());
 
-        let active_after = crate::worker::active(home.path()).unwrap();
+        let active_after = crate::worker::observe_active(home.path()).unwrap();
         assert_eq!(active_after.len(), 3);
         for (id, _, kind, key, pid) in workers {
             let job = active_after

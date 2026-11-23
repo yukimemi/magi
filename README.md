@@ -1342,10 +1342,11 @@ The same binary has three process roles:
 During an upgrade:
 
 1. `kaishin` replaces the installed executable.
-2. The scheduler stops claiming work and is replaced. Existing task, Chat and
-   maintenance workers continue on their immutable executable generations.
-3. The web closes admission briefly and finishes only outstanding
+2. The web closes admission briefly and drains only outstanding
    persistence-to-reservation handoffs, not agent invocations.
+3. The scheduler stops claiming work and is replaced. Existing task, Chat and
+   service workers and their pinned helpers continue on their original immutable
+   executable generations.
 4. The listener is released before the successor web starts on the same address.
    The browser reconnects; new work uses the new executable.
 
