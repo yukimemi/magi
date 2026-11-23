@@ -2669,16 +2669,32 @@ pub fn request_control(home: &Path, control: crate::worker::Control) -> Result<(
     crate::worker::request(home, "scheduler", control)
 }
 
+/// Resolve what a restart would replace without signalling the scheduler.
+pub(crate) fn scheduler_restart_options(home: &Path) -> Result<Option<Opts>> {
+    if let Some(job) = crate::worker::active(home)?
+        .into_iter()
+        .find(|job| job.kind == "scheduler")
+    {
+        return serde_json::from_value(job.payload)
+            .context("read detached scheduler options")
+            .map(Some);
+    }
+    if read_status(home).is_some_and(|r| r.worker_protocol == Some(1))
+        && crate::worker::try_lease(home, "scheduler")?.is_none()
+    {
+        let path = home.join("scheduler-options.json");
+        let body = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+        return serde_json::from_slice(&body)
+            .context("decode detached scheduler options")
+            .map(Some);
+    }
+    Ok(None)
+}
+
 /// Replace the scheduler, leaving all active task and conversation jobs alone.
 pub async fn restart_detached(home: &Path) -> Result<()> {
-    let active = crate::worker::active(home)?;
-    let prior = active.into_iter().find(|job| job.kind == "scheduler");
-    if prior.is_none() && !managed(home) {
+    let Some(opts) = scheduler_restart_options(home)? else {
         return Ok(());
-    }
-    let opts: Opts = match prior {
-        Some(job) => serde_json::from_value(job.payload)?,
-        None => serde_json::from_slice(&std::fs::read(home.join("scheduler-options.json"))?)?,
     };
     request_control(home, crate::worker::Control::Stop)?;
     loop {

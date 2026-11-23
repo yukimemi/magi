@@ -3565,7 +3565,6 @@ async fn begin_upgrade(
             updater::log_step(&ui.home, &format!("auto-upgrade: {reason}"));
             return StatusCode::NO_CONTENT.into_response();
         }
-        updater::log_step(&ui.home, "auto-upgrade: beginning update and restart");
         return finish_upgrade_request(
             ui,
             upgrade_checked_for(
@@ -3681,6 +3680,17 @@ fn upgrade_checked_for(
             }),
         ));
     };
+
+    if let Err(error) = daemon::scheduler_restart_options(&ui.home) {
+        let detail = format!("cannot determine scheduler restart state: {error:#}");
+        if trigger == updater::UpgradeTrigger::Auto {
+            updater::log_warn(&ui.home, &format!("auto-upgrade: {detail}"));
+        }
+        return Err(ApiError::internal(detail));
+    }
+    if trigger == updater::UpgradeTrigger::Auto {
+        updater::log_step(&ui.home, "auto-upgrade: beginning update and restart");
+    }
 
     let detail = "Downloading the release, then restarting web and scheduler. Active task and chat workers keep running on their started executable; nothing is parked.".to_owned();
 
@@ -24210,6 +24220,22 @@ mod tests {
             .expect("free chat turn");
         assert_eq!(crate::worker::observe_active(home.path()).unwrap().len(), 3);
 
+        // An unreadable reservation must defer replacement, not look like an
+        // idle scheduler. Once repaired, the same release can still proceed.
+        let corrupt = home.path().join("workers/jobs/444444");
+        std::fs::create_dir_all(&corrupt).unwrap();
+        std::fs::write(corrupt.join("job.json"), "{").unwrap();
+        let latest = || {
+            Some(kaishin::LatestRelease {
+                tag_name: "v999.0.0".into(),
+                html_url: String::new(),
+            })
+        };
+        let refused = begin_upgrade(&ui, updater::UpgradeTrigger::Auto, latest()).await;
+        assert_eq!(refused.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(updater::read_progress(home.path()).is_none());
+        std::fs::remove_dir_all(corrupt).unwrap();
+
         let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .expect("bind loopback");
@@ -24224,15 +24250,7 @@ mod tests {
             .insert(home.path().to_path_buf(), Arc::clone(&handover_signal));
 
         let admission = ui.begin_admission().expect("admit");
-        let response = begin_upgrade(
-            &ui,
-            updater::UpgradeTrigger::Auto,
-            Some(kaishin::LatestRelease {
-                tag_name: "v999.0.0".into(),
-                html_url: String::new(),
-            }),
-        )
-        .await;
+        let response = begin_upgrade(&ui, updater::UpgradeTrigger::Auto, latest()).await;
         assert_eq!(response.status(), StatusCode::ACCEPTED);
         tokio::time::timeout(Duration::from_secs(2), handover_signal.notified())
             .await

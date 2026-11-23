@@ -1621,8 +1621,11 @@ Skips and automatic triggers appear as `auto-upgrade:` entries in the upgrade
 log; `/api/health` includes the progress `trigger` (`manual` or `auto`).
 A failed automatic release tag is skipped for this process's lifetime; a
 different tag or a process restart allows another attempt. Failed-tag memory
-is not persisted. Config errors defer automatic updates. Older binaries reject
-the new `auto_restart` key, so upgrade them before adding it to shared config.
+is not persisted. Config errors defer automatic updates. If worker records or
+the scheduler's restart options cannot be read, neither trigger starts the
+installer; automatic checks can retry the same release once the state is
+readable again. Older binaries reject the new `auto_restart` key, so upgrade
+them before adding it to shared config.
 
 An arbitrary agent, or a deterministic stub for testing:
 
