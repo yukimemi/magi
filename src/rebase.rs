@@ -124,6 +124,11 @@ pub(crate) async fn rebase_prepared_with_exec(
             }
             git::RebaseStart::Conflicted(why) | git::RebaseStart::Sequencer(why) => said = why,
         }
+    } else {
+        git::finish_rebase_pick_capture(scratch, exec)
+            .await
+            .context("cannot record rebase picks")
+            .map_err(|e| sequencer_block(state, "", e))?;
     }
     // A tracking ref may have advanced while this rebase was parked. Finish
     // the saved operation against its own target, then start an ordinary
@@ -199,8 +204,7 @@ pub(crate) async fn rebase_prepared_with_exec(
             .await
             .and_then(|pick| pick.context("unmerged index without a verified stopped pick"))
             .map_err(|e| sequencer_block(state, &said, e))?;
-        let spent = stop_rounds(state, &orig, &onto_sha, &stop)
-            .map_err(|e| sequencer_block(state, &said, e))?;
+        let spent = stop_rounds(state, &orig, &onto_sha, &stop);
         if spent >= cap {
             let why = reason(spent, cap, &paths, &said, "the rounds are spent");
             abandon(&repo, scratch, branch, &orig).await;
@@ -596,28 +600,20 @@ fn stop_records(state: &RunState) -> &[RebaseFixRecord] {
     &state.rebase_fixes[start..]
 }
 
-fn stop_rounds(state: &RunState, original: &str, onto: &str, pick: &str) -> Result<usize> {
-    let mut spent = 0;
-    for record in &state.rebase_fixes {
-        if record.paths.is_empty()
-            || record.from.as_deref().is_some_and(|from| from != original)
-            || record.onto.as_deref().is_some_and(|target| target != onto)
-        {
-            continue;
-        }
-        let stop = record
-            .stop
-            .as_deref()
-            .context("cannot attribute a previous fixer invocation to a pick")?;
-        if stop == pick {
-            anyhow::ensure!(
-                record.onto.is_some() || !state.handovers.iter().any(|h| h.node == "rebase"),
-                "legacy rebase handovers do not identify which pick spent the invocation"
-            );
-            spent += 1;
-        }
-    }
-    Ok(spent)
+fn stop_rounds(state: &RunState, original: &str, onto: &str, pick: &str) -> usize {
+    // The launcher binds a verified legacy same-path stop to its pick. Any
+    // still-unidentified round compatible with this operation must count:
+    // treating an unknown pick as free could reissue a spent invocation.
+    state
+        .rebase_fixes
+        .iter()
+        .filter(|record| {
+            !record.paths.is_empty()
+                && record.from.as_deref().is_none_or(|from| from == original)
+                && record.onto.as_deref().is_none_or(|target| target == onto)
+                && record.stop.as_deref().is_none_or(|stop| stop == pick)
+        })
+        .count()
 }
 
 async fn round_baseline(state: &mut RunState, scratch: &Path, paths: &[String]) -> Result<String> {
@@ -2685,12 +2681,23 @@ mod tests {
         let original = git::rev_parse(&f.state.repo, "topic").await.unwrap();
         let onto = rebase_target(&f.scratch).await.unwrap();
         let pick = rebase_head(&f.scratch).await.unwrap();
-        assert_eq!(stop_rounds(&f.state, &original, &onto, &pick).unwrap(), 1);
+        assert_eq!(stop_rounds(&f.state, &original, &onto, &pick), 1);
         std::fs::write(f.scratch.join("f.txt"), BOTH).unwrap();
         assert!(matches!(stage(&mut f).await.unwrap(), Launch::Advanced));
         assert_eq!(git::unmerged_paths(&f.scratch).await.unwrap(), ["g.txt"]);
         let pick = rebase_head(&f.scratch).await.unwrap();
-        assert_eq!(stop_rounds(&f.state, &original, &onto, &pick).unwrap(), 0);
+        // The earlier pick handed over; neither of these older records knows
+        // its target. The known pick still separates their budgets.
+        crate::graph::record_handover(
+            &mut f.state,
+            "rebase",
+            "fix",
+            "first",
+            "next",
+            &crate::run::FailClass::Other("fixture".into()),
+            "fixture",
+        );
+        assert_eq!(stop_rounds(&f.state, &original, &onto, &pick), 0);
         let paths = git::unmerged_paths(&f.scratch).await.unwrap();
         let mut round = f.state.rebase_fixes[0].clone();
         round.index_outside = Some(
@@ -2699,9 +2706,10 @@ mod tests {
                 .unwrap(),
         );
         round.paths = paths;
-        round.stop = rebase_head(&f.scratch).await;
+        round.stop = None;
         f.state.rebase_fixes.push(round);
-        assert_eq!(stop_rounds(&f.state, &original, &onto, &pick).unwrap(), 1);
+        assert_eq!(stop_rounds(&f.state, &original, &onto, &pick), 1);
+        f.state.rebase_fixes.last_mut().unwrap().stop = Some(pick);
         std::fs::write(f.scratch.join("g.txt"), "upstream g\ng\n").unwrap();
         assert_eq!(
             rebase_with_fixer(&mut f.state, &f.scratch, "topic", "main")

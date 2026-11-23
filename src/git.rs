@@ -1204,6 +1204,8 @@ pub struct RebaseRecord {
 pub(crate) const REBASE_EXEC: &str =
     "git rev-parse HEAD >> \"$(git rev-parse --git-path magi-rebase-heads)\"";
 
+const REBASE_PICKS_PENDING: &str = "magi-rebase-picks-pending";
+
 async fn rebase_file(scratch: &Path, name: &str) -> Result<PathBuf> {
     let path = git(scratch, &["rev-parse", "--git-path", name]).await?;
     let path = Path::new(path.trim());
@@ -1296,6 +1298,26 @@ async fn save_rebase_picks(scratch: &Path, exec: &str) -> Result<()> {
     std::fs::write(&tmp, picks.join("\n") + "\n")?;
     std::fs::rename(tmp, path)?;
     Ok(())
+}
+
+/// Only a launcher-marked, not-yet-admitted replay may capture its pick
+/// ledger. Once a fixer can run, a missing ledger must never be rebuilt.
+pub(crate) async fn finish_rebase_pick_capture(scratch: &Path, exec: &str) -> Result<()> {
+    let pending = rebase_file(scratch, REBASE_PICKS_PENDING).await?;
+    match pending.symlink_metadata() {
+        Ok(meta) => ensure!(meta.is_file(), "invalid pick capture marker"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).context("inspect pick capture marker"),
+    }
+    let ledger = pending.with_file_name("magi-rebase-picks");
+    match ledger.symlink_metadata() {
+        Ok(meta) => ensure!(meta.is_file(), "invalid pick ledger"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            save_rebase_picks(scratch, exec).await?;
+        }
+        Err(e) => return Err(e).context("inspect pick ledger"),
+    }
+    std::fs::remove_file(pending).context("finish pick capture")
 }
 
 /// Under the caller's repository lease, prove that the next `--continue`
@@ -1571,6 +1593,7 @@ pub(crate) async fn rebase_execute(
     onto: &str,
     exec: &str,
 ) -> Result<RebaseStart> {
+    std::fs::File::create_new(rebase_file(scratch, REBASE_PICKS_PENDING).await?)?.sync_all()?;
     let out = git_raw(
         scratch,
         &[
@@ -1592,11 +1615,9 @@ pub(crate) async fn rebase_execute(
         .await
         .with_context(|| format!("{why}\ncannot read scratch rebase state"))?
     {
-        if let Err(error) = save_rebase_picks(scratch, exec).await {
-            return Ok(RebaseStart::Sequencer(format!(
-                "{why}\ncannot record rebase picks: {error:#}"
-            )));
-        }
+        finish_rebase_pick_capture(scratch, exec)
+            .await
+            .with_context(|| format!("{why}\ncannot record rebase picks"))?;
         return Ok(match unmerged_paths(scratch).await {
             Ok(paths) if paths.is_empty() => RebaseStart::Sequencer(why),
             Err(e) => RebaseStart::Sequencer(format!("{why}\ncannot read unmerged paths: {e:#}")),
@@ -1962,6 +1983,59 @@ mod tests {
             use std::os::unix::fs::PermissionsExt as _;
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn rebase_pick_ledger_publish_failure_can_resume() {
+        use crate::rebase::{Rebased, SEQUENCER_INFRASTRUCTURE, rebase_prepared_with_exec};
+        use crate::run::RunState;
+
+        crate::run::pin_test_home();
+        let (_temp, repo) = scratch().await;
+        let base = rev_parse(&repo, "main").await.unwrap();
+        sh(&repo, &["checkout", "-qb", "topic"]);
+        track(&repo, "topic", "topic").await;
+        let original = rev_parse(&repo, "topic").await.unwrap();
+        sh(&repo, &["checkout", "-q", "main"]);
+        track(&repo, "upstream", "upstream").await;
+        let mut state = RunState::new(
+            repo.clone(),
+            "main".into(),
+            base,
+            "sync".into(),
+            crate::config::Config::default(),
+        );
+        let work = repo.parent().unwrap().join("scratch");
+        rebase_prepare(&repo, &work, "topic").await.unwrap();
+        let obstacle = rebase_file(&work, "magi-rebase-picks.tmp").await.unwrap();
+        std::fs::create_dir(&obstacle).unwrap();
+        let exec = format!(
+            r#"if test -d "$(git rev-parse --git-path magi-rebase-picks.tmp)"; then echo 'fixture ledger failure' >&2; exit 1; fi; {REBASE_EXEC}"#
+        );
+        let error = rebase_prepared_with_exec(&mut state, &work, "topic", "main", &exec)
+            .await
+            .unwrap_err();
+        assert!(error.is::<crate::repo_lock::ResourceBlocked>());
+        let mut state = RunState::load(&state.id).unwrap();
+        let block = state.resource_block.as_ref().unwrap();
+        assert_eq!(block.kind, SEQUENCER_INFRASTRUCTURE);
+        assert!(block.detail.contains("fixture ledger failure"), "{block:?}");
+        assert!(
+            block.detail.contains("cannot record rebase picks"),
+            "{block:?}"
+        );
+        assert!(rebase_in_progress(&work).await);
+        assert_eq!(rev_parse(&repo, "topic").await.unwrap(), original);
+        std::fs::remove_dir(obstacle).unwrap();
+
+        assert_eq!(
+            rebase_prepared_with_exec(&mut state, &work, "topic", "main", &exec)
+                .await
+                .unwrap(),
+            Rebased::Applied
+        );
+        assert!(state.rebase_fixes.is_empty());
+        assert!(is_ancestor(&repo, "main", "topic").await);
     }
 
     async fn recording_exec_fixture(persistent: bool) {

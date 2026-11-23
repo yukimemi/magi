@@ -25,6 +25,12 @@ resume the owning run normally. A later explicit task resumption can retry
 the verified exec once; restarting the daemon does not renew the retry.
 Neither `--recover-base` nor a base-conflict repair grant is needed.
 
+If the initial pick ledger cannot be saved, magi pauses before continuing Git
+or calling a fixer. A scratch-local marker created before Git starts lets
+ordinary resume finish capturing the ledger after the write problem is fixed.
+Magi clears the marker before allowing any fixer to run; it never reconstructs
+a missing ledger after that boundary.
+
 Historical conflict records are not rewritten. Repair inspection identifies
 a failed recording exec when the saved Git diagnostic and matching empty-path
 fixer records establish it. That diagnosis does not authorize textual repair
