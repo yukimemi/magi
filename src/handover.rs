@@ -676,11 +676,15 @@ pub(crate) fn failed_gate_repair_e2e(state: &RunState) -> Option<&crate::run::Ga
 pub(crate) fn spent_post_repair_e2e_unresolved(state: &RunState) -> bool {
     state.gate_repair_retry_pass.is_some()
         && !resume_checkpoint(state)
-        && state.head_e2e.as_ref().is_some_and(|e| {
+        && (state.gate_repair_e2e.as_ref().is_some_and(|e| {
             !e.passed
-                && (state.resource_block.is_none() || !e.outcomes.is_empty())
-                && e.outcomes.iter().all(|o| !o.resource_blocked)
-        })
+                && e.outcomes.iter().any(|o| o.resource_blocked)
+                && e.outcomes.iter().any(|o| !o.resource_blocked)
+        }) || state.head_e2e.as_ref().is_some_and(|e| {
+            !e.passed
+                && (e.outcomes.is_empty() && state.resource_block.is_none()
+                    || e.outcomes.iter().any(|o| !o.resource_blocked))
+        }))
 }
 
 /// A resumable publication, landing or owner decision must keep its existing

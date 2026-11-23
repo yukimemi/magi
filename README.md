@@ -230,13 +230,16 @@ base synchronization and verification of the actual head. A divergent or
 dirty checkout instead stops. On either path, the head being published needs
 its own E2E and gate results, and existing merge approvals still apply.
 If base synchronization rewrites an existing public branch, magi makes the
-leased push only after verification, using the original observed remote tip.
+leased push only after verification, using the original observed remote tip
+or the SHA of its own last successful push. Magi saves that SHA before
+looking up or creating the pull request.
 A repeated failure or mismatched checkpoint leaves the task held without
 publishing or starting a replacement. Only an unspent, matching owner request
 protects this checkpoint from worktree handover; the old failure alone does
-not. A resource wait during the direct E2E recheck refunds the attempt.
-Explicitly resume again when the resource is available. A retry interrupted
-with an unknown result is not replayed, even on an advanced head. When no
+not. A resource wait before any E2E command finishes can refund the attempt.
+If a command already returned a result, a later resource wait does not
+refund or reopen the retry. A retry interrupted with an unknown result is
+not replayed, even on an advanced head. When no
 pending checkpoint protects the branch, you can request a successor review
 explicitly with `magi review <branch> --task <task-id> --merge none`.
 

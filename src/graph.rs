@@ -2581,7 +2581,8 @@ impl Runner {
             }
             result => result?,
         };
-        if verify_inconclusive(&outcomes) {
+        let deferred = verify_inconclusive(&outcomes);
+        if deferred && outcomes.iter().all(|o| o.resource_blocked) {
             self.state.gate_repair_retry_pass = None;
             self.state.save()?;
             return Ok(false);
@@ -2600,6 +2601,11 @@ impl Runner {
                 outcomes,
             });
         self.archive_repair_e2e(&head, previous);
+        if deferred {
+            // The saved outcomes retain the denial. It did not prevent the
+            // earlier commands from running, so do not refund this pass.
+            self.state.resource_block = None;
+        }
         if passed {
             self.state.reconcile_verification_head(&head);
         } else {
@@ -10114,6 +10120,13 @@ impl Runner {
                         empty: false,
                     }
                 } else {
+                    if let Some(lease) = &mut self.state.deferred_rebase_push {
+                        // Only our successful push advances this lease. A
+                        // fetch after restart must not adopt a human push.
+                        lease.expected.clone_from(&delivery_head);
+                        self.state.pr_pushed_head = Some(delivery_head.clone());
+                        self.state.save()?;
+                    }
                     if self.state.foreign_checkout.is_some() {
                         self.state.pr_pushed_head = Some(delivery_head.clone());
                     }
@@ -13390,6 +13403,12 @@ pub(crate) async fn verify_current_head(
         outcomes
     };
     let unresolved = verify_inconclusive(&outcomes);
+    let partial_retry = unresolved
+        && state.gate_repair_retry_pass.is_some()
+        && outcomes.iter().any(|o| !o.resource_blocked);
+    if partial_retry {
+        state.resource_block = None;
+    }
     let passed = !unresolved
         && outcomes.iter().all(CommandOutcome::ok)
         && git::rev_parse(&winner.worktree, "HEAD").await? == head;
@@ -13401,7 +13420,7 @@ pub(crate) async fn verify_current_head(
         passed,
         outcomes,
     });
-    if !passed && !unresolved {
+    if !passed && (!unresolved || partial_retry) {
         let detail = state
             .head_e2e
             .as_ref()

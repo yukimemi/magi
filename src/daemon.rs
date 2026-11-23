@@ -6697,6 +6697,12 @@ fn review_retry_starter(
     exists: bool,
     unfinished: Option<&str>,
 ) -> Starter {
+    if task.fresh_start
+        && let Some(branch) = branch
+        && task.review_of.as_deref() == Some(branch)
+    {
+        return Starter::Review(branch.to_owned());
+    }
     if let Some(run) = previous
         && unfinished == Some(run.id.as_str())
         && run.reviewed_commits.is_some()

@@ -133,6 +133,7 @@ async fn owner_resume_rechecks_the_retained_gate_repair_before_publication() {
     let log = fx.tmp.path().join("verification");
     let fixed = fx.tmp.path().join("e2e-ready");
     let gate_closed = fx.tmp.path().join("gate-closed");
+    let deny_second = fx.tmp.path().join("deny-second");
     fx.config.verify.e2e = vec![format!(
         "echo \"e2e $(git rev-parse HEAD)\" >> {}; test ! -f gatefix.txt || test -f {}",
         quote(&log), quote(&fixed),
@@ -144,7 +145,10 @@ async fn owner_resume_rechecks_the_retained_gate_repair_before_publication() {
     let queue = Queue::open();
     let opts = magi::daemon::Opts { repo: fx.repo.clone(), ..Default::default() };
 
-    for scenario in ["success", "timeout", "repeated-failure", "moved-head", "moved-head-fails", "changed-checkpoint", "attempt-limit", "final-gate", "base-moved"] {
+    for scenario in ["success", "timeout", "mixed-outcomes", "moved-head-mixed", "repeated-failure", "moved-head", "moved-head-fails", "changed-checkpoint", "attempt-limit", "final-gate", "base-moved"] {
+        let mixed = matches!(scenario, "mixed-outcomes" | "moved-head-mixed");
+        let moved_head = matches!(scenario, "moved-head" | "moved-head-fails" | "moved-head-mixed");
+        let _ = std::fs::remove_file(&deny_second);
         let _ = std::fs::remove_file(&fixed);
         let mut task = Task::new("create note.txt".into(), "create note.txt".into(), fx.repo.clone(), Source::Human);
         let claim = queue.file_claimed(&mut task).unwrap();
@@ -155,6 +159,12 @@ async fn owner_resume_rechecks_the_retained_gate_repair_before_publication() {
                 "{}; rc=$?; if [ \"$rc\" -ne 0 ]; then sleep 20; fi; exit \"$rc\"",
                 config.verify.e2e[0],
             );
+        }
+        if mixed {
+            config.verify.e2e.push(format!(
+                "test ! -f {} || {{ echo 'incremental cache admission blocked'; exit 1; }}",
+                quote(&deny_second),
+            ));
         }
         let mut runner = Runner::start(&fx.repo, task.instruction.clone(), config, Origin::queue(&task.id))
             .await.unwrap();
@@ -231,10 +241,13 @@ async fn owner_resume_rechecks_the_retained_gate_repair_before_publication() {
         task = magi::chat_control::resume(&queue, &magi::run::home(), &run).unwrap();
         let claim = queue.claim(&task.id).unwrap();
         assert_eq!(task.attempts, 1, "a resume pin does not refill attempts");
-        if !matches!(scenario, "repeated-failure" | "moved-head-fails") {
+        if mixed {
+            std::fs::write(&deny_second, "").unwrap();
+        }
+        if !mixed && !matches!(scenario, "repeated-failure" | "moved-head-fails") {
             std::fs::write(&fixed, "").unwrap();
         }
-        if matches!(scenario, "moved-head" | "moved-head-fails") {
+        if moved_head {
             git(&winner, &["commit", "--allow-empty", "-m", "External head movement"]).await.unwrap();
         } else if scenario == "changed-checkpoint" {
             stopped.gate_repair_e2e.as_mut().unwrap().outcomes[0].output_tail = "different failure".into();
@@ -267,7 +280,7 @@ async fn owner_resume_rechecks_the_retained_gate_repair_before_publication() {
             assert_eq!(task.status, TaskStatus::Done);
             continue;
         }
-        if matches!(scenario, "moved-head" | "moved-head-fails") {
+        if moved_head {
             let moved = rev_parse(&winner, "HEAD").await.unwrap();
             assert_ne!(moved, repaired);
             assert!(saved.verification_history.iter().any(|record| {
@@ -282,6 +295,13 @@ async fn owner_resume_rechecks_the_retained_gate_repair_before_publication() {
                 assert_eq!(task.status, TaskStatus::Held);
                 assert!(saved.merge.is_none() && saved.pr.is_none());
                 assert!(magi::chat_control::resume(&queue, &magi::run::home(), &run).is_err());
+                if mixed {
+                    let outcomes = &saved.head_e2e.as_ref().unwrap().outcomes;
+                    assert_eq!(outcomes[0].code, Some(1));
+                    assert!(outcomes[1].resource_blocked);
+                    assert_eq!(task.attempts, 2);
+                    continue;
+                }
                 let mut interrupted = saved;
                 interrupted.status = RunStatus::Gating;
                 interrupted.head_e2e.as_mut().unwrap().outcomes.clear();
@@ -293,13 +313,21 @@ async fn owner_resume_rechecks_the_retained_gate_repair_before_publication() {
             continue;
         }
         let expected = match scenario {
-            "repeated-failure" => format!("e2e {repaired}\n"),
+            "mixed-outcomes" | "repeated-failure" => format!("e2e {repaired}\n"),
             "final-gate" => format!("e2e {repaired}\ngate {repaired}\n"),
             _ => String::new(),
         };
         assert_eq!(observed, expected, "{scenario}");
         assert!(saved.merge.is_none() && saved.pr.is_none(), "{scenario}");
         assert_eq!(task.status, TaskStatus::Held, "{scenario}");
+        if scenario == "mixed-outcomes" {
+            let outcomes = &saved.gate_repair_e2e.as_ref().unwrap().outcomes;
+            assert_eq!(outcomes.len(), 2);
+            assert_eq!(outcomes[0].code, Some(1));
+            assert!(!outcomes[0].resource_blocked && outcomes[1].resource_blocked);
+            assert_eq!(task.attempts, 2);
+            assert!(magi::chat_control::resume(&queue, &magi::run::home(), &run).is_err());
+        }
         if matches!(scenario, "repeated-failure" | "final-gate") {
             assert!(magi::chat_control::resume(&queue, &magi::run::home(), &run).is_err());
             let _ = std::fs::remove_file(&gate_closed);
@@ -328,6 +356,23 @@ async fn owner_resume_rechecks_the_retained_gate_repair_before_publication() {
             assert_eq!(successor.runs.len(), 2);
             assert_eq!(successor.runs[0], run);
             assert_eq!(successor.status, TaskStatus::Done);
+
+            let remote_only = "remote-only-review";
+            let refspec = format!("{repaired}:refs/heads/{remote_only}");
+            git(&fx.repo, &["push", "origin", &refspec]).await.unwrap();
+            assert!(rev_parse(&fx.repo, &format!("refs/heads/{remote_only}")).await.is_err());
+            let out = common::magi_cli(&magi::run::home())
+                .current_dir(&fx.repo)
+                .args(["review", remote_only, "--task", &task.id, "--merge", "none", "--config"])
+                .arg(fx.tmp.path().join("successor.toml"))
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{out:?}");
+            let task = queue.get(&task.id).unwrap();
+            assert_eq!(task.runs.len(), 3);
+            let review = RunState::load(task.runs.last().unwrap()).unwrap();
+            assert_eq!(review.winner().unwrap().branch, remote_only);
+            assert_eq!(rev_parse(&review.winner().unwrap().worktree, "HEAD").await.unwrap(), repaired);
         }
     }
 }
@@ -351,6 +396,8 @@ async fn post_repair_rebase_pushes_only_after_verification() {
         git(&fx.repo, args).await.unwrap();
     }
     let old = remote_head(&fx.repo, "origin", branch).await.unwrap().unwrap();
+    let remote_at_gate = fx.tmp.path().join("remote-at-gate");
+    std::fs::write(&remote_at_gate, &old).unwrap();
     fx.config.merge.mode = magi::config::MergeMode::Pr;
     fx.config.graph.land = false;
     fx.config.graph.github_text_guard = false;
@@ -362,8 +409,8 @@ async fn post_repair_rebase_pushes_only_after_verification() {
         quote(&log), quote(&ready)
     )];
     fx.config.verify.gate = vec![format!(
-        "{GATE_NEEDS_FIX}; remote=$(git --git-dir={} rev-parse refs/heads/{branch}) && test \"$remote\" = {old} && echo \"gate $(git rev-parse HEAD)\" >> {}",
-        quote(&bare), quote(&log)
+        "{GATE_NEEDS_FIX}; remote=$(git --git-dir={} rev-parse refs/heads/{branch}) && test \"$remote\" = \"$(cat {})\" && echo \"gate $(git rev-parse HEAD)\" >> {}",
+        quote(&bare), quote(&remote_at_gate), quote(&log)
     )];
     let queue = Queue::open();
     let mut task = Task::new("Review source".into(), "Review source".into(), fx.repo.clone(), Source::Human);
@@ -404,19 +451,41 @@ async fn post_repair_rebase_pushes_only_after_verification() {
     }
     let path = std::env::var_os("PATH").unwrap();
     let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&path))).unwrap();
-    let out = common::magi_cli(&magi::run::home())
+    let resume = || common::magi_cli(&magi::run::home())
         .current_dir(&fx.repo)
-        .env("PATH", path)
+        .env("PATH", &path)
         .args(["run", "--resume", &run])
         .output()
         .unwrap();
-    let saved = RunState::load(&run).unwrap();
+    let out = resume();
+    let mut saved = RunState::load(&run).unwrap();
     let head = rev_parse(&checkout, "HEAD").await.unwrap();
     assert_ne!(head, repaired, "{out:?}");
     assert_eq!(saved.gate_head.as_deref(), Some(head.as_str()), "{out:?}");
     assert_eq!(std::fs::read_to_string(&log).unwrap(), format!("e2e {repaired}\ne2e {head}\ngate {head}\n"));
     assert!(!magi::git::is_ancestor(&fx.repo, &old, &head).await);
     assert_eq!(remote_head(&fx.repo, "origin", branch).await.unwrap().as_deref(), Some(head.as_str()), "{out:?}");
+    assert!(saved.pr.is_none());
+    assert_eq!(saved.pr_pushed_head.as_deref(), Some(head.as_str()));
+
+    // Restore the boundary before the forge response, keeping the saved push receipt.
+    saved.status = RunStatus::Gating;
+    saved.merge = None;
+    saved.save().unwrap();
+    std::fs::write(&remote_at_gate, &head).unwrap();
+    std::fs::write(&log, "").unwrap();
+    std::fs::write(fx.repo.join("upstream.txt"), "second base update\n").unwrap();
+    for args in [&["add", "upstream.txt"][..], &["commit", "-m", "Advance base again"], &["push", "origin", "main"]] {
+        git(&fx.repo, args).await.unwrap();
+    }
+    let out = resume();
+    let next = rev_parse(&checkout, "HEAD").await.unwrap();
+    assert_ne!(next, head, "{out:?}");
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), format!("e2e {next}\ngate {next}\n"));
+    assert!(!magi::git::is_ancestor(&fx.repo, &head, &next).await);
+    assert_eq!(remote_head(&fx.repo, "origin", branch).await.unwrap().as_deref(), Some(next.as_str()), "{out:?}");
+    let saved = RunState::load(&run).unwrap();
+    assert_eq!(saved.pr_pushed_head.as_deref(), Some(next.as_str()));
     assert!(saved.pr.is_none());
 }
 }
