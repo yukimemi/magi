@@ -279,6 +279,7 @@ mod tests {
             Message {
                 body: "送信1".into(),
                 sender: Some(Sender::Operator),
+                accepted_at: None,
                 display: None,
                 recovery_event: None,
                 reply: None,
@@ -287,6 +288,7 @@ mod tests {
             Message {
                 body: "内部通知".into(),
                 sender: Some(Sender::Magi),
+                accepted_at: None,
                 display: None,
                 recovery_event: None,
                 reply: None,
@@ -295,6 +297,7 @@ mod tests {
             Message {
                 body: "送信2".into(),
                 sender: Some(Sender::Operator),
+                accepted_at: None,
                 display: None,
                 recovery_event: None,
                 reply: None,

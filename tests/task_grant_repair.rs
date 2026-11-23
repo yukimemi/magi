@@ -313,9 +313,8 @@ async fn automatic_budget_hold_admits_only_an_explicit_same_run_repair() {
     ];
     let agent = spec.id.clone();
     let mut talk = magi::talk::begin(&store, &chat_config, fx.repo.clone(), Some(&agent)).unwrap();
-    let prior_instruction = magi::talk::record(
-        &mut talk, &store, "Repair the retained review once.", Vec::new(),
-    ).unwrap();
+    magi::talk::queue(&mut talk, &store, "Repair the retained review once.", Vec::new())
+        .unwrap();
     let lease = store.claim_turn(&talk.id).unwrap().unwrap();
     // Model an automatic requeue, not an operator release. Neither a requeue
     // nor another scheduler launch can replenish the recovery budget.
@@ -353,6 +352,13 @@ async fn automatic_budget_hold_admits_only_an_explicit_same_run_repair() {
     refused(&request, "owner hold"); // Exact legacy text without a settled pass.
     fixture_record["passes"] = settled;
     write_fixture(&fixture_record);
+    let changed = magi_cli(&magi::run::home())
+        .args(["task", "build-cache", &task.id, "isolated"])
+        .output().unwrap();
+    assert!(changed.status.success(), "{}", String::from_utf8_lossy(&changed.stderr));
+    let upgraded = queue.get(&task.id).unwrap();
+    assert_eq!(upgraded.status, TaskStatus::Held);
+    assert_eq!(upgraded.hold_reason, held.hold_reason);
     let legacy = accepted(&request);
     assert_eq!(legacy["request"]["run"], run.id);
 
@@ -387,8 +393,8 @@ async fn automatic_budget_hold_admits_only_an_explicit_same_run_repair() {
         true
     }).unwrap();
 
-    magi::talk::respond(&lease, &mut talk, &store, &chat_config, &prior_instruction)
-        .await.unwrap();
+    let text = magi::talk::drain(&mut talk, &store).unwrap().unwrap();
+    magi::talk::respond(&lease, &mut talk, &store, &chat_config, &text).await.unwrap();
     assert!(talk.turns.last().unwrap().body.contains("owner hold"), "{:?}", talk.turns.last());
     assert!(queue.get(&task.id).unwrap().repair_grants.is_empty());
     magi::talk::queue_magi(&mut talk, &store, "Automatic report: the task is held.").unwrap();
@@ -396,8 +402,10 @@ async fn automatic_budget_hold_admits_only_an_explicit_same_run_repair() {
     magi::talk::respond(&lease, &mut talk, &store, &chat_config, &text).await.unwrap();
     assert!(talk.turns.last().unwrap().body.contains("owner hold"), "{:?}", talk.turns.last());
     assert!(queue.get(&task.id).unwrap().repair_grants.is_empty());
-    magi::talk::say(&lease, &mut talk, &store, &chat_config, "Repair the retained review once.", Vec::new())
-        .await.unwrap();
+    magi::talk::queue(&mut talk, &store, "Repair the retained review once.", Vec::new())
+        .unwrap();
+    let text = magi::talk::drain(&mut talk, &store).unwrap().unwrap();
+    magi::talk::respond(&lease, &mut talk, &store, &chat_config, &text).await.unwrap();
     assert!(talk.turns.last().unwrap().body.contains("budget-review-1"), "{:?}", talk.turns.last());
     assert_eq!(queue.get(&task.id).unwrap().repair_grants.len(), 1, "the bridge accepted the grant");
     drop(lease);

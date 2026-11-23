@@ -712,6 +712,8 @@ struct RecoveryBudgetHold {
     pass: usize,
     held_at: Timestamp,
     decision: Option<Timestamp>,
+    #[serde(default)]
+    legacy: bool,
 }
 
 /// Failures against one recovery input generation. An owner release explicitly
@@ -1570,6 +1572,9 @@ impl Task {
     /// ([`Task::chat_notice_due`]).
     fn stamp_schema(&mut self) {
         self.preserve_legacy_build_cache();
+        if self.schema < RECOVERY_HOLD_SCHEMA && self.recovery_budget_hold.is_none() {
+            self.recovery_budget_hold = self.legacy_recovery_budget_hold();
+        }
         self.schema = self.schema.max(SCHEMA);
     }
 
@@ -2315,8 +2320,49 @@ impl Task {
                 pass: pass.pass_index,
                 held_at: self.held_at.expect("hold timestamp just recorded"),
                 decision: self.operator_decided_at,
+                legacy: false,
             });
         }
+    }
+
+    fn matches_budget_hold(&self, admission: &RecoveryAdmission) -> bool {
+        self.status == TaskStatus::Held
+            && self.hold_source == Some(HoldSource::Manual)
+            && self.machine_hold_cause.is_none()
+            && self.recovery_budget.as_ref().is_some_and(|budget| {
+                budget.instruction == self.instruction
+                    && budget.base == admission.base
+                    && budget.inputs == admission.inputs
+                    && budget.stage == "execution"
+                    && budget.failures >= self.attempt_limit.map_or(1, std::num::NonZeroUsize::get)
+                    && self
+                        .hold_reason
+                        .as_ref()
+                        .is_some_and(|reason| *reason == budget.budget_reason())
+            })
+    }
+
+    fn legacy_recovery_budget_hold(&self) -> Option<RecoveryBudgetHold> {
+        let held_at = self.held_at?;
+        let settled = self.passes.last()?;
+        let admission = self.recovery_admission.as_ref()?;
+        if !self.matches_budget_hold(admission)
+            || self.execution_runs().last() != Some(&settled.run)
+            || settled.cost != PassCost::Spent
+            || settled.parked.is_some()
+            || settled.settled_at > held_at
+            || self.operator_decided_at.is_some_and(|at| at >= held_at)
+        {
+            return None;
+        }
+        Some(RecoveryBudgetHold {
+            admission: admission.clone(),
+            run: settled.run.clone(),
+            pass: settled.pass_index,
+            held_at,
+            decision: self.operator_decided_at,
+            legacy: true,
+        })
     }
 
     pub(crate) fn held_for_recovery_budget(&self, run: &crate::run::RunState) -> bool {
@@ -2328,9 +2374,7 @@ impl Task {
         ) else {
             return false;
         };
-        if self.status != TaskStatus::Held
-            || self.hold_source != Some(HoldSource::Manual)
-            || self.machine_hold_cause.is_some()
+        if !self.matches_budget_hold(admission)
             || self.execution_runs().last() != Some(&run.id)
             || settled.run != run.id
             || settled.pass_index != pass.index
@@ -2339,17 +2383,6 @@ impl Task {
             || settled.settled_at < pass.started_at
             || settled.settled_at > held_at
             || self.operator_decided_at.is_some_and(|at| at >= held_at)
-            || !self.recovery_budget.as_ref().is_some_and(|budget| {
-                budget.instruction == self.instruction
-                    && budget.base == admission.base
-                    && budget.inputs == admission.inputs
-                    && budget.stage == "execution"
-                    && budget.failures >= self.attempt_limit.map_or(1, std::num::NonZeroUsize::get)
-                    && self
-                        .hold_reason
-                        .as_ref()
-                        .is_some_and(|reason| *reason == budget.budget_reason())
-            })
             || !crate::daemon::compatible_run_instruction(run, self)
         {
             return false;
@@ -2361,6 +2394,10 @@ impl Task {
                     && hold.held_at == held_at
                     && hold.decision == self.operator_decided_at
                     && &hold.admission == admission
+                    && (!hold.legacy
+                        || self
+                            .operator_decided_at
+                            .is_none_or(|at| at < pass.started_at))
             }
             None => {
                 self.schema < RECOVERY_HOLD_SCHEMA

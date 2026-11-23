@@ -8929,6 +8929,7 @@ impl TalkView {
                 if let Some(display) = talk::notice_display(&snapshot, original, None) {
                     turn.messages.push(talk::Message {
                         sender: Some(talk::Sender::Magi),
+                        accepted_at: None,
                         body: original.body.clone(),
                         display: Some(display),
                         recovery_event: None,
@@ -8969,6 +8970,7 @@ impl TalkView {
         {
             talk.pending_messages.push(talk::Message {
                 sender: Some(talk::Sender::Magi),
+                accepted_at: None,
                 display: Some(display),
                 recovery_event: None,
                 body: talk.pending.clone(),

@@ -193,6 +193,9 @@ pub struct Message {
     /// Display provenance; absent in legacy records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sender: Option<Sender>,
+    /// When this owner send was accepted, before any wait in the draft.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_at: Option<Timestamp>,
     /// Unmodified message text.
     pub body: String,
     /// Images belonging to this send.
@@ -335,7 +338,21 @@ fn messages_need_no_metadata(messages: &[Message]) -> bool {
             && message.recovery_event.is_none()
             && message.reply.is_none()
             && message.attachments.is_empty()
+            && message.accepted_at.is_none()
     })
+}
+
+pub(crate) fn owner_send_boundary(messages: &[Message]) -> Option<Timestamp> {
+    // A batch cannot lend a newer send's authority to older or undated text.
+    let mut earliest: Option<Timestamp> = None;
+    for message in messages
+        .iter()
+        .filter(|message| matches!(message.sender, None | Some(Sender::Operator)))
+    {
+        let at = message.accepted_at?;
+        earliest = Some(earliest.map_or(at, |earliest| earliest.min(at)));
+    }
+    earliest
 }
 
 /// One message in the conversation.
@@ -1804,15 +1821,17 @@ pub fn record_reply(
 }
 
 fn operator_turn(text: &str, attachments: Vec<Attachment>, reply: Option<Reply>) -> Turn {
+    let at = Timestamp::now();
     Turn {
         sender: Some(Sender::Operator),
         who: Who::Operator,
         body: text.to_owned(),
-        at: Timestamp::now(),
+        at,
         messages: vec![Message {
             display: None,
             recovery_event: None,
             sender: Some(Sender::Operator),
+            accepted_at: Some(at),
             body: text.to_owned(),
             attachments: attachments.clone(),
             reply,
@@ -1871,6 +1890,7 @@ pub(crate) fn restore_recorded_draft(
             display: None,
             recovery_event: None,
             sender: None,
+            accepted_at: None,
             body: fresh.pending.clone(),
             attachments: fresh.pending_attachments.clone(),
             reply: None,
@@ -1882,6 +1902,7 @@ pub(crate) fn restore_recorded_draft(
             display: None,
             recovery_event: None,
             sender: Some(Sender::Operator),
+            accepted_at: None,
             body: recorded.body,
             attachments: recorded.attachments,
             reply: None,
@@ -2175,6 +2196,7 @@ fn append_pending(
             display: None,
             recovery_event: None,
             sender: None,
+            accepted_at: None,
             body: fresh.pending.clone(),
             attachments: fresh.pending_attachments.clone(),
             reply: None,
@@ -2184,6 +2206,7 @@ fn append_pending(
         display,
         recovery_event,
         sender: Some(provenance),
+        accepted_at: (provenance == Sender::Operator).then(Timestamp::now),
         body: text.to_owned(),
         attachments: attachments.clone(),
         reply,
@@ -2605,10 +2628,12 @@ pub fn edit_pending_message(
             bail!("edit queued replies individually");
         }
         let reply = fresh.pending_messages.first().and_then(|m| m.reply.clone());
+        let accepted_at = owner_send_boundary(&fresh.pending_messages);
         fresh.pending_messages = vec![Message {
             display: None,
             recovery_event: None,
             sender: Some(Sender::Operator),
+            accepted_at,
             body: text.to_owned(),
             attachments: fresh.pending_attachments.clone(),
             reply,
@@ -3870,6 +3895,7 @@ fn plain_messages(body: &str, breaks: Option<&[usize]>) -> Vec<Message> {
             recovery_event: None,
             display: None,
             sender: None,
+            accepted_at: None,
             body: text.to_owned(),
             attachments: Vec::new(),
             reply: None,
@@ -4842,6 +4868,7 @@ mod tests {
                 turn.messages.push(Message {
                     recovery_event: None,
                     sender: Some(Sender::External),
+                    accepted_at: None,
                     body: body.to_owned(),
                     display: None,
                     attachments: Vec::new(),
@@ -6410,6 +6437,7 @@ mod tests {
                                 recovery_event: None,
                                 display: None,
                                 sender: Some(Sender::Magi),
+                                accepted_at: None,
                                 body: "message-only input".to_owned(),
                                 attachments: Vec::new(),
                                 reply: None,

@@ -503,19 +503,11 @@ async fn execute(
             // Keep run-state admission out of the shared control dispatcher
             // future, which is also embedded in ordinary CLI task operations.
             let owner_requested_at = match crate::chat_goal::current_source() {
-                crate::chat_goal::Source::Input { turn } => {
-                    talks.get(talk)?.turns.get(turn).and_then(|turn| {
-                        let operator = Some(crate::talk::Sender::Operator);
-                        let owner_input = if turn.messages.is_empty() {
-                            turn.sender == operator
-                        } else {
-                            turn.messages
-                                .iter()
-                                .any(|message| message.sender == operator)
-                        };
-                        owner_input.then_some(turn.at)
-                    })
-                }
+                crate::chat_goal::Source::Input { turn } => talks
+                    .get(talk)?
+                    .turns
+                    .get(turn)
+                    .and_then(|turn| crate::talk::owner_send_boundary(&turn.messages)),
                 _ => None,
             };
             let receipt = Box::pin(crate::repair_budget::grant_with_claim(
