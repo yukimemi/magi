@@ -14,6 +14,10 @@ Only a stopped pick with unmerged index entries can start a conflict fixer.
 `graph.review_rounds` limits actual fixer calls for that pick, including
 fallback agents and calls that report a quota or authentication failure.
 Staging or continuing an already resolved pick does not spend a call.
+On older runs, a fallback reused its round record. The saved round-start
+and handover events attribute those extra calls to their original pick.
+If the event history is incomplete, unattributed calls count conservatively
+when the active pick has a compatible legacy round.
 
 If Git stops with no unmerged paths, magi checks whether Git rescheduled its
 recording exec. When the scratch identity, todo and pick/HEAD records agree,

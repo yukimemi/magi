@@ -604,16 +604,67 @@ fn stop_rounds(state: &RunState, original: &str, onto: &str, pick: &str) -> usiz
     // The launcher binds a verified legacy same-path stop to its pick. Any
     // still-unidentified round compatible with this operation must count:
     // treating an unknown pick as free could reissue a spent invocation.
-    state
-        .rebase_fixes
+    let matches = |record: &RebaseFixRecord| {
+        !record.paths.is_empty()
+            && record.from.as_deref().is_none_or(|from| from == original)
+            && record.onto.as_deref().is_none_or(|target| target == onto)
+            && record.stop.as_deref().is_none_or(|stop| stop == pick)
+    };
+    let mut spent = 0;
+    let mut legacy = false;
+    for record in state.rebase_fixes.iter().filter(|record| matches(record)) {
+        spent += 1;
+        legacy |= record.onto.is_none();
+    }
+    if !legacy {
+        return spent;
+    }
+    let handovers = state
+        .handovers
         .iter()
-        .filter(|record| {
-            !record.paths.is_empty()
-                && record.from.as_deref().is_none_or(|from| from == original)
-                && record.onto.as_deref().is_none_or(|target| target == onto)
-                && record.stop.as_deref().is_none_or(|stop| stop == pick)
-        })
-        .count()
+        .filter(|h| h.node == "rebase")
+        .count();
+    spent + legacy_handover_calls(state, matches, handovers)
+}
+
+fn legacy_handover_calls(
+    state: &RunState,
+    matches: impl Fn(&RebaseFixRecord) -> bool,
+    handovers: usize,
+) -> usize {
+    if handovers == 0 {
+        return 0;
+    }
+    // Both writers logged a round start with each appended record, but the
+    // legacy writer overwrote that record's agent for every fallback. Use
+    // event order (not timestamps) to associate handovers with their round.
+    let mut records = state.rebase_fixes.iter();
+    let mut current = None;
+    let mut seen = 0;
+    let mut spent = 0;
+    for event in state.events.iter().filter(|e| e.node == "rebase") {
+        if event.message.contains(" conflicts with ")
+            && event.message.contains(" path(s)); fixer round ")
+        {
+            current = records.next();
+            if current.is_none() {
+                return handovers;
+            }
+        } else if event.message.split_once(": ").is_some_and(|(_, detail)| {
+            detail.starts_with("handed over ") || detail.starts_with("rate limited (quota) on ")
+        }) {
+            let Some(record) = current else {
+                return handovers;
+            };
+            seen += 1;
+            spent += usize::from(record.onto.is_none() && matches(record));
+        }
+    }
+    if seen != handovers || records.next().is_some() {
+        // Incomplete history cannot prove which pick spent the calls.
+        return handovers;
+    }
+    spent
 }
 
 async fn round_baseline(state: &mut RunState, scratch: &Path, paths: &[String]) -> Result<String> {
@@ -2675,6 +2726,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_fallback_calls_exhaust_the_cap_after_reload() {
+        let mut f = fixture(true).await;
+        f.state.config.graph.review_rounds = 3;
+        f.state.event(
+            "rebase",
+            "topic conflicts with main (1 path(s)); fixer round 1 of 3",
+        );
+        for (from, to) in [("first", "second"), ("second", "third")] {
+            crate::graph::record_handover(
+                &mut f.state,
+                "rebase",
+                "fix",
+                from,
+                to,
+                &crate::run::FailClass::Quota,
+                "quota",
+            );
+        }
+        f.state.rebase_fixes[0].agent = "third".into();
+        f.state.rebase_fixes[0].outage = Some(crate::agent::QuotaCause::Authentication);
+        f.state.save().unwrap();
+        let mut state = RunState::load(&f.state.id).unwrap();
+        let result = rebase_with_fixer(&mut state, &f.scratch, "topic", "main")
+            .await
+            .unwrap();
+        assert!(matches!(result, Rebased::Stopped(why) if why.contains("after 3 of 3")));
+        assert_eq!(state.rebase_fixes.len(), 1);
+        assert!(!f.scratch.exists());
+        std::fs::remove_dir_all(state.dir()).ok();
+    }
+
+    #[tokio::test]
     async fn successful_progression_gets_a_budget_for_the_next_conflicting_commit() {
         let mut f = fixture_stops(true, "f.txt", 2, true).await;
         f.state.config.graph.review_rounds = 1;
@@ -2682,12 +2765,10 @@ mod tests {
         let onto = rebase_target(&f.scratch).await.unwrap();
         let pick = rebase_head(&f.scratch).await.unwrap();
         assert_eq!(stop_rounds(&f.state, &original, &onto, &pick), 1);
-        std::fs::write(f.scratch.join("f.txt"), BOTH).unwrap();
-        assert!(matches!(stage(&mut f).await.unwrap(), Launch::Advanced));
-        assert_eq!(git::unmerged_paths(&f.scratch).await.unwrap(), ["g.txt"]);
-        let pick = rebase_head(&f.scratch).await.unwrap();
-        // The earlier pick handed over; neither of these older records knows
-        // its target. The known pick still separates their budgets.
+        f.state.event(
+            "rebase",
+            "topic conflicts with main (1 path(s)); fixer round 1 of 1",
+        );
         crate::graph::record_handover(
             &mut f.state,
             "rebase",
@@ -2697,6 +2778,10 @@ mod tests {
             &crate::run::FailClass::Other("fixture".into()),
             "fixture",
         );
+        std::fs::write(f.scratch.join("f.txt"), BOTH).unwrap();
+        assert!(matches!(stage(&mut f).await.unwrap(), Launch::Advanced));
+        assert_eq!(git::unmerged_paths(&f.scratch).await.unwrap(), ["g.txt"]);
+        let pick = rebase_head(&f.scratch).await.unwrap();
         assert_eq!(stop_rounds(&f.state, &original, &onto, &pick), 0);
         let paths = git::unmerged_paths(&f.scratch).await.unwrap();
         let mut round = f.state.rebase_fixes[0].clone();
@@ -2708,6 +2793,10 @@ mod tests {
         round.paths = paths;
         round.stop = None;
         f.state.rebase_fixes.push(round);
+        f.state.event(
+            "rebase",
+            "topic conflicts with main (1 path(s)); fixer round 1 of 1",
+        );
         assert_eq!(stop_rounds(&f.state, &original, &onto, &pick), 1);
         f.state.rebase_fixes.last_mut().unwrap().stop = Some(pick);
         std::fs::write(f.scratch.join("g.txt"), "upstream g\ng\n").unwrap();
