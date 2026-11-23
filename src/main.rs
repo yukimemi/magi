@@ -279,6 +279,9 @@ enum Command {
         /// Authorize a new bounded base synchronization interval after movement exhaustion.
         #[arg(long, requires = "resume", conflicts_with = "dry_run")]
         recover_base: bool,
+        /// Synchronize the retained winner to the fetched base, then hold without verification.
+        #[arg(long, requires = "resume", conflicts_with_all = ["recover_base", "dry_run"])]
+        sync_base_only: bool,
         #[command(flatten)]
         opts: RunOpts,
     },
@@ -856,6 +859,9 @@ enum ControlCmd {
     Resume {
         /// Full run id.
         run: String,
+        /// Synchronize the retained winner to the fetched base, then hold without verification.
+        #[arg(long)]
+        sync_base_only: bool,
     },
     /// Hold a task for the owner.
     Hold {
@@ -1712,6 +1718,7 @@ async fn dispatch(command: Command) -> Result<()> {
             issue,
             resume,
             recover_base,
+            sync_base_only,
             opts,
         } => {
             // A single trailing word is a run id: `magi run rm <id>`. More
@@ -1751,7 +1758,7 @@ async fn dispatch(command: Command) -> Result<()> {
                 );
             }
             if let Some(id) = resume {
-                return resume_run(&id, opts.dry_run, recover_base).await;
+                return resume_run(&id, opts.dry_run, recover_base, sync_base_only).await;
             }
             let queue = Queue::open();
             if let Some(task_id) = opts.task.as_deref() {
@@ -4265,7 +4272,16 @@ async fn task_cmd_inner(command: TaskCmd, q: Queue) -> Result<()> {
                     head,
                     request,
                 },
-                ControlCmd::Resume { run } => cc::Operation::Resume { run },
+                ControlCmd::Resume {
+                    run,
+                    sync_base_only,
+                } => {
+                    if sync_base_only {
+                        cc::Operation::SyncBaseOnly { run }
+                    } else {
+                        cc::Operation::Resume { run }
+                    }
+                }
                 ControlCmd::RecoverBase { run, head, request } => {
                     cc::Operation::RecoverBase { run, head, request }
                 }
@@ -5099,6 +5115,10 @@ const AGENT_FOLLOW: std::time::Duration = std::time::Duration::from_secs(240);
 /// [`AGENT_FOLLOW`] and exits non-zero: the outcome is unknown, so it must not
 /// read as a success. The error names the task id and `magi task show`.
 async fn follow_task(queue: &Queue, home: &Path, id: &str) -> Result<()> {
+    report_task_outcome(&follow_task_record(queue, home, id).await?)
+}
+
+async fn follow_task_record(queue: &Queue, home: &Path, id: &str) -> Result<queue::Task> {
     let followed = magi::direct::follow(
         queue,
         home,
@@ -5112,7 +5132,7 @@ async fn follow_task(queue: &Queue, home: &Path, id: &str) -> Result<()> {
     if let Some(err) = followed.unfinished() {
         return Err(err);
     }
-    report_task_outcome(&followed.task)
+    Ok(followed.task)
 }
 
 /// Is a loop in another process serving this machine's queue?
@@ -5230,7 +5250,12 @@ async fn run_existing_task(
 /// `magi run --resume <run>`: the run's owning task is claimed for the
 /// duration (so no loop resumes it too), and filed first when the run never
 /// had one. A live loop that would resume the run itself is handed the task.
-async fn resume_run(id: &str, dry_run: bool, recover_base: bool) -> Result<()> {
+async fn resume_run(
+    id: &str,
+    dry_run: bool,
+    recover_base: bool,
+    sync_base_only: bool,
+) -> Result<()> {
     let runner = Runner::resume(id)?;
     println!(
         "{}",
@@ -5266,6 +5291,10 @@ async fn resume_run(id: &str, dry_run: bool, recover_base: bool) -> Result<()> {
             runner.state.short()
         )
     })?;
+    ensure!(
+        !sync_base_only || magi::direct::resume_owner(&queue, &run_id).is_some(),
+        "sync-base-only requires a held task owning this run"
+    );
     let (mut task, claim) = magi::direct::claim_resume_owner(
         &queue,
         &run_id,
@@ -5274,6 +5303,10 @@ async fn resume_run(id: &str, dry_run: bool, recover_base: bool) -> Result<()> {
         task_source(None).await,
         &runner.state.sources,
     )?;
+    ensure!(
+        sync_base_only || task.sync_only.is_none() || task.status == TaskStatus::Running,
+        "the task has a pending base-only pass"
+    );
     if recover_base {
         Runner::authorize_base_recovery(&home, &run_id, &task.id).await?;
     }
@@ -5283,22 +5316,28 @@ async fn resume_run(id: &str, dry_run: bool, recover_base: bool) -> Result<()> {
         && !task.fresh_start
         && task.review_branch.is_none()
         && magi::daemon::loop_would_resume(&run_id);
-    let hand_to_loop = live_loop(&home) && loop_resumes;
+    let hand_to_loop = live_loop(&home) && (sync_base_only || loop_resumes);
     println!(
         "task {} (open it with `magi task show {}`)",
         task.short(),
         task.short()
     );
-    if !magi::repair_budget::queue_resumption(&queue, &mut task, &run_id)? {
-        task.release_operator("cli-run-resume", None);
+    if sync_base_only {
+        magi::base_sync_only::queue(&mut task, &home, &run_id)?;
+    } else {
+        task.sync_only = None;
+        if !magi::repair_budget::queue_resumption(&queue, &mut task, &run_id)? {
+            task.release_operator("cli-run-resume", None);
+        }
+        task.resume_override = Some(queue::OperatorResume {
+            question_id: String::new(),
+            at: jiff::Timestamp::now(),
+            conductor_rehold: None,
+            forced: true,
+            pinned_run: Some(run_id.clone()),
+        });
     }
-    task.resume_override = Some(queue::OperatorResume {
-        question_id: String::new(),
-        at: jiff::Timestamp::now(),
-        conductor_rehold: None,
-        forced: true,
-        pinned_run: Some(run_id.clone()),
-    });
+    let sync_request = task.sync_only.clone();
     if hand_to_loop {
         // The loop resumes it: an attempt at a task whose newest run is
         // unfinished resumes that run (`Runner::resume`), never competes again.
@@ -5311,13 +5350,30 @@ async fn resume_run(id: &str, dry_run: bool, recover_base: bool) -> Result<()> {
             "task {} marked urgent for the running magi loop",
             task.short()
         );
-        return follow_task(&queue, &home, &task.id).await;
+        task = follow_task_record(&queue, &home, &task.id).await?;
+    } else {
+        queue.put(&mut task)?;
+        drop(guard);
+        let opts = standalone_opts(&task);
+        drop(runner);
+        magi::daemon::run_detached_claimed(&opts, &queue, &mut task, claim).await?;
     }
-    queue.put(&mut task)?;
-    drop(guard);
-    let opts = standalone_opts(&task);
-    drop(runner);
-    magi::daemon::run_detached_claimed(&opts, &queue, &mut task, claim).await?;
+    if let Some(request) = sync_request {
+        let state = RunState::load(&request.run)?;
+        print!("{}", report::run(&state));
+        ensure!(
+            state
+                .sync_only_passes
+                .iter()
+                .any(|pass| pass.request == request
+                    && matches!(pass.result, magi::base_sync_only::Outcome::Synchronized)),
+            "{}",
+            task.last_error
+                .as_deref()
+                .unwrap_or("base synchronization did not complete")
+        );
+        return Ok(());
+    }
     report_task_outcome(&task)
 }
 

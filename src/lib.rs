@@ -27,6 +27,8 @@ pub mod already;
 pub mod ask;
 mod base_conflict;
 mod base_recovery_control;
+#[doc(hidden)]
+pub mod base_sync_only;
 mod base_sync_recovery;
 pub mod blind;
 pub mod blockers;

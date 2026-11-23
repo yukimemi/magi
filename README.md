@@ -972,11 +972,21 @@ Unix のチャット席では継承 FD、Windows ではローカル名前付き�
 | `magi task control reassign <task> --repo <selector>` | the same transaction through the authenticated standing-chat bridge. Use it for a clear owner request to move implementation elsewhere; if the channel is unavailable, report the launcher/backend infrastructure error. Reopening the conversation does not repair descriptor propagation. Never edit queue files or repeatedly resume the old run. Queue task actions also offer repository reassignment. |
 | `magi task control recover-base <full run id> --request <id> --head <retained-sha>` | explicitly authorizes bounded recovery of exhausted base movement and queues that exact run through the inherited chat channel. Inspect the retained HEAD; reuse identical request arguments after interruption. Generic resume grants no recovery budget. |
 | `magi task control resume <full run id>` | pins the owning task to that run and queues it; the loop resumes it under the graph's execution lease (same checks as the Web resume). It starts no driver itself, so it needs `magi serve` |
+| `magi task control resume <full run id> --sync-base-only` | queues a Git-only pass on the latest held, pre-publication winner. Requires an explicit owner request through the authenticated chat channel. |
 | `magi task control hold <task> [reason]` / `release <task>` | the same transitions as `magi task hold` / `release` |
 | `magi task control retry <task> <instruction>` | replaces a queued or held task's instruction and queues it in one save; attempts restart as for any release, runs and history are kept |
 | `magi task control rerun-checks <full run id> --request <id> --head <sha> --workflow <id>` | 指定した head と失敗 workflow を再確認し、リクエスト単位で再実行する。同じ操作の再送には同じ request ID を使う。`chat-controls/<talk>/<request>.json` に受付を記録し、結果不明の再送は拒否する |
 | `magi task control decide <question id> <option> [--title "<replacement>"]` | records the owner's decision on publication (github-text), branch divergence, release recovery or merge approval awaiting a chat decision. This includes repair, dismissal, withdrawal and replacement when available. No extra evidence is required. `use my text` requires the literal replacement title as `--title` data, which the existing publication gate vets. The calling chat, open record and offered choice are checked; existing consumers and transition checks apply the answer. |
 | `magi task control abandon <full run id>` | terminal, on the owner's request: the shared liveness judge runs under the owner lock and only a proven-dead driver is abandoned; a Live or Unknown driver is refused |
+
+From a terminal, use `magi run --resume <run> --sync-base-only`. The pass
+requires a fresh fetch and integrates that exact base without rewriting the
+winner's commits. It stops on conflict without changing the checkout, runs no
+setup, reviewers, fixers or verification, and does not publish or approve a
+merge. `magi show <run>` and the Web run report show the required base,
+observed HEADs and outcome. After a successful sync, use an ordinary explicit
+resume to verify the updated tree. The sync-only pass consumes no task attempt
+and grants no additional base-sync or repair budget.
 
 Windows の実 sandbox の限定チェックは認証済み CLI が必要。PowerShell で
 `$env:RUSTUP_TOOLCHAIN = "stable"` を設定し、

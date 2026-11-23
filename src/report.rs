@@ -1014,6 +1014,22 @@ pub fn run(state: &RunState) -> String {
         }
     }
 
+    if !state.sync_only_passes.is_empty() {
+        let _ = writeln!(s, "\n{}", bold("base synchronization only"));
+        for pass in &state.sync_only_passes {
+            let _ = writeln!(
+                s,
+                "  {} — {}\n    required: {} @ {}\n    HEAD: {} → {}",
+                pass.request.at,
+                pass.summary(),
+                pass.required_base,
+                pass.tip.as_deref().unwrap_or("not fetched"),
+                pass.head_before.as_deref().unwrap_or("unknown"),
+                pass.head_after.as_deref().unwrap_or("unknown"),
+            );
+        }
+    }
+
     if let Some(bs) = &state.base_sync {
         let _ = writeln!(s, "\n{}", bold("base sync"));
         let status = if let Some(a) = &bs.already_in {

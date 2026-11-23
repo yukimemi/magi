@@ -527,6 +527,9 @@ pub struct Task {
     /// *after* the answer. See [`OperatorResume`]. `#[serde(default)]`.
     #[serde(default)]
     pub resume_override: Option<OperatorResume>,
+    /// The sync-only fence survives consumption of the ordinary dispatch pin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_only: Option<crate::base_sync_only::Request>,
     /// Immutable repair receipts, saved atomically with the exact-run queue pin.
     #[serde(default)]
     pub repair_grants: Vec<crate::repair_budget::Receipt>,
@@ -1069,6 +1072,7 @@ impl Task {
             dispatched_resumes: Default::default(),
             base_recovery_requests: Vec::new(),
             resume_override: None,
+            sync_only: None,
             repair_grants: Vec::new(),
             repair_reconciliations: Vec::new(),
             resumption: None,
@@ -1470,6 +1474,7 @@ impl Task {
         self.stamp_schema();
         self.status = TaskStatus::Done;
         self.resume_override = None;
+        self.sync_only = None;
         self.last_error = None;
         self.park_reason = None;
         self.hold_reason = None;
@@ -1744,6 +1749,9 @@ impl Task {
     pub fn hold_manual(&mut self, reason: Option<String>) {
         // A later explicit hold supersedes outstanding triage answers.
         self.operator_decided_at = Some(Timestamp::now());
+        if self.status != TaskStatus::Running && self.sync_only.take().is_some() {
+            self.resume_override = None;
+        }
         self.hold_unrequested_retry(reason);
     }
 
@@ -1763,6 +1771,12 @@ impl Task {
         self.blocked_by.clear();
         self.block_reason = None;
         self.blocked_from = None;
+    }
+
+    pub(crate) fn hold_after_sync_only(&mut self, reason: String) {
+        let recovery_hold = self.recovery_budget_hold.take();
+        self.hold_unrequested_retry(Some(reason));
+        self.recovery_budget_hold = recovery_hold;
     }
 
     /// Take this task out of the loop's reach during automatic recovery.
@@ -3087,10 +3101,12 @@ impl Queue {
             // Receipt history is append-only; control state comes from the
             // newer snapshot, not from whichever writer happens to keep a receipt.
             if task.updated_at < stored.updated_at
-                && (stored
-                    .recovery_budget_hold
-                    .as_ref()
-                    .is_some_and(|hold| hold.held_at > task.updated_at)
+                && (task.sync_only != stored.sync_only
+                    || stored.sync_only.is_some()
+                    || stored
+                        .recovery_budget_hold
+                        .as_ref()
+                        .is_some_and(|hold| hold.held_at > task.updated_at)
                     || stored.repair_grants.last().is_some_and(|grant| {
                         task.repair_grants.last() != Some(grant)
                             || stored.operator_decided_at > task.operator_decided_at
@@ -3219,7 +3235,7 @@ impl Queue {
 
     fn write_record_inner(&self, task: &mut Task, notify: bool) -> Result<()> {
         task.import_chat_notice();
-        if task.status != TaskStatus::Held {
+        if task.status != TaskStatus::Held && task.sync_only.is_none() {
             task.recovery_budget_hold = None;
         }
         task.updated_at = Timestamp::now();

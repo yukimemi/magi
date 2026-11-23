@@ -2340,6 +2340,10 @@ fn note_open_question(task: &mut Task, run: &str, p: &Phrases) {
 /// not a second one that quietly drifts from it — and that is only checkable
 /// without spawning a real run.
 fn reclaim(task: &mut Task, last_run: Option<RunState>, max_attempts: usize, language: &str) {
+    if let Some(request) = task.sync_only.clone() {
+        crate::base_sync_only::settle(task, &request, last_run.as_ref(), None);
+        return;
+    }
     match last_run {
         Some(state) => {
             let verdict = Verdict {
@@ -3130,6 +3134,9 @@ enum LandResume {
 /// approval. Read-only - no claim taken, nothing written - so it is cheap
 /// enough to call on every candidate, every poll.
 fn land_resume_state(task: &Task) -> LandResume {
+    if task.sync_only.is_some() {
+        return LandResume::NotLanding;
+    }
     let Some(run_id) = task.execution_runs().last() else {
         return LandResume::NotLanding;
     };
@@ -4489,6 +4496,18 @@ async fn attempt(
     interrupt_pause: crate::graph::Pause,
     task: &mut Task,
 ) -> Vec<QuotaLoss> {
+    if let Some(request) = task.sync_only.clone() {
+        Box::pin(attempt_sync_only(
+            queue,
+            status,
+            stop,
+            interrupt_pause,
+            task,
+            request,
+        ))
+        .await;
+        return Vec::new();
+    }
     let repo = repo_for(task, &opts.repo);
     tracing::info!(
         "task {} — {} (repo {})",
@@ -5371,6 +5390,64 @@ async fn attempt(
         &quota_before,
         result,
     )
+}
+
+async fn attempt_sync_only(
+    queue: &Queue,
+    status: &Arc<Mutex<Status>>,
+    stop: &Stop,
+    interrupt: crate::graph::Pause,
+    task: &mut Task,
+    request: crate::base_sync_only::Request,
+) {
+    let result = async {
+        anyhow::ensure!(
+            task.status == TaskStatus::Queued
+                && task.execution_runs().last() == Some(&request.run)
+                && task.resume_override.as_ref().is_some_and(
+                    |pin| pin.at == request.at && pin.pinned_run.as_ref() == Some(&request.run)
+                ),
+            "sync-base-only request no longer owns the exact queued run"
+        );
+        let mut runner = Runner::resume(&request.run)?;
+        anyhow::ensure!(
+            public_resume_owner(&crate::run::home(), &task.runs, &runner.state.repo)
+                .await?
+                .is_none(),
+            "the task still has a public execution owner"
+        );
+        anyhow::ensure!(
+            !stop.parking() && !interrupt.parked(),
+            "paused before base synchronization"
+        );
+        let original = task.clone();
+        task.start(request.run.clone());
+        task.attempts = original.attempts;
+        if let Err(error) = queue.put(task) {
+            *task = original;
+            return Err(error);
+        }
+        if task.status != TaskStatus::Running || task.sync_only.as_ref() != Some(&request) {
+            return Ok(());
+        }
+        lock(status).current.push(Current {
+            worker: None,
+            task: task.id.clone(),
+            run: request.run.clone(),
+        });
+        runner.on_pause(stop.pause());
+        runner.watch_interrupt(interrupt);
+        runner.execute_sync_only(request.clone()).await
+    }
+    .await;
+    if task.sync_only.as_ref() == Some(&request) {
+        let saved = RunState::load(&request.run).ok();
+        let detail = result.err().map(|error| {
+            format!("Base synchronization only: {error:#}; verification was not allowed")
+        });
+        crate::base_sync_only::settle(task, &request, saved.as_ref(), detail);
+        record(queue, task);
+    }
 }
 
 /// Settle `task` after its run executed: the verdict, the diagnosis, the
@@ -10129,6 +10206,37 @@ mod tests {
                 .is_some_and(|e| e.contains("running")),
             "the operator needs to know why this task was held"
         );
+    }
+
+    #[test]
+    fn sync_base_only_orphan_holds_without_replay_or_attempt_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = Queue::at(dir.path().to_path_buf());
+        let mut task = task();
+        let run = "20261124-000000-dead";
+        task.link_run(run);
+        task.attempts = 2;
+        task.status = TaskStatus::Running;
+        task.sync_only = Some(crate::base_sync_only::Request {
+            run: run.into(),
+            at: Timestamp::now(),
+        });
+        queue.put(&mut task).unwrap();
+        assert_eq!(
+            reclaim_orphaned_running(&queue, 3, &Default::default()),
+            vec![task.id.clone()]
+        );
+        let saved = queue.get(&task.id).unwrap();
+        assert_eq!(saved.status, TaskStatus::Held);
+        assert_eq!(saved.attempts, 2);
+        assert_eq!(saved.execution_runs(), [run]);
+        assert!(
+            saved
+                .last_error
+                .unwrap()
+                .contains("verification was not allowed")
+        );
+        assert!(reclaim_orphaned_running(&queue, 3, &Default::default()).is_empty());
     }
 
     #[test]

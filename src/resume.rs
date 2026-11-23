@@ -63,6 +63,10 @@ pub(crate) async fn spawn_detached(home: &Path, id: &str) -> Result<crate::worke
     // and execution lease. Preflight checked run liveness, and the task claim
     // acquired above excludes a concurrent queue driver; no scheduler reclaim
     // is required before this explicit resume.
+    ensure!(
+        task.sync_only.is_none(),
+        "the task has a pending base-only pass"
+    );
     if !crate::repair_budget::queue_resumption(&queue, &mut task, id)? {
         task.release_operator("resume", None);
     }
@@ -126,6 +130,10 @@ pub(crate) fn pin_queued(
             "run queue owner changed"
         );
         ensure!(
+            task.sync_only.is_none(),
+            "the task has a pending base-only pass"
+        );
+        ensure!(
             match decided_before {
                 Some(answered) => task.operator_decided_at.is_none_or(|at| at <= answered),
                 None => true,
@@ -161,6 +169,10 @@ pub(crate) fn pin_standing(
     task: &mut crate::queue::Task,
     run: &str,
 ) -> Result<()> {
+    ensure!(
+        task.sync_only.is_none(),
+        "the task has a pending base-only pass"
+    );
     if !crate::repair_budget::queue_resumption(queue, task, run)? {
         release_standing(task);
     }

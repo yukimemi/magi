@@ -3751,7 +3751,10 @@ pub fn briefing_for(
          automatic reports resume this conversation through its own turn.\n\n\
          You can act on any task or run directly, whoever filed it: `magi task \
          control resume <full run id>` (queues the run for the loop to resume; \
-         it starts nothing itself). Exhausted base movement needs the owner's explicit \
+         it starts nothing itself). If the owner explicitly asks to sync a held \
+         pre-publication winner without verification, add `--sync-base-only`. \
+         Report the result from the run record and do not resume normally until asked. \
+         Exhausted base movement needs the owner's explicit \
          recovery request: `magi task control recover-base <full run id> \
          --request <unique-id> --head <retained-head-sha>` through this inherited \
          control channel. Inspect the retained HEAD first (full SHA or 7+ hex digits); \

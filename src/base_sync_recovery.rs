@@ -448,6 +448,10 @@ impl RunState {
     /// Legacy exhaustion is recognized only by the exact message and budget.
     /// Once recorded, its identity remains stable across no-progress passes.
     pub(crate) fn record_base_sync_stop(&mut self, head: &str) {
+        self.record_base_sync_stop_as(head, None);
+    }
+
+    pub(crate) fn record_base_sync_stop_as(&mut self, head: &str, kind: Option<StopKind>) {
         let Some(sync) = self.base_sync.as_ref() else {
             return;
         };
@@ -472,22 +476,25 @@ impl RunState {
                 self.base_branch, sync.behind, w.branch, crate::graph::BASE_SYNC_ROUNDS, noun, verb
             ))
         });
-        let kind = if self.base_sync_closure_pending() {
-            StopKind::ClosingIntegratedPr
-        } else if sync.attempts >= crate::graph::BASE_SYNC_ROUNDS && exhausted {
-            StopKind::Exhausted
-        } else if detail.contains("not rebasing over") {
-            StopKind::Divergence
-        } else if detail.contains("refused the push")
-            || detail.contains("could not push")
-            || detail.contains("could not be pushed")
-        {
-            StopKind::Publication
-        } else if detail.contains("conflicts with") && detail.contains("did not rebase") {
-            StopKind::Conflict
-        } else {
-            StopKind::Unknown
+        let inferred = || {
+            if self.base_sync_closure_pending() {
+                StopKind::ClosingIntegratedPr
+            } else if sync.attempts >= crate::graph::BASE_SYNC_ROUNDS && exhausted {
+                StopKind::Exhausted
+            } else if detail.contains("not rebasing over") {
+                StopKind::Divergence
+            } else if detail.contains("refused the push")
+                || detail.contains("could not push")
+                || detail.contains("could not be pushed")
+            {
+                StopKind::Publication
+            } else if detail.contains("conflicts with") && detail.contains("did not rebase") {
+                StopKind::Conflict
+            } else {
+                StopKind::Unknown
+            }
         };
+        let kind = kind.unwrap_or_else(inferred);
         let at = self
             .events
             .iter()
