@@ -271,7 +271,7 @@ async fn apply_inner(queue: &Queue, home: &Path, mut request: Request) -> Result
     // Stage the exemptions in memory for validation; authority and the pin are
     // published together only by the final queue write below.
     task.repair_reconciliations.push(receipt.clone());
-    controls(home, &task, &state, grant.request.kind)?;
+    controls(home, &task, &state, grant.request.kind, false)?;
     owner_effects_settled(home, &task, &state)?;
     unique_owner(queue, &task, &state)?;
     ensure!(task.status != TaskStatus::Running, "task driver is running");

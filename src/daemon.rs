@@ -4641,6 +4641,19 @@ async fn attempt(
         .flatten()
         .filter(|id| RunState::load(id).is_ok_and(|run| may_resume_run(&run, task)));
     let previous = resume_runs.last().and_then(|id| RunState::load(id).ok());
+    if task.repair_grants.last().is_some_and(|receipt| {
+        task.execution_runs().last() == Some(&receipt.request.run)
+            && task.operator_decided_at == receipt.decision
+            && previous
+                .as_ref()
+                .is_none_or(|run| run.id != receipt.request.run)
+    }) {
+        task.hold_unrequested_retry(Some(
+            "The retained repair run cannot be read or no longer owns this task's recovery. Inspect the saved grant and run; no replacement was started.".into(),
+        ));
+        record(queue, task);
+        return Vec::new();
+    }
     if let Some(id) = &task.disk_resume_run
         && unfinished.as_ref() != Some(id)
     {
@@ -4799,7 +4812,10 @@ async fn attempt(
                 })
             })
         {
-            task.hold_unrequested_retry(Some(reason));
+            task.hold_recovery_budget(
+                reason,
+                crate::queue::RecoveryAdmission { base: head, inputs },
+            );
             record(queue, task);
             return Vec::new();
         }
@@ -5329,6 +5345,10 @@ async fn attempt(
             "Could not persist task start; no agents dispatched: {error:#}"
         )));
         record(queue, task);
+        return Vec::new();
+    }
+    if task.status != TaskStatus::Running {
+        // Queue::put kept a newer hold or continuation instead of this start.
         return Vec::new();
     }
     lock(status).current.push(Current {

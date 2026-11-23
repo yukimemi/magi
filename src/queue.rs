@@ -143,7 +143,11 @@ use crate::id_reserve::{IdSource, path_exists};
 /// 22: typed disk resource waits and a retained execution pin for automatic recovery.
 /// 23: new tasks inherit `verify.build_cache` unless explicitly overridden.
 /// Older tasks retain shared builds.
-pub const SCHEMA: u32 = 23;
+///
+/// 24: bind automatic recovery-budget holds to their stopped execution.
+pub const SCHEMA: u32 = 24;
+
+const RECOVERY_HOLD_SCHEMA: u32 = 24;
 
 /// Candidate order only: all claims, lanes and eligibility gates still apply.
 /// Upgrade-parked runs retain their pass-start order ahead of ordinary work,
@@ -419,6 +423,8 @@ pub struct Task {
     /// see [`Task::operator_held`] for its deliberately conservative meaning.
     #[serde(default)]
     pub hold_source: Option<HoldSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recovery_budget_hold: Option<RecoveryBudgetHold>,
     /// Disk resource wait recorded by the admission gate; never owner consent.
     #[serde(default)]
     pub machine_hold_cause: Option<MachineHoldCause>,
@@ -691,12 +697,23 @@ pub struct Task {
 }
 
 /// Admission identity shared by start and settlement.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecoveryAdmission {
     /// Fetched upstream commit before any run-local rebase.
     pub base: String,
     /// Resolved instruction references and explicit review source.
     pub inputs: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RecoveryBudgetHold {
+    admission: RecoveryAdmission,
+    run: String,
+    pass: usize,
+    held_at: Timestamp,
+    decision: Option<Timestamp>,
+    #[serde(default)]
+    legacy: bool,
 }
 
 /// Failures against one recovery input generation. An owner release explicitly
@@ -717,6 +734,15 @@ pub struct RecoveryBudget {
     /// not count as progress. Unknown inputs never replenish the budget.
     #[serde(default)]
     pub progress: Option<String>,
+}
+
+impl RecoveryBudget {
+    fn budget_reason(&self) -> String {
+        format!(
+            "[recovery-budget] {} failed passes against unchanged inputs ({}). Inspect the retained recovery sources and correct the cause, change the inputs, or explicitly release the task to approve another generation. Automatic requeue does not reset this budget.",
+            self.failures, self.stage
+        )
+    }
 }
 
 fn recovery_progress(state: &crate::run::RunState) -> Option<String> {
@@ -1026,6 +1052,7 @@ impl Task {
             last_error: None,
             hold_reason: None,
             hold_source: None,
+            recovery_budget_hold: None,
             machine_hold_cause: None,
             disk_resume_run: None,
             disk_checked_at: None,
@@ -1545,6 +1572,9 @@ impl Task {
     /// ([`Task::chat_notice_due`]).
     fn stamp_schema(&mut self) {
         self.preserve_legacy_build_cache();
+        if self.schema < RECOVERY_HOLD_SCHEMA && self.recovery_budget_hold.is_none() {
+            self.recovery_budget_hold = self.legacy_recovery_budget_hold();
+        }
         self.schema = self.schema.max(SCHEMA);
     }
 
@@ -1552,6 +1582,7 @@ impl Task {
     /// that is already held keeps the time its hold began.
     fn note_held(&mut self) {
         self.stamp_schema();
+        self.recovery_budget_hold = None;
         let continuing = self.status == TaskStatus::Held
             || (self.status == TaskStatus::Blocked
                 && (self.blocked_from == Some(TaskStatus::Held)
@@ -2275,10 +2306,123 @@ impl Task {
             .as_ref()
             .filter(same_input)
             .or_else(|| self.recovery_generations.iter().rev().find(same_input))?;
-        (budget.instruction == self.instruction && budget.base == base && budget.inputs == inputs
-            && budget.failures >= limit.max(1)).then(|| format!(
-                "[recovery-budget] {} failed passes against unchanged inputs ({}). Inspect the retained recovery sources and correct the cause, change the inputs, or explicitly release the task to approve another generation. Automatic requeue does not reset this budget.",
-                budget.failures, budget.stage))
+        (budget.failures >= limit.max(1)).then(|| budget.budget_reason())
+    }
+
+    pub(crate) fn hold_recovery_budget(&mut self, reason: String, admission: RecoveryAdmission) {
+        self.hold_unrequested_retry(Some(reason));
+        if let Some(pass) = self.passes.last()
+            && self.execution_runs().last() == Some(&pass.run)
+        {
+            self.recovery_budget_hold = Some(RecoveryBudgetHold {
+                admission,
+                run: pass.run.clone(),
+                pass: pass.pass_index,
+                held_at: self.held_at.expect("hold timestamp just recorded"),
+                decision: self.operator_decided_at,
+                legacy: false,
+            });
+        }
+    }
+
+    fn matches_budget_hold(&self, admission: &RecoveryAdmission) -> bool {
+        self.status == TaskStatus::Held
+            && self.hold_source == Some(HoldSource::Manual)
+            && self.machine_hold_cause.is_none()
+            && self.recovery_budget.as_ref().is_some_and(|budget| {
+                budget.instruction == self.instruction
+                    && budget.base == admission.base
+                    && budget.inputs == admission.inputs
+                    && budget.stage == "execution"
+                    && budget.failures > 0
+                    && self
+                        .hold_reason
+                        .as_ref()
+                        .is_some_and(|reason| *reason == budget.budget_reason())
+            })
+    }
+
+    fn legacy_recovery_budget_hold(&self) -> Option<RecoveryBudgetHold> {
+        let held_at = self.held_at?;
+        let settled = self.passes.last()?;
+        let admission = self.recovery_admission.as_ref()?;
+        if !self.matches_budget_hold(admission)
+            || self.execution_runs().last() != Some(&settled.run)
+            || settled.cost != PassCost::Spent
+            || settled.parked.is_some()
+            || settled.settled_at > held_at
+            || self.operator_decided_at.is_some_and(|at| at >= held_at)
+        {
+            return None;
+        }
+        Some(RecoveryBudgetHold {
+            admission: admission.clone(),
+            run: settled.run.clone(),
+            pass: settled.pass_index,
+            held_at,
+            decision: self.operator_decided_at,
+            legacy: true,
+        })
+    }
+
+    pub(crate) fn held_for_recovery_budget(&self, run: &crate::run::RunState) -> bool {
+        let (Some(held_at), Some(settled), Some(pass), Some(admission)) = (
+            self.held_at,
+            self.passes.last(),
+            run.passes.last(),
+            self.recovery_admission.as_ref(),
+        ) else {
+            return false;
+        };
+        if !self.matches_budget_hold(admission)
+            || self.execution_runs().last() != Some(&run.id)
+            || settled.run != run.id
+            || settled.pass_index != pass.index
+            || settled.cost != PassCost::Spent
+            || settled.parked.is_some()
+            || settled.settled_at < pass.started_at
+            || settled.settled_at > held_at
+            || self.operator_decided_at.is_some_and(|at| at >= held_at)
+            || !crate::daemon::compatible_run_instruction(run, self)
+        {
+            return false;
+        }
+        match &self.recovery_budget_hold {
+            Some(hold) => {
+                hold.run == run.id
+                    && hold.pass == pass.index
+                    && hold.held_at == held_at
+                    && hold.decision == self.operator_decided_at
+                    && &hold.admission == admission
+                    && (!hold.legacy
+                        || self
+                            .operator_decided_at
+                            .is_none_or(|at| at < pass.started_at))
+            }
+            None => {
+                self.schema < RECOVERY_HOLD_SCHEMA
+                    && self
+                        .operator_decided_at
+                        .is_none_or(|at| at < pass.started_at)
+            }
+        }
+    }
+
+    pub(crate) fn queue_repair(&mut self, receipt: &crate::repair_budget::Receipt) {
+        self.stamp_schema();
+        self.repair_grants.push(receipt.clone());
+        self.status = TaskStatus::Queued;
+        self.hold_source = None;
+        self.hold_reason = None;
+        self.held_at = None;
+        self.recovery_budget_hold = None;
+        self.resume_override = Some(OperatorResume {
+            question_id: String::new(),
+            at: receipt.at,
+            conductor_rehold: None,
+            forced: true,
+            pinned_run: Some(receipt.request.run.clone()),
+        });
     }
 
     /// Put a held or finished task back in line, with its attempt count reset
@@ -2887,6 +3031,20 @@ impl Queue {
         self.put_unlocked(task)
     }
 
+    pub(crate) fn commit_repair_grant(
+        &self,
+        task: &mut Task,
+        expected: &serde_json::Value,
+    ) -> Result<()> {
+        let _lock = self.lock_task(&task.id)?;
+        anyhow::ensure!(
+            serde_json::to_value(self.get(&task.id)?)? == *expected,
+            "repair grant refused: task changed during admission"
+        );
+        self.write_record(task)
+            .context(crate::repair_budget::PublicationUnknown)
+    }
+
     /// Save a disk monitor transition only while its complete task snapshot matches.
     pub(crate) fn commit_disk_wait(&self, task: &mut Task, expected: &Task) -> Result<()> {
         let _lock = self.lock_task(&task.id)?;
@@ -2926,6 +3084,36 @@ impl Queue {
                     }
                 }
             }
+            // Receipt history is append-only; control state comes from the
+            // newer snapshot, not from whichever writer happens to keep a receipt.
+            if task.updated_at < stored.updated_at
+                && (stored
+                    .recovery_budget_hold
+                    .as_ref()
+                    .is_some_and(|hold| hold.held_at > task.updated_at)
+                    || stored.repair_grants.last().is_some_and(|grant| {
+                        task.repair_grants.last() != Some(grant)
+                            || stored.operator_decided_at > task.operator_decided_at
+                            || stored
+                                .resume_override
+                                .as_ref()
+                                .is_some_and(|pin| pin.at > task.updated_at)
+                            || (task.resume_override != stored.resume_override
+                                && task
+                                    .resume_override
+                                    .as_ref()
+                                    .is_some_and(|pin| pin.at == grant.at))
+                    }))
+                && task
+                    .operator_decided_at
+                    .is_none_or(|at| at <= stored.updated_at)
+                && task
+                    .resume_override
+                    .as_ref()
+                    .is_none_or(|pin| pin.at <= stored.updated_at)
+            {
+                *task = stored.clone();
+            }
             for key in &stored.base_recovery_requests {
                 if !task.base_recovery_requests.contains(key) {
                     task.base_recovery_requests.push(key.clone());
@@ -2937,16 +3125,8 @@ impl Queue {
                     .iter()
                     .any(|r| r.request.request == receipt.request.request)
                 {
-                    // A pre-grant snapshot cannot drop the atomic queue reservation.
+                    // History can be recovered independently of the live pin.
                     task.repair_grants.push(receipt.clone());
-                    task.resume_override = stored.resume_override.clone();
-                    task.status = stored.status;
-                    task.hold_source = stored.hold_source;
-                    task.machine_hold_cause = stored.machine_hold_cause.clone();
-                    task.disk_resume_run = stored.disk_resume_run.clone();
-                    task.disk_checked_at = stored.disk_checked_at;
-                    task.hold_reason = stored.hold_reason.clone();
-                    task.held_at = stored.held_at;
                 }
             }
             for receipt in &stored.repair_reconciliations {
@@ -3039,6 +3219,9 @@ impl Queue {
 
     fn write_record_inner(&self, task: &mut Task, notify: bool) -> Result<()> {
         task.import_chat_notice();
+        if task.status != TaskStatus::Held {
+            task.recovery_budget_hold = None;
+        }
         task.updated_at = Timestamp::now();
         std::fs::create_dir_all(&self.root)
             .with_context(|| format!("create {}", self.root.display()))?;

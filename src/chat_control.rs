@@ -502,9 +502,30 @@ async fn execute(
         Operation::GrantRepair { request } => {
             // Keep run-state admission out of the shared control dispatcher
             // future, which is also embedded in ordinary CLI task operations.
-            serde_json::to_string(
-                &Box::pin(crate::repair_budget::grant(queue, home, request)).await?,
-            )?
+            let owner_requested_at = match crate::chat_goal::current_source() {
+                crate::chat_goal::Source::Input { turn } => talks
+                    .get(talk)?
+                    .turns
+                    .get(turn)
+                    .and_then(|turn| crate::talk::owner_send_boundary(&turn.messages)),
+                _ => None,
+            };
+            let receipt = Box::pin(crate::repair_budget::grant_with_claim(
+                queue,
+                home,
+                request,
+                None,
+                owner_requested_at,
+            ))
+            .await
+            .map_err(|error| {
+                if error.is::<crate::repair_budget::PublicationUnknown>() {
+                    error
+                } else {
+                    BeforeEffect(error).into()
+                }
+            })?;
+            serde_json::to_string(&receipt)?
         }
         Operation::RecoverBase { run, head, request } => {
             let result = Box::pin(crate::base_recovery_control::recover(

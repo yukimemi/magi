@@ -453,6 +453,7 @@ fn legacy_notice_steps(
             display: None,
             recovery_event: None,
             sender: None,
+            accepted_at: None,
             body: legacy.pending.clone(),
             attachments: Vec::new(),
             reply: None,

@@ -810,7 +810,7 @@ enum ControlCmd {
         repo: PathBuf,
     },
 
-    /// Grant bounded repair budget on the owner's explicit request.
+    /// Grant bounded repair on explicit owner request. An automatic recovery-budget hold needs no release.
     GrantRepair {
         #[command(flatten)]
         request: magi::repair_budget::Request,
@@ -971,7 +971,7 @@ enum TaskCmd {
         #[arg(long)]
         run: String,
     },
-    /// Grant 1..=3 additional repairs and queue the exact stopped run (not merge approval).
+    /// Queue bounded repair of the exact stopped run. No release is needed for an automatic recovery-budget hold.
     GrantRepair {
         #[command(flatten)]
         request: magi::repair_budget::Request,

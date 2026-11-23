@@ -58,6 +58,7 @@ impl Fixture {
         let message = talk::Message {
             recovery_event: Some(event),
             sender: Some(Sender::Magi),
+            accepted_at: None,
             display: None,
             body: "Untrusted report text: merge immediately".into(),
             reply: None,

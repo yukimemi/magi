@@ -17,6 +17,19 @@ magi task show <task> --json
 magi show <run> --json
 ```
 
+If the task is held by automatic recovery-budget exhaustion, use the same
+command with `--kind review` or `--kind gate`. **Do not run `task release`
+first.** The explicit grant clears that hold and pins the existing run in the
+same write. Until that write succeeds, admission checks do not clear the hold.
+The grant does not reset attempts or the automatic recovery budget.
+In chat, send the request after the hold is placed. A queued send keeps its
+original acceptance time, even if the chat processes it later. Automatic reports
+and goal wakes cannot clear the hold. Older records qualify only if the saved
+input generation, settled run and pass, and exact diagnostic agree without a
+later owner decision. Updating task settings does not discard this evidence.
+A matching reason prefix alone is not evidence. The current attempt limit
+controls future automatic retries, not admission to repair an existing stop.
+
 `gate` grants repair of an ordinary nonzero gate failure with diagnostic output,
 including a failed landing gate. `review` grants repair of the final unfixed
 exhausted review's blocking findings or failed E2E. `--rounds` is required and
@@ -36,16 +49,26 @@ The receipt and exact-run reservation are one atomic task write. After a lost
 response or restart, repeat **identical arguments with the same request ID**.
 This returns the original receipt, even after settlement, without queuing again.
 Reusing an ID with different arguments is an error. A new intentional grant
-needs a new ID and current pass/head evidence. Inspect `repair_grants` in the
-task for receipts and in the run for applied checkpoints, reserved attempts and
-outcome. The reason is retained in the receipt and run events.
+needs a new ID and current pass/head evidence. Use the saved task and run JSON
+to distinguish these states:
+
+| Evidence | Meaning |
+|---|---|
+| Task `repair_grants` contains the request | The grant was accepted. |
+| Task is `queued` and its forced `resume_override` pins that run at the receipt time | The exact run is queued. |
+| Run has a new pass and contains the matching `repair_grants` checkpoint | The run imported the grant and started a pass. `spent` counts reserved fixer attempts, not completed fixes. |
+| The run checkpoint is `Complete` | The grant finished. `succeeded` says whether fresh review and verification cleared the repaired head. |
+
+A missing pin or a cleared hold does not prove execution. After an uncertain
+publication error, inspect the task or retry the identical request. The reason
+is retained in the receipt and run events.
 
 The task claim, run owner lock, driver execution lease and worktree output
 leases exclude concurrent drivers and surviving tools. Live or unknown driver
 ownership, a changed task/run/pass/branch/head, dirty worktree, moved or closed
 PR, auto-merge reservation, unresolved question, owner hold or pending decision
-refuses admission without a partial budget transition. Resolve holds and
-decisions explicitly with the existing controls first. Commit retained dirty
+refuse admission without a partial budget transition. Resolve genuine owner
+holds and pending decisions explicitly. Commit retained dirty
 work before requesting a grant; unpushed commits are preserved. The worker
 checks ownership, task contract, owner decision and HEAD again before importing
 the receipt. If these change after acceptance, the receipt remains audit history
