@@ -203,7 +203,7 @@ async fn owner_resume_rechecks_the_retained_gate_repair_before_publication() {
             magi::daemon::run_claimed(&opts, &queue, &mut task).await;
             assert_eq!(task.status, TaskStatus::Held);
             assert_eq!(std::fs::read_to_string(&log).unwrap(), "");
-            assert_eq!(task.runs, [run.clone()]);
+            assert_eq!(task.runs.as_slice(), std::slice::from_ref(&run));
         }
 
         drop(claim);
@@ -270,7 +270,7 @@ async fn owner_resume_rechecks_the_retained_gate_repair_before_publication() {
         drop(claim);
         let saved = RunState::load(&run).unwrap();
         let observed = std::fs::read_to_string(&log).unwrap();
-        assert_eq!(task.runs, [run.clone()], "{scenario}");
+        assert_eq!(task.runs.as_slice(), std::slice::from_ref(&run), "{scenario}");
         assert_eq!(saved.gate_fixes.len(), 1, "{scenario}");
         if scenario == "base-moved" {
             let synced = rev_parse(&winner, "HEAD").await.unwrap();
@@ -340,7 +340,7 @@ async fn owner_resume_rechecks_the_retained_gate_repair_before_publication() {
             magi::daemon::run_claimed(&opts, &queue, &mut task).await;
             drop(claim);
             assert_eq!(task.status, TaskStatus::Held);
-            assert_eq!(task.runs, [run.clone()]);
+            assert_eq!(task.runs.as_slice(), std::slice::from_ref(&run));
             std::fs::write(&fixed, "").unwrap();
             let config = fx.tmp.path().join("successor.toml");
             std::fs::write(&config, toml::to_string(&fx.config).unwrap()).unwrap();
