@@ -955,11 +955,13 @@ pub struct GateFixRecord {
 /// One fixer round spent on a rebase that stopped on a conflict: which fixer,
 /// what it was shown and whether git says the rebase then finished.
 ///
-/// The records at each sequencer stop count against `graph.review_rounds`,
-/// written to disk *before* the fixer runs so a park or crash cannot hand the
-/// round back.
+/// Records reserve a slot before invoking the fixer, so a park or crash
+/// cannot hand the round back without proof that no spawn was attempted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RebaseFixRecord {
+    /// Resource admission failed before any attempt to spawn the agent.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unstarted: bool,
     /// The fixer reported a machine outage. Its invocation still counts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outage: Option<crate::agent::QuotaCause>,

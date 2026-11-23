@@ -706,6 +706,7 @@ fn legacy_stop(runner: &mut Runner, head: &str, typed: bool) {
     runner.state.base_sync_recovery.operations.clear();
     runner.state.rebase_fixes = (0..3)
         .map(|_| magi::run::RebaseFixRecord {
+            unstarted: false,
             agent: "fixture".into(),
             paths: vec!["README.md".into()],
             from: Some(head.into()),
@@ -1005,6 +1006,7 @@ async fn modern_conflict_operation_ignores_legacy_history_on_grant_and_restart()
     let (_fx, task, mut runner, request) = stopped().await;
     // An upgraded run retains both successful and unfinished historical rounds.
     let old = magi::run::RebaseFixRecord {
+        unstarted: false,
         agent: "fixture".into(), paths: vec!["historical.txt".into()],
         from: Some(runner.state.base_commit.clone()), finished: true,
         onto: None,
@@ -1044,6 +1046,7 @@ async fn modern_conflict_sequencer_proof_ignores_unrelated_legacy_rounds() {
     let (_fx, task, mut runner, request) = stopped().await;
     runner.state.base_sync_recovery.operations.clear();
     let old = magi::run::RebaseFixRecord {
+        unstarted: false,
         agent: "fixture".into(), paths: vec!["README.md".into()],
         from: Some(runner.state.base_commit.clone()), finished: true,
         onto: None,

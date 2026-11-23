@@ -7748,6 +7748,28 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             .collect();
         state.config.roles.fixer = Some(crate::config::AgentChoice::Chain(ids.to_vec()));
         state.config.graph.review_rounds = 3;
+        state.config.verify.build_cache = crate::config::BuildCache::Isolated;
+        state.config.graph.timeout_resource_wait = 0;
+        let started = git::rebase_start(&state.repo, &scratch, "winner", &target)
+            .await
+            .unwrap();
+        assert!(matches!(started, git::RebaseStart::Conflicted(_)));
+        let home = crate::run::home();
+        let cache = crate::build_target::resolve(&home, &scratch).unwrap();
+        let owner = crate::cache::Owner::here("other-run", "e2e", "e2e", &scratch, &original);
+        let crate::cache::AcquireOutcome::Acquired(lease) =
+            crate::cache::try_acquire(&home, &cache, &owner).unwrap()
+        else {
+            panic!("test target was already leased");
+        };
+        let error = crate::rebase::rebase_with_fixer(&mut state, &scratch, "winner", &target)
+            .await
+            .unwrap_err();
+        assert!(error.is::<crate::agent::IsolatedSeatWait>(), "{error:#}");
+        assert!(!counter.exists());
+        assert_eq!(git::unmerged_paths(&scratch).await.unwrap(), ["change"]);
+        drop(lease);
+        state = RunState::load(&state.id).unwrap();
         for _ in 0..2 {
             let crate::rebase::Rebased::Stopped(why) =
                 crate::rebase::rebase_with_fixer(&mut state, &scratch, "winner", &target)

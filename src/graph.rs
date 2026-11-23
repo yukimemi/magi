@@ -17805,6 +17805,7 @@ mod tests {
         runner.state.base_sync.as_mut().unwrap().conflict = Some(detail.clone());
         runner.state.record_base_sync_stop(&head);
         runner.state.rebase_fixes.push(crate::run::RebaseFixRecord {
+            unstarted: false,
             agent: "fixture".into(),
             paths: Vec::new(),
             from: Some(head.clone()),
@@ -18818,6 +18819,7 @@ esac
             git::RebaseStart::Conflicted(_)
         ));
         runner.state.rebase_fixes.push(crate::run::RebaseFixRecord {
+            unstarted: false,
             agent: "fixture".into(),
             paths: vec!["retained".into()],
             from: Some(head.clone()),

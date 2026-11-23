@@ -256,6 +256,7 @@ pub(crate) async fn rebase_prepared_with_exec(
             .map_err(|e| sequencer_block(state, &said, e))?;
         let index_outside = Some(round_baseline(state, scratch, &paths).await?);
         state.rebase_fixes.push(RebaseFixRecord {
+            unstarted: false,
             outage: None,
             agent: spec.id.clone(),
             paths: paths.clone(),
@@ -279,7 +280,8 @@ pub(crate) async fn rebase_prepared_with_exec(
 
         let artifacts = agent::artifacts_dir(&state.dir());
         let mut seat = seat_of(state, &seat_key, &spec.id);
-        let out = agent::invoke(
+        let mut spawn_attempted = false;
+        let out = agent::invoke_tracking_spawn(
             &spec,
             &mut seat,
             &Invocation {
@@ -298,6 +300,7 @@ pub(crate) async fn rebase_prepared_with_exec(
                 attachments: &[],
                 writable: &[],
             },
+            &mut spawn_attempted,
         )
         .await;
         let seat_name = seat.key.clone();
@@ -338,9 +341,10 @@ pub(crate) async fn rebase_prepared_with_exec(
             Ok(_) => {}
             Err(e)
                 if e.is::<crate::repo_lock::ResourceBlocked>()
-                    && crate::build_target::isolated(&state.config) =>
+                    && (!spawn_attempted || crate::build_target::isolated(&state.config)) =>
             {
                 if let Some(record) = state.rebase_fixes.last_mut() {
+                    record.unstarted = !spawn_attempted;
                     record.infra = Some(format!("{e:#}"));
                 }
                 if let Some(timeout) = e.downcast_ref::<agent::IsolatedSeatWait>() {
@@ -349,7 +353,13 @@ pub(crate) async fn rebase_prepared_with_exec(
                     state.save()?;
                     return Err(e);
                 }
-                return Err(block(state, crate::build_target::KIND, format!("{e:#}")));
+                state.save()?;
+                let kind = if crate::build_target::isolated(&state.config) {
+                    crate::build_target::KIND
+                } else {
+                    "seat admission"
+                };
+                return Err(block(state, kind, format!("{e:#}")));
             }
             Err(e) => error = Some(format!("{e:#}")),
         }
@@ -613,7 +623,7 @@ fn stop_rounds(state: &RunState, original: &str, onto: &str, pick: &str) -> usiz
     let mut spent = 0;
     let mut legacy = false;
     for record in state.rebase_fixes.iter().filter(|record| matches(record)) {
-        spent += 1;
+        spent += usize::from(!record.unstarted);
         legacy |= record.onto.is_none();
     }
     if !legacy {
@@ -2505,6 +2515,7 @@ mod tests {
         let paths = git::unmerged_paths(&scratch).await.unwrap();
         assert_eq!(paths, vec![conflict]);
         state.rebase_fixes.push(RebaseFixRecord {
+            unstarted: false,
             outage: None,
             agent: "mock".into(),
             index_outside: index_outside(&scratch, &paths).await.ok(),

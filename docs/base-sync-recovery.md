@@ -14,6 +14,8 @@ Only a stopped pick with unmerged index entries can start a conflict fixer.
 `graph.review_rounds` limits actual fixer calls for that pick, including
 fallback agents and calls that report a quota or authentication failure.
 Staging or continuing an already resolved pick does not spend a call.
+起動処理に入る前の資源不足が確定した場合は枠を消費しません。
+起動有無が不明な中断や起動後の資源停止は、上限に数えます。
 On older runs, a fallback reused its round record. The saved round-start
 and handover events attribute those extra calls to their original pick.
 If the event history is incomplete, unattributed calls count conservatively

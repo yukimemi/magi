@@ -719,6 +719,7 @@ async fn the_conflict_round_bound_is_counted_in_state_and_survives_a_resume() {
     // Two rounds were already spent by an earlier process of this run.
     for _ in 0..2 {
         runner.state.rebase_fixes.push(magi::run::RebaseFixRecord {
+            unstarted: false,
             outage: None,
             agent: "mock".to_owned(),
             paths: vec!["note.txt".to_owned()],
@@ -765,6 +766,7 @@ async fn legacy_conflict_records_recover_the_baseline_and_retain_the_resume_budg
     // Two rounds were already spent by an earlier process of this run.
     for _ in 0..2 {
         runner.state.rebase_fixes.push(magi::run::RebaseFixRecord {
+            unstarted: false,
             outage: None,
             agent: "mock".to_owned(),
             paths: vec!["note.txt".to_owned()],
@@ -813,6 +815,7 @@ async fn legacy_baseline_mismatch_blocks_without_spending_a_conflict_round() {
     // Two rounds were already spent by an earlier process of this run.
     for _ in 0..2 {
         runner.state.rebase_fixes.push(magi::run::RebaseFixRecord {
+            unstarted: false,
             outage: None,
             agent: "mock".to_owned(),
             paths: vec!["unexpected.txt".to_owned()],
