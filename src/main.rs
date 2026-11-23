@@ -5303,7 +5303,9 @@ async fn run_existing_task(
             task.overrides.as_ref().and_then(|o| o.config.as_deref()),
         )?;
         magi::handover::preflight_review(&task.repo, &branch, &home, &cfg.merge.remote).await?;
-        task.review_of = Some(branch);
+        task.review_of = Some(branch.clone());
+        task.review_branch = Some(branch);
+        task.review_instruction = Some(task.instruction.clone());
         // An explicit review is not a retry of earlier work: it must not be
         // swallowed by resuming an unfinished run of this task.
         task.fresh_start = true;

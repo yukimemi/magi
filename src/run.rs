@@ -911,6 +911,13 @@ pub struct GateRepairE2e {
     pub outcomes: Vec<CommandOutcome>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct DeferredRebasePush {
+    pub remote: String,
+    pub branch: String,
+    pub expected: String,
+}
+
 /// Superseded head-specific evidence; repair budgets remain on the run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerificationEvidence {
@@ -2408,6 +2415,8 @@ pub struct RunState {
     /// Pass that spent the explicit post-repair E2E retry, saved before commands.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) gate_repair_retry_pass: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) deferred_rebase_push: Option<DeferredRebasePush>,
     /// Fixer rounds spent on a rebase conflict (base sync and land share one
     /// budget, `graph.review_rounds`), oldest first. Persisted right before
     /// each fixer call, so a resumed run spends only what is left.
@@ -2927,6 +2936,7 @@ impl RunState {
             gate_fixes: Vec::new(),
             gate_repair_e2e: None,
             gate_repair_retry_pass: None,
+            deferred_rebase_push: None,
             rebase_fixes: Vec::new(),
             graft: None,
             recovery: None,

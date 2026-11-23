@@ -217,6 +217,8 @@ verification attempt.
 
 A failed **E2E after a gate repair** is different: the failed gate belongs
 to the older commit, and the repaired winner has not reached its final gate.
+A recorded E2E timeout also qualifies; an unstarted command or resource
+wait does not.
 The owner can use `magi run --resume <full-run-id>`, the run's **Resume** action,
 or `magi task control resume <full-run-id>` in chat. The request pins the
 existing task and run and requires an attempt to remain. It does not refill
@@ -227,12 +229,16 @@ spends the retry without using the old E2E result and resumes through normal
 base synchronization and verification of the actual head. A divergent or
 dirty checkout instead stops. On either path, the head being published needs
 its own E2E and gate results, and existing merge approvals still apply.
+If base synchronization rewrites an existing public branch, magi makes the
+leased push only after verification, using the original observed remote tip.
 A repeated failure or mismatched checkpoint leaves the task held without
 publishing or starting a replacement. Only an unspent, matching owner request
 protects this checkpoint from worktree handover; the old failure alone does
 not. A resource wait during the direct E2E recheck refunds the attempt.
 Explicitly resume again when the resource is available. A retry interrupted
-with an unknown result is not replayed.
+with an unknown result is not replayed, even on an advanced head. When no
+pending checkpoint protects the branch, you can request a successor review
+explicitly with `magi review <branch> --task <task-id> --merge none`.
 
 **Every run is a task.** `magi run` and `magi review` first file a task in the
 queue (the same path as `magi task add`) and print its id - open it with

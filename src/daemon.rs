@@ -4682,6 +4682,8 @@ async fn attempt(
     let mut previous = resume_runs.last().and_then(|id| RunState::load(id).ok());
     let repair_retry = crate::resume::GateRepairRetry::queued(task).cloned();
     let retry_task = repair_retry.as_ref().map(|_| task.clone());
+    let explicit_review =
+        task.fresh_start && task.review_branch.is_some() && task.review_branch == task.review_of;
     if let Some(retry) = &repair_retry {
         let admitted = (|| -> Result<()> {
             anyhow::ensure!(public_owner.is_none(), "another run owns publication");
@@ -4698,7 +4700,7 @@ async fn attempt(
             record(queue, task);
             return Vec::new();
         }
-    } else if previous.as_ref().is_some_and(post_repair_held) {
+    } else if previous.as_ref().is_some_and(post_repair_held) && !explicit_review {
         task.hold_unrequested_retry(Some(
             "Post-repair verification is stopped; inspect the retained run. No replacement was started.".into(),
         ));
@@ -5654,6 +5656,7 @@ async fn attempt_sync_only(
 
 fn post_repair_held(state: &RunState) -> bool {
     crate::handover::failed_gate_repair_e2e(state).is_some()
+        || crate::handover::spent_post_repair_e2e_unresolved(state)
         || (state.status == RunStatus::Blocked
             && state.gate_repair_retry_pass.is_some()
             && !crate::handover::can_resume(state))

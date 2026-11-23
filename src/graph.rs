@@ -1831,8 +1831,9 @@ impl Runner {
             retry.retained_head(&disk).await?;
         } else {
             anyhow::ensure!(
-                crate::handover::failed_gate_repair_e2e(&disk).is_none(),
-                "post-repair E2E failure requires explicit owner resume"
+                crate::handover::failed_gate_repair_e2e(&disk).is_none()
+                    && !crate::handover::spent_post_repair_e2e_unresolved(&disk),
+                "post-repair E2E failure requires an unused owner retry; an uncertain result is not replayed"
             );
             crate::repair_budget::apply(&crate::run::home(), &mut execution.runner.state, &disk)
                 .await?;
@@ -6215,6 +6216,16 @@ impl Runner {
             }
             return Err(error);
         }
+        let defer_push = self.state.gate_repair_retry_pass.is_some() && self.state.pr.is_none();
+        if defer_push && let Some(expected) = &remote_tip {
+            self.state
+                .deferred_rebase_push
+                .get_or_insert_with(|| crate::run::DeferredRebasePush {
+                    remote: remote.clone(),
+                    branch: winner.branch.clone(),
+                    expected: expected.clone(),
+                });
+        }
         self.state.reserve_base_operation(&head, &tip);
         self.state.save()?;
         let rebased =
@@ -6242,7 +6253,7 @@ impl Runner {
                 refresh_reviewed_commits(&mut self.state, &winner.branch).await;
                 let mut conflict = None;
                 if let Some(pinned) = &remote_tip
-                    && (self.state.gate_repair_retry_pass.is_none() || self.state.pr.is_some())
+                    && !defer_push
                 {
                     let pushed = git::push_pinned(&repo, &remote, &winner.branch, pinned).await;
                     match pushed {
@@ -6337,6 +6348,9 @@ impl Runner {
         if self.state.task_pr_branch().is_some() {
             return None;
         }
+        if self.state.deferred_rebase_push.is_some() {
+            return None;
+        }
         let repo = self.state.repo.clone();
         let remote = self.state.config.merge.remote.clone();
         let fetched = git::fetch(&repo, &remote, branch).await;
@@ -6358,8 +6372,12 @@ impl Runner {
                 short(&theirs)
             ));
         }
-        // An owner retry has not earned publication until the synced head's gate passes.
         if self.state.gate_repair_retry_pass.is_some() && self.state.pr.is_none() {
+            self.state.deferred_rebase_push = Some(crate::run::DeferredRebasePush {
+                remote,
+                branch: branch.to_owned(),
+                expected: theirs,
+            });
             return None;
         }
         match git::push_pinned(&repo, &remote, branch, &theirs).await {
@@ -9989,6 +10007,13 @@ impl Runner {
         let message = pr.commit_message();
 
         let delivery_head = git::rev_parse(&winner.worktree, "HEAD").await?;
+        if self.state.deferred_rebase_push.is_some() && delivery_head != head {
+            self.state.status = RunStatus::Blocked;
+            self.state
+                .event("gate", "winner changed before deferred rebase publication");
+            self.state.save()?;
+            return Ok(());
+        }
         if !crate::foreign_checkout::write_back(&mut self.state, &delivery_head).await? {
             return Ok(());
         }
@@ -10066,7 +10091,16 @@ impl Runner {
             MergeMode::Pr => {
                 let remote = self.state.config.merge.remote.clone();
                 let public = self.state.pr_branch().unwrap_or(&winner.branch).to_owned();
-                let pushed = if self.state.foreign_checkout.is_some() {
+                let pushed = if let Some(lease) = &self.state.deferred_rebase_push {
+                    anyhow::ensure!(
+                        lease.remote == remote && lease.branch == public && public == winner.branch,
+                        "deferred rebase push no longer matches the publication target"
+                    );
+                    let option =
+                        format!("--force-with-lease=refs/heads/{public}:{}", lease.expected);
+                    let refspec = format!("{delivery_head}:refs/heads/{public}");
+                    git::git_raw(&winner.worktree, &["push", &option, &remote, &refspec]).await?
+                } else if self.state.foreign_checkout.is_some() {
                     let refspec = format!("{delivery_head}:refs/heads/{public}");
                     git::git_raw(&winner.worktree, &["push", &remote, &refspec]).await?
                 } else {

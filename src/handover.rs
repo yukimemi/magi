@@ -566,13 +566,7 @@ pub(crate) fn resume_refusal_under(state: &RunState, home: Option<&Path>) -> Opt
             ResumeRefusal::GateRepairRetryExhausted
         });
     }
-    if state.status == RunStatus::Blocked
-        && state.gate_repair_retry_pass.is_some()
-        && !resume_checkpoint(state)
-        && state.head_e2e.as_ref().is_some_and(|e| {
-            !e.passed && !e.outcomes.is_empty() && e.outcomes.iter().all(|o| !o.resource_blocked)
-        })
-    {
+    if spent_post_repair_e2e_unresolved(state) {
         return Some(ResumeRefusal::GateRepairRetryExhausted);
     }
     let review = crate::graph::review_conclusion(&state.reviews, state.config.graph.review_rounds);
@@ -656,7 +650,18 @@ pub(crate) fn failed_gate_repair_e2e(state: &RunState) -> Option<&crate::run::Ga
         && !state.config.verify.e2e.is_empty()
         && !e.passed
         && !e.head.is_empty()
-        && failed(&e.outcomes)
+        && e.outcomes.iter().all(|o| !o.resource_blocked)
+        && (failed(&e.outcomes)
+            // `code: None` also includes spawn failures. The runner appends
+            // its timeout diagnostic after the command output.
+            || e.outcomes.iter().any(|o| {
+                o.code.is_none()
+                    && o.output_tail.lines().last().is_some_and(|line| {
+                        line.strip_prefix("timed out after ")
+                            .and_then(|s| s.strip_suffix('s'))
+                            .is_some_and(|s| s.parse::<u64>().is_ok())
+                    })
+            }))
         && state
             .gate_head
             .as_ref()
@@ -666,6 +671,16 @@ pub(crate) fn failed_gate_repair_e2e(state: &RunState) -> Option<&crate::run::Ga
             .as_ref()
             .is_none_or(|other| other.head != e.head))
     .then_some(e)
+}
+
+pub(crate) fn spent_post_repair_e2e_unresolved(state: &RunState) -> bool {
+    state.gate_repair_retry_pass.is_some()
+        && !resume_checkpoint(state)
+        && state.head_e2e.as_ref().is_some_and(|e| {
+            !e.passed
+                && (state.resource_block.is_none() || !e.outcomes.is_empty())
+                && e.outcomes.iter().all(|o| !o.resource_blocked)
+        })
 }
 
 /// A resumable publication, landing or owner decision must keep its existing
