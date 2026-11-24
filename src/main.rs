@@ -7137,10 +7137,11 @@ mod tests {
             magi::queue::Source::Human,
         );
         t.start("20260903-134458-ec12".to_owned());
+        let home = tempfile::tempdir().unwrap();
         t.succeed(magi::queue::CompletionContext::new(
             magi::queue::CompletionActor::Cli,
             None,
-            &magi::run::home(),
+            home.path(),
             &t,
         ));
         assert_eq!(t.status, magi::queue::TaskStatus::Done);

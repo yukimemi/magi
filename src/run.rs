@@ -4126,25 +4126,17 @@ pub fn short_of(id: &str) -> &str {
 /// is what lets the integration tests drive a whole graph without writing into
 /// the operator's real history.
 ///
-/// In a unit test build (`cfg(test)`), falling through to the real
-/// `<data_local>/magi` is not a fallback worth having: it is exactly how
-/// three broken fixture runs ended up in the operator's actual history and
-/// were counted as `unreadable` by the deck. So a unit test that reaches this
-/// point without [`set_home`] or `MAGI_HOME` gets this process's own temp
-/// home (`test_home`) pinned for it.
-///
-/// It used to panic instead, to flag the test. But the home is process-global
-/// and first-wins, so that panic fired only when no earlier test in the same
-/// process had pinned one: the same test passed or failed by test order, and
-/// the panic, raised from deep inside nested futures, showed up on Windows as
-/// a stack overflow that took the whole test binary down. The protection the
-/// panic was for - never the operator's real home - is kept either way.
+/// Library unit tests ignore inherited `MAGI_HOME`. Without an explicit pin,
+/// they get a private, lazily created home owned by this test process.
 pub fn home() -> PathBuf {
     #[cfg(test)]
-    if HOME.get().is_none() && std::env::var_os("MAGI_HOME").is_none() {
-        pin_test_home();
+    {
+        HOME.get_or_init(test_home).clone()
     }
-    resolve_home(HOME.get().cloned(), std::env::var_os("MAGI_HOME"))
+    #[cfg(not(test))]
+    {
+        resolve_home(HOME.get().cloned(), std::env::var_os("MAGI_HOME"))
+    }
 }
 
 /// The decision `home` makes, taking its two overrides as plain values
@@ -4177,14 +4169,11 @@ fn resolve_home(pinned: Option<PathBuf>, magi_home_env: Option<std::ffi::OsStrin
     }
 }
 
-/// [`home`] without the test panic: `None` in a test that never pinned a
-/// home, so best-effort writers (see [`crate::notices::raise`]) skip the write
-/// instead of touching the operator's real state or aborting the test.
+/// In unit tests, best-effort writers skip work until a fixture or a call to
+/// [`home`] has pinned a home. This never adopts an inherited `MAGI_HOME`.
 pub fn try_home() -> Option<PathBuf> {
     if cfg!(test) {
-        HOME.get()
-            .cloned()
-            .or_else(|| std::env::var_os("MAGI_HOME").map(PathBuf::from))
+        HOME.get().cloned()
     } else {
         Some(home())
     }
@@ -4195,19 +4184,38 @@ pub fn set_home(dir: PathBuf) {
     let _ = HOME.set(dir);
 }
 
-/// A temp directory unique to this test process, created once and kept.
-/// `set_home` is a first-wins `OnceLock`, so a fixed `temp_dir().join(..)`
-/// would be shared by every concurrent `cargo test` process on the machine.
+/// A private temp directory, initialized on demand and removed on normal exit.
 #[cfg(test)]
 pub(crate) fn test_home() -> PathBuf {
-    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    static DIR: std::sync::OnceLock<(u32, PathBuf)> = std::sync::OnceLock::new();
+
+    extern "C" fn cleanup() {
+        if let Some((owner, path)) = DIR.get()
+            && *owner == std::process::id()
+        {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+
+    unsafe extern "C" {
+        fn atexit(callback: extern "C" fn()) -> std::ffi::c_int;
+    }
+
     DIR.get_or_init(|| {
-        tempfile::Builder::new()
+        let dir = tempfile::Builder::new()
             .prefix("magi-unit-home-")
             .tempdir()
-            .expect("create the unit-test home")
-            .keep()
+            .expect("create the unit-test home");
+        // SAFETY: The callback has a static lifetime, uses nonblocking access
+        // to the initialized path, and skips forked processes.
+        assert_eq!(
+            unsafe { atexit(cleanup) },
+            0,
+            "register unit-test home cleanup"
+        );
+        (std::process::id(), dir.keep())
     })
+    .1
     .clone()
 }
 
@@ -4851,12 +4859,18 @@ mod tests {
     fn test_home_is_private_stable_and_unique_per_process() {
         // Child mode: report this process's home and stop.
         if std::env::var_os("MAGI_HOME_PROBE").is_some() {
-            println!("HOME={}", super::test_home().display());
+            assert!(super::try_home().is_none());
+            let home = super::home();
+            assert_eq!(home, super::home());
+            assert_eq!(super::try_home().as_deref(), Some(home.as_path()));
+            std::fs::write(home.join("probe"), b"owned by child").unwrap();
+            println!("HOME={}", home.display());
             return;
         }
         let a = super::test_home();
         assert_eq!(a, super::test_home());
         assert!(a.is_dir() && a.starts_with(std::env::temp_dir()));
+        let inherited = tempfile::tempdir().unwrap();
         let probe = || {
             let out = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
@@ -4866,9 +4880,15 @@ mod tests {
                     "--test-threads=1",
                 ])
                 .env("MAGI_HOME_PROBE", "1")
+                .env("MAGI_HOME", inherited.path())
                 .quiet()
                 .output()
                 .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
             String::from_utf8_lossy(&out.stdout)
                 .lines()
                 .find_map(|l| l.split_once("HOME=").map(|(_, h)| h.to_owned()))
@@ -4877,6 +4897,10 @@ mod tests {
         let (b, c) = (probe(), probe());
         assert_ne!(b, c, "two processes must never share a unit-test home");
         assert_ne!(b, a.display().to_string());
+        for home in [b, c] {
+            assert!(!Path::new(&home).exists(), "child did not remove {home}");
+        }
+        assert_eq!(std::fs::read_dir(inherited.path()).unwrap().count(), 0);
     }
 
     #[test]

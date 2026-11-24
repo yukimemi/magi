@@ -21094,6 +21094,7 @@ esac
             );
             return;
         }
+        crate::run::set_home(PathBuf::from(std::env::var_os("MAGI_HOME").unwrap()));
         let home = crate::run::home();
         let directory = home.join("workers/jobs/abcdef");
         std::fs::create_dir_all(&directory).unwrap();
@@ -21376,7 +21377,7 @@ esac
         config.disk.min_free_bytes = 0;
         config.verify.gate = vec![
             "printf started > started.marker; i=0; while [ ! -f release.marker ] && \
-             [ \"$i\" -lt 100 ]; do i=$((i+1)); sleep 0.05; done"
+             [ \"$i\" -lt 100 ]; do i=$((i+1)); sleep 0.05; done; test -f release.marker"
                 .to_owned(),
         ];
 
@@ -21460,30 +21461,30 @@ esac
 
         let started_marker = repo.join("started.marker");
         let release_marker = repo.join("release.marker");
-        let poller = tokio::spawn(async move {
-            // Bounded so a regression that never records the task entry
-            // fails this test in seconds instead of hanging the suite —
-            // the same shape `a_park_requested_while_a_seat_is_mid_call_
-            // does_not_cut_it_short` uses for the same reason.
-            for _ in 0..100 {
+        let observe = async {
+            loop {
                 if started_marker.exists()
                     && let Ok(s) = crate::run::RunState::load(&run_id)
                     && let Some(a) = s.active.get("gate")
                 {
                     std::fs::write(&release_marker, b"go").expect("release marker");
-                    return Some(a.clone());
+                    break a.clone();
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            None
-        });
-
-        runner.gate().await.expect("gate");
-        let captured = poller.await.expect("poller task");
-        let captured = captured.expect(
-            "the poller never saw a `gate` task entry in run.json while the command was \
-             still blocked on its own release marker",
-        );
+        };
+        let captured = {
+            let gate = runner.gate();
+            tokio::pin!(gate);
+            let captured = tokio::select! {
+                observed = observe => observed,
+                result = &mut gate => panic!(
+                    "gate exited before its in-flight entry was observed: {result:?}"
+                ),
+            };
+            gate.await.expect("gate");
+            captured
+        };
 
         assert_eq!(captured.task.as_deref(), Some("gate"));
         assert_eq!(captured.node, "gate");

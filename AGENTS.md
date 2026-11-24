@@ -2272,19 +2272,18 @@ enter the alternate screen and block on input forever.
 
 ### Tests must not touch the operator's history
 
-`run::set_home` (and `MAGI_HOME`) exist so tests never write into
-`<data_local>/magi`. `report::set_color` exists so rendering is assertable —
-that is also why there is no colour crate: the ones available decide for you
-whether the stream supports colour, which makes the output untestable.
+Library unit tests never adopt inherited `MAGI_HOME`. `run::home()` lazily
+pins a private process home if there is no explicit fixture pin. Optional
+`run::try_home()` callers skip work until the home is pinned; tests that assert
+those effects must set up their own home first. The creating process removes
+its private directory at normal exit without scanning other test homes.
+Forced termination can leave leftovers: when measuring, use a private OS temp
+root outside the checkout and remove it only after the children exit.
 
-A unit test that reaches `run::home()` without either gets the process's own
-temp home pinned for it (`run::test_home`). It used to panic, but the home is
-process-global and first-wins, so the panic fired only when no earlier test in
-the same process had pinned one: about a hundred unit tests passed or failed by
-test order, and on Windows the panic, raised deep inside nested futures,
-appeared as a stack overflow that killed the whole test binary. Do not bring
-the panic back; `run::resolve_home(None, None)` still panics and is tested
-directly.
+Integration tests and bin unit tests link the normal library build, so the
+library's unit-test guard does not apply. Pass a fixture root explicitly or
+pin it before calling code that needs the global home. `report::set_color`
+lets the terminal renderer be tested without relying on terminal detection.
 
 ### Changes to this repo go through the graph
 
@@ -3811,6 +3810,55 @@ two counts equal.
   failure excerpts when it has to reduce a long output. A passing command with a
   retried test can therefore show those excerpts; the final `FLAKY` line is not
   a trigger and nothing reads `FLAKY` as a failure.
+
+### Opt-in template change for nextest unit tests
+
+This repository has not opted in yet. Keep `cargo make test`, `verify.e2e`,
+the CI unit jobs, and both retry counts unchanged until coordinated adoption.
+The upstream task is `20261124-192920-9c39` (`yukimemi/pj-rust`).
+
+Windows measurement (base `cb49796`, 16 logical CPUs, stable toolchain,
+warm launcher-managed target): `cargo nextest run --locked --lib --no-fail-fast
+--retries 0` ran 2,734 tests, with 7 skipped. On the base it failed one
+isolated-launcher setup in 33m55.824s; the run initially sampled 35% CPU
+and later overlapped two to three running tasks. After the changes it passed
+all 2,734 in 21m10.407s, versus 27m33.122s for `cargo test --locked --lib`
+(2,734 passed, 7 ignored). These are command wall times, not isolated process
+startup costs. The default nextest schedule was 6m22.715s faster in this
+comparison; it does not justify a unit-test thread cap.
+The baseline `cargo test --locked --lib` log ended before its summary.
+Running the preserved baseline libtest executable directly completed in
+29m37.995s (2,734 passed, 7 ignored; excludes Cargo startup and build time).
+
+- In `yukimemi/pj-rust`'s `Makefile.toml`, extend `tasks.test-targets` with
+  `PJ_RUST_TEST_RUNNER = "nextest-unit"` (the consumer sets it in `[env]`).
+  With nextest installed, run `cargo nextest run --locked --no-tests=pass -E
+  'kind(lib) | kind(bin) | kind(test)'` and `cargo test --locked --examples
+  --benches` once each. Filter by kind rather than requiring a library or
+  binary target. With nextest absent, warn and use `cargo test --locked
+  --all-targets`. Keep the unset and existing `nextest` branches and
+  `tasks.test-doc` unchanged.
+- In `.github/workflows/ci.yml.tera`, guard the optional
+  `vars.PJ_RUST_TEST_RUNNER` lookup and leave the existing workflow unchanged
+  without `nextest-unit`. On Linux/macOS, the opt-in `test` job installs
+  nextest and runs the same combined filter once with `--profile ci`, so one
+  JUnit result per OS covers both unit and integration tests. Run
+  `cargo test --locked --examples --benches` once, and retain the separate,
+  library-presence-guarded doctest step.
+- For opted-in Windows CI, `test-windows-unit` installs nextest and runs
+  `cargo nextest run --locked --profile ci --no-tests=pass -E
+  'kind(lib) | kind(bin)'`, uploads `target/nextest/ci/junit.xml` as
+  `junit-windows-unit` (non-fatal), and runs the Cargo examples/benches
+  and guarded doctest steps. `test-windows-shard` keeps integration tests
+  alone (`kind(test)`, `--partition count:N/3`), per-shard JUnit artifacts,
+  and a cache key separate from the unit job. `test-windows` remains
+  named `test (windows-latest)` and fails if either unit or any shard fails
+  or is skipped.
+- After upstream support lands, set the local and CI selectors together.
+  `.kata/applied.toml` ignores this repository's `.github/workflows/ci.yml`;
+  explicitly synchronize its existing split with the opted-in variant rather
+  than expecting `kata apply` to replace it. Check rendered opt-in and default
+  workflows, including a bin-only consumer, before enabling the new runner.
 
 ### Standing chat recovery
 
