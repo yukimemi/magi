@@ -13,12 +13,12 @@
 //! dropped). Standard `files`-backend repositories resolve the remote-tracking
 //! ref directly from the common git directory without spawning `git`, then
 //! reuse a manifest-verified, content-addressed generation under the git common
-//! dir (`<common>/magi/config/<sha>-<hash of repo>-v1/`, temp dir when that is
-//! not writable). On a cache miss, a single `git cat-file --batch` verifies the
-//! commit and reads both repository layers together before atomically publishing
-//! the generation. Reviewed branches may additionally enable literal owner-hold
-//! switches; these never weaken base policy or load other branch settings,
-//! includes or templates.
+//! dir (`<common>/magi/config/<sha>-<hash of repo>-v2/`, user cache directory
+//! when that is not writable). On a cache miss, a single `git cat-file --batch`
+//! verifies the commit and reads both repository layers together before
+//! atomically publishing the generation. Reviewed branches may additionally
+//! enable literal owner-hold switches; these never weaken base policy or load
+//! other branch settings, includes or templates.
 //!
 //! `remote` and `base` are themselves in the file, so they are resolved in a
 //! fixed order, first hit wins:
@@ -2729,7 +2729,7 @@ const REPO_MARKER: &str = ".magi-repo";
 /// Completion manifest written inside each materialised commit cache directory
 /// before it is atomically renamed into place.
 const CACHE_MANIFEST: &str = ".magi-cache-manifest.json";
-const CACHE_MANIFEST_VERSION: u32 = 1;
+const CACHE_MANIFEST_VERSION: u32 = 2;
 const REPO_LAYER_RELS: [&str; 2] = [".magi/config.toml", "magi.toml"];
 
 /// Git environment overrides that alter repository discovery or ref storage.
@@ -3123,11 +3123,19 @@ fn resolve_ref_oid_files(common_dir: &Path, start_ref: &str) -> Option<String> {
     None
 }
 
-fn git_out(repo: &Path, args: &[&str]) -> Option<String> {
-    use crate::proc::Quiet as _;
+fn repository_git() -> std::process::Command {
     #[cfg(test)]
     crate::web::request_cost::git();
-    let out = std::process::Command::new("git")
+    let mut command = std::process::Command::new("git");
+    command
+        .arg("--no-replace-objects")
+        .env("GIT_NO_LAZY_FETCH", "1");
+    command
+}
+
+fn git_out(repo: &Path, args: &[&str]) -> Option<String> {
+    use crate::proc::Quiet as _;
+    let out = repository_git()
         .args(args)
         .quiet()
         .current_dir(repo)
@@ -3362,9 +3370,7 @@ fn declares_include(text: &str) -> bool {
 /// repository layer resolve against the same commit.
 fn extract_tree(repo: &Path, sha: &str, dest: &Path) -> Result<()> {
     use crate::proc::Quiet as _;
-    #[cfg(test)]
-    crate::web::request_cost::git();
-    let mut archive = std::process::Command::new("git")
+    let mut archive = repository_git()
         .args(["archive", "--format=tar", sha])
         .quiet()
         .current_dir(repo)
@@ -3388,6 +3394,17 @@ fn extract_tree(repo: &Path, sha: &str, dest: &Path) -> Result<()> {
             String::from_utf8_lossy(&tar.stderr).trim()
         );
     }
+    Ok(())
+}
+
+fn write_extracted(path: &Path, bytes: impl AsRef<[u8]>) -> Result<()> {
+    use std::io::Write as _;
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    std::fs::File::create_new(path)?.write_all(bytes.as_ref())?;
     Ok(())
 }
 
@@ -3484,9 +3501,7 @@ fn read_commit_layers_batch(
     use crate::proc::Quiet as _;
     use std::io::Write as _;
 
-    #[cfg(test)]
-    crate::web::request_cost::git();
-    let mut child = std::process::Command::new("git")
+    let mut child = repository_git()
         .args(["cat-file", "--batch"])
         .quiet()
         .current_dir(repo)
@@ -3710,7 +3725,7 @@ fn materialize_remote_layers(
         )
     };
     let primary_root = common_dir.map(|c| c.join("magi").join("config"));
-    let temp_root = std::env::temp_dir().join("magi-config");
+    let fallback_root = dirs::cache_dir().map(|p| p.join("magi").join("config"));
     let lookup = |commit_sha: &str| -> Option<Vec<PathBuf>> {
         let key = key_for(commit_sha);
         if let Some(root) = &primary_root
@@ -3718,7 +3733,7 @@ fn materialize_remote_layers(
         {
             return Some(layers);
         }
-        read_cached_layers(&temp_root.join(&key), commit_sha, repo)
+        read_cached_layers(&fallback_root.as_ref()?.join(&key), commit_sha, repo)
     };
     if let Some(layers) = lookup(sha) {
         return Ok(layers);
@@ -3761,8 +3776,8 @@ fn materialize_remote_layers(
                 let file = join_rel_path(&tmp, rel);
                 let parent = file.parent().unwrap_or(&tmp);
                 std::fs::create_dir_all(parent)?;
-                std::fs::write(&file, text)?;
-                std::fs::write(parent.join(REPO_MARKER), repo.to_string_lossy().as_bytes())?;
+                write_extracted(&file, text)?;
+                write_extracted(&parent.join(REPO_MARKER), repo.to_string_lossy().as_bytes())?;
             }
             let manifest = CacheManifest {
                 version: CACHE_MANIFEST_VERSION,
@@ -3771,8 +3786,8 @@ fn materialize_remote_layers(
                 layers: texts.iter().map(|(rel, _)| (*rel).to_owned()).collect(),
                 extracted_tree: wants_tree,
             };
-            std::fs::write(
-                tmp.join(CACHE_MANIFEST),
+            write_extracted(
+                &tmp.join(CACHE_MANIFEST),
                 serde_json::to_vec(&manifest).context("serialize config cache manifest")?,
             )?;
             Ok(())
@@ -3798,7 +3813,10 @@ fn materialize_remote_layers(
     let layers = match primary_root.as_deref().map(&build) {
         Some(Ok(layers)) => layers,
         _ => {
-            build(&temp_root).with_context(|| format!("extracting config from {remote}/{base}"))?
+            let root = fallback_root
+                .as_deref()
+                .context("no user config cache directory")?;
+            build(root).with_context(|| format!("extracting config from {remote}/{base}"))?
         }
     };
     Ok(layers)
@@ -5651,6 +5669,34 @@ lock_file = "{{ vars.bad }}"
             assert!(values.iter().all(|&n| n == 2));
             assert_eq!(discoveries, 20);
             assert_eq!(warm_git, 0);
+        }
+
+        #[test]
+        fn reftable_warm_discover_uses_one_git_process() {
+            let tmp = tempfile::tempdir().unwrap();
+            let repo = tmp.path();
+            git(repo, &["init", "--ref-format=reftable", "-b", "trunk"]);
+            git(repo, &["config", "user.name", "t"]);
+            git(repo, &["config", "user.email", "t@example.com"]);
+            std::fs::write(repo.join("magi.toml"), "[graph]\ncandidates = 2\n").unwrap();
+            git(repo, &["add", "magi.toml"]);
+            git(repo, &["commit", "-m", "config"]);
+            git(repo, &["update-ref", "refs/remotes/origin/trunk", "HEAD"]);
+            git(
+                repo,
+                &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/trunk"],
+            );
+            assert_eq!(
+                Config::discover(repo, None).unwrap().0.graph.implementers,
+                2
+            );
+            let (values, (_, count)) = crate::web::request_cost::measure_sync(|| {
+                (0..10)
+                    .map(|_| Config::discover(repo, None).unwrap().0.graph.implementers)
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(values, vec![2; 10]);
+            assert_eq!(count, 10);
         }
 
         #[test]
