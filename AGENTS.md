@@ -3815,6 +3815,20 @@ two counts equal.
 
 This repository has not opted in yet. Keep `cargo make test`, `verify.e2e`,
 the CI unit jobs, and both retry counts unchanged until coordinated adoption.
+The upstream task is `20261124-192920-9c39` (`yukimemi/pj-rust`).
+
+Windows measurement (base `cb49796`, 16 logical CPUs, stable toolchain,
+warm launcher-managed target): `cargo nextest run --locked --lib --no-fail-fast
+--retries 0` ran 2,734 tests, with 7 skipped. On the base it failed one
+isolated-launcher setup in 33m55.824s; the run initially sampled 35% CPU
+and later overlapped two to three running tasks. After the changes it passed
+all 2,734 in 21m10.407s, versus 27m33.122s for `cargo test --locked --lib`
+(2,734 passed, 7 ignored). These are command wall times, not isolated process
+startup costs. The default nextest schedule was 6m22.715s faster in this
+comparison; it does not justify a unit-test thread cap.
+The baseline `cargo test --locked --lib` log ended before its summary.
+Running the preserved baseline libtest executable directly completed in
+29m37.995s (2,734 passed, 7 ignored; excludes Cargo startup and build time).
 
 - In `yukimemi/pj-rust`'s `Makefile.toml`, extend `tasks.test-targets` with
   `PJ_RUST_TEST_RUNNER = "nextest-unit"` (the consumer sets it in `[env]`).
