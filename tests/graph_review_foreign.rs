@@ -88,7 +88,13 @@ async fn foreign_dirty_checkout_is_refused_before_filing_and_untouched() {
         .args(["review", BRANCH, "--task", &task.id, "--config"])
         .arg(&config).output().unwrap();
     assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("dirty"));
+    let message = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        message.contains("dirty"),
+        "status={} stdout={} stderr={message}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+    );
     assert_eq!(serde_json::to_string(&queue.get(&task.id).unwrap()).unwrap(), before_task);
     assert!(Runner::review(&fx.repo, BRANCH, fx.config.clone(), Origin::operator()).await.is_err());
     assert_eq!(std::fs::read_to_string(path.join("scratch.txt")).unwrap(), "keep this\n");
