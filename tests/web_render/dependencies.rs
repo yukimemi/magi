@@ -8,7 +8,7 @@ use std::time::Duration;
 
 const WAIT: Duration = Duration::from_secs(30);
 const LOADING: &str = "document.querySelector('#dependencies-message')?.textContent.includes('Loading dependencies') && document.querySelector('#dependencies-graph').hidden";
-const GRAPH: &str = "location.hash === '#/dependencies' && !document.querySelector('#view-dependencies')?.hidden && document.querySelectorAll('.dep-node').length === 19";
+const GRAPH: &str = "location.hash === '#/dependencies' && !document.querySelector('#view-dependencies')?.hidden && document.querySelectorAll('.dep-node').length === 20";
 const QUESTION: &str = "20261121-140452-1111";
 const FIRST_QUESTION: &str = "20261121-140453-2222";
 
@@ -99,11 +99,15 @@ async fn dependencies_page_preserves_graph_navigation_and_load_boundaries() {
         add_task(format!("Parallel dependency {i}"), QUESTION);
     }
     let mut dep = QUESTION.to_string();
-    for i in 0..7 {
+    for i in 0..6 {
         dep = add_task(format!("Chain link {i}"), &dep).id;
     }
+    let a = add_task("Chain branch A".into(), &dep);
+    let b = add_task("Chain branch B".into(), &dep);
     let title = "A long dependency title that wraps across multiple readable lines";
-    let mut top = add_task(title.into(), &dep);
+    let mut top = add_task(title.into(), &a.id);
+    top.blocked_by.extend([b.id, dep]);
+    queue.put(&mut top).unwrap();
 
     older_queue.send_replace(DependencyRead::Wait);
     let phone = browser.open_page(&url, 390, 844, true).await.unwrap();
@@ -134,7 +138,7 @@ async fn dependencies_page_preserves_graph_navigation_and_load_boundaries() {
                 "{GRAPH}
                   && document.querySelector('#questions-origin-state')?.textContent.includes('Question origins:')
                   && document.querySelector('#dependencies-status').hidden
-                  && document.querySelector('#dependencies-count').textContent === '18 tasks, 1 question · 18 dependencies'"
+                  && document.querySelector('#dependencies-count').textContent === '19 tasks, 1 question · 21 dependencies'"
             ),
             WAIT,
         )
@@ -198,7 +202,7 @@ async fn navigation(browser: &mut cdp::Browser, page: &cdp::Page, mobile: bool, 
             return !document.body.hasAttribute('data-split')
                 && !document.querySelector('#view-queue .dep-graph')
                 && document.title.includes('Dependencies')
-                && document.querySelector('#dependencies-count').textContent === '18 tasks, 1 question · 18 dependencies'
+                && document.querySelector('#dependencies-count').textContent === '19 tasks, 1 question · 21 dependencies'
                 && node.textContent.includes('blocked')
                 && title.offsetHeight > parseFloat(getComputedStyle(title).lineHeight)
                 && edge.getPointAtLength(0).y < edge.getPointAtLength(edge.getTotalLength()).y
@@ -206,6 +210,37 @@ async fn navigation(browser: &mut cdp::Browser, page: &cdp::Page, mobile: bool, 
                 && document.documentElement.scrollWidth === innerWidth;
         })()"#).await.unwrap(),
         true
+    );
+    assert_eq!(
+        browser.eval(page, r#"(() => {
+            const pane = document.querySelector('#dependencies-graph');
+            const nodes = [...pane.querySelectorAll('.dep-node')];
+            const box = name => nodes.find(node => node.querySelector('.dep-node-title').textContent === name)
+                .querySelector('rect').getBBox();
+            const source = nodes[0].querySelector('rect').getBBox();
+            const target = box('Chain link 5');
+            const middle = [box('Chain branch A'), box('Chain branch B')];
+            const paths = [...pane.querySelectorAll('.dep-edge')].map(path => {
+                const length = path.getTotalLength();
+                return {path, length, start: path.getPointAtLength(0), end: path.getPointAtLength(length)};
+            });
+            const starts = paths.filter(({start}) => start.y === source.y + source.height
+                && start.x > source.x && start.x < source.x + source.width);
+            const incoming = paths.filter(({end}) => end.y === target.y
+                && end.x > target.x && end.x < target.x + target.width);
+            const direct = starts.find(edge => incoming.includes(edge));
+            if (!direct || starts.length !== 3 || incoming.length !== 3) return false;
+            if (starts.some(edge => edge !== direct && edge.start.x === direct.start.x)
+                || incoming.some(edge => edge !== direct && edge.end.x === direct.end.x)) return false;
+            for (let offset = 0; offset < direct.length; offset += 2) {
+                const point = direct.path.getPointAtLength(offset);
+                if (middle.some(rect => point.x >= rect.x && point.x <= rect.x + rect.width
+                    && point.y >= rect.y && point.y <= rect.y + rect.height)) return false;
+            }
+            return true;
+        })()"#).await.unwrap(),
+        true,
+        "the direct edge remains visible alongside the two indirect paths"
     );
     let session = Some(page.session.as_str());
     let previous_load = browser.eval(page, "performance.timeOrigin").await.unwrap();

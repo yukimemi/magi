@@ -4644,7 +4644,10 @@ function renderDependencyGraph(host, tasks, questionsById) {
   for (const row of rows) row.sort((a, b) => a.label.localeCompare(b.label));
 
   const cols = Math.max(1, ...rows.map((row) => row.length));
-  const width = cols * (DEP_NODE_W + DEP_COL_GAP) + DEP_COL_GAP;
+  const nodeWidth = cols * (DEP_NODE_W + DEP_COL_GAP) + DEP_COL_GAP;
+  const skipCount = edges.filter(e => ranks.get(e.from) - ranks.get(e.to) > 1).length;
+  const laneGap = 12;
+  const width = nodeWidth + skipCount * laneGap;
   const height = (maxRank + 1) * (DEP_NODE_H + DEP_ROW_GAP) + DEP_ROW_GAP;
 
   const pos = new Map();
@@ -4661,17 +4664,26 @@ function renderDependencyGraph(host, tasks, questionsById) {
     class: "dep-graph",
   });
 
+  let lane = 0;
   for (const e of edges) {
     const a = pos.get(e.from);
     const b = pos.get(e.to);
     if (!a || !b) continue;
-    const midY = (a.y + b.y) / 2;
-    /* `to` is always the lower rank - closer to the bottom, since its y grows
-       with `height - rank * ...` - so the path leaves the bottom edge of
-       `from`'s box and arrives at the top edge of `to`'s box. */
+    const startY = a.y + DEP_NODE_H / 2;
+    const endY = b.y - DEP_NODE_H / 2;
+    const midY = (startY + endY) / 2;
+    let path = `M ${a.x} ${startY} C ${a.x} ${midY}, ${b.x} ${midY}, ${b.x} ${endY}`;
+    if (ranks.get(e.from) - ranks.get(e.to) > 1) {
+      // Cross intervening ranks outside the node columns. Enter and leave
+      // the gutter in the row gaps, using ports separate from adjacent edges.
+      const x = nodeWidth + lane++ * laneGap;
+      const exitY = startY + DEP_ROW_GAP / 2;
+      const enterY = endY - DEP_ROW_GAP / 2;
+      path = `M ${a.x + 24} ${startY} C ${a.x + 24} ${exitY}, ${x} ${startY}, ${x} ${exitY} V ${enterY} C ${x} ${endY}, ${b.x + 24} ${enterY}, ${b.x + 24} ${endY}`;
+    }
     root.append(svg("path", {
       class: "dep-edge",
-      d: `M ${a.x} ${a.y + DEP_NODE_H / 2} C ${a.x} ${midY}, ${b.x} ${midY}, ${b.x} ${b.y - DEP_NODE_H / 2}`,
+      d: path,
       "aria-hidden": "true",
       "marker-end": "url(#dep-arrow)",
     }));
