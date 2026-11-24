@@ -724,7 +724,7 @@ main {
    card edge as `merged` at a glance or in greyscale. */
 .card[data-tone="wait"] { border-left-color: var(--gold-line); border-left-style: dashed; }
 
-/* Jumped to from the dependency graph: a brief highlight so the card that
+/* After following a Backlog permalink: a brief highlight so the card that
    scrolled into view is the one the eye lands on, not just wherever the
    scroll happened to stop. `animation-fill-mode` is not `forwards` - it
    reverts to normal on its own rather than leaving a permanent mark on a
@@ -1316,18 +1316,35 @@ li[data-tone="wait"] > .card-tail { border-left-color: var(--gold-line); border-
   overflow-wrap: anywhere;
 }
 
-/* dependency graph: one node per task involved in a "blocked on" chain, laid
-   out in ranks with an arrow from a blocked task to what it waits on. Fixed
-   pixel sizing rather than `width: 100%` like `.converge` above - a wide
-   graph scrolls horizontally instead of squeezing node labels unreadable on
-   a phone. */
-.dep-graph-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
-.dep-graph { display: block; }
-.dep-graph text {
-  font: 600 var(--t1) var(--sans); fill: var(--ink);
-  pointer-events: none; user-select: none;
+.queue-dependencies { align-self: start; font-size: var(--t2); }
+main:has(> #view-dependencies:not([hidden])) { max-width: none; }
+#dependencies-status { color: var(--ink-2); font-size: var(--t3); }
+#dependencies-retry { margin-left: var(--s2); }
+.dep-graph-wrap {
+  overflow: auto;
+  overscroll-behavior: contain;
+  max-height: max(14rem, calc(100dvh - 17rem));
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
 }
-.dep-node-meta { font-weight: 400; fill: var(--ink-3); }
+.dep-graph { display: block; max-width: none; }
+.dep-graph foreignObject { pointer-events: none; }
+.dep-node-title {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  text-align: center;
+  font: 650 13px/16px var(--sans);
+  color: var(--ink);
+}
+.dep-node-meta {
+  font: 400 var(--t1) var(--sans);
+  fill: var(--ink-3);
+  pointer-events: none;
+}
 .dep-edge { fill: none; stroke: var(--line-2); stroke-width: 1.75; }
 .dep-node rect { fill: var(--tint-ink); stroke: var(--line-2); stroke-width: 1.5; }
 .dep-node[data-tone="blue"] rect { fill: var(--tint-blue); stroke: var(--blue); }
@@ -2118,6 +2135,11 @@ details.panel > summary + * { margin-top: var(--s2); }
      another grey link — the same gold as the dock's chat item, and the only
      .btn among the links. */
   .rail-link.btn-gold { color: #241d05; background: var(--fill); border-color: var(--gold-line); }
+  @media (max-width: 900px) {
+    .rail-link { padding-inline: var(--s2); }
+    .top { gap: var(--s2); }
+    .brand-text { display: none; }
+  }
   main { padding: var(--s5); }
   h1 { font-size: var(--t7); }
   .view { gap: var(--s5); }

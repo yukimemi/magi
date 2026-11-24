@@ -4351,10 +4351,6 @@ const query = state.queueSearch.trim().toLowerCase();
     show($("queue-search-status"), false);
     show(sectionsRoot, true);
     syncQueueSections(sectionsRoot, groupQueueBySection(tasks));
-    const questionsById = state.questions === null
-      ? null
-      : new Map(state.questions.map((q) => [q.id, q]));
-    renderDependencyGraph(tasks, questionsById);
   } else {
     show(sectionsRoot, false);
     renderQueueSearch(tasks, query, allowSearchJump);
@@ -4498,7 +4494,7 @@ function dependencyEdges(tasks, questionsById) {
       if (dep === task.id) continue;
       if (byId.has(dep)) {
         edges.push({ from: task.id, to: dep });
-      } else if (questionsById && questionsById.has(dep)) {
+      } else if (questionsById.has(dep)) {
         questionNodes.set(dep, questionsById.get(dep));
         edges.push({ from: task.id, to: dep });
       }
@@ -4530,50 +4526,9 @@ function dependencyRanks(nodeIds, outEdges) {
   return ranks;
 }
 
-/* Display width of one code point: East Asian Wide / Fullwidth count as two
-   units, everything else (half-width katakana included) as one. */
-function labelUnits(cp) {
-  return (cp >= 0x1100 && cp <= 0x115f) ||
-    (cp >= 0x2e80 && cp <= 0x303e) ||
-    (cp >= 0x3041 && cp <= 0x33ff) ||
-    (cp >= 0x3400 && cp <= 0x4dbf) ||
-    (cp >= 0x4e00 && cp <= 0x9fff) ||
-    (cp >= 0xa000 && cp <= 0xa4cf) ||
-    (cp >= 0xac00 && cp <= 0xd7a3) ||
-    (cp >= 0xf900 && cp <= 0xfaff) ||
-    (cp >= 0xfe30 && cp <= 0xfe4f) ||
-    (cp >= 0xff00 && cp <= 0xff60) ||
-    (cp >= 0xffe0 && cp <= 0xffe6) ||
-    (cp >= 0x1f300 && cp <= 0x1f64f) ||
-    (cp >= 0x1f900 && cp <= 0x1f9ff) ||
-    (cp >= 0x20000 && cp <= 0x3fffd)
-    ? 2
-    : 1;
-}
-
-/* `max` is a budget in Latin-character units; full-width characters cost two. */
-function truncateLabel(text, max) {
-  const chars = Array.from(String(text || ""));
-  let total = 0;
-  for (const ch of chars) total += labelUnits(ch.codePointAt(0));
-  if (total <= max) return chars.join("");
-  let used = 0;
-  let out = "";
-  for (const ch of chars) {
-    const w = labelUnits(ch.codePointAt(0));
-    if (used + w > max - 1) break;
-    used += w;
-    out += ch;
-  }
-  return `${out}…`;
-}
-
-const DEP_NODE_W = 164;
-const DEP_NODE_H = 56;
-/* Title budget: DEP_NODE_W - 2 * DEP_NODE_PAD_X is the text width (140px),
-   which ~20 latin units of 12px/600 text fill; keep the three in step. */
+const DEP_NODE_W = 220;
+const DEP_NODE_H = 88;
 const DEP_NODE_PAD_X = 12;
-const DEP_LABEL_UNITS = 20;
 const DEP_COL_GAP = 24;
 const DEP_ROW_GAP = 48;
 
@@ -4606,32 +4561,69 @@ function depNode(id, byId, questionNodes) {
   };
 }
 
-/* One `<g>` per node, positioned by rank and by its slot within that rank's
-   row. Built fresh on every call, the same as `convergeDiagram` - the graph
-   is small enough that a full rebuild costs nothing next to the layout work
-   it would take to diff it in place.
-   `questionsById` is `null` until `/api/questions` has loaded once - see
-   `classifyBlockedBy` for why that must not be read as "no questions". A
-   task blocked only on a question is simply left out of the graph until
-   then, the same as one blocked on an id nothing here recognises. */
-function renderDependencyGraph(tasks, questionsById) {
-  const panel = $("queue-graph-panel");
-  const host = $("queue-graph");
-  const { byId, questionNodes, edges } = dependencyEdges(tasks, questionsById);
+const dependencies = {
+  queue: null, questions: null, failures: new Set(), key: null,
+};
 
+// Backlog can render progressive pages. Only a settled store read can
+// replace the graph's complete snapshot.
+function dependenciesLoaded(name, error) {
+  if (error) dependencies.failures.add(name);
+  else {
+    dependencies.failures.delete(name);
+    dependencies[name] = state[name];
+  }
+  if (state.route.name === "dependencies") renderDependencies();
+}
+
+function renderDependencies() {
+  const { queue, questions, failures } = dependencies;
+  const host = $("dependencies-graph");
+  const ready = queue !== null && questions !== null;
+  let message = "";
+  if (failures.size) {
+    message = `Could not load ${[...failures].sort().join(" and ")}.`;
+    if (dependencies.key !== null) message += " Showing the last successful snapshot.";
+  } else if (!ready) {
+    message = "Loading dependencies…";
+  } else {
+    renderDependencyGraph(host, queue, new Map(questions.map(q => [q.id, q])));
+    if (host.hidden) message = "No task or question dependencies to show.";
+  }
+  setText($("dependencies-message"), message);
+  show($("dependencies-status"), Boolean(message));
+  show($("dependencies-retry"), failures.size > 0);
+}
+
+function retryDependencies() {
+  if (dependencies.failures.has("queue")) loadQueue();
+  if (dependencies.failures.has("questions")) loadQuestions();
+}
+
+function renderDependencyGraph(host, tasks, questionsById) {
+  const { byId, questionNodes, edges } = dependencyEdges(tasks, questionsById);
+  edges.sort((a, b) => a.from.localeCompare(b.from) || a.to.localeCompare(b.to));
   const nodeIds = new Set();
   for (const e of edges) { nodeIds.add(e.from); nodeIds.add(e.to); }
+  const nodes = new Map([...nodeIds].map(id => [id, depNode(id, byId, questionNodes)]));
+  const key = JSON.stringify([edges, [...nodes.values()]]);
+  if (key === dependencies.key) return;
+  dependencies.key = key;
 
-  show(panel, nodeIds.size > 0);
-  clear(host);
-  if (nodeIds.size === 0) return;
-
-  const taskNodeCount = [...nodeIds].filter((id) => byId.has(id)).length;
-  const questionNodeCount = nodeIds.size - taskNodeCount;
+  const count = $("dependencies-count");
+  show(count, nodeIds.size > 0);
+  if (!nodeIds.size) {
+    if (host.contains(document.activeElement)) $("dependencies-h").focus({ preventScroll: true });
+    show(host, false);
+    clear(host);
+    return;
+  }
+  const taskNodeCount = nodeIds.size - questionNodes.size;
+  const questionNodeCount = questionNodes.size;
   const nodeCountText = questionNodeCount
     ? `${plural(taskNodeCount, "task", "tasks")}, ${plural(questionNodeCount, "question", "questions")}`
     : plural(taskNodeCount, "task", "tasks");
-  setText($("queue-graph-count"), nodeCountText);
+  setText(count, `${nodeCountText} · ${plural(edges.length, "dependency", "dependencies")}`);
 
   const outEdges = new Map();
   for (const id of nodeIds) outEdges.set(id, []);
@@ -4643,7 +4635,8 @@ function renderDependencyGraph(tasks, questionsById) {
   const ranks = dependencyRanks(nodeIds, outEdges);
   const maxRank = Math.max(...ranks.values());
   const rows = Array.from({ length: maxRank + 1 }, () => []);
-  const nodes = new Map([...nodeIds].map((id) => [id, depNode(id, byId, questionNodes)]));
+  const focused = host.contains(document.activeElement) ? document.activeElement.getAttribute("href") : null;
+  const { scrollLeft, scrollTop } = host;
   for (const id of nodeIds) rows[ranks.get(id)].push(nodes.get(id));
   /* Stable, content-derived order rather than arrival order: a graph that
      reshuffles its columns on every poll is harder to read than one that
@@ -4657,20 +4650,15 @@ function renderDependencyGraph(tasks, questionsById) {
   const pos = new Map();
   rows.forEach((row, rank) => {
     const y = height - DEP_ROW_GAP - DEP_NODE_H / 2 - rank * (DEP_NODE_H + DEP_ROW_GAP);
-    const slot = width / row.length;
-    row.forEach((node, i) => pos.set(node.id, { x: slot * (i + 0.5), y }));
+    row.forEach((node, i) => pos.set(node.id, {
+      x: DEP_COL_GAP + DEP_NODE_W / 2 + i * (DEP_NODE_W + DEP_COL_GAP), y,
+    }));
   });
 
-  /* No `role="img"` here, unlike `convergeDiagram` - this graph's `<g>`
-     nodes are individually focusable buttons, and an image role would tell
-     assistive tech to treat the whole thing as one flat picture and hide
-     them. `aria-label` still names the graph as a whole for anyone tabbing
-     into it. */
   const root = svg("svg", {
     viewBox: `0 0 ${width} ${height}`,
     width, height,
     class: "dep-graph",
-    "aria-label": `Dependency graph of ${nodeCountText} and ${plural(edges.length, "dependency", "dependencies")}.`,
   });
 
   for (const e of edges) {
@@ -4684,6 +4672,7 @@ function renderDependencyGraph(tasks, questionsById) {
     root.append(svg("path", {
       class: "dep-edge",
       d: `M ${a.x} ${a.y + DEP_NODE_H / 2} C ${a.x} ${midY}, ${b.x} ${midY}, ${b.x} ${b.y - DEP_NODE_H / 2}`,
+      "aria-hidden": "true",
       "marker-end": "url(#dep-arrow)",
     }));
   }
@@ -4692,39 +4681,32 @@ function renderDependencyGraph(tasks, questionsById) {
     markerWidth: 7, markerHeight: 7, orient: "auto-start-reverse",
   }, svg("path", { d: "M0,0 L10,5 L0,10 z", fill: "var(--line-2)" }))));
 
-  for (const id of nodeIds) {
-    const node = nodes.get(id);
-    const { x, y } = pos.get(id);
-    const kindLabel = node.kind === "question" ? "question" : "task";
-    /* A question node jumps to the Questions screen the same way any other
-       navigation there does - see the `route.name === "questions"` handler
-       that calls `focusFirstAsk()` - rather than trying to scroll one
-       specific ask card into view from a different screen. */
-    const jump = node.kind === "question"
-      ? () => { location.hash = "#/questions"; }
-      : () => jumpToTask(node.id);
-    const g = svg("g", {
+  let focusTarget = host;
+  for (const row of rows.reverse()) for (const node of row) {
+    const { x, y } = pos.get(node.id);
+    const left = x - DEP_NODE_W / 2;
+    const top = y - DEP_NODE_H / 2;
+    const href = `#/${node.kind === "task" ? "tasks" : "questions"}/${encodeURIComponent(node.id)}`;
+    const link = svg("a", {
+      href,
       class: "dep-node",
       "data-tone": node.tone,
       "data-kind": node.kind,
-      tabindex: "0",
-      role: "button",
-      "aria-label": `${node.label}, ${kindLabel} ${node.status}${node.detail ? `, ${node.detail.toLowerCase()}` : ""}. ${node.kind === "question" ? "Open questions." : "Jump to this task."}`,
+      "aria-label": `${node.label}, ${node.kind} ${node.status}${node.detail ? `. ${node.detail}` : ""}`,
     },
-    svg("title", { text: node.detail ? `${node.label}\n${node.status}\n${node.detail}` : `${node.label}\n${node.status}` }),
-    svg("rect", { x: x - DEP_NODE_W / 2, y: y - DEP_NODE_H / 2, width: DEP_NODE_W, height: DEP_NODE_H, rx: 10 }),
-    svg("text", { x, y: y - 8, class: "dep-node-title", "text-anchor": "middle", text: truncateLabel(node.label, DEP_LABEL_UNITS) }),
-    svg("text", { x, y: y + 12, class: "dep-node-meta", "text-anchor": "middle", text: `${shortId(node.id)} · ${node.status}` }));
-    g.addEventListener("click", jump);
-    g.addEventListener("keydown", (ev) => {
-      if (ev.key !== "Enter" && ev.key !== " ") return;
-      ev.preventDefault();
-      jump();
-    });
-    root.append(g);
+    svg("title", { text: [node.label, node.status, node.detail].filter(Boolean).join("\n") }),
+    svg("rect", { x: left, y: top, width: DEP_NODE_W, height: DEP_NODE_H, rx: 10 }),
+    svg("foreignObject", { x: left + DEP_NODE_PAD_X, y: top + 10, width: DEP_NODE_W - 2 * DEP_NODE_PAD_X, height: 48 },
+      el("div", { class: "dep-node-title", text: node.label })),
+    svg("text", { x, y: top + 74, class: "dep-node-meta", "text-anchor": "middle", text: `${shortId(node.id)} · ${node.status}` }));
+    if (href === focused) focusTarget = link;
+    root.append(link);
   }
-
-  host.append(root);
+  show(host, true);
+  host.replaceChildren(root);
+  if (focused) focusTarget.focus({ preventScroll: true });
+  host.scrollLeft = scrollLeft;
+  host.scrollTop = scrollTop;
 }
 
 /* Opens a Backlog section (if closed) and persists that the same way every
@@ -5826,6 +5808,8 @@ function renderTitle() {
   const count = needsOwnerCount();
   const base = state.route.name === "queue"
     ? "Backlog \u2014 magi"
+    : state.route.name === "dependencies"
+      ? "Dependencies \u2014 magi"
     : state.route.name === "stats"
       ? "Stats \u2014 magi"
       : state.route.name === "settings"
@@ -5882,15 +5866,18 @@ function consumeQuestionFocus() {
    the caret at the top of the document would make them find it again. */
 function focusFirstAsk() {
   const active = document.activeElement;
+  const id = state.route.id;
   requestAnimationFrame(() => {
-    // Do not take focus back after the operator has started answering.
-    if (document.activeElement !== active) return;
+    if (state.route.name !== "questions" || state.route.id !== id) return;
+    // Hiding the previous view can clear its focused link on the next layout.
+    // That browser blur is not an operator focus change.
+    if (document.activeElement !== active &&
+        !(document.activeElement === document.body && active?.closest("[hidden]"))) return;
     const list = $("questions-list");
-    const target = state.route.name === "questions" && state.route.id
-      ? [...list.querySelectorAll(".ask")].find((row) => row.dataset.questionId === state.route.id)
+    const target = id
+      ? [...list.querySelectorAll(".ask")].find((row) => row.dataset.questionId === id)
       : null;
-    const specific = state.route.name === "questions" && state.route.id;
-    const first = specific ? target?.querySelector(".ask-summary")
+    const first = id ? target?.querySelector(".ask-summary")
       : list.querySelector('.ask[data-state="open"] .ask-summary');
     if (first) {
       first.focus({ preventScroll: true });
@@ -10386,7 +10373,7 @@ function mergeStore(name, rows, delta) {
   return sortTalks(list);
 }
 
-function loadStore(name, url, change, apply) {
+function loadStore(name, url, change, apply, settled) {
   cancelStoreRetry(name);
   let flight = storeReads.get(name);
   if (flight) {
@@ -10493,15 +10480,17 @@ function loadStore(name, url, change, apply) {
           sectionNotice(`${name === "queue" ? "queue" : name}-h`, `${name}-load-state`, "");
           if (name === "talks") showOlderTalks();
           ok();
+          settled?.(null);
         } catch (error) {
           state.rev[name] = null;
-          sectionNotice(`${name}-h`, `${name}-load-state`, `Could not load ${name}: ${error.message}`, () => loadStore(name, url, null, apply));
+          sectionNotice(`${name}-h`, `${name}-load-state`, `Could not load ${name}: ${error.message}`, () => loadStore(name, url, null, apply, settled));
+          settled?.(error);
           // Even the final change must recover while SSE stays connected:
           // health otherwise polls without applying revisions in that state.
           cancelStoreRetry(name);
           storeRetryTimers.set(name, setTimeout(() => {
             storeRetryTimers.delete(name);
-            if (!storeReads.has(name)) loadStore(name, url, target && { rev: target.rev }, apply);
+            if (!storeReads.has(name)) loadStore(name, url, target && { rev: target.rev }, apply, settled);
           }, 3000));
         }
       }
@@ -10523,7 +10512,7 @@ function loadQueue(change) {
     state.queue = list;
     renderStoreList(partial, renderQueue);
     refreshSearch("tasks");
-  });
+  }, error => dependenciesLoaded("queue", error));
 }
 
 async function loadStats({ background = false, queueOnly = false } = {}) {
@@ -10635,14 +10624,13 @@ function loadQuestions() {
        views are re-rendered from the answer, not from the run revision. The
        Queue is included for the same reason: a task blocked on a question id
        cannot be told apart from one blocked on an unresolved id until this
-       lands - see `classifyBlockedBy` - so the note line and dependency
-       graph both need another pass once it does. */
+       lands (see `classifyBlockedBy`). */
     renderRuns();
     renderQueue();
     if (state.route.name === "run" && state.detail.run) renderRunDetail();
     if (state.questions.length) loadQuestionOrigins();
     else sectionNotice("questions-h", "questions-origin-state", "");
-  });
+  }, error => dependenciesLoaded("questions", error));
 }
 
 /* ---- notification centre ------------------------------------------------
@@ -11386,6 +11374,7 @@ function parseRoute() {
   }
   if (parts[0] === "queue" && parts[1]) return { name: "queue", id: decodeURIComponent(parts[1]) };
   if (parts[0] === "queue") return { name: "queue", id: null };
+  if (parts[0] === "dependencies") return { name: "dependencies", id: null };
   if (parts[0] === "stats") return { name: "stats", id: null };
   if (parts[0] === "settings") return { name: "settings", id: null };
   if (parts[0] === "questions") return { name: "questions", id: parts[1] ? decodeURIComponent(parts[1]) : null };
@@ -11580,6 +11569,7 @@ function applyRoute() {
   show($("view-runs"), listShown("runs"));
   show($("view-run"), detailShown("run"));
   show($("view-queue"), listShown("queue"));
+  show($("view-dependencies"), route.name === "dependencies");
   show($("view-task"), detailShown("task"));
   show($("view-stats"), route.name === "stats");
   show($("view-settings"), route.name === "settings");
@@ -11674,6 +11664,7 @@ function applyRoute() {
     state.queueFocus = route.id;
     renderQueue();
   }
+  if (changed && route.name === "dependencies") renderDependencies();
   /* Fetched on arrival rather than at boot - see state.stats's own comment -
      so every visit re-reads the current numbers even if nothing changed on
      the stream since the last visit. */
@@ -12739,6 +12730,7 @@ function onPageShow(event) {
 
 function wire() {
   splitDivider.wireUp();
+  $("dependencies-retry").addEventListener("click", retryDependencies);
   $("stats-unreadable-close").addEventListener("click", () => {
     if (state.stats) {
       saveUnreadableDismissed(state.stats.runs_unreadable);
