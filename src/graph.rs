@@ -17848,7 +17848,12 @@ mod tests {
         };
         crate::daemon::run_claimed(&opts, &queue, &mut task).await;
         let task = queue.get(&owner).unwrap();
-        assert_eq!(task.runs, [id.clone()], "{:?}", task.hold_reason);
+        assert_eq!(
+            task.runs.as_slice(),
+            std::slice::from_ref(&id),
+            "{:?}",
+            task.hold_reason
+        );
         runner.state = RunState::load(&id).unwrap();
         assert!(!runner.state.base_sync_blocked());
         assert_eq!(runner.state.base_sync.as_ref().unwrap().attempts, 1);
