@@ -230,6 +230,7 @@ fn layer_paths_strict(repo: &Path, machine: Option<&Path>) -> anyhow::Result<Vec
 /// Every layer that applies, machine first - [`Config::layers`] with the
 /// machine path injected. Lenient: for *other* checkouts, whose own failures
 /// are not this screen's business.
+#[cfg(test)]
 fn layer_paths(repo: &Path, machine: Option<&Path>) -> Vec<PathBuf> {
     let mut paths: Vec<PathBuf> = machine
         .filter(|m| m.is_file())
@@ -377,8 +378,8 @@ pub(crate) fn view_with_repos(
     let is_machine = |p: &Path| machine.is_some_and(|m| m == p);
 
     let mut other_declares: BTreeMap<&str, String> = BTreeMap::new();
-    for other in other_checkouts(repo, &cfg.repos.roots, known) {
-        let theirs = Config::layer_tables(&repo_layers(&other.path));
+    for (other, layers) in other_checkouts(repo, &cfg.repos.roots, known) {
+        let theirs = Config::layer_tables(&layers);
         for key in ROLE_KEYS {
             if theirs
                 .iter()
@@ -803,12 +804,12 @@ pub(crate) fn save_with_repos(
 }
 
 /// Every checkout under `roots` other than `repo` that has its own config
-/// layers.
+/// layers, paired with those resolved layers so callers do not re-resolve them.
 fn other_checkouts(
     repo: &Path,
     roots: &[PathBuf],
     known: &[crate::repos::Repo],
-) -> Vec<crate::repos::Repo> {
+) -> Vec<(crate::repos::Repo, Vec<PathBuf>)> {
     let here = repo.canonicalize().unwrap_or_else(|_| repo.to_path_buf());
     let mut checkouts = crate::repos::scan(roots);
     for r in known {
@@ -818,7 +819,11 @@ fn other_checkouts(
     }
     checkouts
         .into_iter()
-        .filter(|r| r.path != here && !repo_layers(&r.path).is_empty())
+        .filter(|r| r.path != here)
+        .filter_map(|r| {
+            let layers = repo_layers(&r.path);
+            (!layers.is_empty()).then_some((r, layers))
+        })
         .collect()
 }
 
@@ -834,12 +839,14 @@ fn other_repos_still_load(
     roots: &[PathBuf],
     known: &[crate::repos::Repo],
 ) -> Result<(), SaveError> {
-    for other in other_checkouts(repo, roots, known) {
-        let layers = repo_layers(&other.path);
-        let mut old = layer_paths(&other.path, Some(machine));
-        if old.is_empty() {
-            old = layers.clone();
-        }
+    let machine_exists = machine.is_file();
+    for (other, layers) in other_checkouts(repo, roots, known) {
+        let mut old: Vec<PathBuf> = if machine_exists {
+            vec![machine.to_path_buf()]
+        } else {
+            Vec::new()
+        };
+        old.extend(layers.iter().cloned());
         if Config::load_layers(&old).is_err() {
             continue;
         }

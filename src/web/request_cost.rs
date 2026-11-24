@@ -48,7 +48,28 @@ pub(super) fn carry<T>(job: impl FnOnce() -> T + Send + 'static) -> impl FnOnce(
     }
 }
 
-pub(super) async fn measure<T>(job: impl std::future::Future<Output = T>) -> (T, (usize, usize)) {
+pub(crate) fn measure_sync<T>(job: impl FnOnce() -> T) -> (T, (usize, usize)) {
+    let counts = Arc::new(Counts::default());
+    struct Restore(Option<Arc<Counts>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            BLOCKING.with(|c| {
+                c.replace(self.0.take());
+            });
+        }
+    }
+    let _restore = Restore(BLOCKING.with(|c| c.replace(Some(counts.clone()))));
+    let result = job();
+    (
+        result,
+        (
+            counts.discoveries.load(Ordering::Relaxed),
+            counts.git.load(Ordering::Relaxed),
+        ),
+    )
+}
+
+pub(crate) async fn measure<T>(job: impl std::future::Future<Output = T>) -> (T, (usize, usize)) {
     let counts = Arc::new(Counts::default());
     let result = REQUEST.scope(counts.clone(), job).await;
     (

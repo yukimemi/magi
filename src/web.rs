@@ -11915,6 +11915,153 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn consecutive_monitor_scans_and_web_config_reads_bound_git_processes() {
+        let (tmp, repos) = performance_repositories().await;
+        let fx = Fixture {
+            home: TempDir::new().unwrap(),
+            addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        };
+        let ui = Arc::new(
+            Ui::new(
+                fx.queue(),
+                fx.questions(),
+                fx.talks(),
+                fx.runs(),
+                fx.home.path().to_path_buf(),
+                repos[0].clone(),
+            )
+            .with_worktrees_root(fx.home.path().join("wt")),
+        );
+        let cache = repos[0].join(".git/magi/config");
+        if cache.exists() {
+            std::fs::remove_dir_all(&cache).unwrap();
+        }
+
+        // 20 consecutive monitor ticks + web config reads over an unchanged
+        // repository: at most 1 git process from a cold cache, and 0 once warm.
+        let (_, (cold_discoveries, cold_git)) = request_cost::measure(async {
+            let mut snapshot = None;
+            for _ in 0..20 {
+                let state = Arc::clone(&ui);
+                let prev = snapshot.clone();
+                let next = tokio::task::spawn_blocking(request_cost::carry(move || {
+                    monitor_scan(&state, prev)
+                }))
+                .await
+                .unwrap();
+                snapshot = Some(next);
+                let repo = ui.repo.clone();
+                let (cfg, _) = tokio::task::spawn_blocking(request_cost::carry(move || {
+                    Config::discover(&repo, None)
+                }))
+                .await
+                .unwrap()
+                .unwrap();
+                assert_eq!(cfg.graph.implementers, 1);
+            }
+        })
+        .await;
+        assert_eq!(cold_discoveries, 20);
+        assert!(cold_git <= 1, "expected <= 1 cold git call, got {cold_git}");
+
+        let (_, (warm_discoveries, warm_git)) = request_cost::measure(async {
+            let mut snapshot = None;
+            for _ in 0..20 {
+                let state = Arc::clone(&ui);
+                let prev = snapshot.clone();
+                let next = tokio::task::spawn_blocking(request_cost::carry(move || {
+                    monitor_scan(&state, prev)
+                }))
+                .await
+                .unwrap();
+                snapshot = Some(next);
+                let repo = ui.repo.clone();
+                let (cfg, _) = tokio::task::spawn_blocking(request_cost::carry(move || {
+                    Config::discover(&repo, None)
+                }))
+                .await
+                .unwrap()
+                .unwrap();
+                assert_eq!(cfg.graph.implementers, 1);
+            }
+        })
+        .await;
+        assert_eq!(warm_discoveries, 20);
+        assert_eq!(warm_git, 0);
+
+        // Move `origin/main` via a separate clone without touching `repos[0]`'s
+        // working tree, then fetch; the next scan must immediately observe the
+        // new committed `magi.toml`.
+        let origin = tmp.path().join("one.git");
+        let pusher = tmp.path().join("pusher-one");
+        crate::git::git(
+            tmp.path(),
+            &[
+                "clone",
+                "-b",
+                "main",
+                origin.to_str().unwrap(),
+                pusher.to_str().unwrap(),
+            ],
+        )
+        .await
+        .unwrap();
+        std::fs::write(
+            pusher.join("magi.toml"),
+            format!("{MOCK_AGENT_TOML}\n[graph]\nimplementers = 3\n[repos]\nroots = []\n[update]\nmode = \"off\"\n[verify]\ne2e = []\ngate = []\n"),
+        )
+        .unwrap();
+        crate::git::git(&pusher, &["add", "magi.toml"])
+            .await
+            .unwrap();
+        crate::git::git(
+            &pusher,
+            &[
+                "-c",
+                "user.name=fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-m",
+                "bump implementers",
+            ],
+        )
+        .await
+        .unwrap();
+        crate::git::git(&pusher, &["push", "origin", "main"])
+            .await
+            .unwrap();
+        crate::git::git(&repos[0], &["fetch", "origin"])
+            .await
+            .unwrap();
+
+        let (observed, (moved_discoveries, moved_git)) = request_cost::measure(async {
+            let repo = ui.repo.clone();
+            tokio::task::spawn_blocking(request_cost::carry(move || {
+                Config::discover(&repo, None).unwrap().0.graph.implementers
+            }))
+            .await
+            .unwrap()
+        })
+        .await;
+        assert_eq!(observed, 3);
+        assert_eq!(moved_discoveries, 1);
+        assert_eq!(moved_git, 1);
+
+        let (observed_again, (_, warm_after_move)) = request_cost::measure(async {
+            let repo = ui.repo.clone();
+            tokio::task::spawn_blocking(request_cost::carry(move || {
+                Config::discover(&repo, None).unwrap().0.graph.implementers
+            }))
+            .await
+            .unwrap()
+        })
+        .await;
+        assert_eq!(observed_again, 3);
+        assert_eq!(warm_after_move, 0);
+    }
+
+    #[tokio::test]
     async fn list_request_cost_scopes_do_not_mix() {
         let (_tmp, repos, fx) = performance_fixture().await;
         seed_performance(&fx, &repos, 10, 0, 10);
