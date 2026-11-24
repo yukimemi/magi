@@ -21094,6 +21094,7 @@ esac
             );
             return;
         }
+        crate::run::set_home(PathBuf::from(std::env::var_os("MAGI_HOME").unwrap()));
         let home = crate::run::home();
         let directory = home.join("workers/jobs/abcdef");
         std::fs::create_dir_all(&directory).unwrap();
