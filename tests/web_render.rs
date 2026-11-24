@@ -949,6 +949,360 @@ async fn urgent_toggle_saves_in_queue_and_detail_and_reports_claim_conflicts() {
     }
 }
 
+#[tokio::test]
+async fn queue_drag_paints_and_saves_the_insertion_boundary() {
+    use serde_json::json;
+
+    async fn pointer(
+        browser: &mut cdp::Browser,
+        page: &cdp::Page,
+        mobile: bool,
+        phase: usize,
+        point: (f64, f64),
+    ) {
+        let (x, y) = point;
+        let (method, params) = if mobile {
+            let points = if phase < 2 {
+                vec![json!({ "x": x, "y": y })]
+            } else {
+                vec![]
+            };
+            (
+                "Input.dispatchTouchEvent",
+                json!({
+                    "type": (["touchStart", "touchMove", "touchEnd", "touchCancel"][phase]),
+                    "touchPoints": points,
+                }),
+            )
+        } else {
+            (
+                "Input.dispatchMouseEvent",
+                json!({
+                    "type": (["mousePressed", "mouseMoved", "mouseReleased"][phase]),
+                    "x": x, "y": y, "button": "left",
+                    "buttons": if phase == 2 { 0 } else { 1 }, "clickCount": 1,
+                }),
+            )
+        };
+        browser
+            .call(Some(&page.session), method, params)
+            .await
+            .unwrap();
+    }
+
+    async fn point(
+        browser: &mut cdp::Browser,
+        page: &cdp::Page,
+        node: &str,
+        fraction: f64,
+    ) -> (f64, f64) {
+        let coords = browser
+            .eval(
+                page,
+                &format!(
+                    "(() => {{
+            const r = ({node}).getBoundingClientRect();
+            return [r.left + r.width / 2, r.top + r.height * {fraction}];
+        }})()"
+                ),
+            )
+            .await
+            .unwrap();
+        (coords[0].as_f64().unwrap(), coords[1].as_f64().unwrap())
+    }
+
+    async fn assert_line(
+        browser: &mut cdp::Browser,
+        page: &cdp::Page,
+        side: &str,
+        edge: (f64, f64),
+    ) {
+        let (x, y) = edge;
+        let shot = browser
+            .call(
+                Some(&page.session),
+                "Page.captureScreenshot",
+                json!({ "format": "png" }),
+            )
+            .await
+            .unwrap();
+        let png = shot["data"].as_str().unwrap();
+        let painted = browser.eval(page, &format!(r#" (async () => {{
+            const image = new Image();
+            image.src = 'data:image/png;base64,{png}';
+            await image.decode();
+            const ctx = document.createElement('canvas').getContext('2d');
+            ctx.drawImage(image, -Math.round({x}), -Math.round({y}) + 5);
+            const rgba = ctx.getImageData(0, 0, 1, 11).data;
+            return rgba.some((r, i) => i % 4 === 0 && r >= 220 && rgba[i+1] >= 180 && rgba[i+2] <= 90);
+        }})() "#)).await.unwrap();
+        assert_eq!(
+            painted, true,
+            "no yellow pixels at the {side} edge {edge:?}"
+        );
+    }
+
+    let Some(chrome) = cdp::find_chrome() else {
+        assert!(std::env::var_os("CI").is_none(), "Chrome required in CI");
+        eprintln!("SKIP queue drag: no Chrome");
+        return;
+    };
+    let guard = common::home_lock().await;
+    let fx = common::fixture(guard, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("magi-home");
+    let queue = Queue::at(home.join("queue"));
+    let mut ids = Vec::new();
+    for i in 0..18 {
+        let mut task = Task::new(
+            format!("Drag task {i}"),
+            "Drag fixture".into(),
+            fx.repo.clone(),
+            Source::Human,
+        );
+        task.priority = 100 - i * 5;
+        queue.put(&mut task).unwrap();
+        ids.push(task.id);
+    }
+    let mut run = RunState::new(
+        fx.repo.clone(),
+        "main".into(),
+        "0000000".into(),
+        "Review fixture".into(),
+        fx.config.clone(),
+    );
+    run.status = RunStatus::Reviewing;
+    run.save_under(&home).unwrap();
+    let base = serve(
+        &home,
+        queue,
+        Talks::at(home.join("talks")),
+        home.join("runs"),
+        &fx.repo,
+    )
+    .await;
+    let mut browser = cdp::Browser::launch(&chrome).await.expect("Chrome");
+    let selector = "#queue-sections details[data-key=upnext] .task-card";
+    let rows = format!("document.querySelectorAll('{selector}')");
+    let ordered = |ids: &[String]| {
+        format!(
+            "JSON.stringify(Array.from({rows}, r => r.dataset.taskId)) === '{}'",
+            json!(ids)
+        )
+    };
+    let wait = Duration::from_secs(15);
+
+    for (width, height, mobile) in [(1280, 900, false), (390, 844, true)] {
+        let page = browser
+            .open_page(&format!("{base}#/queue"), width, height, mobile)
+            .await
+            .unwrap();
+        browser.wait_for(&page, &ordered(&ids), wait).await.unwrap();
+        let scroller = if mobile {
+            "document.scrollingElement"
+        } else {
+            "document.querySelector('#view-queue')"
+        };
+        let scroll_top = format!("{scroller}.scrollTop");
+        let source = format!("{rows}[0].querySelector('.reorder-handle')");
+        let third = format!("{rows}[2]");
+        let center = format!("{rows}[1].scrollIntoView({{block:'center'}})");
+        browser.eval(&page, &center).await.unwrap();
+        let start = point(&mut browser, &page, &source, 0.5).await;
+        pointer(&mut browser, &page, mobile, 0, start).await;
+        for (side, fraction, boundary) in [("before", 0.25, 0.0), ("after", 0.75, 1.0)] {
+            let target = point(&mut browser, &page, &third, fraction).await;
+            pointer(&mut browser, &page, mobile, 1, target).await;
+            browser
+                .wait_for(&page, &format!("{third}.dataset.drop === '{side}'"), wait)
+                .await
+                .unwrap_or_else(|error| panic!("{width}px at {target:?}: {error}"));
+            assert_eq!(browser.eval(&page, &ordered(&ids)).await.unwrap(), true);
+            let edge = point(&mut browser, &page, &third, boundary).await;
+            assert_line(&mut browser, &page, side, edge).await;
+        }
+        let target = point(&mut browser, &page, &third, 0.75).await;
+        pointer(&mut browser, &page, mobile, 2, target).await;
+        ids[..3].rotate_left(1);
+        browser.wait_for(&page, &ordered(&ids), wait).await.unwrap();
+
+        browser
+            .call(Some(&page.session), "Page.reload", json!({}))
+            .await
+            .unwrap();
+        browser.wait_for(&page, &ordered(&ids), wait).await.unwrap();
+        browser.eval(&page, &center).await.unwrap();
+        let start = point(&mut browser, &page, &source, 0.5).await;
+        let target = point(&mut browser, &page, &third, 0.75).await;
+        pointer(&mut browser, &page, mobile, 0, start).await;
+        pointer(&mut browser, &page, mobile, 1, target).await;
+        browser
+            .wait_for(&page, &format!("{third}.dataset.drop === 'after'"), wait)
+            .await
+            .unwrap();
+        let fourth = format!("{rows}[3]");
+        browser
+            .eval(
+                &page,
+                &format!(
+                    "{scroll_top} += {fourth}.getBoundingClientRect().top - {third}.getBoundingClientRect().top"
+                ),
+            )
+            .await
+            .unwrap();
+        browser
+            .wait_for(&page, &format!("{fourth}.dataset.drop === 'after'"), wait)
+            .await
+            .unwrap();
+        let outside = (1.0, target.1);
+        pointer(&mut browser, &page, mobile, 1, outside).await;
+        let clear = "!document.querySelector('#queue-sections [data-drop]')";
+        browser.wait_for(&page, clear, wait).await.unwrap();
+        pointer(&mut browser, &page, mobile, 2, outside).await;
+
+        let bottom = if mobile {
+            "document.querySelector('.dock').getBoundingClientRect().top"
+        } else {
+            "document.querySelector('#view-queue').getBoundingClientRect().bottom"
+        };
+        let clipped = format!("{rows}[7]");
+        browser
+            .eval(
+                &page,
+                &format!(
+                    "{scroll_top} += {clipped}.getBoundingClientRect().bottom - ({bottom} + 6)"
+                ),
+            )
+            .await
+            .unwrap();
+        let handle = format!("{rows}[5].querySelector('.reorder-handle')");
+        let start = point(&mut browser, &page, &handle, 0.5).await;
+        let target = point(&mut browser, &page, &clipped, 0.53).await;
+        let (x, y) = target;
+        assert_eq!(
+            browser
+                .eval(&page, &format!(
+                    "{y} < {bottom} - 48 && {clipped}.getBoundingClientRect().bottom > {bottom} && {clipped}.contains(document.elementFromPoint({x}, {y}))"
+                ))
+                .await
+                .unwrap(),
+            true,
+            "{width}px: pointer must hit the visible lower half outside the auto-scroll zone"
+        );
+        pointer(&mut browser, &page, mobile, 0, start).await;
+        browser
+            .wait_for(
+                &page,
+                "!!document.querySelector('#queue-sections .row-dragging')",
+                wait,
+            )
+            .await
+            .unwrap();
+        pointer(&mut browser, &page, mobile, 1, target).await;
+        assert_eq!(
+            browser.eval(&page, clear).await.unwrap(),
+            true,
+            "{width}px: clipped boundary was offered"
+        );
+        pointer(&mut browser, &page, mobile, 2, target).await;
+        let unchanged = format!("!{handle}.disabled && ({})", ordered(&ids));
+        assert_eq!(browser.eval(&page, &unchanged).await.unwrap(), true);
+        browser
+            .call(Some(&page.session), "Page.reload", json!({}))
+            .await
+            .unwrap();
+        browser.wait_for(&page, &ordered(&ids), wait).await.unwrap();
+
+        browser.eval(&page, &center).await.unwrap();
+        let start = point(&mut browser, &page, &source, 0.5).await;
+        let top = browser.eval(&page, &scroll_top).await.unwrap();
+        let y = browser
+            .eval(&page, &format!("{bottom} - 20"))
+            .await
+            .unwrap()
+            .as_f64()
+            .unwrap();
+        pointer(&mut browser, &page, mobile, 0, start).await;
+        pointer(&mut browser, &page, mobile, 1, (start.0, y)).await;
+        let scrolled = format!(
+            "{scroll_top} > {top} + 140 && Array.from({rows}).slice(3).some(row => row.dataset.drop)"
+        );
+        browser.wait_for(&page, &scrolled, wait).await.unwrap();
+        if mobile {
+            pointer(&mut browser, &page, mobile, 3, (start.0, y)).await;
+        } else {
+            browser.call(Some(&page.session), "Input.dispatchKeyEvent", json!({
+                "type": "keyDown", "key": "Escape", "code": "Escape", "windowsVirtualKeyCode": 27,
+            })).await.unwrap();
+            pointer(&mut browser, &page, mobile, 2, (start.0, y)).await;
+        }
+        browser
+            .wait_for(
+                &page,
+                &format!("{clear} && !document.querySelector('#queue-sections .row-dragging')"),
+                wait,
+            )
+            .await
+            .unwrap();
+        assert_eq!(browser.eval(&page, &ordered(&ids)).await.unwrap(), true);
+        browser
+            .call(Some(&page.session), "Page.reload", json!({}))
+            .await
+            .unwrap();
+        browser.wait_for(&page, &ordered(&ids), wait).await.unwrap();
+        if !mobile {
+            browser
+                .eval(&page, &format!("{source}.focus()"))
+                .await
+                .unwrap();
+            browser
+                .call(
+                    Some(&page.session),
+                    "Input.dispatchKeyEvent",
+                    json!({ "type": "keyDown", "key": "ArrowDown", "code": "ArrowDown", "windowsVirtualKeyCode": 40 }),
+                )
+                .await
+                .unwrap();
+            ids.swap(0, 1);
+            browser.wait_for(&page, &ordered(&ids), wait).await.unwrap();
+            assert_eq!(
+                browser
+                    .eval(
+                        &page,
+                        &format!(
+                            "document.activeElement === {rows}[1].querySelector('.reorder-handle')"
+                        )
+                    )
+                    .await
+                    .unwrap(),
+                true
+            );
+        }
+
+        browser
+            .eval(&page, "location.hash = '#/runs'")
+            .await
+            .unwrap();
+        browser
+            .wait_for(
+                &page,
+                "!!document.querySelector('#runs-sections a.card')",
+                wait,
+            )
+            .await
+            .unwrap();
+        let controls = "#runs-sections .reorder-handle, #runs-sections summary button";
+        assert_eq!(
+            browser
+                .eval(&page, &format!("!document.querySelector('{controls}')"))
+                .await
+                .unwrap(),
+            true
+        );
+        browser.close_page(&page).await;
+        eprintln!("queue drag verified at {width}px (touch={mobile})");
+    }
+}
+
 /// `Task::urgent` shows as an URGENT tag on the Queue card and the task page,
 /// whatever the priority or status; a non-urgent task never carries one.
 #[tokio::test]
@@ -5009,7 +5363,8 @@ async fn avatar_settings_preview_isolation_reload_and_reset_on_phone() {
         eprintln!("SKIP avatar settings: no Chrome");
         return;
     };
-    // Avatar storage does not need a Git repository or a remote config layer.
+    // Avatar storage is independent of Git. Load local settings without
+    // reading a remote-tracking ref on each catalog and preview request.
     let fixture = tempfile::tempdir().unwrap();
     let repo = fixture.path().join("settings-context");
     std::fs::create_dir(&repo).unwrap();

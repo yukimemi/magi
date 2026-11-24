@@ -3,10 +3,10 @@ import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
 import { test } from 'node:test';
 const source = readFileSync(new URL('../assets/ui/app.js', import.meta.url), 'utf8');
-const logic = source.slice(source.indexOf('const priorityOrder ='), source.indexOf('async function moveListRow('));
-function harness(order = {}) {
-  return runInNewContext(`${logic}\n({priorityEdits, queueMoveEdits, queueOrder, orderedRuns, rememberRunMove})`, {
-    runOrder: order, queueSection: task => task.status || 'upnext',
+const logic = source.slice(source.indexOf('const priorityOrder ='), source.indexOf('function queueReorderNotice('));
+function harness() {
+  return runInNewContext(`${logic}\n({priorityEdits, queueMoveEdits, queueOrder, queueDropSlot})`, {
+    queueSection: task => task.status || 'upnext',
   });
 }
 test('every insertion preserves exact dispatch order at ties and integer boundaries', () => {
@@ -44,21 +44,20 @@ test('drop planning uses fresh priorities and surviving neighbour IDs', () => {
   assert.throws(() => queueMoveEdits(tasks, 'c', 'gone', 'missing', 'upnext'), /list changed/);
   assert.throws(() => queueMoveEdits(tasks.map(task => task.id === 'c' ? { ...task, status: 'running' } : task), 'c', 'a', 'b', 'upnext'), /no longer movable/);
 });
-test('filtered and unloaded runs keep their remembered slots after visible moves', () => {
-  const order = { flight: ['a', 'hidden', 'b', 'unloaded'] };
-  const { rememberRunMove, orderedRuns } = harness(order);
-  rememberRunMove('flight', ['b', 'a']);
-  assert.deepEqual(Array.from(order.flight), ['b', 'hidden', 'a', 'unloaded']);
-  assert.deepEqual(Array.from(orderedRuns('flight', ['a', 'hidden', 'b', 'unloaded'].map(id => ({ id }))), row => row.id), ['b', 'hidden', 'a', 'unloaded']);
-});
 test('upgrade resumes stay ahead of priority and order by dispatch time', () => {
   const { queueOrder } = harness();
   const tasks = [{ id: 'ordinary', priority: 2147483647 }, { id: 'later', priority: 0, upgrade_resume_at: '2026-01-02T00:00:00Z' }, { id: 'earlier', priority: -10, upgrade_resume_at: '2026-01-01T00:00:00Z' }];
   assert.deepEqual(tasks.sort(queueOrder).map(t => t.id), ['earlier', 'later', 'ordinary']);
 });
-test('browser order ignores absent IDs and puts new runs first in default order', () => {
-  const { orderedRuns } = harness({ active: ['gone', 'b', 'a'], done: 'corrupt' });
-  const rows = ['new2', 'a', 'new1', 'b'].map(id => ({ id }));
-  assert.deepEqual(Array.from(orderedRuns('active', rows), r => r.id), ['new2', 'new1', 'b', 'a']);
-  assert.deepEqual(Array.from(orderedRuns('done', rows), r => r.id), rows.map(r => r.id));
+test('neither side of an upgrade resume is a drop boundary', () => {
+  const { queueDropSlot } = harness();
+  const row = (fixed = false) => ({ hasAttribute: name => fixed && name === 'data-upgrade-resume' });
+  const [upgrade, a, b] = [row(true), row(), row()];
+  const rows = [upgrade, a, b];
+  assert.equal(queueDropSlot(rows, 3, 0, true), null);
+  assert.equal(queueDropSlot(rows, 3, 0, false), null);
+  assert.equal(queueDropSlot(rows, 3, 1, true), null);
+  const slot = queueDropSlot(rows, 3, 2, true);
+  assert.equal(slot.prev, a);
+  assert.equal(slot.next, b);
 });

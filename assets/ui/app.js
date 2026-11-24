@@ -2326,13 +2326,9 @@ function syncSections(root, sectionDefs, itemsByKey, createFn, updateFn) {
   for (const stale of existing.values()) stale.remove();
 }
 
-/* Reordering is confined to complete sections. Store refreshes still update
-   state during a gesture/save, but leave the keyed DOM (and pointer capture)
-   alone until it ends. No requested queue order is shown before persistence. */
-let rowGesture = null;
-let rowSaving = false;
-const RUN_ORDER_KEY = "magi-run-order";
-let runOrder = loadCollapsed(RUN_ORDER_KEY);
+/* Keep Queue rows stable through pointer capture and priority writes. */
+let queueDragging = false;
+let queueSaving = false;
 const rowId = (row) => row.dataset.key;
 const priorityOrder = (a, b) => b.priority - a.priority || a.id.localeCompare(b.id);
 function queueOrder(a, b) {
@@ -2343,34 +2339,6 @@ function queueOrder(a, b) {
     return stamp(a.upgrade_resume_at).localeCompare(stamp(b.upgrade_resume_at)) || a.id.localeCompare(b.id);
   }
   return priorityOrder(a, b);
-}
-
-function orderedRuns(key, runs) {
-  const saved = Array.isArray(runOrder[key]) ? runOrder[key] : [];
-  const ranks = new Map(saved.map((id, i) => [id, i]));
-  // New arrivals retain their default order, ahead of the remembered rows.
-  return [...runs].sort((a, b) =>
-    (ranks.get(a.id) ?? -1) - (ranks.get(b.id) ?? -1));
-}
-
-function rememberRunMove(key, visible) {
-  const saved = Array.isArray(runOrder[key]) ? runOrder[key] : [];
-  const shown = new Set(visible);
-  const full = [...visible.filter((id) => !saved.includes(id)), ...saved];
-  let cursor = 0;
-  // Only refill visible slots; filtered and unloaded runs retain their places.
-  runOrder[key] = full.map((id) => shown.has(id) ? visible[cursor++] : id);
-}
-
-function reorderAllowed(scope) {
-  return !rowSaving && !searchText(scope);
-}
-
-function reorderSnapshot(scope) {
-  return JSON.stringify((scope === "queue" ? state.queue : state.runs).map((item) =>
-    scope === "queue"
-      ? [item.id, queueSection(item), item.priority, item.upgrade_resume_at]
-      : [item.id, runSection(item), item.superseded_by]));
 }
 
 /* Pick one integer if possible; otherwise expand only the contiguous interval
@@ -2415,59 +2383,58 @@ function queueMoveEdits(tasks, key, prevKey, nextKey, section) {
   }
   return priorityEdits(items, items.indexOf(moved), to);
 }
-function reorderNotice(scope, message) {
-  setText($(`${scope}-reorder-status`), message);
+
+function queueDropSlot(rows, from, index, before) {
+  const anchor = rows[index];
+  if (!anchor) return null;
+  const at = index + (before ? 0 : 1);
+  const prev = rows[at - 1], next = rows[at];
+  if (at === from || prev?.hasAttribute("data-upgrade-resume") || next?.hasAttribute("data-upgrade-resume")) return null;
+  return { anchor, side: before ? "before" : "after", prev, next };
+}
+
+function queueDragRows(row) {
+  const rows = [...row.parentElement.children];
+  const from = rows.indexOf(row);
+  rows.splice(from, 1);
+  return { rows, from };
+}
+
+function queueReorderNotice(message) {
+  setText($("queue-reorder-status"), message);
   announce(message);
 }
 
+function queueReorderAllowed() {
+  return !queueSaving && !searchText("queue");
+}
 
-async function moveListRow(scope, row, target, snapshot) {
-  if (!reorderAllowed(scope) || (scope === "runs" && snapshot && snapshot !== reorderSnapshot(scope))) {
-    reorderNotice(scope, "List changed. Reorder cancelled; try again.");
-    return;
-  }
-  const list = row.parentElement;
-  const ids = [...list.children].map(rowId);
-  const from = ids.indexOf(rowId(row));
-  const to = ids.indexOf(rowId(target));
-  if (from < 0 || to < 0 || from === to) return;
+async function moveQueueRow(row, prev, next) {
+  if (!queueReorderAllowed()) return;
   const focusId = rowId(row);
-  const section = list.closest(".list-section").dataset.key;
-  const desired = [...ids];
-  desired.splice(from, 1);
-  desired.splice(to, 0, focusId);
-  const prevKey = desired[to - 1], nextKey = desired[to + 1];
-  let result = "Row order saved.";
-  rowSaving = true;
-  for (const control of document.querySelectorAll(".reorder-handle, #queue-sections .btn-step")) control.disabled = true;
+  const section = row.closest(".list-section").dataset.key;
+  queueSaving = true;
+  for (const control of $("queue-sections").querySelectorAll(".reorder-handle, .btn-step")) control.disabled = true;
   try {
-    if (scope === "runs") {
-      rememberRunMove(section, desired);
-      try { localStorage.setItem(RUN_ORDER_KEY, JSON.stringify(runOrder)); }
-      catch { result = "Run order changed for this tab only; browser storage is unavailable."; }
-    } else {
-      // Read at drop time. A failed refresh must never plan from cached state.
-      const tasks = await getJson(API.queue);
-      for (const edit of queueMoveEdits(tasks, focusId, prevKey, nextKey, section)) {
-        await postJson(API.priority(edit.id), { priority: edit.priority });
-      }
-      await loadQueue();
+    // A failed read must never plan a move from cached priorities.
+    const tasks = await getJson(API.queue);
+    for (const edit of queueMoveEdits(tasks, focusId, prev && rowId(prev), next && rowId(next), section)) {
+      await postJson(API.priority(edit.id), { priority: edit.priority });
     }
-    reorderNotice(scope, result);
+    await loadQueue();
+    queueReorderNotice("Row order saved.");
   } catch (error) {
-    reorderNotice(scope, `Could not reorder: ${error.message}. Refreshing saved order.`);
-    if (scope === "queue") await loadQueue();
+    queueReorderNotice(`Could not reorder: ${error.message}. Refreshing saved order.`);
+    await loadQueue();
   } finally {
-    rowSaving = false;
+    queueSaving = false;
     renderQueue();
-    renderRuns();
-    const root = $(scope === "queue" ? "queue-sections" : "runs-sections");
-    [...root.querySelectorAll(".reorder-handle")].find((button) =>
+    [...$("queue-sections").querySelectorAll(".reorder-handle")].find((button) =>
       rowId(button.closest("li")) === focusId)?.focus({ preventScroll: true });
   }
 }
 
-function addReorderHandle(row, scope) {
+function addQueueReorderHandle(row) {
   const handle = el("button", { type: "button", class: "btn btn-quiet reorder-handle",
     text: "↕", "aria-label": "Reorder row. Use Arrow Up or Arrow Down.",
     title: "Drag to reorder, or use Arrow Up / Arrow Down" });
@@ -2476,76 +2443,112 @@ function addReorderHandle(row, scope) {
   handle.addEventListener("keydown", (event) => {
     if (!["ArrowUp", "ArrowDown"].includes(event.key)) return;
     event.preventDefault();
-    const target = event.key === "ArrowUp" ? row.previousElementSibling : row.nextElementSibling;
-    if (!handle.disabled && target) void moveListRow(scope, row, target);
+    if (handle.disabled || queueDragging || !queueReorderAllowed()) return;
+    const { rows, from } = queueDragRows(row);
+    const up = event.key === "ArrowUp";
+    const slot = queueDropSlot(rows, from, up ? from - 1 : from, up);
+    if (slot) void moveQueueRow(row, slot.prev, slot.next);
   });
   handle.addEventListener("pointerdown", (event) => {
-    if (event.button !== 0 || handle.disabled || !reorderAllowed(scope)) return;
+    if (event.button !== 0 || handle.disabled || queueDragging || !queueReorderAllowed()) return;
     event.preventDefault();
-    const snapshot = reorderSnapshot(scope);
+    const { pointerId } = event;
     const list = row.parentElement;
-    let target = row;
-    let y = event.clientY;
-    let frame;
-    rowGesture = { scope };
+    const { rows, from } = queueDragRows(row);
+    const pane = list.closest(".view");
+    const scroller = getComputedStyle(pane).overflowY === "auto" ? pane : document.scrollingElement;
+    const header = document.querySelector("header.top");
+    const dock = document.querySelector(".dock");
+    let { clientX: x, clientY: y } = event;
+    let frame, marked, markedSide;
+    queueDragging = true;
     row.classList.add("row-dragging");
-    handle.setPointerCapture(event.pointerId);
-    const indicate = () => {
-      for (const child of list.children) child.removeAttribute("data-drop");
-      const candidates = [...list.children];
-      target = candidates.reduce((best, child) => {
-        const box = child.getBoundingClientRect();
-        const distance = Math.abs(y - (box.top + box.height / 2));
-        return distance < best.distance ? { child, distance } : best;
-      }, { child: row, distance: Infinity }).child;
-      if (target !== row) target.dataset.drop =
-        candidates.indexOf(target) < candidates.indexOf(row) ? "before" : "after";
+    handle.setPointerCapture(pointerId);
+
+    const inList = () => queueReorderAllowed() && list.contains(document.elementFromPoint(x, y));
+    const scrollBounds = () => scroller === document.scrollingElement
+      ? { top: header.getBoundingClientRect().bottom, bottom: dock.offsetHeight ? dock.getBoundingClientRect().top : innerHeight }
+      : scroller.getBoundingClientRect();
+    const slotAtPointer = () => {
+      if (!inList() || rows.length === 0) return null;
+      for (const [i, anchor] of rows.entries()) {
+        const { top, bottom } = anchor.getBoundingClientRect();
+        if (y >= bottom && i < rows.length - 1) continue;
+        const before = y < (top + bottom) / 2;
+        const bounds = scrollBounds();
+        // The insertion line is centered in the gap, just beyond the card edge.
+        const line = before ? top - 2 : bottom + 2;
+        if (line <= bounds.top || line >= bounds.bottom) return null;
+        return queueDropSlot(rows, from, i, before);
+      }
+      return null;
     };
+    const indicate = (slot) => {
+      if (marked === slot?.anchor && markedSide === slot?.side) return;
+      marked?.removeAttribute("data-drop");
+      marked = slot?.anchor;
+      markedSide = slot?.side;
+      if (marked) marked.dataset.drop = markedSide;
+    };
+    const refreshDrop = () => indicate(slotAtPointer());
     const scroll = () => {
-      const pane = list.closest(".view");
-      const scroller = pane && pane.scrollHeight > pane.clientHeight ? pane : document.scrollingElement;
-      const box = scroller === document.scrollingElement
-        ? { top: 0, bottom: innerHeight } : scroller.getBoundingClientRect();
-      const dy = y < box.top + 48 ? -10 : y > box.bottom - 48 ? 10 : 0;
-      if (dy) { scroller.scrollTop += dy; indicate(); }
+      if (inList()) {
+        const { top, bottom } = scrollBounds();
+        const dy = y < top + 48 ? -10 : y > bottom - 48 ? 10 : 0;
+        if (dy) scroller.scrollTop += dy;
+      } else {
+        indicate(null);
+      }
       frame = requestAnimationFrame(scroll);
     };
-    const move = (e) => { y = e.clientY; indicate(); };
+    const move = (e) => {
+      if (e.pointerId !== pointerId) return;
+      ({ clientX: x, clientY: y } = e);
+      refreshDrop();
+    };
     const finish = (e) => {
+      if (e.type !== "keydown" && e.pointerId !== pointerId) return;
+      let slot = null;
+      if (e.type === "pointerup") {
+        ({ clientX: x, clientY: y } = e);
+        slot = slotAtPointer();
+      }
       cancelAnimationFrame(frame);
       handle.removeEventListener("pointermove", move);
       handle.removeEventListener("pointerup", finish);
       handle.removeEventListener("pointercancel", finish);
       handle.removeEventListener("lostpointercapture", finish);
-      handle.removeEventListener("keydown", cancel);
+      document.removeEventListener("keydown", cancel, true);
+      document.removeEventListener("scroll", refreshDrop, true);
       row.classList.remove("row-dragging");
-      for (const child of list.children) child.removeAttribute("data-drop");
-      rowGesture = null;
-      if (handle.hasPointerCapture(event.pointerId)) handle.releasePointerCapture(event.pointerId);
-      if (e.type === "pointerup") void moveListRow(scope, row, target, snapshot);
+      indicate(null);
+      queueDragging = false;
+      if (handle.hasPointerCapture(pointerId)) handle.releasePointerCapture(pointerId);
+      if (slot) void moveQueueRow(row, slot.prev, slot.next);
       renderQueue();
-      renderRuns();
     };
-    const cancel = (e) => { if (e.key === "Escape") finish(e); };
+    const cancel = (e) => {
+      if (e.key !== "Escape") return;
+      e.preventDefault();
+      e.stopPropagation();
+      finish(e);
+    };
     handle.addEventListener("pointermove", move);
     handle.addEventListener("pointerup", finish);
     handle.addEventListener("pointercancel", finish);
     handle.addEventListener("lostpointercapture", finish);
-    handle.addEventListener("keydown", cancel);
+    document.addEventListener("keydown", cancel, true);
+    document.addEventListener("scroll", refreshDrop, true);
     frame = requestAnimationFrame(scroll);
   });
 }
 
-function updateReorderHandles(node, scope, items) {
+function updateQueueReorderControls(node, items) {
   for (const row of node.refs.list.children) {
     const task = items.find((item) => item.id === rowId(row));
-    row.refs.reorder.setAttribute("aria-label", `Reorder ${task.title || task.task || task.id}. Use Arrow Up or Arrow Down.`);
-    row.refs.reorder.disabled = !reorderAllowed(scope) || (scope === "queue"
-      && (queueSection(task) === "running" || Boolean(task.upgrade_resume_at)));
-    if (scope === "queue") {
-      row.refs.priorityDown.disabled = rowSaving || queueSection(task) === "running" || task.priority <= -2147483648;
-      row.refs.priorityUp.disabled = rowSaving || queueSection(task) === "running" || task.priority >= 2147483647;
-    }
+    row.refs.reorder.setAttribute("aria-label", `Reorder ${task.title || task.id}. Use Arrow Up or Arrow Down.`);
+    row.refs.priorityDown.disabled = queueSaving || queueSection(task) === "running" || task.priority <= -2147483648;
+    row.refs.priorityUp.disabled = queueSaving || queueSection(task) === "running" || task.priority >= 2147483647;
   }
 }
 
@@ -2556,16 +2559,6 @@ function createRunSection(def) {
   const folded = el("span", { class: "runs-section-folded" });
   section.refs.summary.append(folded);
   section.refs.folded = folded;
-  const reset = el("button", { type: "button", class: "btn btn-quiet", text: "Reset order",
-    "aria-label": `Reset ${def.label} run order` });
-  reset.addEventListener("click", (event) => {
-    event.preventDefault();
-    if (rowGesture || rowSaving) return;
-    delete runOrder[def.key];
-    saveCollapsed(RUN_ORDER_KEY, runOrder);
-    renderRuns();
-  });
-  section.refs.summary.append(reset);
   return section;
 }
 
@@ -2575,10 +2568,9 @@ function updateRunSection(node, heads, childrenOf) {
   setText(node.refs.folded, foldedTotal
     ? `, ${plural(foldedTotal, "earlier attempt", "earlier attempts")} folded`
     : "");
-  syncList(node.refs.list, orderedRuns(node.dataset.key, heads), (r) => r.id, createRunRow,
+  syncList(node.refs.list, heads, (r) => r.id, createRunRow,
     (row, run) => updateRunRow(row, run, childrenOf.get(run.id) || []),
     (run) => [run, ...(childrenOf.get(run.id) || [])]);
-  updateReorderHandles(node, "runs", heads);
 }
 
 function syncRunSections(root, bySection, childrenOf) {
@@ -2593,7 +2585,6 @@ function syncRunSections(root, bySection, childrenOf) {
  * interactive element. */
 function createRunRow() {
   const row = createRunCard();
-  addReorderHandle(row, "runs");
   const summary = el("summary", { class: "run-folded-summary" });
   const list = el("ul", { class: "run-folded-list" });
   const folded = el("details", { class: "run-folded advanced" }, summary, list);
@@ -2625,7 +2616,6 @@ function updateRunRow(row, run, children) {
 }
 
 function renderRuns() {
-  if (rowGesture || rowSaving) return;
   const runs = state.runs;
   const sectionsRoot = $("runs-sections");
 
@@ -2859,7 +2849,7 @@ function createTaskCard() {
     outcome, note, snippet, error, instruction, answers, answersList, runLink, actionMenu,
     priorityDown, priorityUp, priorityValue, editBtn, urgentBox, holdBox, doneBox, deleteBox,
   };
-  addReorderHandle(card, "queue");
+  addQueueReorderHandle(card);
   return card;
 }
 
@@ -2867,7 +2857,8 @@ function updateTaskCard(row, task) {
   const r = row.refs;
   const status = String(task.status_str || task.status || "");
   const meta = TASK_STATUS[status] || {};
-  row.refs.reorder.disabled = !reorderAllowed("queue") || status === "running" || Boolean(task.upgrade_resume_at);
+  row.toggleAttribute("data-upgrade-resume", Boolean(task.upgrade_resume_at));
+  row.refs.reorder.disabled = !queueReorderAllowed() || status === "running" || row.hasAttribute("data-upgrade-resume");
 
   setAttr(r.card, "data-tone", toneOf(status, TASK_STATUS));
   /* The full id, a stable hook for jumpToTask() that does not depend on
@@ -3391,7 +3382,7 @@ function createQueueSection(def) {
 function updateQueueSection(node, tasks) {
   setText(node.refs.count, plural(tasks.length, "task", "tasks"));
   syncList(node.refs.list, tasks, (t) => t.id, createTaskCard, updateTaskCard);
-  updateReorderHandles(node, "queue", tasks);
+  updateQueueReorderControls(node, tasks);
 }
 
 function syncQueueSections(root, bySection) {
@@ -4321,7 +4312,7 @@ function renderStatsQueue(q) {
 }
 
 function renderQueue(allowSearchJump = false) {
-  if (rowGesture || rowSaving) return;
+  if (queueDragging || queueSaving) return;
   const sectionsRoot = $("queue-sections");
   const tasks = state.queue;
 
