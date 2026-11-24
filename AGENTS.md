@@ -3453,11 +3453,14 @@ and drop cleanup.
 
 `[update] auto_restart` is opt-in and uses the manual upgrade gate, progress,
 installer and successor handover in `src/web.rs`. Keep those paths shared.
-Automatic requests wait for idle task and chat workers and never park active
-runs. Workers racing the idle snapshot retain their executable and continue
-through handover; neither manual nor automatic restarts wait for execution
-leases. The handover drains only admission transactions. Failed-tag suppression
-is process-local, not run state; do not persist it or change `run::SCHEMA` for update bookkeeping.
+Automatic requests trigger without waiting for idle task, chat, or service
+workers and never park active runs. The handover drains only short admission
+transactions before restarting the detached scheduler and web listener; active
+workers and pinned helpers continue uninterrupted on their original executable
+generation while newly dispatched work uses the new generation (old and new
+generations may temporarily coexist). Legacy embedded schedulers are still
+refused. Failed-tag suppression is process-local, not run state; do not persist
+it or change `run::SCHEMA` for update bookkeeping.
 
 ### Verification runs as a standalone caller
 

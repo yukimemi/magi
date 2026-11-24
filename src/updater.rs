@@ -328,7 +328,7 @@ pub enum UpgradeTrigger {
     /// Requested through the web UI.
     #[default]
     Manual,
-    /// Requested by the idle-only background checker.
+    /// Requested by the background update checker.
     Auto,
 }
 
