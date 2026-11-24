@@ -4193,7 +4193,7 @@ pub(crate) fn test_home() -> PathBuf {
         if let Some((owner, path)) = DIR.get()
             && *owner == std::process::id()
         {
-            let _ = std::fs::remove_dir_all(path);
+            if let Err(e) = std::fs::remove_dir_all(path) { eprintln!("CLEANUP-ERR {e}"); }
         }
     }
 
