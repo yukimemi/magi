@@ -698,7 +698,9 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn interruption_reaps_descendants_before_releasing_pre_clean_lock() {
-        let (_tmp, mut state, wt) = fixture(&["sleep 30 & echo $! > child; wait"]).await;
+        let (_tmp, mut state, wt) = fixture(&[r#"sleep 30 &
+            printf '%s\n' "$!" > child.tmp && mv child.tmp child && wait"#])
+        .await;
         let target = wt.clone();
         let task = tokio::spawn(async move { reset(&mut state, &target, None).await });
         tokio::time::timeout(Duration::from_secs(10), async {
