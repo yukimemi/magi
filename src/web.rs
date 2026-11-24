@@ -2659,41 +2659,43 @@ fn auto_upgrade_decision(
 /// Refresh the shared cache and optionally request the same handover as the UI.
 async fn run_update_recheck(ui: Arc<Ui>) {
     loop {
-        let cfg = match Config::discover(&ui.repo, None) {
-            Ok((cfg, _)) => cfg,
-            Err(e) => {
-                updater::log_warn(
-                    &ui.home,
-                    &format!("auto-upgrade: config unavailable: {e:#}"),
-                );
-                tokio::time::sleep(UPDATE_RECHECK_POLL_MAX).await;
-                continue;
-            }
-        };
-        if should_spawn_recheck(&cfg.update)
-            && let Some(checker) = updater::Checker::new(&cfg.update)
-        {
-            let progress = updater::read_progress(&ui.home);
-            let mut latest = checker.cached_update();
-            if update_recheck_due(&checker, progress.as_ref()) {
-                match checker.newer_release().await {
-                    Ok(found) => latest = found,
-                    Err(e) => tracing::warn!("background update recheck failed: {e:#}"),
-                }
-            }
-            if cfg.update.auto_restart
-                && let Some(latest) = latest
-            {
-                let response =
-                    begin_upgrade(&ui, updater::UpgradeTrigger::Auto, Some(latest)).await;
-                updater::log_step(
-                    &ui.home,
-                    &format!("auto-upgrade: request status {}", response.status()),
-                );
+        tokio::time::sleep(update_recheck_once(&ui).await).await;
+    }
+}
+
+async fn update_recheck_once(ui: &Arc<Ui>) -> Duration {
+    let cfg = match Config::discover(&ui.repo, None) {
+        Ok((cfg, _)) => cfg,
+        Err(e) => {
+            updater::log_warn(
+                &ui.home,
+                &format!("auto-upgrade: config unavailable: {e:#}"),
+            );
+            return UPDATE_RECHECK_POLL_MAX;
+        }
+    };
+    if should_spawn_recheck(&cfg.update)
+        && let Some(checker) = updater::Checker::new(&cfg.update)
+    {
+        let progress = updater::read_progress(&ui.home);
+        let mut latest = checker.cached_update();
+        if update_recheck_due(&checker, progress.as_ref()) {
+            match checker.newer_release().await {
+                Ok(found) => latest = found,
+                Err(e) => tracing::warn!("background update recheck failed: {e:#}"),
             }
         }
-        tokio::time::sleep(recheck_poll_period(&cfg.update)).await;
+        if cfg.update.auto_restart
+            && let Some(latest) = latest
+        {
+            let response = begin_upgrade(ui, updater::UpgradeTrigger::Auto, Some(latest)).await;
+            updater::log_step(
+                &ui.home,
+                &format!("auto-upgrade: request status {}", response.status()),
+            );
+        }
     }
+    recheck_poll_period(&cfg.update)
 }
 
 /// [`UpdateView`] from the same throttled, disk-only state
@@ -11915,7 +11917,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn consecutive_monitor_scans_and_web_config_reads_bound_git_processes() {
+    async fn monitor_and_periodic_update_recheck_git_cost() {
         let (tmp, repos) = performance_repositories().await;
         let fx = Fixture {
             home: TempDir::new().unwrap(),
@@ -11937,57 +11939,30 @@ mod tests {
             std::fs::remove_dir_all(&cache).unwrap();
         }
 
-        // 20 consecutive monitor ticks + web config reads over an unchanged
-        // repository: at most 1 git process from a cold cache, and 0 once warm.
-        let (_, (cold_discoveries, cold_git)) = request_cost::measure(async {
+        let (_, monitor_cost) = request_cost::measure(async {
             let mut snapshot = None;
             for _ in 0..20 {
                 let state = Arc::clone(&ui);
-                let prev = snapshot.clone();
-                let next = tokio::task::spawn_blocking(request_cost::carry(move || {
-                    monitor_scan(&state, prev)
-                }))
-                .await
-                .unwrap();
-                snapshot = Some(next);
-                let repo = ui.repo.clone();
-                let (cfg, _) = tokio::task::spawn_blocking(request_cost::carry(move || {
-                    Config::discover(&repo, None)
-                }))
-                .await
-                .unwrap()
-                .unwrap();
-                assert_eq!(cfg.graph.implementers, 1);
+                snapshot = Some(
+                    tokio::task::spawn_blocking(request_cost::carry(move || {
+                        monitor_scan(&state, snapshot)
+                    }))
+                    .await
+                    .unwrap(),
+                );
             }
         })
         .await;
-        assert_eq!(cold_discoveries, 20);
-        assert!(cold_git <= 1, "expected <= 1 cold git call, got {cold_git}");
+        assert_eq!(monitor_cost, (0, 0));
 
-        let (_, (warm_discoveries, warm_git)) = request_cost::measure(async {
-            let mut snapshot = None;
+        // The idle update worker, unlike the revision monitor, reads config.
+        let (_, cold_cost) = request_cost::measure(async {
             for _ in 0..20 {
-                let state = Arc::clone(&ui);
-                let prev = snapshot.clone();
-                let next = tokio::task::spawn_blocking(request_cost::carry(move || {
-                    monitor_scan(&state, prev)
-                }))
-                .await
-                .unwrap();
-                snapshot = Some(next);
-                let repo = ui.repo.clone();
-                let (cfg, _) = tokio::task::spawn_blocking(request_cost::carry(move || {
-                    Config::discover(&repo, None)
-                }))
-                .await
-                .unwrap()
-                .unwrap();
-                assert_eq!(cfg.graph.implementers, 1);
+                assert_eq!(update_recheck_once(&ui).await, UPDATE_RECHECK_POLL_MAX);
             }
         })
         .await;
-        assert_eq!(warm_discoveries, 20);
-        assert_eq!(warm_git, 0);
+        assert_eq!(cold_cost, (20, 21));
 
         // Move `origin/main` via a separate clone without touching `repos[0]`'s
         // working tree, then fetch; the next scan must immediately observe the
@@ -12008,7 +11983,7 @@ mod tests {
         .unwrap();
         std::fs::write(
             pusher.join("magi.toml"),
-            format!("{MOCK_AGENT_TOML}\n[graph]\nimplementers = 3\n[repos]\nroots = []\n[update]\nmode = \"off\"\n[verify]\ne2e = []\ngate = []\n"),
+            format!("{MOCK_AGENT_TOML}\n[graph]\nimplementers = 3\n[repos]\nroots = []\n[update]\nmode = \"off\"\ninterval = \"1m\"\n[verify]\ne2e = []\ngate = []\n"),
         )
         .unwrap();
         crate::git::git(&pusher, &["add", "magi.toml"])
@@ -12035,30 +12010,12 @@ mod tests {
             .await
             .unwrap();
 
-        let (observed, (moved_discoveries, moved_git)) = request_cost::measure(async {
-            let repo = ui.repo.clone();
-            tokio::task::spawn_blocking(request_cost::carry(move || {
-                Config::discover(&repo, None).unwrap().0.graph.implementers
-            }))
-            .await
-            .unwrap()
-        })
-        .await;
-        assert_eq!(observed, 3);
-        assert_eq!(moved_discoveries, 1);
-        assert_eq!(moved_git, 1);
-
-        let (observed_again, (_, warm_after_move)) = request_cost::measure(async {
-            let repo = ui.repo.clone();
-            tokio::task::spawn_blocking(request_cost::carry(move || {
-                Config::discover(&repo, None).unwrap().0.graph.implementers
-            }))
-            .await
-            .unwrap()
-        })
-        .await;
-        assert_eq!(observed_again, 3);
-        assert_eq!(warm_after_move, 0);
+        let (observed, moved_cost) = request_cost::measure(update_recheck_once(&ui)).await;
+        assert_eq!(observed, UPDATE_RECHECK_POLL_MIN);
+        assert_eq!(moved_cost, (1, 2));
+        let (observed_again, warm_cost) = request_cost::measure(update_recheck_once(&ui)).await;
+        assert_eq!(observed_again, observed);
+        assert_eq!(warm_cost, (1, 1));
     }
 
     #[tokio::test]

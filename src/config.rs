@@ -2729,7 +2729,7 @@ const REPO_MARKER: &str = ".magi-repo";
 /// Completion manifest written inside each materialised commit cache directory
 /// before it is atomically renamed into place.
 const CACHE_MANIFEST: &str = ".magi-cache-manifest.json";
-const CACHE_MANIFEST_VERSION: u32 = 2;
+const CACHE_MANIFEST_VERSION: u32 = 3;
 const REPO_LAYER_RELS: [&str; 2] = [".magi/config.toml", "magi.toml"];
 
 /// Git environment overrides that alter repository discovery or ref storage.
@@ -3127,9 +3127,7 @@ fn repository_git() -> std::process::Command {
     #[cfg(test)]
     crate::web::request_cost::git();
     let mut command = std::process::Command::new("git");
-    command
-        .arg("--no-replace-objects")
-        .env("GIT_NO_LAZY_FETCH", "1");
+    command.arg("--no-replace-objects");
     command
 }
 
@@ -3536,10 +3534,38 @@ fn read_commit_layers_batch(
         Some(BatchEntry::Object { oid, kind, .. }) if kind == "commit" && is_hex_oid(&oid) => oid,
         _ => bail!("{}", missing_tracking_ref_msg(remote, base)),
     };
+    // Batch "missing" conflates absent paths with missing objects. Verify
+    // absence against the commit tree before publishing an immutable manifest.
+    let present_paths = if iter
+        .as_slice()
+        .iter()
+        .any(|e| matches!(e, BatchEntry::Missing))
+    {
+        let tree = git_out(
+            repo,
+            &[
+                "ls-tree",
+                "--full-tree",
+                "--name-only",
+                &commit_sha,
+                "--",
+                ".magi/config.toml",
+                "magi.toml",
+            ],
+        )
+        .context("cannot read repository configuration tree")?;
+        tree.lines().map(str::to_owned).collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     let mut texts = Vec::new();
     for (rel, entry) in REPO_LAYER_RELS.into_iter().zip(iter) {
         match entry {
-            BatchEntry::Missing => continue,
+            BatchEntry::Missing => {
+                if present_paths.iter().any(|path| path == rel) {
+                    bail!("cannot read {rel} from {remote}/{base} ({commit_sha}): missing object");
+                }
+            }
             BatchEntry::Object { kind, content, .. } if kind == "blob" => {
                 texts.push((rel, String::from_utf8_lossy(&content).into_owned()));
             }
@@ -3639,7 +3665,7 @@ fn remote_layers_fallback(repo: &Path) -> Result<Vec<PathBuf>> {
     let (remote, cfg_base) = probe_remote_base(repo);
     if let Some(base) = cfg_base {
         if let Some((common_dir, sha)) = resolve_common_and_commit_cli(repo, &remote, &base) {
-            return materialize_remote_layers(repo, Some(common_dir), &remote, &base, &sha);
+            return materialize_remote_layers(repo, Some(common_dir), &remote, &base, &sha, true);
         }
         if !is_git_worktree(repo) {
             return Ok(local_repo_layers(repo));
@@ -3676,6 +3702,7 @@ fn remote_layers_with_git(repo: &Path, git_dirs: Option<GitDirs>) -> Result<Vec<
                     &remote,
                     &base,
                     &sha,
+                    false,
                 );
             }
         }
@@ -3707,7 +3734,7 @@ fn remote_layers_with_git(repo: &Path, git_dirs: Option<GitDirs>) -> Result<Vec<
             (None, base, sha)
         }
     };
-    materialize_remote_layers(repo, common_dir, &remote, &base, &sha)
+    materialize_remote_layers(repo, common_dir, &remote, &base, &sha, true)
 }
 
 fn materialize_remote_layers(
@@ -3716,6 +3743,7 @@ fn materialize_remote_layers(
     remote: &str,
     base: &str,
     sha: &str,
+    verified: bool,
 ) -> Result<Vec<PathBuf>> {
     let repo_key = repo.to_string_lossy();
     let key_for = |commit_sha: &str| {
@@ -3736,6 +3764,20 @@ fn materialize_remote_layers(
         read_cached_layers(&fallback_root.as_ref()?.join(&key), commit_sha, repo)
     };
     if let Some(layers) = lookup(sha) {
+        if !verified {
+            let commit = git_out(
+                repo,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    &format!("{sha}^{{commit}}"),
+                ],
+            );
+            if !commit.is_some_and(|s| s.trim() == sha) {
+                bail!("{}", missing_tracking_ref_msg(remote, base));
+            }
+        }
         return Ok(layers);
     }
 
@@ -5495,7 +5537,7 @@ lock_file = "{{ vars.bad }}"
                 crate::web::request_cost::measure_sync(|| Config::discover(&repo, None).unwrap());
             assert_eq!((cfg_warm.graph.implementers, cfg_warm.graph.judges), (2, 3));
             assert_eq!(warm_layers, layers);
-            assert_eq!(warm_git, 0);
+            assert_eq!(warm_git, 1);
         }
 
         #[test]
@@ -5649,8 +5691,8 @@ lock_file = "{{ vars.bad }}"
         fn repeated_discovers_stay_within_bounded_git_spawns() {
             let (_t, repo) = fixture("[graph]\ncandidates = 2\n", "[graph]\ncandidates = 9\n");
 
-            // Cold cache: 20 consecutive loads spawn at most 1 git process
-            // (`git cat-file --batch` once for the commit, 0 on subsequent reads).
+            // Cold cache: two processes to read the commit and prove absent
+            // paths, then one commit validation per subsequent load.
             let (values, (discoveries, cold_git)) = crate::web::request_cost::measure_sync(|| {
                 (0..20)
                     .map(|_| Config::discover(&repo, None).unwrap().0.graph.implementers)
@@ -5658,9 +5700,9 @@ lock_file = "{{ vars.bad }}"
             });
             assert!(values.iter().all(|&n| n == 2));
             assert_eq!(discoveries, 20);
-            assert_eq!(cold_git, 1);
+            assert_eq!(cold_git, 21);
 
-            // Warm cache: 20 more consecutive loads spawn 0 git processes.
+            // Warm cache: one validation per load, no layer extraction.
             let (values, (discoveries, warm_git)) = crate::web::request_cost::measure_sync(|| {
                 (0..20)
                     .map(|_| Config::discover(&repo, None).unwrap().0.graph.implementers)
@@ -5668,7 +5710,7 @@ lock_file = "{{ vars.bad }}"
             });
             assert!(values.iter().all(|&n| n == 2));
             assert_eq!(discoveries, 20);
-            assert_eq!(warm_git, 0);
+            assert_eq!(warm_git, 20);
         }
 
         #[test]
@@ -5684,7 +5726,11 @@ lock_file = "{{ vars.bad }}"
             git(repo, &["update-ref", "refs/remotes/origin/trunk", "HEAD"]);
             git(
                 repo,
-                &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/trunk"],
+                &[
+                    "symbolic-ref",
+                    "refs/remotes/origin/HEAD",
+                    "refs/remotes/origin/trunk",
+                ],
             );
             assert_eq!(
                 Config::discover(repo, None).unwrap().0.graph.implementers,
@@ -5725,7 +5771,7 @@ lock_file = "{{ vars.bad }}"
                 last
             });
             assert!(layers.is_empty());
-            assert_eq!(cold_git, 1);
+            assert_eq!(cold_git, 21);
 
             let (layers, (_, warm_git)) = crate::web::request_cost::measure_sync(|| {
                 let mut last = Vec::new();
@@ -5735,7 +5781,7 @@ lock_file = "{{ vars.bad }}"
                 last
             });
             assert!(layers.is_empty());
-            assert_eq!(warm_git, 0);
+            assert_eq!(warm_git, 20);
         }
 
         #[test]
@@ -5750,7 +5796,7 @@ lock_file = "{{ vars.bad }}"
             );
             let (_, (_, warm_git)) =
                 crate::web::request_cost::measure_sync(|| Config::discover(&repo, None).unwrap());
-            assert_eq!(warm_git, 0);
+            assert_eq!(warm_git, 1);
 
             // Move loose ref without touching the working tree.
             push_remote_config(&bare, "trunk", "[graph]\ncandidates = 3\n");
@@ -5758,18 +5804,18 @@ lock_file = "{{ vars.bad }}"
             let (cfg, (_, moved_git)) =
                 crate::web::request_cost::measure_sync(|| Config::discover(&repo, None).unwrap().0);
             assert_eq!(cfg.graph.implementers, 3);
-            assert_eq!(moved_git, 1);
+            assert_eq!(moved_git, 2);
             let (cfg, (_, warm_after_move)) =
                 crate::web::request_cost::measure_sync(|| Config::discover(&repo, None).unwrap().0);
             assert_eq!(cfg.graph.implementers, 3);
-            assert_eq!(warm_after_move, 0);
+            assert_eq!(warm_after_move, 1);
 
             // Pack all refs so the tracking ref lives only in `packed-refs`.
             git(&repo, &["pack-refs", "--all"]);
             let (cfg, (_, packed_warm)) =
                 crate::web::request_cost::measure_sync(|| Config::discover(&repo, None).unwrap().0);
             assert_eq!(cfg.graph.implementers, 3);
-            assert_eq!(packed_warm, 0);
+            assert_eq!(packed_warm, 1);
 
             // Advance the remote again and pack-refs so only `packed-refs` moves.
             push_remote_config(&bare, "trunk", "[graph]\ncandidates = 4\n");
@@ -5778,11 +5824,11 @@ lock_file = "{{ vars.bad }}"
             let (cfg, (_, packed_move)) =
                 crate::web::request_cost::measure_sync(|| Config::discover(&repo, None).unwrap().0);
             assert_eq!(cfg.graph.implementers, 4);
-            assert_eq!(packed_move, 1);
+            assert_eq!(packed_move, 2);
             let (cfg, (_, packed_warm_2)) =
                 crate::web::request_cost::measure_sync(|| Config::discover(&repo, None).unwrap().0);
             assert_eq!(cfg.graph.implementers, 4);
-            assert_eq!(packed_warm_2, 0);
+            assert_eq!(packed_warm_2, 1);
 
             // Confirm working tree still holds the stale value and was never used.
             assert!(
@@ -5793,7 +5839,7 @@ lock_file = "{{ vars.bad }}"
         }
 
         #[test]
-        fn linked_worktree_reuses_common_dir_cache_with_zero_warm_git_spawns() {
+        fn linked_worktree_reuses_common_dir_cache_with_one_warm_git_spawn() {
             let (t, repo) = fixture("[graph]\ncandidates = 2\n", "[graph]\ncandidates = 9\n");
             let bare = t.path().join("o.git");
             let wt = t.path().join("linked-wt");
@@ -5805,7 +5851,7 @@ lock_file = "{{ vars.bad }}"
             let (cfg, (_, cold_git)) =
                 crate::web::request_cost::measure_sync(|| Config::discover(&wt, None).unwrap().0);
             assert_eq!(cfg.graph.implementers, 2);
-            assert_eq!(cold_git, 1);
+            assert_eq!(cold_git, 2);
 
             let (values, (_, warm_git)) = crate::web::request_cost::measure_sync(|| {
                 (0..10)
@@ -5813,14 +5859,14 @@ lock_file = "{{ vars.bad }}"
                     .collect::<Vec<_>>()
             });
             assert!(values.iter().all(|&n| n == 2));
-            assert_eq!(warm_git, 0);
+            assert_eq!(warm_git, 10);
 
             push_remote_config(&bare, "trunk", "[graph]\ncandidates = 5\n");
             git(&wt, &["fetch", "origin"]);
             let (cfg, (_, moved_git)) =
                 crate::web::request_cost::measure_sync(|| Config::discover(&wt, None).unwrap().0);
             assert_eq!(cfg.graph.implementers, 5);
-            assert_eq!(moved_git, 1);
+            assert_eq!(moved_git, 2);
         }
 
         #[test]
@@ -5858,7 +5904,7 @@ lock_file = "{{ vars.bad }}"
         }
 
         #[test]
-        fn include_repository_reuses_extracted_tree_with_zero_warm_git_spawns() {
+        fn include_repository_reuses_extracted_tree_with_one_warm_git_spawn() {
             let (_t, repo) = fixture("include = [\"gate.toml\"]\n", "");
             std::fs::write(repo.join("magi.toml"), "include = [\"gate.toml\"]\n").unwrap();
             std::fs::write(repo.join("gate.toml"), "[graph]\ncandidates = 2\n").unwrap();
@@ -5871,8 +5917,8 @@ lock_file = "{{ vars.bad }}"
             let (cfg, (_, cold_git)) =
                 crate::web::request_cost::measure_sync(|| Config::discover(&repo, None).unwrap().0);
             assert_eq!(cfg.graph.implementers, 2);
-            // 1 batch read + 1 git archive for the include tree.
-            assert_eq!(cold_git, 2);
+            // Batch read, absence proof and archive for the include tree.
+            assert_eq!(cold_git, 3);
 
             let (values, (_, warm_git)) = crate::web::request_cost::measure_sync(|| {
                 (0..10)
@@ -5880,7 +5926,74 @@ lock_file = "{{ vars.bad }}"
                     .collect::<Vec<_>>()
             });
             assert!(values.iter().all(|&n| n == 2));
-            assert_eq!(warm_git, 0);
+            assert_eq!(warm_git, 10);
+        }
+
+        #[test]
+        fn partial_clone_loads_promised_config_blob() {
+            let (tmp, source) = fixture("[graph]\ncandidates = 2\n", "");
+            let bare = tmp.path().join("o.git");
+            git(&bare, &["config", "uploadpack.allowFilter", "true"]);
+            let clone = tmp.path().join("partial");
+            git(
+                tmp.path(),
+                &[
+                    "clone",
+                    "--no-local",
+                    "--no-checkout",
+                    "--filter=blob:none",
+                    &bare.to_string_lossy(),
+                    &clone.to_string_lossy(),
+                ],
+            );
+            let oid = git_out(&source, &["rev-parse", "HEAD:magi.toml"]).unwrap();
+            let missing = repository_git()
+                .env("GIT_NO_LAZY_FETCH", "1")
+                .args(["cat-file", "-e", oid.trim()])
+                .current_dir(&clone)
+                .output()
+                .unwrap();
+            assert!(!missing.status.success(), "fixture must omit the blob");
+            assert_eq!(
+                Config::discover(&clone, None).unwrap().0.graph.implementers,
+                2
+            );
+        }
+
+        #[test]
+        fn missing_config_blob_is_not_cached_as_an_absent_layer() {
+            let (_tmp, repo) = fixture("[graph]\ncandidates = 2\n", "");
+            let oid = git_out(&repo, &["rev-parse", "HEAD:magi.toml"]).unwrap();
+            let oid = oid.trim();
+            let blob = repo.join(".git/objects").join(&oid[..2]).join(&oid[2..]);
+            let saved = blob.with_extension("saved");
+            std::fs::rename(&blob, &saved).unwrap();
+            assert!(Config::discover(&repo, None).is_err());
+            std::fs::rename(saved, blob).unwrap();
+            assert_eq!(
+                Config::discover(&repo, None).unwrap().0.graph.implementers,
+                2
+            );
+        }
+
+        #[test]
+        fn a_cached_config_does_not_hide_a_missing_base_commit() {
+            let (_tmp, repo) = fixture("[graph]\ncandidates = 2\n", "");
+            assert_eq!(
+                Config::discover(&repo, None).unwrap().0.graph.implementers,
+                2
+            );
+            let oid = git_out(&repo, &["rev-parse", "HEAD"]).unwrap();
+            let oid = oid.trim();
+            let commit = repo.join(".git/objects").join(&oid[..2]).join(&oid[2..]);
+            let saved = commit.with_extension("saved");
+            std::fs::rename(&commit, &saved).unwrap();
+            assert!(Config::discover(&repo, None).is_err());
+            std::fs::rename(saved, commit).unwrap();
+            assert_eq!(
+                Config::discover(&repo, None).unwrap().0.graph.implementers,
+                2
+            );
         }
 
         #[test]

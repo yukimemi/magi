@@ -1635,6 +1635,13 @@ there before using it. Avoid putting `ci = "none"` in machine config: it would
 ignore CI across repositories inheriting that setting. Restore `"expected"`
 when CI is introduced.
 
+Repository layers are materialized once per base commit and checkout. Repeat
+loads reuse that snapshot after validating the commit, normally with one Git
+invocation instead of reading each configuration blob again. A missing
+configuration path is cached only when the commit tree confirms its absence;
+promised blobs in partial clones are fetched by Git as needed.
+The web revision monitor itself reads store metadata, not repository config.
+
 `[update] auto_restart = true` opts `magi web` into the same update-and-restart
 handover as the UI's **Update & restart** button. It defaults to `false`.
 Checks use `interval` (default `24h`, minimum `1m`); configuration is reloaded
