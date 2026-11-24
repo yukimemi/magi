@@ -431,7 +431,12 @@ mod tests {
         let mut command = tokio::process::Command::new("sh");
         command
             .quiet()
-            .args(["-c", "echo $$ > \"$MAGI_TEST_TOOL_PID\"; exec sleep 10"])
+            .args([
+                "-c",
+                r#"printf '%s\n' "$$" > "$MAGI_TEST_TOOL_PID.tmp" &&
+                   mv "$MAGI_TEST_TOOL_PID.tmp" "$MAGI_TEST_TOOL_PID" &&
+                   exec sleep 10"#,
+            ])
             .env("MAGI_TEST_TOOL_PID", &pid_file);
         // A runtime is required by tokio's process registration even though
         // the launcher deliberately never polls or drops the running process.

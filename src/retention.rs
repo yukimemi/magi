@@ -5509,11 +5509,17 @@ mod tests {
         std::fs::create_dir(&cache).unwrap();
         let pid_file = f.repo.join("child-pid");
         let mut cmd = tokio::process::Command::new("sh");
-        cmd.args(["-c", "sleep 30 & echo $! > \"$CHILD_PID_FILE\"; wait"])
-            .quiet()
-            .env("CHILD_PID_FILE", &pid_file)
-            .process_group(0)
-            .kill_on_drop(true);
+        cmd.args([
+            "-c",
+            r#"sleep 30 &
+               printf '%s\n' "$!" > "$CHILD_PID_FILE.tmp" &&
+               mv "$CHILD_PID_FILE.tmp" "$CHILD_PID_FILE" &&
+               wait"#,
+        ])
+        .quiet()
+        .env("CHILD_PID_FILE", &pid_file)
+        .process_group(0)
+        .kill_on_drop(true);
         let running = crate::seat_process::Running::spawn(
             cmd,
             None,
