@@ -4810,7 +4810,10 @@ mod tests {
             assert_eq!(saved.base_recovery_requests, ["base-request"]);
             assert_eq!(saved.chat_notices, ["delivery", "other-delivery"]);
             assert_eq!(saved.repair_grants, [grant.clone(), latest_grant.clone()]);
-            assert_eq!(saved.repair_reconciliations, [reconciliation.clone()]);
+            assert_eq!(
+                saved.repair_reconciliations,
+                std::slice::from_ref(&reconciliation)
+            );
             for ledger in [
                 saved.decision_effects,
                 saved.dispatched_resumes,
