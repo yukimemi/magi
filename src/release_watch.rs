@@ -1414,7 +1414,12 @@ impl Watcher {
                 .as_deref()
                 .is_some_and(|r| r.starts_with(HOLD_PREFIX));
         if ours {
-            t.succeed();
+            t.succeed(crate::queue::CompletionContext::new(
+                crate::queue::CompletionActor::DaemonSettle,
+                Some("Release completed; restoring the task after its release hold".into()),
+                &self.home,
+                &t,
+            ));
             if let Err(e) = q.put(&mut t) {
                 tracing::warn!("could not restore task {id} after the release: {e:#}");
                 st.held_task = Some(id);
@@ -2869,7 +2874,21 @@ mod tests {
         // A restart reconciling again does not hold twice.
         w.hold_task(&mut st, "failed again");
         assert!(w.unhold_task(&mut st));
-        assert_eq!(q.get(&t.id).unwrap().status, crate::queue::TaskStatus::Done);
+        let restored = q.get(&t.id).unwrap();
+        assert_eq!(restored.status, crate::queue::TaskStatus::Done);
+        let completion = restored.completion_history.last().unwrap();
+        assert_eq!(
+            completion.actor,
+            crate::queue::CompletionActor::DaemonSettle
+        );
+        assert_eq!(completion.prior_status, crate::queue::TaskStatus::Held);
+        assert!(
+            completion
+                .reason
+                .as_deref()
+                .unwrap()
+                .contains("Release completed")
+        );
         assert!(st.held_task.is_none());
 
         // The owner re-held it by hand with their own reason: left alone.
@@ -2879,6 +2898,7 @@ mod tests {
         q.put(&mut h).unwrap();
         assert!(w.unhold_task(&mut st));
         assert_eq!(q.get(&t.id).unwrap().status, crate::queue::TaskStatus::Held);
+        assert_eq!(q.get(&t.id).unwrap().completion_history.len(), 1);
     }
 
     #[tokio::test]

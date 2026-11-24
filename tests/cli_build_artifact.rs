@@ -117,3 +117,108 @@ fn msvc_cli_selection_rejects_an_unrelated_library() {
     std::fs::rename(hashed, executable).unwrap();
     cli::matching_cli_for_layout(&profile.join("deps/example-testhash"), false);
 }
+
+fn build_dir_artifact(
+    profile: &Path,
+    hash: &str,
+    library: u64,
+    rustc: u64,
+    hashed_executable: bool,
+) -> PathBuf {
+    let unit = profile.join("build").join("magi-cli").join(hash);
+    let fingerprint = unit.join("fingerprint");
+    std::fs::create_dir_all(&fingerprint).unwrap();
+    std::fs::write(
+        fingerprint.join("bin-magi.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "rustc": rustc, "deps": [[1, "magi", false, library]],
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let name = if hashed_executable {
+        format!("magi-{hash}{}", std::env::consts::EXE_SUFFIX)
+    } else {
+        format!("magi{}", std::env::consts::EXE_SUFFIX)
+    };
+    let executable = unit.join("out").join(name);
+    std::fs::create_dir_all(executable.parent().unwrap()).unwrap();
+    std::fs::write(&executable, "binary").unwrap();
+    executable
+}
+
+#[test]
+fn build_dir_cli_selection_matches_test_library_and_ignores_top_level_binary() {
+    for hashed in [true, false] {
+        let tmp = tempfile::tempdir().unwrap();
+        let profile = tmp.path();
+        let test_unit = profile.join("build/magi-cli/testhash");
+        let fingerprint = test_unit.join("fingerprint");
+        std::fs::create_dir_all(&fingerprint).unwrap();
+        std::fs::write(
+            fingerprint.join("test-integration-test-example.json"),
+            r#"{"rustc":42,"deps":[[1,"magi",false,123]]}"#,
+        )
+        .unwrap();
+        build_dir_artifact(profile, "old-library", 122, 42, hashed);
+        build_dir_artifact(profile, "other-toolchain", 123, 41, hashed);
+        let expected = build_dir_artifact(profile, "matching", 123, 42, hashed);
+        std::fs::write(
+            profile.join(format!("magi{}", std::env::consts::EXE_SUFFIX)),
+            "replaced by an unrelated build",
+        )
+        .unwrap();
+        let test = test_unit
+            .join("out")
+            .join(format!("example-testhash{}", std::env::consts::EXE_SUFFIX));
+        assert_eq!(
+            cli::matching_cli_for_layout(&test, hashed),
+            Some(expected.clone())
+        );
+    }
+}
+
+#[test]
+#[should_panic(expected = "no CLI artifact links this test's magi library")]
+fn build_dir_mismatched_local_build_does_not_fall_back_to_top_level_binary() {
+    let tmp = tempfile::tempdir().unwrap();
+    let profile = tmp.path();
+    let test_unit = profile.join("build/magi-cli/testhash");
+    let fingerprint = test_unit.join("fingerprint");
+    std::fs::create_dir_all(&fingerprint).unwrap();
+    std::fs::write(
+        fingerprint.join("test-integration-test-example.json"),
+        r#"{"rustc":42,"deps":[[1,"magi",false,123]]}"#,
+    )
+    .unwrap();
+    build_dir_artifact(profile, "unrelated", 122, 42, false);
+    std::fs::write(
+        profile.join(format!("magi{}", std::env::consts::EXE_SUFFIX)),
+        "unrelated top-level build",
+    )
+    .unwrap();
+    let test = test_unit
+        .join("out")
+        .join(format!("example-testhash{}", std::env::consts::EXE_SUFFIX));
+    cli::matching_cli_for_layout(&test, false);
+}
+
+#[test]
+fn current_build_layout_resolves_a_matching_cli_artifact() {
+    let test = std::env::current_exe().expect("test executable");
+    let has_metadata = test
+        .parent()
+        .and_then(Path::parent)
+        .is_some_and(|dir| dir.join("fingerprint").is_dir() || dir.join(".fingerprint").is_dir());
+    if !has_metadata {
+        return;
+    }
+    let resolved = cli::matching_cli(&test)
+        .expect("local Cargo build should resolve a library-matched CLI artifact");
+    assert!(resolved.is_file(), "{}", resolved.display());
+    assert_ne!(
+        resolved,
+        PathBuf::from(env!("CARGO_BIN_EXE_magi")),
+        "resolved CLI must come from the library-matched unit directory, not the shared top-level binary"
+    );
+}

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use crate::{
     git,
-    queue::{OperatorResume, Task, TaskStatus},
+    queue::{CompletionActor, CompletionContext, OperatorResume, Task, TaskStatus},
     run::{BaseSync, RunState, RunStatus},
 };
 
@@ -242,10 +242,15 @@ pub(crate) fn settle(
         });
     task.sync_only = None;
     task.resume_override = None;
-    if state.is_some_and(|state| state.status == RunStatus::AlreadyInBase)
+    if let Some(state) = state.filter(|state| state.status == RunStatus::AlreadyInBase)
         && pass.is_some_and(|pass| pass.result == Outcome::AlreadyInBase)
     {
-        task.succeed();
+        task.succeed(CompletionContext::from_run(
+            CompletionActor::DaemonSettle,
+            Some(reason.clone()),
+            task,
+            state,
+        ));
         task.last_error = Some(reason);
         return;
     }

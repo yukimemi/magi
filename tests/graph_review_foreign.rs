@@ -66,12 +66,16 @@ async fn foreign_dirty_checkout_is_refused_before_filing_and_untouched() {
     std::fs::write(&config, toml::to_string(&fx.config).unwrap()).unwrap();
     let cli_home = fx.tmp.path().join("cli-home");
     std::fs::create_dir_all(&cli_home).unwrap();
-    let out = common::magi_cli(&cli_home).current_dir(&path)
-        .args(["review", BRANCH, "--merge", "none", "--config"])
+    let mut cli = common::magi_cli(&cli_home);
+    let out = cli.current_dir(&path).args(["review", BRANCH, "--merge", "none", "--config"])
         .arg(&config).output().unwrap();
-    assert!(!out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
     let message = String::from_utf8_lossy(&out.stderr);
-    assert!(message.contains("dirty"), "{message}");
+    assert!(
+        !out.status.success() && message.contains("dirty"),
+        "new review via {:?}: status={}, stdout={stdout:?}, stderr={message:?}",
+        cli.get_program(), out.status,
+    );
     // Diagnostics use Git's worktree path spelling. On Windows it differs
     // from std::fs::canonicalize's verbatim path, even for the same directory.
     let holder = git::worktree_holding(&fx.repo, BRANCH).await.unwrap().unwrap();
@@ -84,11 +88,16 @@ async fn foreign_dirty_checkout_is_refused_before_filing_and_untouched() {
     let mut task = magi::queue::Task::new("existing task".into(), "keep task".into(), fx.repo.clone(), magi::queue::Source::Human);
     queue.put(&mut task).unwrap();
     let before_task = serde_json::to_string(&queue.get(&task.id).unwrap()).unwrap();
-    let out = common::magi_cli(&cli_home).current_dir(&path)
-        .args(["review", BRANCH, "--task", &task.id, "--config"])
+    let mut cli = common::magi_cli(&cli_home);
+    let out = cli.current_dir(&path).args(["review", BRANCH, "--task", &task.id, "--config"])
         .arg(&config).output().unwrap();
-    assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("dirty"));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let message = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success() && message.contains("dirty"),
+        "existing-task review via {:?}: status={}, stdout={stdout:?}, stderr={message:?}",
+        cli.get_program(), out.status,
+    );
     assert_eq!(serde_json::to_string(&queue.get(&task.id).unwrap()).unwrap(), before_task);
     assert!(Runner::review(&fx.repo, BRANCH, fx.config.clone(), Origin::operator()).await.is_err());
     assert_eq!(std::fs::read_to_string(path.join("scratch.txt")).unwrap(), "keep this\n");

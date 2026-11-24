@@ -404,7 +404,12 @@ async fn selected_fixture() -> (
     );
     task.id = "abcd-1234".into();
     task.runs.push(first.id);
-    task.succeed();
+    task.succeed(magi::queue::CompletionContext::new(
+        magi::queue::CompletionActor::Cli,
+        None,
+        &magi::run::home(),
+        &task,
+    ));
     task.overrides = Some(magi::queue::RunOverrides {
         merge: Some("none".into()),
         reviewers: Some(1),

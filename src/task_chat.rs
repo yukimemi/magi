@@ -2376,8 +2376,12 @@ mod tests {
             run.save_under(home).unwrap();
             let mut task = Task::new("work".into(), "work".into(), home.into(), Source::Human);
             task.runs.push(run.id.clone());
-            task.hold_manual(Some("landing stopped".into()));
-            task.mark_action_applied(&q.id);
+            if choice == crate::land::HOLD {
+                task.status = TaskStatus::Running;
+            } else {
+                task.hold_manual(Some("landing stopped".into()));
+                task.mark_action_applied(&q.id);
+            }
             queue.put(&mut task).unwrap();
             let mut record = history_record(&q, Some(&task));
             let mut decision = Decision::awaiting(q.summary.clone());
@@ -2409,9 +2413,6 @@ mod tests {
             run.save_under(home).unwrap();
             if choice == crate::land::HOLD {
                 // A checkpoint alone is insufficient until the task hold commits.
-                task.actions_applied.clear();
-                task.status = TaskStatus::Running;
-                queue.put(&mut task).unwrap();
                 check(Status::Queued);
                 task.hold_manual(Some("landing stopped".into()));
                 task.mark_action_applied(&q.id);
@@ -2424,12 +2425,13 @@ mod tests {
                         .unwrap()
                         .is_some()
                 );
-                // New receipts also survive reopening/removing the run checkpoint.
+                run.merge_decision = None;
+                run.save_under(home).unwrap();
+                check(Status::Queued); // The legacy task marker alone is insufficient.
+                // New receipts survive removal of the run checkpoint.
                 task.decision_effects
                     .insert(q.id.clone(), format!("decision: {choice}"));
                 queue.put(&mut task).unwrap();
-                run.merge_decision = None;
-                run.save_under(home).unwrap();
                 check(Status::Resolved);
             } else {
                 check(Status::Queued); // Failed closure, despite the old pass marker.

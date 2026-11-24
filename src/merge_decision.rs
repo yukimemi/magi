@@ -155,7 +155,12 @@ pub(crate) fn dismiss(home: &std::path::Path, q: &crate::ask::Question) -> anyho
         if task.execution_runs().last() == Some(&q.run)
             && task.status != crate::queue::TaskStatus::Done
         {
-            task.succeed();
+            task.succeed(crate::queue::CompletionContext::from_run(
+                crate::queue::CompletionActor::DaemonSettle,
+                Some(format!("Owner dismissed obsolete approval {}", q.id)),
+                &task,
+                &state,
+            ));
             task.mark_action_applied(&q.id);
             queue.put(&mut task)?;
         }

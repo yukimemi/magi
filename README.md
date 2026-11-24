@@ -492,6 +492,40 @@ recur on every attempt, and is charged to the task, so the attempt counter
 still bounds it. Refunding *that* would take the bound off the loop entirely
 and pay for a fresh implement wave every time.
 
+### Completion audit and reopening
+
+`magi task done <ID> [--reason "<text>"]` and Web **Mark done** preserve the task
+and append an audit event: occurrence ID, actor (CLI, Web, chat, conductor or
+daemon settle), reason, prior task status and the latest run/PR snapshot.
+
+Without a chat control channel, `magi task done` records a supplied chat ID
+as actor provenance even if no conversation record exists. The ID does not
+authorize chat control operations.
+
+**Done is not proof of merge.** Closing an unfinished latest run requires
+`--discard --reason "<text>"` (or the Web discard confirmation and reason); this
+records an intentional closure, not a successful delivery. Web **Mark done**
+opens that explicit confirmation when the server refuses unmerged work, showing
+the retained run, status, branches and PR. Every completion
+path records its evidence, including automatic settlement and structured done.
+Task show and the Web task detail expose the append-only completion history;
+legacy tasks may have none.
+Explicit discard may close work with missing, corrupt or unsupported historical
+run records; their unknown outcomes remain in the audit. It still refuses
+execution/ownership lock contention and does not modify the retained runs.
+
+Use `magi task control reopen <ID> --reason "<text>"` or Web **Reopen to Held** for an
+incorrectly closed, unlanded task. The reason is required. Reopening preserves
+history and leaves the task **Held**; inspect/edit it and explicitly Release
+when ready. It refuses any historical Ready, Merged or AlreadyInBase run, any
+merged PR (including a replacement PR from the same public branch), ambiguous
+merge matches, and unknown run or forge state. Chat-filed tasks receive a
+distinct notice for every completion occurrence, so reopening and closing again
+is not hidden by an earlier notice.
+Automatic goal turns cannot discard or reopen tasks; those operations require
+an explicit owner turn. Non-discard completion still checks the goal's task scope
+and the shared unfinished-work admission rules.
+
 ## Working out what to build, with someone
 
 A task file without completion criteria produces a competition whose candidates

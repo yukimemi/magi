@@ -43,18 +43,66 @@ pub(super) fn matching_cli(test: &Path) -> Option<PathBuf> {
 
 pub(super) fn matching_cli_for_layout(test: &Path, hashed_executable: bool) -> Option<PathBuf> {
     let (name, hash) = test.file_stem()?.to_str()?.rsplit_once('-')?;
-    let profile = test.parent()?.parent()?;
-    let fingerprints = profile.join(".fingerprint");
-    let test_fingerprint = fingerprints
-        .join(format!("{}-{hash}", env!("CARGO_PKG_NAME")))
-        .join(format!("test-integration-test-{name}.json"));
-    let bytes = std::fs::read(&test_fingerprint).ok()?;
-    let test: serde_json::Value = serde_json::from_slice(&bytes).expect("test build fingerprint");
     let library = |value: &serde_json::Value| {
         value["deps"]
             .as_array()
             .and_then(|deps| deps.iter().find(|dep| dep[1] == "magi").cloned())
     };
+    let test_fingerprint_name = format!("test-integration-test-{name}.json");
+
+    // Cargo >= 1.100 build-dir layout:
+    //   <profile>/build/<pkg>/<hash>/out/<test>-<hash><EXE_SUFFIX>
+    //   <profile>/build/<pkg>/<hash>/fingerprint/test-integration-test-<name>.json
+    //   <profile>/build/<pkg>/<bin-hash>/fingerprint/bin-magi.json
+    //   <profile>/build/<pkg>/<bin-hash>/out/magi[-<bin-hash>]<EXE_SUFFIX>
+    if test.parent().and_then(Path::file_name) == Some(std::ffi::OsStr::new("out"))
+        && let Some(unit_dir) = test.parent().and_then(Path::parent)
+        && let Some(pkg_build_dir) = unit_dir.parent()
+        && let Ok(bytes) = std::fs::read(unit_dir.join("fingerprint").join(&test_fingerprint_name))
+    {
+        let test: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("test build fingerprint");
+        let dependency = library(&test).expect("test links magi library");
+        for entry in std::fs::read_dir(pkg_build_dir).expect("Cargo package build units") {
+            let entry = entry.expect("Cargo build unit entry");
+            let unit = entry.path();
+            let Ok(bytes) = std::fs::read(unit.join("fingerprint").join("bin-magi.json")) else {
+                continue;
+            };
+            let Ok(binary) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                continue;
+            };
+            if library(&binary).as_ref() != Some(&dependency) || binary["rustc"] != test["rustc"] {
+                continue;
+            }
+            let Some(bin_hash) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let out_dir = unit.join("out");
+            let hashed = out_dir.join(format!("magi-{bin_hash}{}", std::env::consts::EXE_SUFFIX));
+            let unhashed = out_dir.join(format!("magi{}", std::env::consts::EXE_SUFFIX));
+            if hashed_executable && hashed.is_file() {
+                return Some(hashed);
+            }
+            if unhashed.is_file() {
+                return Some(unhashed);
+            }
+        }
+        panic!("no CLI artifact links this test's magi library; rebuild the magi binary");
+    }
+
+    // Legacy Cargo layout:
+    //   <profile>/deps/<test>-<hash><EXE_SUFFIX>
+    //   <profile>/.fingerprint/<pkg>-<hash>/test-integration-test-<name>.json
+    //   <profile>/.fingerprint/<pkg>-<bin-hash>/bin-magi.json
+    //   <profile>/deps/magi[-<bin-hash>]<EXE_SUFFIX>
+    let profile = test.parent()?.parent()?;
+    let fingerprints = profile.join(".fingerprint");
+    let test_fingerprint = fingerprints
+        .join(format!("{}-{hash}", env!("CARGO_PKG_NAME")))
+        .join(&test_fingerprint_name);
+    let bytes = std::fs::read(&test_fingerprint).ok()?;
+    let test: serde_json::Value = serde_json::from_slice(&bytes).expect("test build fingerprint");
     let dependency = library(&test).expect("test links magi library");
     for entry in std::fs::read_dir(&fingerprints).expect("Cargo fingerprints") {
         let entry = entry.expect("Cargo fingerprint entry");

@@ -150,6 +150,7 @@ fn snapshot(
             "answers": t.answers, "applied": t.actions_applied,
             "triage": t.triage_applied, "operator_decision": t.operator_decided_at,
             "attempts": t.attempts,
+            "completion_event": t.completion_history.last(),
         })),
         "run": run, "evidence": run_evidence(home, run),
         "extra": extra, "resolutions": resolutions,
@@ -360,5 +361,27 @@ mod tests {
         assert!(!covers(&required, &question(home.path(), &task, "run", &q)));
         task.status = crate::queue::TaskStatus::Done;
         assert!(!covers(&original, &outcome(home.path(), &task)));
+    }
+
+    #[test]
+    fn completion_occurrences_never_share_a_semantic_receipt() {
+        let home = tempfile::tempdir().unwrap();
+        let mut task = fixture(home.path());
+        let context = crate::queue::CompletionContext::new(
+            crate::queue::CompletionActor::Web,
+            Some("owner cancelled".into()),
+            home.path(),
+            &task,
+        );
+        task.succeed(context);
+        let first = outcome(home.path(), &task);
+        task.completion_history
+            .last_mut()
+            .unwrap()
+            .occurrence
+            .push_str("-next");
+        let next = outcome(home.path(), &task);
+        assert!(!covers(&first, &next));
+        assert!(!covers(&next, &first));
     }
 }

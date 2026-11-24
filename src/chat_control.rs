@@ -114,6 +114,19 @@ pub enum Operation {
     Done {
         /// Task id or unambiguous prefix.
         task: String,
+        /// Optional explanation retained with the completion event.
+        #[serde(default)]
+        reason: Option<String>,
+        /// Close unfinished work without deleting its runs or branches.
+        #[serde(default)]
+        discard: bool,
+    },
+    /// Restore mistakenly closed unfinished work to an operator hold.
+    Reopen {
+        /// Task id or unambiguous prefix.
+        task: String,
+        /// Required explanation for recovery.
+        reason: String,
     },
     /// Change a task's queue priority.
     Priority {
@@ -336,7 +349,7 @@ pub async fn dispatch(
     if std::env::var_os(bridge::CHANNEL_ENV).is_some() {
         return bridge::request(&operation).await;
     }
-    execute(queue, home, talks, talk, operation).await
+    Box::pin(execute(queue, home, talks, talk, operation)).await
 }
 
 /// The transport supplies immutable launcher authority, never the CLI frame.
@@ -354,7 +367,11 @@ async fn execute_authenticated(
         ))
         .await;
     }
-    crate::chat_goal::with_source(source, execute(queue, home, talks, talk, operation)).await
+    crate::chat_goal::with_source(
+        source,
+        Box::pin(execute(queue, home, talks, talk, operation)),
+    )
+    .await
 }
 
 /// Whether the launcher restricted this CLI to read-only inspection and typed controls.
@@ -410,7 +427,10 @@ async fn execute(
             format!("decision {inquiry} reconciled from the task's durable state")
         }
         Operation::ForDecision { inquiry, command } => {
-            execute_decision(queue, home, talks, talk, &inquiry, *command).await?
+            Box::pin(execute_decision(
+                queue, home, talks, talk, &inquiry, *command,
+            ))
+            .await?
         }
         Operation::SettleDecision {
             inquiry,
@@ -466,9 +486,36 @@ async fn execute(
             format!("settled decision {inquiry}: {reason}")
         }
         Operation::Add { filing } => serde_json::to_string(&file_task(queue, *filing)?)?,
-        Operation::Done { task } => {
-            let t = done_claimed(queue, home, claimed_for_chat(queue, &task, talks, talk)?)?;
-            format!("done {} {}", t.short(), t.title)
+        Operation::Done {
+            task,
+            reason,
+            discard,
+        } => {
+            let claimed = claimed_for_chat(queue, &task, talks, talk)?;
+            let task = Box::pin(crate::task_completion::close_claimed(
+                queue,
+                home,
+                claimed,
+                crate::queue::CompletionActor::Chat(talk.to_owned()),
+                reason,
+                discard,
+            ))
+            .await?;
+            crate::task_completion::describe(&task)
+        }
+        Operation::Reopen { task, reason } => {
+            let (_claim, mut t) = claimed_for_chat(queue, &task, talks, talk)?;
+            let expected = t.clone();
+            let (_guards, context) = Box::pin(crate::task_completion::admit_reopen(
+                &t,
+                home,
+                crate::queue::CompletionActor::Chat(talk.to_owned()),
+                &reason,
+            ))
+            .await?;
+            t.reopen(context)?;
+            queue.commit_completion(&mut t, &expected)?;
+            describe(&t, "reopened on hold")
         }
         Operation::Priority { task, priority } => {
             let t = priority_claimed(
@@ -752,7 +799,14 @@ fn admit_goal_operation(
                 "goal filing must retain this conversation's provenance"
             );
         }
-        Operation::Done { task }
+        Operation::Done { discard: true, .. } | Operation::Reopen { .. } => {
+            anyhow::bail!("task discard and reopen require an explicit owner turn");
+        }
+        Operation::Done {
+            task,
+            discard: false,
+            ..
+        }
         | Operation::Priority { task, .. }
         | Operation::Hold { task, .. }
         | Operation::Release { task }
@@ -862,7 +916,8 @@ async fn execute_decision(
         _ => None,
     };
     match &command {
-        Operation::Done { task: target }
+        Operation::Done { task: target, .. }
+        | Operation::Reopen { task: target, .. }
         | Operation::Hold { task: target, .. }
         | Operation::Release { task: target }
         | Operation::Retry { task: target, .. } => {
@@ -1038,15 +1093,18 @@ async fn execute_decision(
             return Err(error);
         }
         Err(error) => Err(anyhow::Error::new(BeforeEffect(error))),
-        Ok(()) => apply_local_decision(
-            queue,
-            home,
-            id,
-            &request,
-            &inquiry.task,
-            &inquiry.repo,
-            &command,
-        ),
+        Ok(()) => {
+            Box::pin(apply_local_decision(
+                queue,
+                home,
+                id,
+                &request,
+                &inquiry.task,
+                &inquiry.repo,
+                &command,
+            ))
+            .await
+        }
     };
     let result = if let Err(error) = local {
         Err(error)
@@ -1159,7 +1217,7 @@ struct BeforeEffect(anyhow::Error);
 /// Commit a task-local effect and its exact receipt under one queue claim.
 /// The inquiry projection may lag this write, but restart never has to infer
 /// completion from the task's current status or repeat the operation.
-fn apply_local_decision(
+async fn apply_local_decision(
     queue: &Queue,
     home: &Path,
     id: &str,
@@ -1169,14 +1227,16 @@ fn apply_local_decision(
     command: &Operation,
 ) -> Result<Option<String>> {
     let target = match command {
-        Operation::Done { task }
+        Operation::Done { task, .. }
+        | Operation::Reopen { task, .. }
         | Operation::Hold { task, .. }
         | Operation::Release { task }
         | Operation::Retry { task, .. } => task,
         _ => return Ok(None),
     };
-    let prepare = || -> Result<_> {
+    let prepare = async {
         let (_claim, mut task) = claimed(queue, target)?;
+        let expected = task.clone();
         ensure!(
             task.id == owner && task.repo == repo,
             "decision ownership changed"
@@ -1184,12 +1244,46 @@ fn apply_local_decision(
         if let Some(prior) = task.decision_effects.get(id) {
             ensure!(prior == request, "decision receipt binds another command");
             let message = format!("task {}: decision {id} already applied", task.id);
-            return Ok((_claim, task, message, true));
+            return Ok((_claim, task, message, true, None, expected));
         }
+        let mut close_guard = None;
         let message = match command {
-            Operation::Done { .. } => {
-                task.succeed();
-                describe(&task, "done")
+            Operation::Done {
+                reason, discard, ..
+            } => {
+                let (guards, context) = crate::task_completion::admit_close(
+                    &task,
+                    home,
+                    crate::queue::CompletionActor::Chat(
+                        crate::task_inquiry::Outbox::at(home)
+                            .get(id)?
+                            .delivered_to
+                            .context("decision has no chat")?,
+                    ),
+                    reason.clone(),
+                    *discard,
+                )
+                .await?;
+                close_guard = Some(guards);
+                task.succeed(context);
+                crate::task_completion::describe(&task)
+            }
+            Operation::Reopen { reason, .. } => {
+                let (guards, context) = crate::task_completion::admit_reopen(
+                    &task,
+                    home,
+                    crate::queue::CompletionActor::Chat(
+                        crate::task_inquiry::Outbox::at(home)
+                            .get(id)?
+                            .delivered_to
+                            .context("decision has no chat")?,
+                    ),
+                    reason,
+                )
+                .await?;
+                close_guard = Some(guards);
+                task.reopen(context)?;
+                describe(&task, "reopened on hold")
             }
             Operation::Hold { reason, .. } => {
                 check_hold_release(&task, "hold")?;
@@ -1220,11 +1314,16 @@ fn apply_local_decision(
         };
         task.decision_effects
             .insert(id.to_owned(), request.to_owned());
-        Ok((_claim, task, message, false))
+        Ok::<_, anyhow::Error>((_claim, task, message, false, close_guard, expected))
     };
-    let (_claim, mut task, message, already_applied) = prepare().map_err(BeforeEffect)?;
+    let (_claim, mut task, message, already_applied, close_guard, expected) =
+        prepare.await.map_err(BeforeEffect)?;
     if !already_applied {
-        queue.put(&mut task)?;
+        if close_guard.is_some() {
+            queue.commit_completion(&mut task, &expected)?;
+        } else {
+            queue.put(&mut task)?;
+        }
     }
     if matches!(command, Operation::Done { .. }) {
         crate::daemon::supersede_prior_runs(&task, home);
@@ -1302,7 +1401,7 @@ fn reconcile_task_decision(queue: &Queue, home: &Path, chat: &str, id: &str) -> 
                 && task.status == TaskStatus::Queued
                 && !task.operator_held()
         }
-        Operation::Done { task: target } => {
+        Operation::Done { task: target, .. } => {
             queue.resolve_id(&target)? == task.id && task.status == TaskStatus::Done
         }
         Operation::Retry {
@@ -1829,21 +1928,23 @@ fn check_hold_release(task: &Task, operation: &str) -> Result<()> {
     }
 }
 
-/// Mark a task complete under its queue claim, as `magi task done` does.
-pub fn done(queue: &Queue, home: &Path, reference: &str) -> Result<Task> {
-    done_claimed(queue, home, claimed(queue, reference)?)
-}
-
-fn done_claimed(
+/// Mark a task complete as a terminal caller, using the audited close transition.
+pub async fn done(
     queue: &Queue,
     home: &Path,
-    (_claim, mut task): (crate::queue::Claim, Task),
+    reference: &str,
+    reason: Option<String>,
+    discard: bool,
 ) -> Result<Task> {
-    task.succeed();
-    // Manual completion also retires earlier attempts when the latest one landed.
-    crate::daemon::supersede_prior_runs(&task, home);
-    queue.put(&mut task)?;
-    Ok(task)
+    crate::task_completion::close(
+        queue,
+        home,
+        reference,
+        crate::queue::CompletionActor::Cli,
+        reason,
+        discard,
+    )
+    .await
 }
 
 /// Change priority under the same claim and state check as the terminal route.
@@ -2098,6 +2199,49 @@ mod tests {
         t
     }
 
+    #[tokio::test]
+    async fn direct_chat_completion_supersedes_the_earlier_blocked_run() {
+        use crate::run::{RunState, RunStatus};
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let talks = Talks::at(home.join("talks"));
+        let queue = Queue::at(home.join("queue"));
+        let talk = talk(&talks, "talk-a");
+        let mut task = filed(&queue, &talk.id, "deliver");
+        for status in [RunStatus::Blocked, RunStatus::Merged] {
+            let mut run = RunState::new(
+                task.repo.clone(),
+                "main".into(),
+                "base".into(),
+                task.instruction.clone(),
+                crate::config::Config::default(),
+            );
+            run.status = status;
+            run.driver_exited = true;
+            run.reserve_under(home).unwrap();
+            task.link_run(&run.id);
+        }
+        queue.put(&mut task).unwrap();
+        execute(
+            &queue,
+            home,
+            &talks,
+            &talk.id,
+            Operation::Done {
+                task: task.id.clone(),
+                reason: None,
+                discard: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            RunState::load_under(&task.runs[0], home).unwrap().status,
+            RunStatus::Superseded
+        );
+    }
+
     #[test]
     fn ownerless_import_reconciliation_requires_effect_evidence_not_saved_consent() {
         use crate::ask::{Answer, Question, Questions};
@@ -2327,7 +2471,12 @@ mod tests {
             let mut t = filed(&queue, "talk-a", "work");
             t.start("20260101-000000-aaaa".into());
             if status == TaskStatus::Done {
-                t.succeed();
+                t.succeed(crate::queue::CompletionContext::new(
+                    crate::queue::CompletionActor::Cli,
+                    None,
+                    tmp.path(),
+                    &t,
+                ));
             }
             queue.put(&mut t).unwrap();
             let before = std::fs::read(queue.path_of(&t.id)).unwrap();
@@ -2574,6 +2723,88 @@ mod goal_admission_tests {
             queue.put(&mut task).unwrap();
         })
         .await;
+        let error = execute_authenticated(
+            &queue,
+            tmp.path(),
+            &talks,
+            &talk.id,
+            source.clone(),
+            Operation::Done {
+                task: task.id.clone(),
+                reason: Some("discard unfinished work".into()),
+                discard: true,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("explicit owner turn"),
+            "{error:#}"
+        );
+        assert_eq!(queue.get(&task.id).unwrap().status, TaskStatus::Queued);
+        assert!(queue.get(&task.id).unwrap().completion_history.is_empty());
+        assert!(
+            execute_authenticated(
+                &queue,
+                tmp.path(),
+                &talks,
+                &talk.id,
+                source.clone(),
+                Operation::Done {
+                    task: unrelated.id.clone(),
+                    reason: None,
+                    discard: false,
+                },
+            )
+            .await
+            .is_err()
+        );
+        execute_authenticated(
+            &queue,
+            tmp.path(),
+            &talks,
+            &talk.id,
+            source.clone(),
+            Operation::Done {
+                task: task.id.clone(),
+                reason: Some("goal work finished".into()),
+                discard: false,
+            },
+        )
+        .await
+        .unwrap();
+        let error = execute_authenticated(
+            &queue,
+            tmp.path(),
+            &talks,
+            &talk.id,
+            source.clone(),
+            Operation::Reopen {
+                task: task.id.clone(),
+                reason: "recover unfinished work".into(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("explicit owner turn"),
+            "{error:#}"
+        );
+        assert_eq!(queue.get(&task.id).unwrap().status, TaskStatus::Done);
+        execute_authenticated(
+            &queue,
+            tmp.path(),
+            &talks,
+            &talk.id,
+            crate::chat_goal::Source::Input { turn: 0 },
+            Operation::Reopen {
+                task: task.id.clone(),
+                reason: "recover unfinished work".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(queue.get(&task.id).unwrap().status, TaskStatus::Held);
         talks
             .mutate(&talk.id, |talk| {
                 talk.turns.push(serde_json::from_value(serde_json::json!({

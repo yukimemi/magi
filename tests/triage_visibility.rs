@@ -81,7 +81,12 @@ fn answered_triage_is_history_and_done_tasks_have_no_open_annotation() {
         vec!["resume it".into(), "not yet".into()],
     );
     questions.put(&mut other).unwrap();
-    task.succeed();
+    task.succeed(magi::queue::CompletionContext::new(
+        magi::queue::CompletionActor::Cli,
+        None,
+        home.path(),
+        &task,
+    ));
     queue.put(&mut task).unwrap();
     assert!(!cli(home.path(), &["task", "list", "--all"]).contains("triage question open"));
     assert!(!cli(home.path(), &["task", "show", &task.id]).contains("question  "));

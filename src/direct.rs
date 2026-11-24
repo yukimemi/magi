@@ -614,7 +614,12 @@ mod tests {
             "the queue is untouched"
         );
         t.link_run("20260101-000000-abcd");
-        t.succeed();
+        t.succeed(crate::queue::CompletionContext::new(
+            crate::queue::CompletionActor::DaemonSettle,
+            None,
+            dir.path(),
+            &t,
+        ));
         q.put(&mut t).unwrap();
         let mut runs = Vec::new();
         let done = follow(
@@ -711,7 +716,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let q = Queue::at(dir.path().join("queue"));
         let mut parent = parent_in(&q, dir.path());
-        parent.succeed();
+        parent.succeed(crate::queue::CompletionContext::new(
+            crate::queue::CompletionActor::Cli,
+            None,
+            dir.path(),
+            &parent,
+        ));
         q.put(&mut parent).unwrap();
         let state = follow_up_state(dir.path());
         assert!(

@@ -2165,6 +2165,15 @@ fn pick_merged_pr(
     base_branch: &str,
     created_at: Timestamp,
 ) -> Result<Option<ExternalMerge>> {
+    pick_merged_pr_with(json, base_branch, created_at, false)
+}
+
+fn pick_merged_pr_with(
+    json: &str,
+    base_branch: &str,
+    created_at: Timestamp,
+    reject_ambiguous: bool,
+) -> Result<Option<ExternalMerge>> {
     let raw: Vec<GhMergedPr> =
         serde_json::from_str(json).context("parse `gh pr list ... --json ...` output")?;
     let mut matches: Vec<ExternalMerge> = Vec::new();
@@ -2183,6 +2192,10 @@ fn pick_merged_pr(
             number: pr.number,
         });
     }
+    anyhow::ensure!(
+        !reject_ambiguous || matches.len() <= 1,
+        "multiple merged pull requests match this run; merge evidence is ambiguous"
+    );
     if matches.len() == 1 {
         Ok(matches.pop())
     } else {
@@ -2564,14 +2577,40 @@ pub async fn find_external_merge(state: &RunState) -> Result<Option<ExternalMerg
     let Some(winner) = state.winner() else {
         return Ok(None);
     };
-    let branch = state.pr_branch().unwrap_or(&winner.branch).to_owned();
+    find_external_merge_with(
+        state,
+        state.pr_head.as_deref().unwrap_or(&winner.branch),
+        false,
+    )
+    .await
+}
+
+/// Reopening needs proof of absence, not merely failure to identify one PR.
+pub(crate) async fn find_external_merge_for_reopen(
+    state: &RunState,
+) -> Result<Option<ExternalMerge>> {
+    let Some(branch) = state.pr_branch() else {
+        anyhow::ensure!(
+            state.pr.is_none() && state.pr_pushed_head.is_none(),
+            "run has public PR evidence but no known branch to check"
+        );
+        return Ok(None);
+    };
+    find_external_merge_with(state, branch, true).await
+}
+
+async fn find_external_merge_with(
+    state: &RunState,
+    branch: &str,
+    reject_ambiguous: bool,
+) -> Result<Option<ExternalMerge>> {
     let out = gh(
         &state.repo,
         &[
             "pr".to_owned(),
             "list".to_owned(),
             "--head".to_owned(),
-            branch.clone(),
+            branch.to_owned(),
             "--state".to_owned(),
             "merged".to_owned(),
             "--json".to_owned(),
@@ -2582,7 +2621,11 @@ pub async fn find_external_merge(state: &RunState) -> Result<Option<ExternalMerg
     if !out.0 {
         bail!("gh pr list --head {branch}: {}", out.1);
     }
-    pick_merged_pr(&out.1, &state.base_branch, state.created_at)
+    if reject_ambiguous {
+        pick_merged_pr_with(&out.1, &state.base_branch, state.created_at, true)
+    } else {
+        pick_merged_pr(&out.1, &state.base_branch, state.created_at)
+    }
 }
 
 /// Whether `branch` is, right now, an ancestor of `base_branch` in the local
@@ -9805,6 +9848,8 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         ]"#;
         let created_at: Timestamp = "2026-09-19T00:00:00Z".parse().unwrap();
         assert_eq!(pick_merged_pr(json, "main", created_at).unwrap(), None);
+        let error = pick_merged_pr_with(json, "main", created_at, true).unwrap_err();
+        assert!(error.to_string().contains("ambiguous"), "{error:#}");
     }
 
     /// A pull request that targets a different base branch cannot be this

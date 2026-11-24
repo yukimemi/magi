@@ -296,7 +296,12 @@ async fn reassign_preserves_idle_transitions_and_save_failure_is_atomic() {
         let moved = magi::task_reassign::reassign(&queue, &home, &f.repo, &task.id, &dest, "test").await.unwrap();
         assert_eq!(moved.status, if status == TaskStatus::Queued { TaskStatus::Queued } else { TaskStatus::Held });
         let mut done = moved;
-        done.succeed();
+        done.succeed(magi::queue::CompletionContext::new(
+            magi::queue::CompletionActor::Cli,
+            None,
+            &home,
+            &done,
+        ));
         queue.put(&mut done).unwrap();
     }
     let (task, mut run) = stopped(&f, &queue);

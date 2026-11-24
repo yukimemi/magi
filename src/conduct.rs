@@ -51,7 +51,7 @@ use crate::agent::{self, Invocation, SeatState};
 use crate::ask::{ChoiceAction, Deputy, Question, Questions};
 use crate::config::Config;
 use crate::prompt;
-use crate::queue::{Queue, Task, TaskStatus};
+use crate::queue::{CompletionActor, Queue, Task, TaskStatus};
 use crate::run::RunState;
 use crate::verdict;
 
@@ -1025,7 +1025,14 @@ fn apply_one(
                 // would actually start the run.
             }
             Some(Recovery::Done) => {
-                task.succeed();
+                let context = crate::task_completion::prepare_close(
+                    &task,
+                    &crate::run::home(),
+                    CompletionActor::Conductor,
+                    d.reason.clone(),
+                    false,
+                )?;
+                task.succeed(context);
                 // Same reason `magi task done` and the web UI's equivalent
                 // do this: the conductor closing a task by hand is just as
                 // much a finished story as the loop's own settle path.
@@ -1417,7 +1424,7 @@ mod tests {
     use super::*;
     use crate::ask::{Answer, QuestionStatus};
     use crate::config::{AgentKind, AgentSpec, Graph};
-    use crate::queue::Source;
+    use crate::queue::{CompletionContext, Source};
 
     fn mock_agent(dir: &Path, script: &str, env: BTreeMap<String, String>) -> AgentSpec {
         let path = dir.join("mock-conduct-agent.sh");
@@ -2206,7 +2213,12 @@ mod tests {
             .unwrap()
             .set_times(std::fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH))
             .unwrap();
-        unrelated.succeed();
+        unrelated.succeed(CompletionContext::new(
+            CompletionActor::DaemonSettle,
+            None,
+            dir.path(),
+            &unrelated,
+        ));
         let mut waiting = task("waiting");
         let mut asking = task("needs a product decision");
         let mut holding = task("must stay held");
@@ -2855,6 +2867,43 @@ printf '%s\n' "$MOCK_REPLY"
         assert_eq!(after.status, TaskStatus::Done);
         assert!(after.hold_reason.is_none());
         assert_eq!(after.answers.len(), 1, "the record of why is kept");
+        let completion = after.completion_history.last().unwrap();
+        assert_eq!(completion.actor, CompletionActor::Conductor);
+        assert_eq!(completion.prior_status, TaskStatus::Held);
+        assert_eq!(
+            completion.reason.as_deref(),
+            Some("operator confirmed this already landed")
+        );
+    }
+
+    #[test]
+    fn done_recovery_cannot_discard_unknown_retained_work() {
+        crate::run::pin_test_home();
+        let dir = tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let questions = Questions::at(dir.path().join("questions"));
+        let mut t = task("unfinished retained work");
+        t.link_run("unknown-completion-run");
+        t.hold_machine(Some("verification failed".into()));
+        queue.put(&mut t).unwrap();
+        let error = apply_one(
+            &queue,
+            &questions,
+            &Decision {
+                id: t.id.clone(),
+                recovery: Some(Recovery::Done),
+                reason: Some("close it".into()),
+                ..Decision::default()
+            },
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("--discard"), "{error:#}");
+        let after = queue.get(&t.id).unwrap();
+        assert_eq!(after.status, TaskStatus::Held);
+        assert_eq!(after.hold_reason, t.hold_reason);
+        assert_eq!(after.runs, t.runs);
+        assert!(after.completion_history.is_empty());
     }
 
     #[test]
