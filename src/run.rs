@@ -3327,12 +3327,12 @@ impl RunState {
                 .as_ref()
                 .and_then(|s| s.conflict.as_ref())
                 .map(|detail| {
-                    let cause = if crate::repair_budget::legacy::legacy_sequencer_head(self).is_some()
-                    {
-                        "Rebase sequencer infrastructure failure"
-                    } else {
-                        "Base-sync conflict"
-                    };
+                    let cause =
+                        if crate::repair_budget::legacy::legacy_sequencer_head(self).is_some() {
+                            "Rebase sequencer infrastructure failure"
+                        } else {
+                            "Base-sync conflict"
+                        };
                     format!("{cause}: {detail}")
                 });
         }
