@@ -593,6 +593,10 @@
 
     <div class="talks-actions">
       <button class="btn btn-gold" type="button" id="talk-start-go">Start a conversation</button>
+      <button class="btn btn-quiet talks-unread-toggle" type="button" id="talks-unread-only" aria-pressed="false">
+        <span class="talks-unread-indicator" aria-hidden="true"></span>
+        <span>Unread only</span>
+      </button>
       <button class="btn btn-quiet" type="button" id="talks-mark-all-read">Mark all as read</button>
     </div>
 
@@ -606,6 +610,10 @@
     <p class="queue-search-status" id="talks-search-status" role="status" hidden></p>
 
     <ol class="cards" id="talks-list"></ol>
+    <div class="empty" id="talks-unread-empty" hidden>
+      <p id="talks-unread-empty-text">No unread conversations.</p>
+      <button class="btn btn-quiet" type="button" id="talks-unread-clear">Show all conversations</button>
+    </div>
     <p class="empty" id="talks-empty" hidden>
       No conversations yet. Open one to ask a question, look something up, or
       think an idea through with an agent that can read the repository and
