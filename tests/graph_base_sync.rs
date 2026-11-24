@@ -275,6 +275,16 @@ async fn sync_base_only_detects_squashed_work_without_creating_a_merge_commit() 
     assert_eq!(magi::git::rev_parse(worktree, "HEAD").await.unwrap(), head);
     let task = magi::queue::Queue::open().get(&task.id).unwrap();
     assert_eq!(task.status, magi::queue::TaskStatus::Done);
+    let [event] = task.completion_history.as_slice() else {
+        panic!("expected one base-sync completion event, got {:?}", task.completion_history);
+    };
+    assert_eq!(event.action, magi::queue::CompletionAction::Complete);
+    assert_eq!(event.actor, magi::queue::CompletionActor::DaemonSettle);
+    let reason = saved.sync_only_passes.last().expect("Git-only sync pass").summary();
+    assert_eq!(event.reason.as_deref(), Some(reason.as_str()));
+    let evidence = event.run.as_ref().expect("retained run evidence");
+    assert_eq!(evidence.id, saved.id);
+    assert_eq!(evidence.status, Some(RunStatus::AlreadyInBase));
     assert_eq!(task.attempts, 2);
     assert!(!fx.tmp.path().join("verification").exists());
     assert!(!saved.dir().join("artifacts/prompts.log").exists());
