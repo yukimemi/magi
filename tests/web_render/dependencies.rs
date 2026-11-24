@@ -41,6 +41,7 @@ async fn dependencies_page_preserves_graph_navigation_and_load_boundaries() {
     let queue = Queue::at(home.join("queue"));
     let (older_queue, older_gate) = tokio::sync::watch::channel(DependencyRead::Pass);
     let (questions, question_gate) = tokio::sync::watch::channel(DependencyRead::Wait);
+    let (question_origins, origin_gate) = tokio::sync::watch::channel(DependencyRead::Pass);
     let base = serve_with_client_probe(
         &home,
         queue.clone(),
@@ -50,6 +51,7 @@ async fn dependencies_page_preserves_graph_navigation_and_load_boundaries() {
         ClientProbe::Dependencies {
             older_queue: older_gate,
             questions: question_gate,
+            question_origins: origin_gate,
         },
     )
     .await;
@@ -122,6 +124,23 @@ async fn dependencies_page_preserves_graph_navigation_and_load_boundaries() {
     let retry = "document.querySelector('#dependencies-retry').click()";
     browser.eval(&phone, retry).await.unwrap();
     browser.wait_for(&phone, GRAPH, WAIT).await.unwrap();
+
+    question_origins.send_replace(DependencyRead::Fail);
+    browser.eval(&phone, "deck.loadQuestions()").await.unwrap();
+    browser
+        .wait_for(
+            &phone,
+            &format!(
+                "{GRAPH}
+                  && document.querySelector('#questions-origin-state')?.textContent.includes('Question origins:')
+                  && document.querySelector('#dependencies-status').hidden
+                  && document.querySelector('#dependencies-count').textContent === '18 tasks, 1 question · 18 dependencies'"
+            ),
+            WAIT,
+        )
+        .await
+        .expect("question origins may fail without failing or staling the dependency graph");
+    question_origins.send_replace(DependencyRead::Pass);
 
     browser
         .eval(

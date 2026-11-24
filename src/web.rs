@@ -21719,13 +21719,9 @@ mod tests {
 
         // A question a task is blocked on gets its own node in the same
         // dependency graph, not just a task-shaped node with nothing known
-        // about it.
+        // about it. The web_render browser test checks the actual destination.
         assert!(APP_JS.contains("function depNode(id, byId, questionNodes)"));
         assert!(APP_JS.contains("questionNodes.set(dep, questionsById.get(dep));"));
-        assert!(
-            APP_JS.contains("location.hash = \"#/questions\";"),
-            "a question node must jump to the Questions screen, not pretend to be a task"
-        );
 
         // `Task::answers` - decisions already made - are shown as a record on
         // the card, the same disclosure style as the full instruction.

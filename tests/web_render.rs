@@ -224,6 +224,7 @@ enum ClientProbe {
     Dependencies {
         older_queue: DependencyGate,
         questions: DependencyGate,
+        question_origins: DependencyGate,
     },
 }
 
@@ -323,6 +324,7 @@ async fn serve_with_client_probe(
     let router = if let ClientProbe::Dependencies {
         older_queue,
         questions,
+        question_origins,
     } = probe
     {
         router.layer(axum::middleware::from_fn(
@@ -332,6 +334,7 @@ async fn serve_with_client_probe(
                         Some(older_queue.clone())
                     }
                     "/api/questions/core" => Some(questions.clone()),
+                    "/api/questions/origins" => Some(question_origins.clone()),
                     _ => None,
                 };
                 async move {
