@@ -376,6 +376,10 @@ without selecting it first. Open confirmations and drafts survive list refreshes
 Row actions keep the current view even when opening a confirmation replaces
 the clicked control; only non-interactive row content selects the task detail.
 
+Open **Dependencies** from the navigation or the Backlog link to see what
+each blocked task waits on. The graph scrolls independently in both directions;
+select a task or question node to open its existing detail.
+
 Competition rows already use the existing run detail. Their handles reorder within
 a section in this browser after clearing search; scope and state filters may stay
 active. Filtered and unloaded runs retain their remembered positions. New runs

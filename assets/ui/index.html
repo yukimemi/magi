@@ -51,6 +51,7 @@
   <nav class="rail" aria-label="Sections">
     <a class="rail-link" href="#/runs" data-nav="runs">Runs</a>
     <a class="rail-link" href="#/queue" data-nav="queue">Queue</a>
+    <a class="rail-link" href="#/dependencies" data-nav="dependencies">Dependencies</a>
     <a class="rail-link" href="#/stats" data-nav="stats">Stats</a>
     <a class="rail-link" href="#/settings" data-nav="settings">Settings</a>
     <a class="rail-link" href="#/decisions" data-nav="decisions">Pending decisions<span class="badge" id="decision-badge-rail" hidden></span></a>
@@ -388,6 +389,7 @@
     <div class="view-head">
       <h1 id="queue-h">Backlog</h1>
       <p class="view-sub" id="queue-count">Loading…</p>
+      <a class="text-link queue-dependencies" href="#/dependencies">View dependencies</a>
     </div>
 <!-- Resolves an id the same loose way the CLI does (`magi task show
          <prefix>`): a leading match on the full id, or a trailing match on
@@ -406,20 +408,29 @@
     <ol class="cards" id="queue-search-results" hidden></ol>
     <p class="empty" id="queue-search-empty" hidden>No task matches this search.</p>
 
-    <div class="panel" id="queue-graph-panel" hidden>
-      <h2>Blocked on <span class="count" id="queue-graph-count"></span></h2>
-      <p class="panel-note">
-        An arrow points from a blocked task to the task it is waiting on.
-        Tap a node to jump to that task below.
-      </p>
-      <div class="dep-graph-wrap" id="queue-graph"></div>
-    </div>
     <div id="queue-sections"></div>
     <p class="empty" id="queue-empty" hidden>
       The backlog is empty. Talk an idea through in Chat, or file one with
       <code>magi task add</code>.
       <a class="btn btn-gold" href="#/chat">Open Chat</a>
     </p>
+  </section>
+
+  <section class="view" id="view-dependencies" aria-labelledby="dependencies-h" hidden>
+    <div class="view-head">
+      <h1 id="dependencies-h" tabindex="-1">Dependencies</h1>
+      <p class="view-sub" id="dependencies-count" hidden></p>
+    </div>
+    <p class="view-sub" id="dependencies-help">
+      Arrows point from a blocked task to the task or question it waits on.
+      Scroll the graph to explore it, or select a node to open its details.
+    </p>
+    <div id="dependencies-status">
+      <span role="status" id="dependencies-message">Loading dependencies…</span>
+      <button class="btn btn-quiet" id="dependencies-retry" type="button" hidden>Retry</button>
+    </div>
+    <div class="dep-graph-wrap" id="dependencies-graph" role="region" tabindex="0"
+         aria-label="Dependency graph" aria-describedby="dependencies-help" hidden></div>
   </section>
 
   <!-- STATS --------------------------------------------------------------- -->
@@ -734,6 +745,17 @@
       </svg>
     </span>
     <span>Queue</span>
+  </a>
+  <a class="dock-item" href="#/dependencies" data-nav="dependencies" aria-label="Dependencies">
+    <span class="dock-glyph" aria-hidden="true">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="8" y="3" width="8" height="5" rx="1"/>
+        <rect x="3" y="16" width="7" height="5" rx="1"/>
+        <rect x="14" y="16" width="7" height="5" rx="1"/>
+        <path d="M12 8v4m-5.5 4v-4h11v4"/>
+      </svg>
+    </span>
+    <span>Deps</span>
   </a>
   <a class="dock-item" href="#/stats" data-nav="stats">
     <span class="dock-glyph" aria-hidden="true">
