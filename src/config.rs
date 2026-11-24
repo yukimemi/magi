@@ -2125,9 +2125,15 @@ impl Config {
     /// defaults. The repository layers come from the remote-tracking ref as it
     /// stands (see the module doc); use [`Config::discover_fetched`] where a
     /// stale ref would matter.
+    #[track_caller]
     pub fn discover(repo: &Path, explicit: Option<&Path>) -> Result<(Self, Vec<PathBuf>)> {
         #[cfg(test)]
         crate::web::request_cost::discovery();
+        tracing::trace!(
+            caller = %std::panic::Location::caller(),
+            explicit = explicit.is_some(),
+            "discovering configuration"
+        );
         if let Some(p) = explicit {
             let paths = vec![p.to_path_buf()];
             return Ok((Self::load_layers(&paths)?, paths));
@@ -3765,6 +3771,9 @@ fn materialize_remote_layers(
     };
     if let Some(layers) = lookup(sha) {
         if !verified {
+            // Observing a ref and its cache key is not proof that the commit
+            // still exists. Git validates the object store (including packs
+            // and alternates); an unchanged ref or TTL cannot prove that.
             let commit = git_out(
                 repo,
                 &[

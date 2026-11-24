@@ -1641,6 +1641,24 @@ invocation instead of reading each configuration blob again. A missing
 configuration path is cached only when the commit tree confirms its absence;
 promised blobs in partial clones are fetched by Git as needed.
 The web revision monitor itself reads store metadata, not repository config.
+Even when the ref can be read directly, one Git validation is intentional:
+an unchanged ref does not prove the commit survived object-store damage or
+removal of an alternate. A TTL or ref timestamp would hide that failure.
+Scheduler admission and repository-scoped services share this layer cache;
+fetches at execution admission remain separate.
+For diagnosing unexpected repeated loads, enable `MAGI_LOG=magi::config=trace`
+to record the discovery call site without logging configuration contents.
+
+The revision worker starts on the first health or events request. In an
+idle-process Trace2 comparison on Windows (same checkout and machine config,
+isolated runtime homes, one events connection then disconnected), the
+installed build and this build both started zero Git processes over 60 seconds
+after startup. Startup through that first observation used 14 versus 3 Git
+invocations respectively (2 on a second candidate launch with a warm cache).
+Discovery tracing on that second launch showed only CLI startup and the
+periodic update worker, not the one-second revision worker. This does not
+reproduce the previously reported 225-per-minute idle rate; its calling path
+remains unidentified.
 
 `[update] auto_restart = true` opts `magi web` into the same update-and-restart
 handover as the UI's **Update & restart** button. It defaults to `false`.
