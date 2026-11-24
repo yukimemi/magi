@@ -491,21 +491,17 @@ async fn execute(
             reason,
             discard,
         } => {
-            let (_claim, mut t) = claimed_for_chat(queue, &task, talks, talk)?;
-            if t.status != TaskStatus::Done {
-                let expected = t.clone();
-                let (_guards, context) = Box::pin(crate::task_completion::admit_close(
-                    &t,
-                    home,
-                    crate::queue::CompletionActor::Chat(talk.to_owned()),
-                    reason,
-                    discard,
-                ))
-                .await?;
-                t.succeed(context);
-                queue.commit_completion(&mut t, &expected)?;
-            }
-            crate::task_completion::describe(&t)
+            let claimed = claimed_for_chat(queue, &task, talks, talk)?;
+            let task = Box::pin(crate::task_completion::close_claimed(
+                queue,
+                home,
+                claimed,
+                crate::queue::CompletionActor::Chat(talk.to_owned()),
+                reason,
+                discard,
+            ))
+            .await?;
+            crate::task_completion::describe(&task)
         }
         Operation::Reopen { task, reason } => {
             let (_claim, mut t) = claimed_for_chat(queue, &task, talks, talk)?;
@@ -2201,6 +2197,49 @@ mod tests {
         );
         queue.put(&mut t).unwrap();
         t
+    }
+
+    #[tokio::test]
+    async fn direct_chat_completion_supersedes_the_earlier_blocked_run() {
+        use crate::run::{RunState, RunStatus};
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let talks = Talks::at(home.join("talks"));
+        let queue = Queue::at(home.join("queue"));
+        let talk = talk(&talks, "talk-a");
+        let mut task = filed(&queue, &talk.id, "deliver");
+        for status in [RunStatus::Blocked, RunStatus::Merged] {
+            let mut run = RunState::new(
+                task.repo.clone(),
+                "main".into(),
+                "base".into(),
+                task.instruction.clone(),
+                crate::config::Config::default(),
+            );
+            run.status = status;
+            run.driver_exited = true;
+            run.reserve_under(home).unwrap();
+            task.link_run(&run.id);
+        }
+        queue.put(&mut task).unwrap();
+        execute(
+            &queue,
+            home,
+            &talks,
+            &talk.id,
+            Operation::Done {
+                task: task.id.clone(),
+                reason: None,
+                discard: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            RunState::load_under(&task.runs[0], home).unwrap().status,
+            RunStatus::Superseded
+        );
     }
 
     #[test]

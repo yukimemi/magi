@@ -1197,6 +1197,22 @@ pub struct AnsweredQuestion {
     pub answer: String,
 }
 
+fn append_missing<T: PartialEq>(ledger: &mut Vec<T>, entries: Vec<T>) {
+    for entry in entries {
+        if !ledger.contains(&entry) {
+            ledger.push(entry);
+        }
+    }
+}
+
+fn prepend_missing_by<T>(ledger: &mut Vec<T>, mut older: Vec<T>, same: impl Fn(&T, &T) -> bool) {
+    older.retain(|old| !ledger.iter().any(|entry| same(entry, old)));
+    if !older.is_empty() {
+        older.append(ledger);
+        *ledger = older;
+    }
+}
+
 impl Task {
     /// File a new task. Persist it with [`Queue::put`].
     pub fn new(title: String, instruction: String, repo: PathBuf, source: Source) -> Self {
@@ -2929,6 +2945,10 @@ impl Drop for TaskLock {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("task changed during completion decision; reload and inspect it")]
+pub(crate) struct CompletionSnapshotChanged;
+
 /// A queue on disk.
 #[derive(Debug, Clone)]
 pub struct Queue {
@@ -3331,7 +3351,7 @@ impl Queue {
         let _lock = self.lock_task(&task.id)?;
         anyhow::ensure!(
             serde_json::to_value(self.get(&task.id)?)? == serde_json::to_value(expected)?,
-            "task changed during completion decision; reload and inspect it"
+            CompletionSnapshotChanged
         );
         self.write_record(task)
     }
@@ -3365,17 +3385,53 @@ impl Queue {
                 }
             }
             if unseen_decision {
-                let stale = std::mem::replace(task, stored.clone());
-                for answer in stale.answers {
-                    if !task.answers.contains(&answer) {
-                        task.answers.push(answer);
+                // Keep the persisted decision and every live control that followed
+                // it. Only import evidence from the writer that missed it.
+                task.import_chat_notice();
+                let mut stale = std::mem::replace(task, stored);
+                append_missing(&mut task.answers, stale.answers);
+                if task.reassignments == stale.reassignments {
+                    append_missing(&mut task.runs, stale.runs);
+                }
+                for (ledger, entries) in [
+                    (&mut task.decision_effects, stale.decision_effects),
+                    (&mut task.superseded_resumes, stale.superseded_resumes),
+                    (&mut task.dispatched_resumes, stale.dispatched_resumes),
+                ] {
+                    for (key, value) in entries {
+                        ledger.entry(key).or_insert(value);
                     }
                 }
-                for run in stale.runs {
-                    if !task.runs.contains(&run) {
-                        task.runs.push(run);
-                    }
-                }
+                append_missing(&mut task.actions_applied, stale.actions_applied);
+                append_missing(&mut task.triage_applied, stale.triage_applied);
+                append_missing(&mut task.chat_notices, stale.chat_notices);
+                append_missing(
+                    &mut task.base_recovery_requests,
+                    stale.base_recovery_requests,
+                );
+                // The tail is the current grant. Older receipts must not replace
+                // it or bring back their queued status or exact-run pins.
+                prepend_missing_by(&mut task.repair_grants, stale.repair_grants, |a, b| {
+                    a.request.request == b.request.request
+                });
+                prepend_missing_by(
+                    &mut task.repair_reconciliations,
+                    stale.repair_reconciliations,
+                    |a, b| a.request.request == b.request.request,
+                );
+                // A triage effect can refer to an approval from the stale writer.
+                // Retain it for proof, never as the active release.
+                stale.resumption_history.extend(stale.resumption);
+                stale.resumption_history.retain(|approval| {
+                    task.resumption
+                        .as_ref()
+                        .is_none_or(|r| r.at != approval.at || r.generation != approval.generation)
+                });
+                prepend_missing_by(
+                    &mut task.resumption_history,
+                    stale.resumption_history,
+                    |a, b| a.at == b.at && a.generation == b.generation,
+                );
                 for failure in stale.startup_failures {
                     task.record_startup_failure(failure);
                 }
@@ -3386,6 +3442,11 @@ impl Queue {
                         task.passes.push(pass);
                     }
                 }
+                task.completion_history = history;
+                if !task.decision_effects.is_empty() {
+                    task.stamp_schema();
+                }
+                return;
             }
             if stored.reassignments.len() > task.reassignments.len() {
                 // An older writer may contribute evidence, but cannot restore
@@ -3431,11 +3492,12 @@ impl Queue {
                 *task = stored.clone();
             }
             task.completion_history = history;
-            for key in &stored.base_recovery_requests {
-                if !task.base_recovery_requests.contains(key) {
-                    task.base_recovery_requests.push(key.clone());
-                }
-            }
+            append_missing(
+                &mut task.base_recovery_requests,
+                stored.base_recovery_requests,
+            );
+            append_missing(&mut task.actions_applied, stored.actions_applied);
+            append_missing(&mut task.triage_applied, stored.triage_applied);
             for receipt in &stored.repair_grants {
                 if !task
                     .repair_grants
@@ -3487,19 +3549,11 @@ impl Queue {
             if task.chat.is_none() {
                 task.chat = stored.chat.clone();
             }
-            for key in stored.chat_notices {
-                if !task.chat_notices.contains(&key) {
-                    task.chat_notices.push(key);
-                }
-            }
+            append_missing(&mut task.chat_notices, stored.chat_notices);
             for failure in stored.startup_failures {
                 task.record_startup_failure(failure);
             }
-            for run in stored.runs {
-                if !task.runs.contains(&run) {
-                    task.runs.push(run);
-                }
-            }
+            append_missing(&mut task.runs, stored.runs);
             for p in stored.passes {
                 if !task
                     .passes
@@ -4674,6 +4728,98 @@ mod tests {
         assert_eq!(stale.hold_reason.as_deref(), Some("not actually finished"));
         assert_eq!(stale.completion_history[0], original);
         assert_eq!(stale.completion_history, current.completion_history);
+    }
+
+    #[test]
+    fn a_writer_missing_a_reopen_contributes_receipts_but_not_authority() {
+        let (_dir, q) = queue();
+        let mut current = task("durable receipts");
+        q.put(&mut current).unwrap();
+        let mut stale = current.clone();
+        let grant: crate::repair_budget::Receipt = serde_json::from_value(serde_json::json!({
+            "request": {
+                "task": current.id, "run": "old-run", "kind": "gate", "rounds": 1,
+                "head": "old-head", "expect_pass": 0, "request": "old-grant", "reason": "retry"
+            },
+            "at": stale.updated_at, "contract": "old-contract"
+        }))
+        .unwrap();
+        stale.release_operator("triage", Some("triage-question"));
+        stale.queue_repair(&grant);
+        let reconciliation: crate::repair_budget::reconcile::Receipt =
+            serde_json::from_value(serde_json::json!({
+                "request": {
+                    "task": current.id, "run": "old-run", "head": "old-head", "expect_pass": 0,
+                    "receipt": "old-grant", "question": "triage-question", "answer_at": grant.at,
+                    "request": "reconciliation", "reason": "retain the answer"
+                },
+                "grant": grant, "source": "answer", "application": "release",
+                "decision": grant.at, "superseded_questions": []
+            }))
+            .unwrap();
+        stale.repair_reconciliations.push(reconciliation.clone());
+        stale.triage_applied.push("triage-question".into());
+        stale.actions_applied.push("choice".into());
+        stale.base_recovery_requests.push("base-request".into());
+        stale.chat_notices.push("delivery".into());
+        stale.chat_notice = Some(ChatNotice {
+            key: "other-delivery".into(),
+            at: grant.at,
+            outcome: ChatNoticeOutcome::Posted,
+        });
+        for ledger in [
+            &mut stale.decision_effects,
+            &mut stale.dispatched_resumes,
+            &mut stale.superseded_resumes,
+        ] {
+            ledger.insert("shared".into(), "stale".into());
+            ledger.insert("only-stale".into(), "receipt".into());
+        }
+
+        let mut latest_grant = grant.clone();
+        latest_grant.request.request = "new-grant".into();
+        current.queue_repair(&latest_grant);
+        for ledger in [
+            &mut current.decision_effects,
+            &mut current.dispatched_resumes,
+            &mut current.superseded_resumes,
+        ] {
+            ledger.insert("shared".into(), "committed".into());
+        }
+        current.succeed(completion(&current));
+        let mut context = completion(&current);
+        context.reason = Some("inspect again".into());
+        current.reopen(context).unwrap();
+        q.put(&mut current).unwrap();
+
+        for _ in 0..2 {
+            q.put(&mut stale.clone()).unwrap();
+            let saved = q.get(&current.id).unwrap();
+            assert_eq!(saved.status, TaskStatus::Held);
+            assert_eq!(saved.hold_reason, current.hold_reason);
+            assert_eq!(saved.operator_decided_at, current.operator_decided_at);
+            assert_eq!(saved.completion_history, current.completion_history);
+            assert!(saved.resume_override.is_none());
+            assert!(saved.resumption.is_none());
+            assert_eq!(
+                saved.resumption_history,
+                [stale.resumption.clone().unwrap()]
+            );
+            assert_eq!(saved.triage_applied, ["triage-question"]);
+            assert_eq!(saved.actions_applied, ["choice"]);
+            assert_eq!(saved.base_recovery_requests, ["base-request"]);
+            assert_eq!(saved.chat_notices, ["delivery", "other-delivery"]);
+            assert_eq!(saved.repair_grants, [grant.clone(), latest_grant.clone()]);
+            assert_eq!(saved.repair_reconciliations, [reconciliation.clone()]);
+            for ledger in [
+                saved.decision_effects,
+                saved.dispatched_resumes,
+                saved.superseded_resumes,
+            ] {
+                assert_eq!(ledger["shared"], "committed");
+                assert_eq!(ledger["only-stale"], "receipt");
+            }
+        }
     }
 
     #[test]

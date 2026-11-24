@@ -2246,6 +2246,14 @@ impl ApiError {
         Self::bad_request(format!("{e:#}"))
     }
 
+    fn completion(e: anyhow::Error) -> Self {
+        if e.is::<crate::queue::CompletionSnapshotChanged>() {
+            Self::conflict(format!("{e:#}"))
+        } else {
+            Self::bad_request_from(e)
+        }
+    }
+
     fn conflict(message: impl Into<String>) -> Self {
         Self {
             text_reason: None,
@@ -7637,16 +7645,18 @@ async fn queue_done(
         Err(JsonRejection::MissingJsonContentType(_)) => CompleteBody::default(),
         Err(e) => return Err(ApiError::bad_request(e.body_text())),
     };
-    let task = crate::task_completion::close(
+    let state = Arc::clone(&ui);
+    let claimed = blocking(move || claim_task(&state.queue, &id)).await?;
+    let task = crate::task_completion::close_claimed(
         &ui.queue,
         &ui.home,
-        &id,
+        claimed,
         crate::queue::CompletionActor::Web,
         body.reason,
         body.discard,
     )
     .await
-    .map_err(ApiError::bad_request_from)?;
+    .map_err(ApiError::completion)?;
     Ok(Json(TaskView::from(task)))
 }
 
@@ -7662,15 +7672,17 @@ async fn queue_reopen(
     Path(id): Path<String>,
     Json(body): Json<ReopenBody>,
 ) -> ApiResult<Json<TaskView>> {
-    let task = crate::task_completion::reopen(
+    let state = Arc::clone(&ui);
+    let claimed = blocking(move || claim_task(&state.queue, &id)).await?;
+    let task = crate::task_completion::reopen_claimed(
         &ui.queue,
         &ui.home,
-        &id,
+        claimed,
         crate::queue::CompletionActor::Web,
         &body.reason,
     )
     .await
-    .map_err(ApiError::bad_request_from)?;
+    .map_err(ApiError::completion)?;
     Ok(Json(TaskView::from(task)))
 }
 
@@ -7693,6 +7705,18 @@ async fn queue_delete(State(ui): State<Arc<Ui>>, Path(id): Path<String>) -> ApiR
     .await
 }
 
+/// Resolve the operator's reference, then reload under the same claim a daemon takes.
+fn claim_task(queue: &Queue, reference: &str) -> ApiResult<(crate::queue::Claim, Task)> {
+    let id = resolve_task(queue, reference)?;
+    let claim = queue.claim(&id).map_err(|e| {
+        ApiError::conflict(format!(
+            "{e:#} - a daemon is running this task, so it cannot be \
+             changed from here yet; wait until it is released, then retry"
+        ))
+    })?;
+    Ok((claim, queue.get(&id)?))
+}
+
 /// Read a task, change it, write it back, under the queue's own lock.
 ///
 /// Taking the same claim a daemon takes is what makes hold, release,
@@ -7707,18 +7731,7 @@ async fn mutate(
     change: impl FnOnce(&mut Task) -> Result<()> + Send + 'static,
 ) -> ApiResult<Json<TaskView>> {
     blocking(move || {
-        let id = resolve_task(&ui.queue, &id)?;
-        // `claim` fails when the lock file already exists, which is the
-        // conflict the UI must report: the daemon owns that task's file for
-        // as long as it is running it, and our write would be lost under its
-        // next save. The message names the lock either way.
-        let _claim = ui.queue.claim(&id).map_err(|e| {
-            ApiError::conflict(format!(
-                "{e:#} - a daemon is running this task, so it cannot be \
-                 changed from here yet; wait until it is released, then retry"
-            ))
-        })?;
-        let mut task = ui.queue.get(&id)?;
+        let (_claim, mut task) = claim_task(&ui.queue, &id)?;
         change(&mut task).map_err(|e| match e.downcast::<crate::dupes::Duplicate>() {
             Ok(dup) => ApiError::conflict(dup.render(
                 "Nothing was saved. If it is not a duplicate, repeat the request with \
@@ -18625,6 +18638,60 @@ mod tests {
             )
             .await;
         assert_eq!(edit.status, 409, "{}", edit.body);
+    }
+
+    #[tokio::test]
+    async fn web_completion_distinguishes_missing_and_claimed_tasks() {
+        let f = Fixture::start().await;
+        let queue = f.queue();
+        let mut task = Task::new(
+            "claimed".into(),
+            "leave unchanged".into(),
+            f.home.path().into(),
+            Source::Human,
+        );
+        queue.put(&mut task).unwrap();
+        let _claim = queue.claim(&task.id).unwrap();
+        for (action, body) in [("done", None), ("reopen", Some(r#"{"reason":"inspect"}"#))] {
+            let missing = f.post(&format!("/api/queue/missing/{action}"), body).await;
+            assert_eq!(missing.status, 404, "{}", missing.body);
+            assert!(missing.json()["error"].as_str().unwrap().contains("task"));
+
+            let busy = f
+                .post(&format!("/api/queue/{}/{action}", task.short()), body)
+                .await;
+            assert_eq!(busy.status, 409, "{}", busy.body);
+            assert!(busy.json()["error"].as_str().unwrap().contains("claimed"));
+        }
+        let unchanged = queue.get(&task.id).unwrap();
+        assert_eq!(unchanged.status, TaskStatus::Queued);
+        assert!(unchanged.completion_history.is_empty());
+    }
+
+    #[test]
+    fn web_completion_reports_a_stale_commit_as_a_conflict() {
+        let home = TempDir::new().unwrap();
+        let queue = Queue::at(home.path().join("queue"));
+        let mut current = Task::new(
+            "stale".into(),
+            "original".into(),
+            home.path().into(),
+            Source::Human,
+        );
+        queue.put(&mut current).unwrap();
+        let expected = current.clone();
+        current.instruction = "updated".into();
+        queue.put(&mut current).unwrap();
+
+        let mut decision = expected.clone();
+        decision.status = TaskStatus::Done;
+        let error = queue
+            .commit_completion(&mut decision, &expected)
+            .unwrap_err();
+        assert_eq!(ApiError::completion(error).status, StatusCode::CONFLICT);
+        let saved = queue.get(&current.id).unwrap();
+        assert_eq!(saved.status, TaskStatus::Queued);
+        assert_eq!(saved.instruction, "updated");
     }
 
     #[tokio::test]

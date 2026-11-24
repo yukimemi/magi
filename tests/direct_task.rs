@@ -267,7 +267,12 @@ async fn cli_persists_build_cache_choices_and_reports_the_effective_dry_run_mode
     stored.set_urgent(false).unwrap();
     queue.put(&mut stored).unwrap();
     assert_eq!(effective(), serde_json::json!({"mode": "shared", "source": "config"}));
-    stored.succeed();
+    stored.succeed(magi::queue::CompletionContext::new(
+        magi::queue::CompletionActor::Cli,
+        None,
+        &home,
+        &stored,
+    ));
     queue.put(&mut stored).unwrap();
     let refused = change("isolated");
     assert!(!refused.status.success());
