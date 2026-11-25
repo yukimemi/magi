@@ -2655,6 +2655,48 @@ struct TaskWorker {
     standalone: bool,
 }
 
+#[doc(hidden)]
+pub struct TaskWorkerLease {
+    pub job: crate::worker::Job,
+    dir: PathBuf,
+    lease: Option<crate::worker::Lease>,
+}
+
+impl TaskWorkerLease {
+    pub fn release_lease(&mut self) {
+        self.lease = None;
+    }
+}
+
+impl Drop for TaskWorkerLease {
+    fn drop(&mut self) {
+        self.release_lease();
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Reserve a task worker without launching a process, for integration tests.
+#[doc(hidden)]
+pub fn live_task_fixture(home: &Path, task: &str) -> Result<TaskWorkerLease> {
+    let request = TaskWorker {
+        opts: Opts::default(),
+        queue: home.join("queue"),
+        task: task.to_owned(),
+        lane: PermitKind::default(),
+        standalone: true,
+    };
+    let (job, lease) = crate::worker::running_fixture(
+        home,
+        &format!("task:{task}"),
+        serde_json::to_value(request)?,
+    )?;
+    Ok(TaskWorkerLease {
+        dir: home.join("workers").join("jobs").join(&job.id),
+        job,
+        lease: Some(lease),
+    })
+}
+
 fn task_jobs(home: &Path) -> Result<Vec<crate::worker::Job>> {
     Ok(crate::worker::active(home)?
         .into_iter()
@@ -7254,6 +7296,32 @@ mod tests {
         let legacy: Current =
             serde_json::from_str(r#"{"task":"same-task","run":"previous"}"#).unwrap();
         assert!(other_claims_run(&[legacy], "previous", Some("own")));
+    }
+
+    #[test]
+    fn os_leased_task_worker_survives_wall_clock_advance() {
+        let home = tempfile::tempdir().unwrap();
+        let queue = Queue::at(home.path().join("queue"));
+        let mut task = task();
+        let run = "20260903-100000-abcd";
+        task.start(run.into());
+        queue.put(&mut task).unwrap();
+        let mut worker = live_task_fixture(home.path(), &task.id).unwrap();
+        let future = Timestamp::now() + jiff::SignedDuration::from_secs(3600);
+        assert!(
+            current_work(home.path(), future)
+                .iter()
+                .any(
+                    |claim| claim.worker.as_deref() == Some(worker.job.id.as_str())
+                        && claim.run == run
+                )
+        );
+        worker.release_lease();
+        assert!(worker.dir.join("job.json").is_file());
+        assert!(!is_working_on(home.path(), run, future));
+        let dir = worker.dir.clone();
+        drop(worker);
+        assert!(!dir.exists());
     }
 
     #[test]

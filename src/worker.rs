@@ -202,8 +202,8 @@ fn try_lock(path: &Path) -> Result<Option<Lease>> {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn execution_lease_for_test(path: &Path) -> Lease {
+#[doc(hidden)]
+pub fn execution_lease_for_test(path: &Path) -> Lease {
     try_lock(path)
         .expect("execution lease")
         .expect("free execution lease")
@@ -885,6 +885,40 @@ fn reserve(
         .with_context(|| format!("publish worker {id} reservation from {}", staging.display()))?;
     sync_dir(&jobs_dir)?;
     Ok((job, true))
+}
+
+pub(crate) fn running_fixture(
+    home: &Path,
+    key: &str,
+    payload: serde_json::Value,
+) -> Result<(Job, Lease)> {
+    let _store = store_lock(home)?;
+    let id = nonce();
+    let dir = job_dir(home, &id)?;
+    std::fs::create_dir_all(&dir)?;
+    let result = (|| {
+        let lease = try_lock(&dir.join("live.lock"))?.context("fixture lease unavailable")?;
+        let job = Job {
+            id,
+            sequence: next_sequence(home)?,
+            kind: "task".into(),
+            key: key.into(),
+            payload,
+            generation: "a".repeat(64),
+            version: None,
+            status: Status::Running,
+            result: None,
+            pid: Some(std::process::id()),
+            created_at: now(),
+            finished_at: None,
+        };
+        save(&dir.join("job.json"), &job)?;
+        Ok((job, lease))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    result
 }
 
 fn prune_results(home: &Path) -> Result<()> {

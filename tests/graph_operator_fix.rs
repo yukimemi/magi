@@ -168,27 +168,63 @@ async fn a_run_that_has_not_concluded_review_refuses_a_targeted_fix() {
 common::e2e! {
 async fn a_run_already_being_worked_on_by_another_process_refuses_a_targeted_fix() {
     let home = common::home_lock().await;
-    let (_fx, mut runner) = ready_run_with_two_minor_findings(home).await;
+    let (fx, mut runner) = ready_run_with_two_minor_findings(home).await;
     let id = runner.state.last_round_findings()[0].id.clone();
+    let home = magi::run::home();
+    let queue = Queue::open();
+    let mut task = Task::new("fix".into(), "fix finding".into(), fx.repo.clone(), Source::Human);
+    task.start(runner.state.id.clone());
+    queue.put(&mut task).unwrap();
+    let mut worker_lease = magi::daemon::live_task_fixture(&home, &task.id).unwrap();
+    let job = &worker_lease.job;
+    assert!(magi::worker::observe_active(&home).unwrap().iter().any(|j| j.id == job.id));
+    assert!(magi::daemon::current_work(&home, jiff::Timestamp::now() + jiff::SignedDuration::from_secs(3600)).iter().any(|c|
+        c.worker.as_deref() == Some(job.id.as_str()) && c.run == runner.state.id));
 
+    let winner = runner.state.winner().unwrap().clone();
+    let head = magi::git::rev_parse(&fx.repo, &winner.branch).await.unwrap();
+    let before = std::fs::read(runner.state.dir().join("run.json")).unwrap();
+    let events = runner.state.events.len();
+    let runs = magi::run::list_ids();
+    for worker in [true, false] {
+        let held = if worker {
+            None
+        } else {
+            worker_lease.release_lease();
+            assert!(magi::worker::observe_active(&home).unwrap().is_empty());
+            Some(magi::graph::hold_execution_lease_for_test(&home, &runner.state.id).unwrap())
+        };
+        let err = runner
+            .fix_selected(std::slice::from_ref(&id), "racing execution", false)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("currently being worked on"), "{err:#}");
+        assert!(runner.state.operator_fixes.is_empty());
+        assert_eq!(runner.state.events.len(), events);
+        assert_eq!(std::fs::read(runner.state.dir().join("run.json")).unwrap(), before);
+        assert!(!runner.state.dir().join("fix.lock").exists());
+        assert_eq!(magi::git::rev_parse(&fx.repo, &winner.branch).await.unwrap(), head);
+        assert!(winner.worktree.exists());
+        assert!(!runner.state.worktree_root().join("operator-fix").exists());
+        assert_eq!(magi::run::list_ids(), runs);
+        drop(held);
+    }
+    assert!(magi::worker::observe_active(&home).unwrap().is_empty());
+    assert!(home.join("workers/jobs").join(&worker_lease.job.id).join("job.json").is_file());
     let mut beat = magi::daemon::Status::new();
+    beat.updated_at = jiff::Timestamp::UNIX_EPOCH;
     beat.current = vec![magi::daemon::Current {
         worker: None,
-        task: "some-task".to_owned(),
+        task: task.id.clone(),
         run: runner.state.id.clone(),
     }];
-    magi::daemon::write_status_to(&magi::run::home().join("daemon.json"), &beat)
-        .expect("publish a heartbeat");
-
-    let err = runner
-        .fix_selected(std::slice::from_ref(&id), "racing the daemon", false)
-        .await
-        .unwrap_err();
-    assert!(
-        err.to_string().contains("currently being worked on"),
-        "{err}"
-    );
-    assert!(runner.state.operator_fixes.is_empty());
+    magi::daemon::write_status_to(&home.join("daemon.json"), &beat).unwrap();
+    assert!(!magi::daemon::is_working_on(&home, &runner.state.id, jiff::Timestamp::now()));
+    task.hold_manual(Some("test worker finished".into()));
+    queue.put(&mut task).unwrap();
+    runner.fix_selected(&[id], "execution ended", false).await.unwrap();
+    assert_eq!(runner.state.operator_fixes.len(), 1);
+    drop(worker_lease);
 }
 }
 
@@ -349,6 +385,7 @@ async fn unavailable_operator_fix_can_be_retried(failure: &str) {
             agent.env.insert(failure.into(), seat.clone());
         }
     }
+    runner.state.save().unwrap();
     runner
         .fix_selected(std::slice::from_ref(&picked), "retryable outage", false)
         .await
@@ -384,6 +421,7 @@ async fn unavailable_operator_fix_can_be_retried(failure: &str) {
         agent.env.remove("MOCK_FIX_INCOMPLETE_SEAT");
         agent.env.remove("MOCK_FIX_UNCOMMITTED");
     }
+    runner.state.save().unwrap();
     runner
         .fix_selected(std::slice::from_ref(&picked), "availability restored", true)
         .await
@@ -425,6 +463,7 @@ async fn a_fix_in_preflight_excludes_repository_reassignment() {
     queue.put(&mut task).unwrap();
     let id = runner.state.last_round_findings()[0].id.clone();
     let run_dir = runner.state.dir();
+    let run_id = runner.state.id.clone();
     let task_before = std::fs::read(queue.path_of(&task.id)).unwrap();
     let ids = [id];
     let mut fix = Box::pin(runner.fix_selected(&ids, "requested fix", false));
@@ -435,6 +474,7 @@ async fn a_fix_in_preflight_excludes_repository_reassignment() {
         Poll::Ready(result) => panic!("fix completed before preflight could be paused: {result:?}"),
     }).await;
     assert!(run_dir.join("fix.lock").exists());
+    assert!(magi::graph::hold_execution_lease_for_test(&magi::run::home(), &run_id).is_err());
     let saved = RunState::load(run_dir.file_name().unwrap().to_str().unwrap()).unwrap();
     assert!(saved.active.is_empty());
     let error = magi::task_reassign::reassign(&queue, &magi::run::home(), &fx.repo,
@@ -443,5 +483,6 @@ async fn a_fix_in_preflight_excludes_repository_reassignment() {
     assert_eq!(std::fs::read(queue.path_of(&task.id)).unwrap(), task_before);
     fix.await.unwrap();
     assert!(!run_dir.join("fix.lock").exists());
+    assert!(magi::graph::hold_execution_lease_for_test(&magi::run::home(), &run_id).is_ok());
 }
 }
