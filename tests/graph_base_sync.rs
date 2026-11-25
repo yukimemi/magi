@@ -318,6 +318,24 @@ async fn sync_base_only_refuses_unintegrated_public_branch() {
     assert_eq!(magi::git::rev_parse(worktree, "HEAD").await.unwrap(), head);
     assert_eq!(magi::git::git(&fx.repo, &["ls-remote", "origin", &format!("refs/heads/{branch}")]).await.unwrap(),
         format!("{public_head}\trefs/heads/{branch}"));
+
+    let url = magi::git::git(&fx.repo, &["remote", "get-url", "origin"]).await.unwrap();
+    let missing = fx.tmp.path().join("missing.git");
+    run_git(&fx.repo, &["remote", "set-url", "origin", missing.to_str().unwrap()]);
+    let mut runner = Runner::resume(&run.id).unwrap();
+    runner.execute().await.unwrap();
+    let resumed = magi::run::RunState::load(&run.id).unwrap();
+    assert!(resumed.events.iter().any(|e| e.message.contains("cannot recheck recorded public branch divergence")));
+    assert_eq!(resumed.status, RunStatus::Blocked);
+    assert_eq!(serde_json::to_value(&resumed.base_sync_recovery.stop).unwrap(),
+        serde_json::to_value(&saved.base_sync_recovery.stop).unwrap());
+    assert!(resumed.base_sync.as_ref().unwrap().already_in.is_none());
+    assert_ne!(magi::queue::Queue::open().get(&task.id).unwrap().status, magi::queue::TaskStatus::Done);
+    assert_eq!(magi::git::rev_parse(worktree, "HEAD").await.unwrap(), head);
+    assert!(!fx.tmp.path().join("verification").exists());
+    run_git(&fx.repo, &["remote", "set-url", "origin", &url]);
+    assert_eq!(magi::git::git(&fx.repo, &["ls-remote", "origin", &format!("refs/heads/{branch}")]).await.unwrap(),
+        format!("{public_head}\trefs/heads/{branch}"));
 }
 }
 
