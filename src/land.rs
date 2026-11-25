@@ -7957,16 +7957,16 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             let head = resume_observed_head(&mut state, &old).await.unwrap();
             state.land_sync_pending = true;
             state.config.verify.e2e = vec!["true".into()];
-            state.gate_repair_e2e = Some(crate::run::GateRepairE2e {
-                head: head.clone(),
-                passed: false,
-                outcomes: vec![crate::run::CommandOutcome {
+            state.gate_repair_e2e = Some(crate::run::GateRepairE2e::new(
+                head.clone(),
+                false,
+                vec![crate::run::CommandOutcome {
                     command: state.config.verify.e2e[0].clone(),
                     code,
                     output_tail: "verification command did not complete".into(),
                     ..Default::default()
                 }],
-            });
+            ));
             state.save().unwrap();
             state = RunState::load(&state.id).unwrap();
             assert_eq!(resume_observed_head(&mut state, &head).await.unwrap(), head);

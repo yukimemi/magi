@@ -655,8 +655,8 @@ mod tests {
             command: command.into(),
             code,
             output_tail: tail.into(),
-            duration_ms: 42,
             resource_blocked,
+            ..Default::default()
         }
     }
 
