@@ -1328,3 +1328,113 @@ for (const count of [70, 300]) test(`hiding at a cooperative yield retains refer
   assert.equal(sent, count, 'visibility recovery resolves every range once');
   await resumed;
 });
+
+test('chat unread-only filter composes with search, paging notices, and zero-unread empty states', () => {
+  const nodes = new Map();
+  const node = id => {
+    if (!nodes.has(id)) {
+      nodes.set(id, {
+        id, attrs: {}, hidden: false, text: '', disabled: false, children: [],
+        classList: { toggle() {} },
+        setAttribute(k, v) { this.attrs[k] = v; },
+        querySelectorAll() { return this.children.filter(c => c.tag === 'button'); },
+        append(child) { this.children.push(child); },
+      });
+    }
+    return nodes.get(id);
+  };
+  let rendered = [];
+  const notices = [];
+  const state = {
+    talks: [
+      { id: 'open-read', status: 'open', created_at: '2026-10-20T03:00:00Z', unread_count: 0, turns: [{ who: 'operator', at: '2026-10-20T03:00:00Z' }] },
+      { id: 'open-unread', status: 'open', created_at: '2026-10-20T02:00:00Z', unread_count: 2, turns: [{ who: 'agent', at: '2026-10-20T02:01:00Z' }] },
+      { id: 'closed-unread', status: 'closed', created_at: '2026-10-20T01:00:00Z', unread_count: 1, turns: [{ who: 'agent', at: '2026-10-20T01:01:00Z' }] },
+    ],
+    talkReads: {},
+    talksSearch: '',
+    talksUnreadOnly: false,
+    search: { chats: { status: 'idle', hits: new Map(), total: 0, truncated: false, unreadable: 0, error: '' } },
+  };
+  const unreadSrc = source.slice(source.indexOf('const talkTurns ='), source.indexOf('/* Open first, then newest first'));
+  const sortSrc = source.slice(source.indexOf('function sortTalks('), source.indexOf('/* The context meter'));
+  const renderSrc = source.slice(source.indexOf('function renderTalks()'), source.indexOf('/* The rail and dock'));
+  const olderSrc = source.slice(source.indexOf('function showOlderTalks('), source.indexOf('function loadOlderTalks('));
+  const searchStatusSrc = source.slice(source.indexOf('function renderSearchStatus('), source.indexOf('function wireSearchBox('));
+  const api = runInNewContext(`let talksNext = 'older-cursor';
+    ${unreadSrc}\n${sortSrc}\n${searchStatusSrc}\n${renderSrc}\n${olderSrc}
+    ({ renderTalks, showOlderTalks, setNext(v) { talksNext = v; } })`, {
+    state,
+    $: node,
+    el: (tag, props) => ({ tag, ...props, remove() {} }),
+    renderTalkIndicators() {},
+    setText: (n, text) => { n.text = text; },
+    show: (n, visible) => { n.hidden = !visible; },
+    plural: (n, one, many) => `${n} ${n === 1 ? one : many}`,
+    searchText: () => state.talksSearch.trim(),
+    syncList: (_, items) => { rendered = items.map(item => item.id); },
+    createTalkCard() {},
+    updateTalkCard() {},
+    markSelected() {},
+    sectionNotice: (...args) => notices.push(args),
+    loadOlderTalks: async () => {},
+  });
+
+  api.renderTalks();
+  api.showOlderTalks();
+  assert.deepEqual(rendered, ['open-read', 'open-unread', 'closed-unread']);
+  assert.equal(node('talks-unread-only').attrs['aria-pressed'], 'false');
+  assert.equal(node('talks-count').text, '2 conversations open');
+  assert.equal(node('talks-unread-empty').hidden, true);
+  assert.equal(notices.at(-1)[2], 'Older conversations are available.');
+
+  state.talksUnreadOnly = true;
+  api.renderTalks();
+  api.showOlderTalks();
+  assert.deepEqual(rendered, ['open-unread', 'closed-unread']);
+  assert.equal(node('talks-unread-only').attrs['aria-pressed'], 'true');
+  assert.equal(node('talks-count').text, '2 unread conversations, older not loaded');
+  assert.equal(node('talks-unread-empty').hidden, true);
+  assert.ok(notices.at(-1)[2].includes('Older conversations are not loaded yet'));
+
+  // Search matching both a read and an unread talk reports the hidden read hit.
+  state.talksSearch = 'needle';
+  state.search.chats = {
+    status: 'ok',
+    hits: new Map([['open-read', { id: 'open-read' }], ['open-unread', { id: 'open-unread' }]]),
+    total: 2, truncated: false, unreadable: 0, error: '',
+  };
+  api.renderTalks();
+  assert.deepEqual(rendered, ['open-unread']);
+  assert.equal(node('talks-count').text, '1 unread conversation, older not loaded');
+  assert.ok(node('talks-search-status').text.includes('2 conversations match'));
+  assert.ok(node('talks-search-status').text.includes('1 hidden by the other filters or not loaded'));
+
+  // Search matching only read talks triggers the dedicated unread-empty notice.
+  state.search.chats = {
+    status: 'ok',
+    hits: new Map([['open-read', { id: 'open-read' }]]),
+    total: 1, truncated: false, unreadable: 0, error: '',
+  };
+  api.renderTalks();
+  assert.deepEqual(rendered, []);
+  assert.equal(node('talks-unread-empty').hidden, false);
+  assert.equal(node('talks-unread-empty-text').text, 'No unread conversations match this search.');
+  assert.equal(node('talks-unread-only').hidden, false);
+
+  // Clearing search and marking everything read shows the unloaded-history empty copy, then the final empty copy.
+  state.talksSearch = '';
+  state.talkReads = {
+    'open-unread': '2026-10-20T02:01:00Z',
+    'closed-unread': '2026-10-20T01:01:00Z',
+  };
+  api.renderTalks();
+  assert.deepEqual(rendered, []);
+  assert.equal(node('talks-unread-empty').hidden, false);
+  assert.ok(node('talks-unread-empty-text').text.includes('Older conversations are not loaded yet'));
+
+  api.setNext(null);
+  api.renderTalks();
+  assert.equal(node('talks-count').text, '0 unread conversations');
+  assert.equal(node('talks-unread-empty-text').text, 'No unread conversations.');
+});

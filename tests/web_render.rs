@@ -9042,3 +9042,847 @@ async fn chat_close_is_scoped_and_does_not_wait_for_the_list() {
         .unwrap();
     browser.close_page(&page).await;
 }
+
+/// The Chat list's "Unread only" toggle filters loaded conversations without
+/// altering sort order, read-marking rules, or the open conversation pane,
+/// reflects live unread/read/mark-all changes, composes with search and paging,
+/// and stays usable with zero overflow on desktop split and mobile viewports.
+#[tokio::test]
+async fn chat_unread_only_toggle_filters_list_and_tracks_updates() {
+    let Some(chrome) = cdp::find_chrome() else {
+        assert!(std::env::var_os("CI").is_none(), "CI requires Chrome");
+        eprintln!("SKIP web_render: no Chrome/Chromium found");
+        return;
+    };
+
+    let guard = common::home_lock().await;
+    let fx = common::fixture(guard, common::Judges::Unanimous, false);
+    let home = fx.tmp.path().join("magi-home");
+    let talks = Talks::at(home.join("talks"));
+    let agent = fx.config.agents[0].id.clone();
+
+    let seed_talk = |id: &str,
+                     created_at: &str,
+                     status: talk::TalkStatus,
+                     prompt: &str,
+                     reply: Option<(&str, &str)>|
+     -> talk::Talk {
+        let mut t = talk::begin(&talks, &fx.config, fx.repo.clone(), Some(&agent)).unwrap();
+        let old_id = t.id.clone();
+        t.id = id.to_owned();
+        t.created_at = created_at.parse().unwrap();
+        t.status = status;
+        let _ = std::fs::remove_file(talks.path_of(&old_id));
+        t.turns.push(
+            serde_json::from_value(serde_json::json!({
+                "who": "operator",
+                "body": prompt,
+                "at": created_at,
+            }))
+            .unwrap(),
+        );
+        if let Some((body, at)) = reply {
+            t.turns.push(
+                serde_json::from_value(serde_json::json!({
+                    "who": "agent",
+                    "body": body,
+                    "at": at,
+                }))
+                .unwrap(),
+            );
+        }
+        talks.put(&mut t).unwrap();
+        t
+    };
+
+    let mut read_open = seed_talk(
+        "20261020-050000-aa01",
+        "2026-10-20T05:00:00Z",
+        talk::TalkStatus::Open,
+        "Read open readonlytoken",
+        None,
+    );
+    let unread_open_newer = seed_talk(
+        "20261020-040000-aa02",
+        "2026-10-20T04:00:00Z",
+        talk::TalkStatus::Open,
+        "Newer unread needle",
+        Some(("Agent reply newer", "2026-10-20T04:01:00Z")),
+    );
+    let read_matching_search = seed_talk(
+        "20261020-030000-aa03",
+        "2026-10-20T03:00:00Z",
+        talk::TalkStatus::Open,
+        "Read matching needle",
+        None,
+    );
+    let unread_open_older = seed_talk(
+        "20261020-020000-aa04",
+        "2026-10-20T02:00:00Z",
+        talk::TalkStatus::Open,
+        "Older unread plain",
+        Some(("Agent reply older", "2026-10-20T02:01:00Z")),
+    );
+    // 17 closed talks: 16 load on page 1 (newest is unread), 1 oldest closed
+    // unread talk stays behind talksNext to exercise on-demand paging.
+    let unread_closed_loaded = seed_talk(
+        "20261019-170000-cc17",
+        "2026-10-19T17:00:00Z",
+        talk::TalkStatus::Closed,
+        "Closed unread loaded",
+        Some(("Agent reply closed loaded", "2026-10-19T17:01:00Z")),
+    );
+    for n in 2..=16u32 {
+        seed_talk(
+            &format!("20261019-{n:02}0000-cc{n:02}"),
+            &format!("2026-10-19T{n:02}:00:00Z"),
+            talk::TalkStatus::Closed,
+            &format!("Closed read {n}"),
+            None,
+        );
+    }
+    let unread_closed_unloaded = seed_talk(
+        "20261019-010000-cc01",
+        "2026-10-19T01:00:00Z",
+        talk::TalkStatus::Closed,
+        "Closed unread unloaded",
+        Some(("Agent reply closed unloaded", "2026-10-19T01:01:00Z")),
+    );
+
+    let base = serve(
+        &home,
+        Queue::at(home.join("queue")),
+        talks.clone(),
+        home.join("runs"),
+        &fx.repo,
+    )
+    .await;
+    let mut browser = cdp::Browser::launch(&chrome)
+        .await
+        .unwrap_or_else(|e| panic!("could not start Chrome at {}: {e}", chrome.display()));
+    let w = Duration::from_secs(30);
+
+    // --- 1280px split view --------------------------------------------------
+    let page = browser
+        .open_page(&format!("{base}#/chat/{}", read_open.id), 1280, 900, false)
+        .await
+        .expect("open desktop");
+    browser
+        .wait_for(
+            &page,
+            "document.querySelectorAll('#talks-list a.card').length === 20 \
+             && document.getElementById('talk-turns').textContent.includes('Read open readonlytoken') \
+             && !document.getElementById('talks-load-state')?.hidden",
+            w,
+        )
+        .await
+        .expect("desktop initial load");
+
+    // Verify default OFF state, tap target, hit-test, and zero overflow.
+    let initial = browser
+        .eval(
+            &page,
+            r#"(() => {
+              const btn = document.getElementById('talks-unread-only');
+              const r = btn.getBoundingClientRect();
+              const pane = document.getElementById('view-talks');
+              const hit = btn.contains(document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2));
+              return {
+                pressed: btn.getAttribute('aria-pressed'),
+                height: r.height,
+                width: r.width,
+                hit,
+                count: document.getElementById('talks-count').textContent,
+                emptyHidden: document.getElementById('talks-unread-empty').hidden,
+                loadState: document.getElementById('talks-load-state').textContent,
+                paneOverflow: pane.scrollWidth > pane.clientWidth + 1,
+                docOverflow: document.documentElement.scrollWidth > document.documentElement.clientWidth + 1,
+              };
+            })()"#,
+        )
+        .await
+        .expect("read initial");
+    assert_eq!(initial["pressed"], "false", "{initial}");
+    assert!(initial["height"].as_f64().unwrap() >= 44.0, "{initial}");
+    assert!(initial["width"].as_f64().unwrap() >= 44.0, "{initial}");
+    assert_eq!(initial["hit"], true, "{initial}");
+    assert_eq!(initial["count"], "4 conversations open", "{initial}");
+    assert_eq!(initial["emptyHidden"], true, "{initial}");
+    assert!(
+        initial["loadState"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Older conversations are available."),
+        "{initial}"
+    );
+    assert_eq!(initial["paneOverflow"], false, "{initial}");
+    assert_eq!(initial["docOverflow"], false, "{initial}");
+
+    // Verify ON vs OFF visual + non-color distinction in both light and dark themes.
+    let themes = browser
+        .eval(
+            &page,
+            r#"(async () => {
+              const btn = document.getElementById('talks-unread-only');
+              const ind = btn.querySelector('.talks-unread-indicator');
+              const wait = () => new Promise(r => setTimeout(r, 240));
+              const read = () => {
+                const bs = getComputedStyle(btn);
+                const is = getComputedStyle(ind);
+                const ks = getComputedStyle(ind, '::after');
+                return {
+                  bg: bs.backgroundColor,
+                  border: bs.borderColor,
+                  weight: bs.fontWeight,
+                  shadow: bs.boxShadow,
+                  trackBg: is.backgroundColor,
+                  knobTransform: ks.transform,
+                };
+              };
+              const prev = document.documentElement.dataset.theme || '';
+              const out = {};
+              for (const theme of ['light', 'dark']) {
+                document.documentElement.dataset.theme = theme;
+                await wait();
+                const off = read();
+                btn.click();
+                await wait();
+                const on = read();
+                btn.click();
+                await wait();
+                out[theme] = { off, on };
+              }
+              if (prev) document.documentElement.dataset.theme = prev;
+              else delete document.documentElement.dataset.theme;
+              return out;
+            })()"#,
+        )
+        .await
+        .expect("theme probe");
+    for theme in ["light", "dark"] {
+        let off = &themes[theme]["off"];
+        let on = &themes[theme]["on"];
+        assert_ne!(off["bg"], on["bg"], "{theme}: bg should change: {themes}");
+        assert_ne!(
+            off["knobTransform"], on["knobTransform"],
+            "{theme}: indicator thumb should move: {themes}"
+        );
+        assert_ne!(
+            off["shadow"], on["shadow"],
+            "{theme}: border emphasis should change: {themes}"
+        );
+    }
+
+    // Turn ON while `read_open` is open in the right pane.
+    browser
+        .eval(
+            &page,
+            "document.getElementById('talks-unread-only').click(); true",
+        )
+        .await
+        .expect("toggle on");
+    let filtered = browser
+        .eval(
+            &page,
+            r#"(() => ({
+              pressed: document.getElementById('talks-unread-only').getAttribute('aria-pressed'),
+              ids: [...document.querySelectorAll('#talks-list a.card')].map(a => a.dataset.talkId),
+              count: document.getElementById('talks-count').textContent,
+              loadState: document.getElementById('talks-load-state').textContent,
+              hash: location.hash,
+              detailHidden: document.getElementById('view-talk').hidden,
+              detailText: document.getElementById('talk-turns').textContent,
+            }))()"#,
+        )
+        .await
+        .expect("read filtered");
+    assert_eq!(filtered["pressed"], "true", "{filtered}");
+    assert_eq!(
+        filtered["ids"],
+        serde_json::json!([
+            unread_open_newer.id,
+            unread_open_older.id,
+            unread_closed_loaded.id
+        ]),
+        "{filtered}"
+    );
+    assert_eq!(
+        filtered["count"], "3 unread conversations, older not loaded",
+        "{filtered}"
+    );
+    assert!(
+        filtered["loadState"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Older conversations are not loaded yet"),
+        "{filtered}"
+    );
+    assert_eq!(
+        filtered["hash"],
+        format!("#/chat/{}", read_open.id),
+        "{filtered}"
+    );
+    assert_eq!(filtered["detailHidden"], false, "{filtered}");
+    assert!(
+        filtered["detailText"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Read open readonlytoken"),
+        "{filtered}"
+    );
+
+    // Search + Unread only composition ("needle" hits 1 unread + 1 read).
+    browser
+        .eval(
+            &page,
+            "(() => { const i = document.getElementById('talks-search-input'); \
+             i.value = 'needle'; i.dispatchEvent(new Event('input', { bubbles: true })); return true; })()",
+        )
+        .await
+        .expect("search needle");
+    browser
+        .wait_for(
+            &page,
+            "(document.getElementById('talks-search-status').textContent || '').includes('2 conversations match')",
+            w,
+        )
+        .await
+        .expect("search needle settled");
+    let search_on = browser
+        .eval(
+            &page,
+            r#"({
+              ids: [...document.querySelectorAll('#talks-list a.card')].map(a => a.dataset.talkId),
+              status: document.getElementById('talks-search-status').textContent,
+              count: document.getElementById('talks-count').textContent,
+            })"#,
+        )
+        .await
+        .expect("read search on");
+    assert_eq!(
+        search_on["ids"],
+        serde_json::json!([unread_open_newer.id]),
+        "{search_on}"
+    );
+    assert!(
+        search_on["status"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("1 hidden by the other filters or not loaded"),
+        "{search_on}"
+    );
+    assert!(
+        search_on["count"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("1 unread conversation"),
+        "{search_on}"
+    );
+
+    // Toggle OFF during search -> both search matches appear.
+    browser
+        .eval(
+            &page,
+            "document.getElementById('talks-unread-only').click(); true",
+        )
+        .await
+        .expect("toggle off during search");
+    let search_off = browser
+        .eval(
+            &page,
+            r#"({
+              ids: [...document.querySelectorAll('#talks-list a.card')].map(a => a.dataset.talkId),
+              status: document.getElementById('talks-search-status').textContent,
+            })"#,
+        )
+        .await
+        .expect("read search off");
+    assert_eq!(
+        search_off["ids"],
+        serde_json::json!([unread_open_newer.id, read_matching_search.id]),
+        "{search_off}"
+    );
+    assert!(
+        !search_off["status"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("hidden"),
+        "{search_off}"
+    );
+
+    // Toggle ON and search for a read-only term -> empty state while toggle remains visible.
+    browser
+        .eval(
+            &page,
+            "(() => { document.getElementById('talks-unread-only').click(); \
+             const i = document.getElementById('talks-search-input'); \
+             i.value = 'readonlytoken'; i.dispatchEvent(new Event('input', { bubbles: true })); return true; })()",
+        )
+        .await
+        .expect("search readonlytoken");
+    browser
+        .wait_for(
+            &page,
+            "(document.getElementById('talks-search-status').textContent || '').includes('1 conversation matches')",
+            w,
+        )
+        .await
+        .expect("search readonlytoken settled");
+    let search_zero = browser
+        .eval(
+            &page,
+            r#"({
+              cards: document.querySelectorAll('#talks-list a.card').length,
+              emptyHidden: document.getElementById('talks-unread-empty').hidden,
+              emptyText: document.getElementById('talks-unread-empty-text').textContent,
+              toggleHidden: document.getElementById('talks-unread-only').hidden,
+              pressed: document.getElementById('talks-unread-only').getAttribute('aria-pressed'),
+            })"#,
+        )
+        .await
+        .expect("read search zero");
+    assert_eq!(search_zero["cards"], 0, "{search_zero}");
+    assert_eq!(search_zero["emptyHidden"], false, "{search_zero}");
+    assert_eq!(
+        search_zero["emptyText"], "No unread conversations match this search.",
+        "{search_zero}"
+    );
+    assert_eq!(search_zero["toggleHidden"], false, "{search_zero}");
+    assert_eq!(search_zero["pressed"], "true", "{search_zero}");
+
+    // Clear search and load older conversations while Unread only is ON.
+    browser
+        .eval(
+            &page,
+            "document.getElementById('talks-search-clear').click(); \
+             document.querySelector('#talks-load-state button').click(); true",
+        )
+        .await
+        .expect("clear search and load older");
+    browser
+        .wait_for(
+            &page,
+            &format!(
+                "!!document.querySelector('#talks-list a[data-talk-id=\"{}\"]') \
+                 && document.getElementById('talks-load-state').hidden",
+                unread_closed_unloaded.id
+            ),
+            w,
+        )
+        .await
+        .expect("older unread loaded");
+    let after_older = browser
+        .eval(
+            &page,
+            r#"({
+              ids: [...document.querySelectorAll('#talks-list a.card')].map(a => a.dataset.talkId),
+              count: document.getElementById('talks-count').textContent,
+            })"#,
+        )
+        .await
+        .expect("read after older");
+    assert_eq!(
+        after_older["ids"],
+        serde_json::json!([
+            unread_open_newer.id,
+            unread_open_older.id,
+            unread_closed_loaded.id,
+            unread_closed_unloaded.id
+        ]),
+        "{after_older}"
+    );
+    assert_eq!(
+        after_older["count"], "4 unread conversations",
+        "{after_older}"
+    );
+
+    // Open an unread conversation -> individual mark-as-read removes it from the
+    // filtered list while keeping it open in the detail pane.
+    browser
+        .eval(
+            &page,
+            &format!(
+                "document.querySelector('#talks-list a[data-talk-id=\"{}\"]').click(); true",
+                unread_open_newer.id
+            ),
+        )
+        .await
+        .expect("open unread_open_newer");
+    browser
+        .wait_for(
+            &page,
+            &format!(
+                "document.getElementById('talk-turns').textContent.includes('Agent reply newer') \
+                 && !document.querySelector('#talks-list a[data-talk-id=\"{}\"]')",
+                unread_open_newer.id
+            ),
+            w,
+        )
+        .await
+        .expect("marked read individually");
+    let after_read_one = browser
+        .eval(
+            &page,
+            r#"({
+              ids: [...document.querySelectorAll('#talks-list a.card')].map(a => a.dataset.talkId),
+              count: document.getElementById('talks-count').textContent,
+              hash: location.hash,
+              detailHidden: document.getElementById('view-talk').hidden,
+            })"#,
+        )
+        .await
+        .expect("read after individual mark-read");
+    assert_eq!(
+        after_read_one["ids"],
+        serde_json::json!([
+            unread_open_older.id,
+            unread_closed_loaded.id,
+            unread_closed_unloaded.id
+        ]),
+        "{after_read_one}"
+    );
+    assert_eq!(
+        after_read_one["count"], "3 unread conversations",
+        "{after_read_one}"
+    );
+    assert_eq!(
+        after_read_one["hash"],
+        format!("#/chat/{}", unread_open_newer.id),
+        "{after_read_one}"
+    );
+    assert_eq!(after_read_one["detailHidden"], false, "{after_read_one}");
+
+    // New incoming agent turn on `read_open` makes it reappear in sort order.
+    read_open.turns.push(
+        serde_json::from_value(serde_json::json!({
+            "who": "agent",
+            "body": "Fresh incoming reply",
+            "at": "2026-10-20T06:00:00Z",
+        }))
+        .unwrap(),
+    );
+    talks.put(&mut read_open).unwrap();
+    browser
+        .wait_for(
+            &page,
+            &format!(
+                "!!document.querySelector('#talks-list a[data-talk-id=\"{}\"]')",
+                read_open.id
+            ),
+            w,
+        )
+        .await
+        .expect("incoming unread appeared");
+    let after_incoming = browser
+        .eval(
+            &page,
+            "[...document.querySelectorAll('#talks-list a.card')].map(a => a.dataset.talkId)",
+        )
+        .await
+        .expect("read after incoming");
+    assert_eq!(
+        after_incoming,
+        serde_json::json!([
+            read_open.id,
+            unread_open_older.id,
+            unread_closed_loaded.id,
+            unread_closed_unloaded.id
+        ]),
+        "{after_incoming}"
+    );
+
+    // Mark all as read -> empty state appears, toggle stays usable, open chat stays open.
+    browser
+        .eval(
+            &page,
+            "document.getElementById('talks-mark-all-read').click(); true",
+        )
+        .await
+        .expect("mark all read");
+    browser
+        .wait_for(
+            &page,
+            "document.querySelectorAll('#talks-list a.card').length === 0 \
+             && !document.getElementById('talks-unread-empty').hidden",
+            w,
+        )
+        .await
+        .expect("all marked read");
+    let after_mark_all = browser
+        .eval(
+            &page,
+            r#"({
+              count: document.getElementById('talks-count').textContent,
+              emptyText: document.getElementById('talks-unread-empty-text').textContent,
+              toggleHidden: document.getElementById('talks-unread-only').hidden,
+              toggleDisabled: document.getElementById('talks-unread-only').disabled,
+              pressed: document.getElementById('talks-unread-only').getAttribute('aria-pressed'),
+              hash: location.hash,
+              detailHidden: document.getElementById('view-talk').hidden,
+            })"#,
+        )
+        .await
+        .expect("read after mark all");
+    assert_eq!(
+        after_mark_all["count"], "0 unread conversations",
+        "{after_mark_all}"
+    );
+    assert_eq!(
+        after_mark_all["emptyText"], "No unread conversations.",
+        "{after_mark_all}"
+    );
+    assert_eq!(after_mark_all["toggleHidden"], false, "{after_mark_all}");
+    assert_eq!(after_mark_all["toggleDisabled"], false, "{after_mark_all}");
+    assert_eq!(after_mark_all["pressed"], "true", "{after_mark_all}");
+    assert_eq!(
+        after_mark_all["hash"],
+        format!("#/chat/{}", unread_open_newer.id),
+        "{after_mark_all}"
+    );
+    assert_eq!(after_mark_all["detailHidden"], false, "{after_mark_all}");
+
+    // Clearing the filter from zero unread works via both the empty-state button and the toggle.
+    browser
+        .eval(
+            &page,
+            "document.getElementById('talks-unread-clear').click(); true",
+        )
+        .await
+        .expect("clear via empty button");
+    let restored = browser
+        .eval(
+            &page,
+            r#"({
+              pressed: document.getElementById('talks-unread-only').getAttribute('aria-pressed'),
+              cards: document.querySelectorAll('#talks-list a.card').length,
+              emptyHidden: document.getElementById('talks-unread-empty').hidden,
+              count: document.getElementById('talks-count').textContent,
+            })"#,
+        )
+        .await
+        .expect("read restored");
+    assert_eq!(restored["pressed"], "false", "{restored}");
+    assert_eq!(restored["cards"], 21, "{restored}");
+    assert_eq!(restored["emptyHidden"], true, "{restored}");
+    assert_eq!(restored["count"], "4 conversations open", "{restored}");
+
+    browser
+        .eval(
+            &page,
+            "document.getElementById('talks-unread-only').click(); \
+             document.getElementById('talks-unread-only').click(); true",
+        )
+        .await
+        .expect("toggle on and off at zero unread");
+    assert_eq!(
+        browser
+            .eval(
+                &page,
+                "document.querySelectorAll('#talks-list a.card').length"
+            )
+            .await
+            .unwrap(),
+        21
+    );
+    let desktop_console = console_problems(&browser.take_events(&page.session));
+    assert!(
+        desktop_console.is_empty(),
+        "desktop console: {desktop_console:?}"
+    );
+    browser.close_page(&page).await;
+
+    // --- 390px mobile view --------------------------------------------------
+    let mobile = browser
+        .open_page(&format!("{base}#/chat"), 390, 844, true)
+        .await
+        .expect("open mobile");
+    browser
+        .wait_for(
+            &mobile,
+            "document.querySelectorAll('#talks-list a.card').length >= 20",
+            w,
+        )
+        .await
+        .expect("mobile initial load");
+    // Reset read markers from the desktop test so mobile starts with unread chats.
+    browser
+        .eval(
+            &mobile,
+            "localStorage.removeItem('magi-talk-reads'); location.reload(); true",
+        )
+        .await
+        .expect("reset mobile reads");
+    browser
+        .wait_for(
+            &mobile,
+            "document.querySelectorAll('#talks-list a.card[data-unread=\"1\"]').length === 4",
+            w,
+        )
+        .await
+        .expect("mobile unread ready");
+
+    let mobile_off = browser
+        .eval(
+            &mobile,
+            r#"(() => {
+              const btn = document.getElementById('talks-unread-only');
+              const r = btn.getBoundingClientRect();
+              const pane = document.getElementById('view-talks');
+              return {
+                pressed: btn.getAttribute('aria-pressed'),
+                height: r.height,
+                width: r.width,
+                hit: btn.contains(document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2)),
+                paneOverflow: pane.scrollWidth > pane.clientWidth + 1,
+                docOverflow: document.documentElement.scrollWidth > document.documentElement.clientWidth + 1,
+              };
+            })()"#,
+        )
+        .await
+        .expect("read mobile off");
+    assert_eq!(mobile_off["pressed"], "false", "{mobile_off}");
+    assert!(
+        mobile_off["height"].as_f64().unwrap() >= 44.0,
+        "{mobile_off}"
+    );
+    assert!(
+        mobile_off["width"].as_f64().unwrap() >= 44.0,
+        "{mobile_off}"
+    );
+    assert_eq!(mobile_off["hit"], true, "{mobile_off}");
+    assert_eq!(mobile_off["paneOverflow"], false, "{mobile_off}");
+    assert_eq!(mobile_off["docOverflow"], false, "{mobile_off}");
+
+    // Toggle ON on mobile, tap an unread conversation, go back, mark all read, toggle OFF.
+    browser
+        .eval(
+            &mobile,
+            "document.getElementById('talks-unread-only').click(); true",
+        )
+        .await
+        .expect("mobile toggle on");
+    let mobile_on = browser
+        .eval(
+            &mobile,
+            r#"(() => {
+              const pane = document.getElementById('view-talks');
+              return {
+                pressed: document.getElementById('talks-unread-only').getAttribute('aria-pressed'),
+                cards: document.querySelectorAll('#talks-list a.card').length,
+                paneOverflow: pane.scrollWidth > pane.clientWidth + 1,
+                docOverflow: document.documentElement.scrollWidth > document.documentElement.clientWidth + 1,
+              };
+            })()"#,
+        )
+        .await
+        .expect("read mobile on");
+    assert_eq!(mobile_on["pressed"], "true", "{mobile_on}");
+    assert_eq!(mobile_on["cards"], 4, "{mobile_on}");
+    assert_eq!(mobile_on["paneOverflow"], false, "{mobile_on}");
+    assert_eq!(mobile_on["docOverflow"], false, "{mobile_on}");
+
+    browser
+        .eval(
+            &mobile,
+            &format!(
+                "document.querySelector('#talks-list a[data-talk-id=\"{}\"]').click(); true",
+                unread_open_older.id
+            ),
+        )
+        .await
+        .expect("mobile open unread");
+    browser
+        .wait_for(
+            &mobile,
+            "!document.getElementById('view-talk').hidden \
+             && document.getElementById('talk-turns').textContent.includes('Agent reply older')",
+            w,
+        )
+        .await
+        .expect("mobile detail opened");
+    browser
+        .eval(
+            &mobile,
+            "document.querySelector('#view-talk .back').click(); true",
+        )
+        .await
+        .expect("mobile back");
+    browser
+        .wait_for(
+            &mobile,
+            "!document.getElementById('view-talks').hidden \
+             && document.querySelectorAll('#talks-list a.card').length === 3",
+            w,
+        )
+        .await
+        .expect("mobile list updated after read");
+    assert_eq!(
+        browser
+            .eval(
+                &mobile,
+                "document.getElementById('talks-unread-only').getAttribute('aria-pressed')"
+            )
+            .await
+            .unwrap(),
+        "true"
+    );
+
+    browser
+        .eval(
+            &mobile,
+            "document.getElementById('talks-mark-all-read').click(); true",
+        )
+        .await
+        .expect("mobile mark all read");
+    browser
+        .wait_for(
+            &mobile,
+            "document.querySelectorAll('#talks-list a.card').length === 0 \
+             && !document.getElementById('talks-unread-empty').hidden",
+            w,
+        )
+        .await
+        .expect("mobile zero unread");
+    let mobile_zero = browser
+        .eval(
+            &mobile,
+            r#"(() => {
+              const btn = document.getElementById('talks-unread-only');
+              const r = btn.getBoundingClientRect();
+              const pane = document.getElementById('view-talks');
+              return {
+                visible: r.width >= 44 && r.height >= 44,
+                paneOverflow: pane.scrollWidth > pane.clientWidth + 1,
+                docOverflow: document.documentElement.scrollWidth > document.documentElement.clientWidth + 1,
+              };
+            })()"#,
+        )
+        .await
+        .expect("read mobile zero");
+    assert_eq!(mobile_zero["visible"], true, "{mobile_zero}");
+    assert_eq!(mobile_zero["paneOverflow"], false, "{mobile_zero}");
+    assert_eq!(mobile_zero["docOverflow"], false, "{mobile_zero}");
+
+    browser
+        .eval(
+            &mobile,
+            "document.getElementById('talks-unread-only').click(); true",
+        )
+        .await
+        .expect("mobile toggle off");
+    browser
+        .wait_for(
+            &mobile,
+            "document.querySelectorAll('#talks-list a.card').length === 21 \
+             && document.getElementById('talks-unread-only').getAttribute('aria-pressed') === 'false'",
+            w,
+        )
+        .await
+        .expect("mobile restored");
+    let mobile_console = console_problems(&browser.take_events(&mobile.session));
+    assert!(
+        mobile_console.is_empty(),
+        "mobile console: {mobile_console:?}"
+    );
+    browser.close_page(&mobile).await;
+}

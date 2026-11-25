@@ -764,6 +764,9 @@ const state = {
   runsSearch: "",
   /* The Chat list's search box; same reasoning as queueSearch. */
   talksSearch: "",
+  /* Whether the Chat list shows only unread conversations. Lives only in
+     memory, same as talksSearch: a reload starts from the full list. */
+  talksUnreadOnly: false,
   search: {
     runs: { status: "idle", forText: "", seq: 0, timer: null, hits: new Map(), total: 0, truncated: false, unreadable: 0, error: "" },
     tasks: { status: "idle", forText: "", seq: 0, timer: null, hits: new Map(), total: 0, truncated: false, unreadable: 0, error: "" },
@@ -3611,6 +3614,15 @@ function setTalksSearch(value) {
   state.talksSearch = value;
   scheduleSearch("chats");
   renderTalks();
+}
+
+function setTalksUnreadOnly(enabled) {
+  const next = Boolean(enabled);
+  if (state.talksUnreadOnly === next) return;
+  state.talksUnreadOnly = next;
+  renderTalks();
+  showOlderTalks();
+  announce(next ? "Showing unread conversations only." : "Showing all conversations.");
 }
 
 function setRunsSearch(value) {
@@ -6487,31 +6499,58 @@ function renderTalks() {
   const list = $("talks-list");
   const talks = state.talks;
   renderTalkIndicators();
+  const unreadOnly = Boolean(state.talksUnreadOnly);
+  const unreadToggle = $("talks-unread-only");
+  if (unreadToggle && typeof unreadToggle.setAttribute === "function") {
+    unreadToggle.setAttribute("aria-pressed", String(unreadOnly));
+  }
   $("talks-mark-all-read").disabled = !talks || talks.length === 0;
 
   if (talks === null) {
     setText($("talks-count"), "Loading…");
+    show($("talks-empty"), false);
+    show($("talks-unread-empty"), false);
     return;
   }
 
-  const open = talks.filter((t) => t.status === "open").length;
-  setText($("talks-count"), talks.length === 0
-    ? "No conversations yet"
-    : open ? `${plural(open, "conversation open", "conversations open")}` : "nothing open");
-
+  const hasOlder = typeof talksNext === "string" && talksNext !== "";
+  const unreadTalks = unreadOnly ? talks.filter((t) => talkUnreadCount(t) > 0) : talks;
   show($("talks-empty"), talks.length === 0);
   /* The box only makes sense once there is a conversation to search. While
      searching, the list is the server's hits within the loaded conversations. */
   show($("talks-search"), talks.length > 0);
   show($("talks-search-clear"), state.talksSearch !== "");
   const searching = talks.length > 0 && searchText("chats") !== "";
+  const searchMatched = searching
+    ? unreadTalks.filter((t) => state.search.chats.hits.has(t.id))
+    : unreadTalks;
   const kind = searching
-    ? renderSearchStatus("chats", $("talks-search-status"), "conversations",
-      talks.filter((t) => state.search.chats.hits.has(t.id)).length)
+    ? renderSearchStatus("chats", $("talks-search-status"), "conversations", searchMatched.length)
     : (show($("talks-search-status"), false), "idle");
-  const visible = !searching ? talks
-    : kind === "error" ? []
-    : talks.filter((t) => state.search.chats.hits.has(t.id));
+  const visible = kind === "error" ? [] : searchMatched;
+
+  const open = talks.filter((t) => t.status === "open").length;
+  const countText = talks.length === 0
+    ? "No conversations yet"
+    : unreadOnly
+      ? `${plural(visible.length, "unread conversation", "unread conversations")}${hasOlder ? ", older not loaded" : ""}`
+      : open ? `${plural(open, "conversation open", "conversations open")}` : "nothing open";
+  setText($("talks-count"), countText);
+
+  const unreadEmpty = talks.length > 0 && unreadOnly && visible.length === 0
+    && (!searching || (kind === "ok" && state.search.chats.total > 0));
+  if (unreadEmpty) {
+    setText(
+      $("talks-unread-empty-text"),
+      searching
+        ? "No unread conversations match this search."
+        : hasOlder
+          ? "No unread conversations among loaded conversations. Older conversations are not loaded yet."
+          : "No unread conversations.",
+    );
+  }
+  show($("talks-unread-empty"), unreadEmpty);
+
   syncList(list, sortTalks(visible), (t) => t.id, createTalkCard, updateTalkCard);
   markSelected();
 }
@@ -6571,7 +6610,11 @@ async function getTalkRows(url) {
   return data;
 }
 function showOlderTalks() {
-  sectionNotice("talks-h", "talks-load-state", talksNext ? "Older conversations are available." : "");
+  const message = !talksNext ? ""
+    : state.talksUnreadOnly
+      ? "Older conversations are not loaded yet and may include unread messages."
+      : "Older conversations are available.";
+  sectionNotice("talks-h", "talks-load-state", message);
   const box = $("talks-load-state");
   if (box) for (const button of box.querySelectorAll("button")) button.remove();
   if (talksNext && box) box.append(el("button", { type: "button", class: "btn btn-quiet", text: "Load older conversations", onclick: () => loadOlderTalks().catch(error => {
@@ -12914,6 +12957,11 @@ function wire() {
   });
 
   $("talk-start-go").addEventListener("click", startTalk);
+  $("talks-unread-only").addEventListener("click", () => setTalksUnreadOnly(!state.talksUnreadOnly));
+  $("talks-unread-clear").addEventListener("click", () => {
+    setTalksUnreadOnly(false);
+    $("talks-unread-only").focus({ preventScroll: true });
+  });
   $("talks-mark-all-read").addEventListener("click", markAllTalksRead);
   $("talk-say").addEventListener("submit", sendTalkTurn);
   $("talk-close-go").addEventListener("click", closeTalk);
