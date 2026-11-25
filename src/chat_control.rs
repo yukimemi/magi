@@ -154,6 +154,9 @@ pub enum Operation {
         head: String,
         /// Durable idempotency key; reuse only for identical arguments.
         request: String,
+        /// Inspected preparation-stop evidence; absent for ordinary exhaustion.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        evidence_digest: Option<String>,
     },
     /// 既存 run の再開を queue に登録する。
     Resume {
@@ -580,7 +583,21 @@ async fn execute(
             })?;
             serde_json::to_string(&receipt)?
         }
-        Operation::RecoverBase { run, head, request } => {
+        Operation::RecoverBase {
+            run,
+            head,
+            request,
+            evidence_digest,
+        } => {
+            if evidence_digest.is_some() {
+                ensure!(
+                    matches!(
+                        crate::chat_goal::current_source(),
+                        crate::chat_goal::Source::Input { .. }
+                    ),
+                    "preparation recovery requires explicit owner input"
+                );
+            }
             let result = Box::pin(crate::base_recovery_control::recover(
                 queue,
                 home,
@@ -591,6 +608,7 @@ async fn execute(
                     actor: talk.to_owned(),
                     decision: None,
                     expected_stop: None,
+                    evidence_digest,
                 },
             ))
             .await?;

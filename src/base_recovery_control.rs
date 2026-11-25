@@ -17,6 +17,8 @@ pub(crate) struct Request {
     pub request: String,
     pub decision: Option<(String, jiff::Timestamp)>,
     pub expected_stop: Option<(crate::base_sync_recovery::Stop, usize)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_digest: Option<String>,
 }
 
 pub(crate) struct Outcome {
@@ -274,6 +276,7 @@ pub(crate) fn effect_receipt(
         request: q.id.clone(),
         decision: Some((task.id.clone(), q.answered_at.unwrap_or(q.asked_at))),
         expected_stop: Some((stop.clone(), *episode)),
+        evidence_digest: None,
     };
     let key = format!("decisions/{}", q.id);
     ensure!(

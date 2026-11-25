@@ -1306,6 +1306,7 @@ async fn apply_maintenance_choices(queue: &Queue, questions: &Questions, home: &
                         request: q.id.clone(),
                         decision: Some((owner, q.answered_at.unwrap_or(q.asked_at))),
                         expected_stop: Some((stop.clone(), *episode)),
+                        evidence_digest: None,
                     },
                 )
                 .await;

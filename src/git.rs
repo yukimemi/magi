@@ -1216,6 +1216,98 @@ async fn rebase_file(scratch: &Path, name: &str) -> Result<PathBuf> {
     })
 }
 
+/// Read-only admission checks shared by inspection and the preparation probe.
+pub(crate) async fn check_rebase_preparation(
+    state: &crate::run::RunState,
+    head: &str,
+    dir: &Path,
+) -> Result<()> {
+    let winner = state.winner().context("missing retained winner")?;
+    let common = crate::repo_lock::common_dir(&state.repo).await?;
+    ensure!(
+        common.is_some() && common == crate::repo_lock::common_dir(&winner.worktree).await?,
+        "retained worktree repository changed"
+    );
+    ensure!(
+        !dir.join("base-sync").try_exists()?,
+        "retained scratch exists; inspect it before recovery"
+    );
+    let scratch = path_arg(&dir.join("base-sync"));
+    let listing = git(&state.repo, &["worktree", "list", "--porcelain", "-z"]).await?;
+    ensure!(
+        !listing
+            .split('\0')
+            .filter_map(|line| line.strip_prefix("worktree "))
+            .any(|path| {
+                if cfg!(windows) {
+                    path.eq_ignore_ascii_case(&scratch)
+                } else {
+                    path == scratch
+                }
+            }),
+        "retained scratch Git registration exists; inspect it before recovery"
+    );
+    for name in [
+        "rebase-merge",
+        "rebase-apply",
+        "MERGE_HEAD",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+        "sequencer",
+        "index.lock",
+    ] {
+        ensure!(
+            !rebase_file(&winner.worktree, name).await?.try_exists()?,
+            "retained Git operation: {name}"
+        );
+    }
+    ensure!(
+        is_clean(&winner.worktree).await?,
+        "retained worktree changed"
+    );
+    ensure!(
+        current_branch(&winner.worktree).await?.as_deref() == Some(winner.branch.as_str()),
+        "retained worktree branch changed"
+    );
+    ensure!(
+        rev_parse(&winner.worktree, "HEAD").await? == head
+            && rev_parse(&state.repo, &format!("refs/heads/{}", winner.branch)).await? == head,
+        "retained HEAD changed"
+    );
+    Ok(())
+}
+
+/// Exercise the current preparation path without replaying a commit or moving
+/// the retained branch. A failed cleanup is a failed proof.
+pub(crate) async fn probe_rebase_preparation(
+    state: &crate::run::RunState,
+    head: &str,
+    dir: &Path,
+) -> Result<()> {
+    let wait = crate::repo_lock::WaitPolicy::current();
+    let _lease = crate::repo_lock::SeatLease::operation_with(
+        &state.repo,
+        state.config.coordination.as_ref(),
+        &wait,
+    )
+    .await?;
+    check_rebase_preparation(state, head, dir).await?;
+    let scratch = dir.join("base-preparation-probe");
+    ensure!(
+        !scratch.try_exists()?,
+        "previous preparation probe requires inspection"
+    );
+    worktree_add_detached(&state.repo, &scratch, head).await?;
+    let result = initialize_rebase_record(&scratch).await;
+    let removed = worktree_remove_clean(&state.repo, &scratch).await?;
+    result?;
+    ensure!(
+        removed && !scratch.try_exists()?,
+        "preparation probe cleanup failed"
+    );
+    Ok(())
+}
+
 async fn full_commit(scratch: &Path, sha: &str) -> Result<String> {
     anyhow::ensure!(
         !sha.is_empty() && sha.bytes().all(|b| b.is_ascii_hexdigit()),
@@ -1551,6 +1643,11 @@ impl std::fmt::Display for RebasePreparationError {
 
 impl std::error::Error for RebasePreparationError {}
 
+async fn initialize_rebase_record(scratch: &Path) -> Result<()> {
+    std::fs::write(rebase_file(scratch, "magi-rebase-heads").await?, "")?;
+    Ok(())
+}
+
 /// Create the scratch checkout without starting the sequencer.
 /// An interrupted sequencer belongs to its existing operation and is kept.
 pub(crate) async fn rebase_prepare(repo: &Path, scratch: &Path, branch: &str) -> Result<()> {
@@ -1573,8 +1670,7 @@ pub(crate) async fn rebase_prepare(repo: &Path, scratch: &Path, branch: &str) ->
                 &out.stderr
             }
         );
-        std::fs::write(rebase_file(scratch, "magi-rebase-heads").await?, "")?;
-        Ok::<_, anyhow::Error>(())
+        initialize_rebase_record(scratch).await
     }
     .await;
     result.map_err(|e| {
