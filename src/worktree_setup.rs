@@ -274,6 +274,7 @@ pub(crate) async fn run_command(
         .current_dir(wt)
         .env_remove("MAGI_RUN")
         .env_remove("MAGI_NODE")
+        .env_remove(crate::build_id::EXPECT_ENV)
         .stdin(std::process::Stdio::null())
         .stdout(out)
         .stderr(err)

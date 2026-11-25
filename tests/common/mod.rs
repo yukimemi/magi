@@ -102,6 +102,7 @@ where
                     std::env::remove_var(key);
                 }
                 std::env::set_var("MAGI_WORKER_EXE", cli::magi_executable());
+                std::env::set_var(magi::build_id::EXPECT_ENV, magi::build_id::BUILD_ID);
             };
         }
         tokio::runtime::Builder::new_current_thread()
@@ -134,6 +135,7 @@ where
         // trip the "array declared in two layers" refusal on that machine only.
         .env(magi::config::Config::CONFIG_DIR_ENV, "")
         .env("MAGI_WORKER_EXE", cli::magi_executable())
+        .env(magi::build_id::EXPECT_ENV, magi::build_id::BUILD_ID)
         .output();
     *lock.lock().unwrap() += 1;
     cv.notify_one();
@@ -767,6 +769,8 @@ fn run_git(repo: &Path, args: &[&str]) {
 /// `Fixture` so it stays held for the fixture's own lifetime rather than
 /// dropping at the end of this call.
 pub fn fixture(home: HomeGuard, judges: Judges, require_fix: bool) -> Fixture {
+    // Pin and verify the matching CLI binary before creating any fixture state.
+    let _ = cli::magi_executable();
     let tmp = tempfile::tempdir().expect("tempdir");
     let repo = tmp.path().join("repo");
     std::fs::create_dir_all(&repo).unwrap();
