@@ -1152,7 +1152,10 @@ async fn verify_grant_runs_fresh_e2e_and_gate_on_the_unchanged_head() {
     assert_eq!(runner.state.gate_head.as_deref(), Some(request.head.as_str()));
     assert!(runner.state.gate_allows_progress());
     let worktree = &runner.state.winner().unwrap().worktree;
-    assert_eq!(magi::git::rev_parse(worktree, "HEAD").await.unwrap(), request.head);
+    assert_eq!(
+        magi::git::rev_parse(worktree, "HEAD").await.unwrap(),
+        request.head
+    );
     assert!(magi::git::is_clean(worktree).await.unwrap());
     let mut again = Runner::resume(&request.run).unwrap();
     again.execute().await.unwrap();
