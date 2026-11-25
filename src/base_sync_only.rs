@@ -508,7 +508,14 @@ pub(crate) async fn sync(state: &mut RunState) -> Result<Outcome> {
     };
     let behind = git::commits_ahead(&checkout.path, &head, &tip).await?;
     let attempts = state.base_sync.as_ref().map_or(0, |sync| sync.attempts);
-    let tree = if behind != 0 && state.sync_only_passes.last().unwrap().prepared_head.is_none() {
+    let tree = if behind != 0
+        && state
+            .sync_only_passes
+            .last()
+            .unwrap()
+            .prepared_head
+            .is_none()
+    {
         let tree = checkout
             .raw(&["merge-tree", "--write-tree", &head, &tip])
             .await?;
