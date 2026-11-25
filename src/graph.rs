@@ -13192,6 +13192,14 @@ pub(crate) async fn verify_current_head(
         state.save()?;
         return Ok(false);
     }
+    // Bind the result to the base used by the candidate, not a tracking ref
+    // that the background fetch can advance independently of verification.
+    let base_commit = state
+        .base_sync
+        .as_ref()
+        .map(|s| s.tip.clone())
+        .filter(|tip| !tip.is_empty())
+        .or_else(|| (!state.base_commit.is_empty()).then(|| state.base_commit.clone()));
     state.head_e2e = Some(crate::run::GateRepairE2e::new(
         head.clone(),
         false,
@@ -13238,12 +13246,6 @@ pub(crate) async fn verify_current_head(
     if !outcomes.is_empty() && !unresolved {
         state.record_base_progress(&head);
     }
-    let tracking = format!("{}/{}", state.config.merge.remote, state.base_branch);
-    let base_commit = git::rev_parse(&state.repo, &tracking)
-        .await
-        .ok()
-        .or_else(|| state.base_sync.as_ref().map(|s| s.tip.clone()))
-        .or_else(|| (!state.base_commit.is_empty()).then(|| state.base_commit.clone()));
     let generation = Some(state.verification_history.len());
     let pass = state.passes.last().map(|p| p.index);
     let recorded_at = Some(Timestamp::now());
@@ -19033,6 +19035,42 @@ esac
         });
         runner.state.status = RunStatus::Blocked;
         (tmp, runner, head)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn current_head_e2e_keeps_synchronized_base_when_tracking_ref_moves() {
+        let (_tmp, mut runner, _) = resumed_gate_fixture().await;
+        runner.sync_to_base().await.unwrap();
+        let winner = runner.state.winner().unwrap().clone();
+        let head = git::rev_parse(&winner.worktree, "HEAD").await.unwrap();
+        let base = runner.state.base_sync.as_ref().unwrap().tip.clone();
+        assert_ne!(head, base);
+        runner.state.config.verify.e2e = vec![format!(
+            "git update-ref refs/remotes/origin/main {head} && false"
+        )];
+        let wait = repository_wait(&runner.state, None);
+        assert!(
+            !verify_current_head(&mut runner.state, &winner, &wait)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            git::rev_parse(&runner.state.repo, "refs/remotes/origin/main")
+                .await
+                .unwrap(),
+            head
+        );
+        assert_eq!(
+            runner
+                .state
+                .head_e2e
+                .as_ref()
+                .unwrap()
+                .base_commit
+                .as_deref(),
+            Some(base.as_str())
+        );
     }
 
     #[cfg(unix)]

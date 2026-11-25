@@ -287,8 +287,14 @@ pub(crate) fn inspect_facts(task: &Task, state: &RunState, stop: &Stop) -> FactC
     if task.pr_recovery.is_some() {
         return FactCheck::Changed("explicit PR recovery selection present".into());
     }
-    if task.replacement.is_some() {
-        return FactCheck::Changed("explicit replacement selection present".into());
+    if task.replacement.as_ref().is_some_and(|replacement| {
+        state.replaces.as_ref().is_none_or(|applied| {
+            applied.question != replacement.question
+                || applied.run != replacement.run
+                || applied.agent != replacement.agent
+        })
+    }) {
+        return FactCheck::Changed("new explicit replacement selection present".into());
     }
     if !crate::daemon::compatible_run_instruction(state, task) {
         return FactCheck::Changed("task instruction changed".into());
@@ -480,6 +486,13 @@ pub(crate) fn dispatch_hold(queue: &Queue, task: &Task) -> Option<HoldAction> {
 pub(crate) fn check_attempt(queue: &Queue, task: &Task) -> Option<AttemptGate> {
     let state = load_latest_run(queue, task)?;
     let stop = conclusive(&state)?;
+    if task
+        .sync_only
+        .as_ref()
+        .is_some_and(|request| request.run == state.id)
+    {
+        return None;
+    }
     let read_diagnostic = match inspect_facts(task, &state, &stop) {
         FactCheck::Changed(_) => return None,
         FactCheck::Unchanged => None,
@@ -516,16 +529,14 @@ pub(crate) fn blocks_automatic_recovery(queue: &Queue, task: &Task) -> bool {
 
 /// Classification for [`crate::triage::run_once`] on a `Held` machine task.
 pub(crate) fn triage_status(queue: &Queue, task: &Task) -> TriageStatus {
-    if task.status != TaskStatus::Held || task.hold_source != Some(HoldSource::Machine) {
+    if task.status != TaskStatus::Held
+        || task.hold_source != Some(HoldSource::Machine)
+        || !task.has_head_e2e_cause()
+    {
         return TriageStatus::NotHeadE2e;
     }
-    let has_typed_cause = task.has_head_e2e_cause();
     let Some(state) = load_latest_run(queue, task) else {
-        return if has_typed_cause {
-            TriageStatus::HoldStillActive
-        } else {
-            TriageStatus::NotHeadE2e
-        };
+        return TriageStatus::HoldStillActive;
     };
     if let Some(stop) = conclusive(&state) {
         return match inspect_facts(task, &state, &stop) {
@@ -533,16 +544,12 @@ pub(crate) fn triage_status(queue: &Queue, task: &Task) -> TriageStatus {
             FactCheck::Unchanged | FactCheck::Unreadable(_) => TriageStatus::HoldStillActive,
         };
     }
-    if has_typed_cause {
-        if state.status.resumable()
-            && !state.base_sync_blocked()
-            && state.prep_failure.is_none()
-            && state.resource_block.is_none()
-        {
-            TriageStatus::ResolvedChanged
-        } else {
-            TriageStatus::NotHeadE2e
-        }
+    if state.status.resumable()
+        && !state.base_sync_blocked()
+        && state.prep_failure.is_none()
+        && state.resource_block.is_none()
+    {
+        TriageStatus::ResolvedChanged
     } else {
         TriageStatus::NotHeadE2e
     }
@@ -922,6 +929,51 @@ mod tests {
             inspect_facts(&task, &missing_base, &stop),
             FactCheck::Unreadable(_)
         ));
+    }
+
+    #[test]
+    fn dispatch_and_triage_respect_explicit_sync_and_hold_ownership() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, wt, base, head) = init_repo_with_origin(tmp.path());
+        let mut state = sample_blocked_state(&repo, &wt, &base, &head);
+        let queue = Queue::at(tmp.path().join("queue"));
+        let mut task = Task::new(
+            "t".into(),
+            "fix typography".into(),
+            repo.clone(),
+            Source::Human,
+        );
+        task.start(state.id.clone());
+        let replacement = crate::merge_decision::Replacement {
+            question: "replacement".into(),
+            run: "previous".into(),
+            pr: "previous-pr".into(),
+            agent: "existing".into(),
+            context: String::new(),
+        };
+        task.replacement = Some(replacement.clone());
+        state.replaces = Some(replacement);
+        state.save_under(tmp.path()).unwrap();
+        let stop = conclusive(&state).unwrap();
+        let hold =
+            dispatch_hold(&queue, &task).expect("historical replacement is not new evidence");
+        hold.apply(&mut task);
+        assert_eq!(triage_status(&queue, &task), TriageStatus::HoldStillActive);
+        task.resume_head_e2e_wait();
+        task.sync_only = Some(crate::base_sync_only::Request {
+            run: state.id.clone(),
+            at: Timestamp::now(),
+        });
+        assert!(dispatch_hold(&queue, &task).is_none());
+        task.sync_only = None;
+        assert!(dispatch_hold(&queue, &task).is_some());
+
+        git_sync(&repo, &["update-ref", "refs/remotes/origin/main", &head]);
+        task.hold_machine(Some("disk capacity unavailable".into()));
+        task.mark_disk_capacity();
+        assert_eq!(triage_status(&queue, &task), TriageStatus::NotHeadE2e);
+        build_hold(&task, &state, stop, None).apply(&mut task);
+        assert_eq!(triage_status(&queue, &task), TriageStatus::ResolvedChanged);
     }
 
     #[test]
