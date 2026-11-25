@@ -398,6 +398,73 @@ async fn fetch_base(checkout: &Checkout, state: &RunState) -> Result<String> {
         .await
 }
 
+async fn public_integrated(
+    checkout: &Checkout,
+    state: &RunState,
+    head: &str,
+    tip: &str,
+) -> Result<bool> {
+    let branch = state.pr_branch().context("public branch is missing")?;
+    let remote = &state.config.merge.remote;
+    let reference = format!("refs/heads/{branch}");
+    let budget = std::time::Duration::from_secs(state.config.graph.timeout_resource_wait);
+    let observed = tokio::time::timeout(
+        budget,
+        checkout.raw(&["ls-remote", "--exit-code", "--refs", "--", remote, &reference]),
+    )
+    .await
+    .context("checking the public branch timed out")??;
+    if observed.code == Some(2) {
+        return Ok(true);
+    }
+    ensure!(
+        observed.ok(),
+        "checking the public branch failed: {}",
+        observed.stderr
+    );
+    let (sha, name) = observed
+        .stdout
+        .split_once('\t')
+        .context("unreadable public branch")?;
+    ensure!(name == reference, "unexpected public branch response");
+    if sha == head {
+        return Ok(true);
+    }
+    tokio::time::timeout(
+        budget,
+        checkout.git(&[
+            "fetch",
+            "--quiet",
+            "--no-auto-maintenance",
+            "--no-tags",
+            "--no-prune",
+            "--no-prune-tags",
+            "--recurse-submodules=no",
+            "--refmap=",
+            "--",
+            remote,
+            &reference,
+        ]),
+    )
+    .await
+    .context("fetching the public branch timed out")??;
+    let theirs = checkout
+        .git(&["rev-parse", "--verify", "FETCH_HEAD^{commit}"])
+        .await?;
+    ensure!(theirs == sha, "public branch moved during synchronization");
+    let tree = checkout
+        .raw(&["merge-tree", "--write-tree", &theirs, tip])
+        .await?;
+    if tree.code == Some(1) {
+        return Ok(false);
+    }
+    ensure!(tree.ok(), "public branch merge-tree failed: {}", tree.stderr);
+    Ok(tree.stdout
+        == checkout
+            .git(&["rev-parse", &format!("{tip}^{{tree}}")])
+            .await?)
+}
+
 pub(crate) async fn sync(state: &mut RunState) -> Result<Outcome> {
     let checkout = checkout(state).await?;
     let _outputs = crate::retention::OutputLease::take(&checkout.path, true)?;
@@ -496,7 +563,7 @@ pub(crate) async fn sync(state: &mut RunState) -> Result<Outcome> {
                             .git(&["rev-parse", &format!("{tip}^{{tree}}")])
                             .await?
                 {
-                    return Ok(already_integrated(state, tip, behind));
+                    return already_integrated(&checkout, state, &head, tip, behind).await;
                 }
                 let prepared = checkout
                     .git(&[
@@ -561,7 +628,7 @@ pub(crate) async fn sync(state: &mut RunState) -> Result<Outcome> {
                         .git(&["rev-parse", &format!("{head}^{{tree}}")])
                         .await?)
     {
-        return Ok(already_integrated(state, tip, behind));
+        return already_integrated(&checkout, state, &head, tip, behind).await;
     }
     state.sync_only_passes.last_mut().unwrap().prepared_head = None;
     if saved || behind != 0 {
@@ -584,7 +651,26 @@ pub(crate) async fn sync(state: &mut RunState) -> Result<Outcome> {
     })
 }
 
-fn already_integrated(state: &mut RunState, tip: String, behind: usize) -> Outcome {
+async fn already_integrated(
+    checkout: &Checkout,
+    state: &mut RunState,
+    head: &str,
+    tip: String,
+    behind: usize,
+) -> Result<Outcome> {
+    if !public_integrated(checkout, state, head, &tip).await? {
+        let why = "public branch contains changes not integrated into the fetched base";
+        stop(
+            state,
+            tip,
+            behind,
+            state.base_sync.as_ref().map_or(0, |sync| sync.attempts),
+            head,
+            why,
+            crate::base_sync_recovery::StopKind::Divergence,
+        );
+        bail!("{why}");
+    }
     state.sync_only_passes.last_mut().unwrap().prepared_head = None;
     state.status = RunStatus::AlreadyInBase;
     state.base_sync_recovery.stop = None;
@@ -599,7 +685,7 @@ fn already_integrated(state: &mut RunState, tip: String, behind: usize) -> Outco
         attempts: state.base_sync.as_ref().map_or(0, |sync| sync.attempts),
         conflict: None,
     });
-    Outcome::AlreadyInBase
+    Ok(Outcome::AlreadyInBase)
 }
 
 fn stop(
