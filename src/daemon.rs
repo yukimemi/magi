@@ -2277,6 +2277,9 @@ fn settle_and_diagnose(
         return;
     }
     let unresolved = task.hold_notice_cause.clone();
+    let head_e2e_stop = crate::head_e2e_stop::conclusive(state)
+        .filter(|_| !verdict.parked && !verdict.quota_hit && task.pr_recovery.is_none());
+    let mut reconsumed_head_e2e = false;
     if state.base_sync_blocked() {
         // No automatic retry may turn a retained sync stop into a new competition.
         task.hold_machine(Some(detail.to_owned()));
@@ -2310,11 +2313,30 @@ fn settle_and_diagnose(
         && !verdict.quota_hit
     {
         task.hold_unrequested_retry(Some(format!("Selected recovery stopped: {detail}. Inspect the retained source and run; correct the cause before explicitly releasing or selecting again. No automatic replacement will start.")));
+    } else if let Some(stop) = head_e2e_stop.clone() {
+        // Conclusive current-head E2E red settles directly to one actionable
+        // machine hold instead of cycling through runnable `Failed` passes.
+        // Refund only when this pass provably reconsumed an earlier stop with
+        // no new verification events, idempotently across reclaim/re-settle.
+        if crate::head_e2e_stop::reconsumed_without_new_verification(state, &stop) {
+            reconsumed_head_e2e = true;
+            let pass = state.passes.last().map_or(0, |p| p.index);
+            if !task
+                .passes
+                .iter()
+                .any(|p| p.run == state.id && p.pass_index == pass)
+            {
+                task.attempts = task.attempts.saturating_sub(1);
+            }
+        }
+        let reason = crate::head_e2e_stop::hold_reason(task, state, &stop, None);
+        task.hold_head_e2e(stop, reason, detail.to_owned());
     } else {
         settle_in(task, verdict, detail, max_attempts, p, Some(state));
     }
     if !verdict.parked
         && !verdict.quota_hit
+        && !reconsumed_head_e2e
         && matches!(
             verdict.status,
             RunStatus::Blocked | RunStatus::Failed | RunStatus::Stalled
@@ -2346,6 +2368,8 @@ fn settle_and_diagnose(
     if task.status == TaskStatus::Held {
         if state.base_sync_blocked() {
             task.base_sync_notice(state);
+        } else if let Some(stop) = &head_e2e_stop {
+            task.head_e2e_notice(stop);
         } else if state.prep_failure.is_none() {
             task.notice_cause(
                 label(verdict.status),
@@ -3767,6 +3791,12 @@ fn claim_dispatch(
             return Err(SkipReason::RereadFailed);
         }
     };
+    if let Some(hold) = crate::head_e2e_stop::dispatch_hold(queue, &task) {
+        let mut held = task;
+        hold.apply(&mut held);
+        record(queue, &mut held);
+        return Err(SkipReason::NoLongerRunnable);
+    }
     let resume = land_resume_state(&task);
     if resume == LandResume::StillWaiting {
         return Err(SkipReason::WaitingOnLanding);
@@ -4775,6 +4805,20 @@ async fn attempt(
             return Vec::new();
         }
     }
+    let head_e2e_approval = match crate::head_e2e_stop::check_attempt(queue, task) {
+        Some(crate::head_e2e_stop::AttemptGate::Hold(hold)) => {
+            hold.apply(task);
+            record(queue, task);
+            return Vec::new();
+        }
+        Some(crate::head_e2e_stop::AttemptGate::ConsumeOwnerApproval {
+            run,
+            stop_id,
+            generation,
+            approval_at,
+        }) => Some((run, stop_id, generation, approval_at)),
+        None => None,
+    };
     let unfinished = (!task.fresh_start)
         .then(|| unfinished_run(&resume_runs, task.short()))
         .flatten()
@@ -5125,6 +5169,15 @@ async fn attempt(
         && starter != Starter::Resume(previous.as_ref().unwrap().id.clone())
     {
         task.hold_manual(Some("The selected replacement already has an attempt. It cannot be resumed safely; inspect its saved pin and restore the existing run. No additional replacement was started.".into()));
+        record(queue, task);
+        return Vec::new();
+    }
+    if let Some((ref run, ..)) = head_e2e_approval
+        && starter != Starter::Resume(run.clone())
+    {
+        task.hold_machine(Some(format!(
+            "Conclusive head_e2e stop on run {run} cannot resume safely with current task settings; inspect `magi show {run}` before retrying. No replacement competition was started."
+        )));
         record(queue, task);
         return Vec::new();
     }
@@ -5500,6 +5553,19 @@ async fn attempt(
     // only what this execution added may arm the cooldown or earn a refund.
     let quota_before = runner.state.quota.clone();
     runner.state.carry_dispatched_resumes(task);
+    runner.state.entry_resumption_generation =
+        Some(task.resumption.as_ref().map_or(0, |r| r.generation));
+    if let Some((run, stop_id, generation, approval_at)) = head_e2e_approval
+        && runner.state.id == run
+    {
+        crate::head_e2e_stop::record_consumed_approval(
+            &mut runner.state,
+            &task.id,
+            &stop_id,
+            generation,
+            approval_at,
+        );
+    }
     runner.state.next_pass_task_entry = true;
     let result = runner.execute().await;
     finish_attempt(
@@ -6959,8 +7025,30 @@ const DIAGNOSTIC_OUTPUT_TAIL: usize = 800;
 /// none of the three shapes this recognises — an ordinary run held for
 /// something not diagnosable from `RunState` alone still explains itself
 /// through `Task::last_error`.
+pub(crate) fn diagnostic_for(state: &RunState) -> Option<String> {
+    diagnostic(state)
+}
+
 fn diagnostic(state: &RunState) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
+
+    if let Some(e2e) = &state.head_e2e
+        && !e2e.passed
+    {
+        for o in e2e
+            .outcomes
+            .iter()
+            .filter(|o| !o.ok() && !o.resource_blocked)
+        {
+            parts.push(format!(
+                "head_e2e `{}` failed on {} ({}):\n{}",
+                o.command,
+                e2e.head.chars().take(7).collect::<String>(),
+                notices::exit_status(o.code),
+                crate::run::summarize_verify(&o.output_tail, DIAGNOSTIC_OUTPUT_TAIL)
+            ));
+        }
+    }
 
     // Gate failure: which check(s), and the tail of what each printed.
     for o in state.gate.iter().filter(|o| !o.ok()) {

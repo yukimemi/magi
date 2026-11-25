@@ -1738,6 +1738,19 @@ fn run_once_with_probe(
         if crate::base_sync_recovery::held_task(queue, &task) {
             continue;
         }
+        if !disk_only {
+            match crate::head_e2e_stop::triage_status(queue, &task) {
+                crate::head_e2e_stop::TriageStatus::NotHeadE2e => {}
+                crate::head_e2e_stop::TriageStatus::HoldStillActive => continue,
+                crate::head_e2e_stop::TriageStatus::ResolvedChanged => {
+                    task.resume_head_e2e_wait();
+                    if queue.put(&mut task).is_ok() {
+                        report.resumed.push(task.id.clone());
+                    }
+                    continue;
+                }
+            }
+        }
         if repair_receipt_notice(queue, &task) {
             continue;
         }

@@ -7910,14 +7910,14 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             // and a successful check for a different (older) SHA.
             state.land_sync_pending = true;
             state.config.verify.e2e = vec!["echo e2e is red; exit 1".into()];
-            state.gate_repair_e2e = Some(crate::run::GateRepairE2e {
-                head: if phase == 2 {
+            state.gate_repair_e2e = Some(crate::run::GateRepairE2e::new(
+                if phase == 2 {
                     old.clone()
                 } else {
                     head.clone()
                 },
-                passed: phase == 2,
-                outcomes: if phase == 1 {
+                phase == 2,
+                if phase == 1 {
                     vec![crate::run::CommandOutcome {
                         command: state.config.verify.e2e[0].clone(),
                         code: None,
@@ -7929,7 +7929,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
                 } else {
                     Vec::new()
                 },
-            });
+            ));
             state.save().unwrap();
             for _ in 0..2 {
                 state = RunState::load(&state.id).unwrap();
@@ -8346,11 +8346,11 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             state.config.coordination = crate::config::test_coordination();
             if e2e {
                 state.config.verify.e2e = vec!["true".into()];
-                state.gate_repair_e2e = Some(crate::run::GateRepairE2e {
-                    head: head.clone(),
-                    passed: false,
-                    outcomes: Vec::new(),
-                });
+                state.gate_repair_e2e = Some(crate::run::GateRepairE2e::new(
+                    head.clone(),
+                    false,
+                    Vec::new(),
+                ));
             } else {
                 state.config.verify.gate = vec!["true".into()];
                 state.gate_ran = false;

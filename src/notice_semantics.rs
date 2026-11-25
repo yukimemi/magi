@@ -18,26 +18,55 @@ fn decision(q: &Question) -> Value {
     json!([subject, q.choices, q.actions, q.merge_target])
 }
 
+fn read_run_record(
+    home: &Path,
+    run: Option<&str>,
+) -> Option<(Value, Option<crate::run::RunState>)> {
+    let run =
+        run.filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))?;
+    let bytes = std::fs::read(home.join("runs").join(run).join("run.json")).ok()?;
+    let record = serde_json::from_slice::<Value>(&bytes).ok()?;
+    let state = serde_json::from_value::<crate::run::RunState>(record.clone())
+        .ok()
+        .and_then(|state| crate::run::migrate_schema(state).ok());
+    Some((record, state))
+}
+
+fn active_head_e2e_stop_id(home: &Path, task: Option<&Task>, run: Option<&str>) -> Option<String> {
+    if let Some(t) = task
+        && !matches!(
+            t.status,
+            crate::queue::TaskStatus::Running
+                | crate::queue::TaskStatus::Failed
+                | crate::queue::TaskStatus::Held
+        )
+    {
+        return None;
+    }
+    if let Some((_, Some(state))) = read_run_record(home, run) {
+        return crate::head_e2e_stop::conclusive(&state).map(|stop| stop.id);
+    }
+    task.and_then(|t| t.head_e2e_stop_id().map(str::to_owned))
+}
+
 fn run_evidence(home: &Path, run: Option<&str>) -> Value {
-    let Some(run) =
-        run.filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
-    else {
-        return Value::Null;
-    };
-    let Ok(bytes) = std::fs::read(home.join("runs").join(run).join("run.json")) else {
-        return Value::Null;
-    };
-    let Ok(record) = serde_json::from_slice::<Value>(&bytes) else {
+    let Some((record, state)) = read_run_record(home, run) else {
         return Value::Null;
     };
     let mut evidence = serde_json::Map::new();
     // Use the same structured cause as run_ended/run_stopped. The last event
     // and the task's formatted error need not contain this diagnostic.
-    let verification_cause = serde_json::from_value::<crate::run::RunState>(record.clone())
-        .ok()
-        .and_then(|state| crate::run::migrate_schema(state).ok())
+    let verification_cause = state
+        .as_ref()
         .and_then(|state| state.verification_blocking_cause());
+    let head_e2e_stop = state
+        .as_ref()
+        .and_then(crate::head_e2e_stop::conclusive)
+        .map(|stop| stop.id);
     evidence.insert("verification_cause".into(), json!(verification_cause));
+    if let Some(stop_id) = &head_e2e_stop {
+        evidence.insert("head_e2e_stop".into(), json!(stop_id));
+    }
     for field in [
         "status",
         "prep_failure",
@@ -55,29 +84,32 @@ fn run_evidence(home: &Path, run: Option<&str>) -> Value {
         "gate_repair_e2e",
         "gate",
         "gate_head",
+        "head_e2e",
     ] {
         if let Some(value) = record.get(field) {
             evidence.insert(field.into(), stable(value));
         }
     }
-    // A new execution of the same run is a new opportunity, even if it fails alike.
-    evidence.insert(
-        "pass".into(),
-        json!(
-            record["passes"]
+    if head_e2e_stop.is_none() {
+        // A new execution of the same run is a new opportunity, even if it fails alike.
+        evidence.insert(
+            "pass".into(),
+            json!(
+                record["passes"]
+                    .as_array()
+                    .and_then(|p| p.last())
+                    .map(|p| &p["index"])
+            ),
+        );
+        evidence.insert(
+            "cause".into(),
+            record["events"]
                 .as_array()
-                .and_then(|p| p.last())
-                .map(|p| &p["index"])
-        ),
-    );
-    evidence.insert(
-        "cause".into(),
-        record["events"]
-            .as_array()
-            .and_then(|e| e.last())
-            .map(|e| e["message"].clone())
-            .unwrap_or(Value::Null),
-    );
+                .and_then(|e| e.last())
+                .map(|e| e["message"].clone())
+                .unwrap_or(Value::Null),
+        );
+    }
     Value::Object(evidence)
 }
 
@@ -93,8 +125,12 @@ fn stable(value: &Value) -> Value {
                             | "created_at"
                             | "checked_at"
                             | "verified_at"
+                            | "recorded_at"
                             | "at"
                             | "duration_ms"
+                            | "pass"
+                            | "recorded_events"
+                            | "resumption_generation"
                     )
                 })
                 .map(|(key, value)| (key.clone(), stable(value)))
@@ -139,21 +175,40 @@ fn snapshot(
         .map(|q| json!([decision(&q), q.answer, q.answered_at]))
         .collect();
     resolutions.sort_by_key(Value::to_string);
+    let head_e2e_stop = active_head_e2e_stop_id(home, task, run);
+    let task_value = if let Some(stop_id) = &head_e2e_stop
+        && extra.is_null()
+    {
+        task.map(|t| {
+            json!({
+                "id": t.id,
+                "state": "head_e2e_stop",
+                "run": run,
+                "instruction": t.instruction,
+                "blockers": blockers,
+                "stop_id": stop_id,
+            })
+        })
+    } else {
+        task.map(|t| {
+            json!({
+                "id": t.id, "state": t.status, "run": run, "instruction": t.instruction,
+                "blockers": blockers, "review_branch": t.review_branch,
+                "cause": t.hold_notice_cause,
+                "error": t.last_error, "hold": t.hold_reason,
+                "diagnostic": t.diagnostic, "block": t.block_reason,
+                "answers": t.answers, "applied": t.actions_applied,
+                "triage": t.triage_applied, "operator_decision": t.operator_decided_at,
+                "attempts": t.attempts,
+                "completion_event": t.completion_history.last(),
+            })
+        })
+    };
     // Delivery timestamps and question IDs are deliberately absent. Owner
     // resolutions delimit separate decision opportunities without changing holds.
     json!({ "decision": q.map(decision), "base": {
         "version": 1,
-        "task": task.map(|t| json!({
-            "id": t.id, "state": t.status, "run": run, "instruction": t.instruction,
-            "blockers": blockers, "review_branch": t.review_branch,
-            "cause": t.hold_notice_cause,
-            "error": t.last_error, "hold": t.hold_reason,
-            "diagnostic": t.diagnostic, "block": t.block_reason,
-            "answers": t.answers, "applied": t.actions_applied,
-            "triage": t.triage_applied, "operator_decision": t.operator_decided_at,
-            "attempts": t.attempts,
-            "completion_event": t.completion_history.last(),
-        })),
+        "task": task_value,
         "run": run, "evidence": run_evidence(home, run),
         "extra": extra, "resolutions": resolutions,
     }})
@@ -219,9 +274,13 @@ pub(crate) fn attention(
             .any(|known| known.lines().next() == Some(cause))
         })
     });
+    let head_e2e_stop = active_head_e2e_stop_id(home, task, run);
+    let head_e2e_match = head_e2e_stop
+        .as_deref()
+        .is_some_and(|stop_id| n.cause.as_deref() == Some(stop_id));
     // Normalize only evidence we can confirm. Immediate graph errors, changed
     // explicit causes and unrelated notices retain their literal evidence.
-    let extra = if n.cause.is_none() && (held || failed) {
+    let extra = if (n.cause.is_none() || head_e2e_match) && (held || failed) {
         Value::Null
     } else {
         json!([n.key, n.cause, n.since, n.severity, n.message, n.link])

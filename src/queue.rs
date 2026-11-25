@@ -147,7 +147,9 @@ use crate::id_reserve::{IdSource, path_exists};
 /// 24: bind automatic recovery-budget holds to their stopped execution.
 ///
 /// 25: append-only completion/reopen audit and occurrence-bound completion notices.
-pub const SCHEMA: u32 = 25;
+///
+/// 26: typed conclusive `head_e2e` machine hold cause.
+pub const SCHEMA: u32 = 26;
 
 const RECOVERY_HOLD_SCHEMA: u32 = 24;
 
@@ -181,6 +183,11 @@ pub enum MachineHoldCause {
         /// Admission stopped before a new execution was established.
         #[serde(default)]
         before_start: bool,
+    },
+    /// Conclusive current-head `verify.e2e` red on an unchanged candidate/base.
+    HeadE2e {
+        /// Stable stop identity and failure facts.
+        stop: crate::head_e2e_stop::Stop,
     },
 }
 
@@ -2106,6 +2113,63 @@ impl Task {
         self.machine_hold_cause = None;
         self.last_error = None;
         self.disk_resume_run = retained;
+    }
+
+    /// Hold this task at one actionable machine hold for a conclusive `head_e2e` failure.
+    pub(crate) fn hold_head_e2e(
+        &mut self,
+        stop: crate::head_e2e_stop::Stop,
+        reason: String,
+        last_error: String,
+    ) {
+        self.hold_machine(Some(reason));
+        self.last_error = Some(last_error);
+        self.machine_hold_cause = Some(MachineHoldCause::HeadE2e { stop });
+    }
+
+    /// Keep a conclusive `head_e2e` stop identity stable across passes and re-holds.
+    pub(crate) fn head_e2e_notice(&mut self, stop: &crate::head_e2e_stop::Stop) {
+        if let Some(at) = stop.recorded_at {
+            self.held_at = Some(at);
+        }
+        self.notice_cause(crate::head_e2e_stop::NOTICE_STAGE, Some(&stop.run), None);
+        if let Some(cause) = &mut self.hold_notice_cause {
+            cause.target = Some(stop.id.clone());
+        }
+    }
+
+    /// Whether this task currently carries a typed conclusive `head_e2e` hold cause.
+    pub fn has_head_e2e_cause(&self) -> bool {
+        matches!(
+            self.machine_hold_cause,
+            Some(MachineHoldCause::HeadE2e { .. })
+        )
+    }
+
+    /// Stable stop identifier when this task is held on a conclusive `head_e2e` failure.
+    pub fn head_e2e_stop_id(&self) -> Option<&str> {
+        if let Some(MachineHoldCause::HeadE2e { stop }) = &self.machine_hold_cause {
+            return Some(stop.id.as_str());
+        }
+        self.hold_notice_cause
+            .as_ref()
+            .filter(|c| c.stage == crate::head_e2e_stop::NOTICE_STAGE)
+            .and_then(|c| c.target.as_deref())
+    }
+
+    /// Requeue a `head_e2e` hold after candidate/base/repair facts changed,
+    /// preserving spent attempts and run/pass history.
+    pub(crate) fn resume_head_e2e_wait(&mut self) {
+        self.status = TaskStatus::Queued;
+        self.held_at = None;
+        self.hold_source = None;
+        self.hold_reason = None;
+        self.machine_hold_cause = None;
+        self.last_error = None;
+        self.diagnostic = None;
+        self.blocked_by.clear();
+        self.block_reason = None;
+        self.blocked_from = None;
     }
 
     /// Block this task on other task ids and/or open question ids, chosen by

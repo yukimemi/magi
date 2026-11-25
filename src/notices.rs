@@ -703,7 +703,8 @@ pub fn run_ended(state: &crate::run::RunState) -> Option<Notice> {
         RunStatus::Blocked | RunStatus::Stalled | RunStatus::Failed
     );
     (failed && !state.parked).then(|| {
-        Notice::error(
+        let head_e2e_stop = crate::head_e2e_stop::conclusive(state);
+        let mut notice = Notice::error(
             &format!("run:{}", state.id),
             format!(
                 "Run {} ended {}. {}",
@@ -723,9 +724,14 @@ pub fn run_ended(state: &crate::run::RunState) -> Option<Notice> {
                 .as_ref()
                 .filter(|_| state.base_sync_blocked())
                 .map(|s| s.at)
+                .or_else(|| head_e2e_stop.as_ref().and_then(|s| s.recorded_at))
                 .or_else(|| state.passes.last().map(|p| p.started_at))
                 .unwrap_or(state.created_at),
-        ))
+        ));
+        if let Some(stop) = head_e2e_stop {
+            notice = notice.cause(stop.id);
+        }
+        notice
     })
 }
 
@@ -806,17 +812,19 @@ pub fn task_held(task: &crate::queue::Task) -> Option<Notice> {
         .or_else(|| clean_text(task.last_error.as_deref()))
         .unwrap_or("no reason recorded");
     let why_sentence = why.trim_end_matches('.');
-    Some(
-        Notice::warn(
-            &format!("task:{}", task.id),
-            format!("Task {} is held: {why_sentence}.", task.short()),
-        )
-        .link(Link::Task {
-            id: task.id.clone(),
-        })
-        .about([task.id.clone()])
-        .since(task.held_at),
+    let mut notice = Notice::warn(
+        &format!("task:{}", task.id),
+        format!("Task {} is held: {why_sentence}.", task.short()),
     )
+    .link(Link::Task {
+        id: task.id.clone(),
+    })
+    .about([task.id.clone()])
+    .since(task.held_at);
+    if let Some(stop_id) = task.head_e2e_stop_id() {
+        notice = notice.cause(stop_id);
+    }
+    Some(notice)
 }
 
 /// The notice for a conductor concern raised after explicit resumption without
@@ -883,6 +891,7 @@ pub fn run_stopped(id: &str, state: &crate::run::RunState) -> Notice {
             .as_ref()
             .filter(|_| state.base_sync_blocked())
             .map(|s| s.at)
+            .or_else(|| crate::head_e2e_stop::conclusive(state).and_then(|s| s.recorded_at))
             .or_else(|| state.passes.last().map(|p| p.started_at))
             .unwrap_or(state.created_at),
     ))
