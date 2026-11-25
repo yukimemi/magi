@@ -345,12 +345,20 @@ pub(crate) fn inspect_facts(task: &Task, state: &RunState, stop: &Stop) -> FactC
         "refs/remotes/{}/{}",
         state.config.merge.remote, state.base_branch
     );
+    // A successful sync can incorporate a new base without changing HEAD.
+    // Its tip is the dispatch baseline; the failed verification's base
+    // remains immutable evidence for the stop identity.
+    let synchronized_base = state
+        .base_sync
+        .as_ref()
+        .filter(|sync| sync.conflict.is_none() && !sync.tip.is_empty())
+        .map_or(stop.base.as_str(), |sync| sync.tip.as_str());
     match git_rev_parse_sync(&state.repo, &tracking) {
-        Ok(base_tip) if !stop.base.is_empty() && base_tip != stop.base => {
+        Ok(base_tip) if !synchronized_base.is_empty() && base_tip != synchronized_base => {
             return FactCheck::Changed(format!(
                 "remote base {} moved from {} to {}",
                 tracking,
-                short(&stop.base),
+                short(synchronized_base),
                 short(&base_tip)
             ));
         }
@@ -977,6 +985,47 @@ mod tests {
     }
 
     #[test]
+    fn conductor_preserves_independent_question_on_unchanged_stop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, wt, base, head) = init_repo_with_origin(tmp.path());
+        let mut state = sample_blocked_state(&repo, &wt, &base, &head);
+        state.save_under(tmp.path()).unwrap();
+        let queue = Queue::at(tmp.path().join("queue"));
+        let questions = crate::ask::Questions::at(tmp.path().join("questions"));
+        let mut task = Task::new("t".into(), "fix typography".into(), repo, Source::Human);
+        task.start(state.id.clone());
+        dispatch_hold(&queue, &task).unwrap().apply(&mut task);
+        queue.put(&mut task).unwrap();
+        crate::conduct::apply(
+            &queue,
+            &questions,
+            &crate::conduct::Verdict {
+                decisions: vec![crate::conduct::Decision {
+                    id: task.id.clone(),
+                    blocked_by: Vec::new(),
+                    missing_dependencies: Vec::new(),
+                    reason: Some("Independent scope decision".into()),
+                    recovery: Some(crate::conduct::Recovery::Hold),
+                    question: Some("Should the scope include another component?".into()),
+                    choices: vec!["hold".into()],
+                    actions: Default::default(),
+                    question_decision: None,
+                    evidence: Vec::new(),
+                }],
+            },
+        )
+        .unwrap();
+        let blocked = queue.get(&task.id).unwrap();
+        assert_eq!(blocked.status, TaskStatus::Blocked);
+        let question = questions.get(&blocked.blocked_by[0]).unwrap();
+        assert!(question.status.open());
+        assert_eq!(
+            question.summary,
+            "Should the scope include another component?"
+        );
+    }
+
+    #[test]
     fn notice_semantics_unifies_run_ended_task_held_and_outcome_for_same_stop() {
         let tmp = tempfile::tempdir().unwrap();
         let (repo, wt, base, head) = init_repo_with_origin(tmp.path());
@@ -1035,6 +1084,30 @@ mod tests {
         assert_eq!(sem_run_while_running, sem_held);
         assert_eq!(sem_held, sem_run_after_hold);
         assert_eq!(sem_held, sem_outcome);
+
+        // A separate admission failure on the same retained run must not
+        // inherit the earlier E2E delivery receipt.
+        let mut disk_held = task.clone();
+        disk_held.release_operator("cli", None);
+        disk_held.hold_machine(Some("disk capacity unavailable".into()));
+        disk_held.mark_disk_capacity();
+        let disk_outcome = crate::notice_semantics::outcome(tmp.path(), &disk_held);
+        assert!(!crate::notice_semantics::covers(
+            &sem_outcome,
+            &disk_outcome
+        ));
+        let disk_notice = notices::task_held(&disk_held).unwrap();
+        let disk_attention = crate::notice_semantics::attention(
+            tmp.path(),
+            Some(&disk_held),
+            Some(&state.id),
+            &disk_notice,
+        )
+        .unwrap();
+        assert!(!crate::notice_semantics::covers(
+            &sem_outcome,
+            &disk_attention
+        ));
 
         // New pass reconsuming the same stop (and later held_at) still produces the same semantic receipt.
         state.begin_pass();

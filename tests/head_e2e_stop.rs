@@ -95,6 +95,8 @@ async fn conclusive_head_e2e_stop_holds_once_suppresses_automatic_retries_and_al
 
     // Create a review-only branch off main.
     git_sync(&fx.repo, &["checkout", "-b", "feat/typography"]);
+    git_sync(&fx.repo, &["commit", "--allow-empty", "-m", "intermediate base"]);
+    let intermediate = git_sync(&fx.repo, &["rev-parse", "HEAD"]);
     std::fs::write(fx.repo.join("typography.txt"), "initial typography\n").unwrap();
     git_sync(&fx.repo, &["add", "typography.txt"]);
     git_sync(&fx.repo, &["commit", "-m", "feat: typography"]);
@@ -293,6 +295,27 @@ async fn conclusive_head_e2e_stop_holds_once_suppresses_automatic_retries_and_al
     assert_eq!(t_no_reuse.status, TaskStatus::Held);
     assert_eq!(s_no_reuse.passes.len(), 2, "consumed owner approval was not reused");
     assert_eq!(count(&counter), 1);
+
+    // The new base is already an ancestor of the failed candidate. Sync
+    // consumes the movement without changing HEAD or the failure identity.
+    git_sync(&fx.repo, &["push", "origin", &format!("{intermediate}:main")]);
+    let report = triage::run_once(&queue, &questions, Some(&config_path), Timestamp::now());
+    assert_eq!(report.resumed, vec![task_id.clone()]);
+    run_serve_lap(serve_opts(&fx.repo, &config_path, &wt_root)).await;
+    let incorporated = RunState::load_under(&run_id, &home).unwrap();
+    assert_eq!(incorporated.base_sync.as_ref().unwrap().tip, intermediate);
+    assert_eq!(magi::head_e2e_stop::conclusive(&incorporated).unwrap().id, stop1.id);
+    let incorporated_task = queue.get(&task_id).unwrap();
+    assert_eq!(incorporated_task.status, TaskStatus::Held);
+    let reopened = Queue::at(home.join("queue"));
+    assert!(triage::run_once(&reopened, &questions, Some(&config_path), Timestamp::now()).resumed.is_empty());
+    run_serve_lap(serve_opts(&fx.repo, &config_path, &wt_root)).await;
+    assert_eq!(queue.get(&task_id).unwrap().passes.len(), incorporated_task.passes.len());
+    assert_eq!(count(&counter), 1);
+    magi::chat_notify::sweep(&queue, &talks, &home);
+    magi::notice_delivery::sweep(&queue, &talks, &home, &fx.repo);
+    assert_eq!(chat_notice_count(&talks, &chat.id), 1);
+    git_sync(&fx.repo, &["merge", "--ff-only", &intermediate]);
 
     // --- Changed remote base SHA + distinct new failure -> automatic recovery runs fresh E2E
     //     and delivers a second actionable chat notice for the distinct new stop.

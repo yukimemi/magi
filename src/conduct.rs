@@ -793,7 +793,8 @@ fn apply_one(
         return Ok(());
     }
 
-    if crate::head_e2e_stop::blocks_automatic_recovery(queue, &task)
+    if d.question.is_none()
+        && crate::head_e2e_stop::blocks_automatic_recovery(queue, &task)
         && (matches!(d.recovery, Some(Recovery::Requeue | Recovery::Review))
             || (task.status == TaskStatus::Held && d.recovery == Some(Recovery::Hold)))
     {

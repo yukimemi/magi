@@ -105,6 +105,11 @@ that hold eligible for synchronization again. Only the typed E2E hold is
 automatically released on changed evidence; unrelated machine holds retain
 their own recovery policy. Explicit `sync-base-only` requests for the retained
 run bypass the E2E dispatch hold without authorizing verification or delivery.
+If synchronization incorporates a changed base without changing the failed
+HEAD, the saved synchronization tip becomes the dispatch baseline. The original
+verification base and failure identity stay unchanged; that same base movement
+cannot repeatedly release the hold. Independent task holds and conductor
+questions retain their own notification and decision semantics.
 
 An already-integrated PR whose closure failed is a separate resumable checkpoint:
 resume rechecks integration and public ownership and retries closure without any

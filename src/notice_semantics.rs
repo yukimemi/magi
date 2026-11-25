@@ -43,6 +43,12 @@ fn active_head_e2e_stop_id(home: &Path, task: Option<&Task>, run: Option<&str>) 
     {
         return None;
     }
+    if let Some(t) = task
+        && t.status == crate::queue::TaskStatus::Held
+        && !t.has_head_e2e_cause()
+    {
+        return None;
+    }
     if let Some((_, Some(state))) = read_run_record(home, run) {
         return crate::head_e2e_stop::conclusive(&state).map(|stop| stop.id);
     }
