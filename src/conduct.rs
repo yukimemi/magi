@@ -793,6 +793,16 @@ fn apply_one(
         return Ok(());
     }
 
+    if d.question.is_none()
+        && crate::head_e2e_stop::blocks_automatic_recovery(queue, &task)
+        && (matches!(d.recovery, Some(Recovery::Requeue | Recovery::Review))
+            || (task.status == TaskStatus::Held && d.recovery == Some(Recovery::Hold)))
+    {
+        // Unchanged conclusive head_e2e red stays at its actionable machine hold
+        // until candidate HEAD, remote base, repair evidence, or the owner changes it.
+        return Ok(());
+    }
+
     // A claimed task may have deferred the pre-scheduling triage sweep.
     // Leave an open or answered-unapplied question to that sweep rather
     // than move the task out from under it.

@@ -909,6 +909,41 @@ pub struct GateRepairE2e {
     pub passed: bool,
     /// Last command results; empty before verification starts.
     pub outcomes: Vec<CommandOutcome>,
+    /// Observed remote base SHA (`<remote>/<base>`) when this verification ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_commit: Option<String>,
+    /// Verification history generation at the time this result was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<usize>,
+    /// Run pass index that actually executed this verification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pass: Option<usize>,
+    /// Event log length immediately after recording this verification failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recorded_events: Option<usize>,
+    /// Timestamp when this verification result was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recorded_at: Option<Timestamp>,
+    /// Owning task `resumption.generation` active when the recording pass began.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resumption_generation: Option<u64>,
+}
+
+impl GateRepairE2e {
+    /// Construct a verification record with only its core head/result fields populated.
+    pub fn new(head: String, passed: bool, outcomes: Vec<CommandOutcome>) -> Self {
+        Self {
+            head,
+            passed,
+            outcomes,
+            base_commit: None,
+            generation: None,
+            pass: None,
+            recorded_events: None,
+            recorded_at: None,
+            resumption_generation: None,
+        }
+    }
 }
 
 /// Superseded head-specific evidence; repair budgets remain on the run.
@@ -2658,6 +2693,12 @@ pub struct RunState {
     /// Stable stop identity and single-use owner authorizations, with prior evidence.
     #[serde(default)]
     pub base_sync_recovery: crate::base_sync_recovery::Recovery,
+    /// Single-use explicit owner approvals consumed against conclusive `head_e2e` stops.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub head_e2e_resumptions: Vec<crate::head_e2e_stop::Resumption>,
+    /// Owning task's `resumption.generation` when the current pass entered execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_resumption_generation: Option<u64>,
     /// Owner-requested base-only execution and its verification refusal.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sync_only_passes: Vec<crate::base_sync_only::Pass>,
@@ -2972,6 +3013,8 @@ impl RunState {
             bump_decision_attempts: Vec::new(),
             base_sync: None,
             base_sync_recovery: Default::default(),
+            head_e2e_resumptions: Vec::new(),
+            entry_resumption_generation: None,
             sync_only_passes: Vec::new(),
             advice: None,
             advise_attempted: false,

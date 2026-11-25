@@ -440,6 +440,9 @@ fn requeue(home: &Path, task: &Task) -> Result<()> {
             "the retained run is waiting on a landing or publication decision"
         );
         crate::repair_budget::owner_effects_settled(home, task, &state)?;
+        if let Some(reason) = crate::head_e2e_stop::standing_refusal(task, &state) {
+            bail!("{reason}");
+        }
     } else {
         ensure!(
             task.runs.is_empty()

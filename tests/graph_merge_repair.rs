@@ -621,11 +621,11 @@ async fn landing_cache_contention_refunds_attempt(e2e: bool, immediate_repair: b
             runner.state.gate_ran = false;
             runner.state.gate_head = None;
         } else {
-            runner.state.gate_repair_e2e = Some(magi::run::GateRepairE2e {
-                head: runner.state.land_approval.as_ref().unwrap().head.clone(),
-                passed: false,
-                outcomes: Vec::new(),
-            });
+            runner.state.gate_repair_e2e = Some(magi::run::GateRepairE2e::new(
+                runner.state.land_approval.as_ref().unwrap().head.clone(),
+                false,
+                Vec::new(),
+            ));
         }
     } else {
         runner.state.config.verify.gate = vec![command];

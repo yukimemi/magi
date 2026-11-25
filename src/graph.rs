@@ -8864,11 +8864,11 @@ impl Runner {
         let patch = git::diff(&winner.worktree, &base, "HEAD").await?;
         // Persist before invoking the fixer: it may commit and then be
         // interrupted before its result (or the following e2e) is saved.
-        self.state.gate_repair_e2e = Some(crate::run::GateRepairE2e {
-            head: before.clone(),
-            passed: false,
-            outcomes: Vec::new(),
-        });
+        self.state.gate_repair_e2e = Some(crate::run::GateRepairE2e::new(
+            before.clone(),
+            false,
+            Vec::new(),
+        ));
         self.state.save()?;
         let (_, seat, out) = self
             .ask_fixer(winner, "gate-fix", None, |spec, seat| SeatJob {
@@ -13192,11 +13192,19 @@ pub(crate) async fn verify_current_head(
         state.save()?;
         return Ok(false);
     }
-    state.head_e2e = Some(crate::run::GateRepairE2e {
-        head: head.clone(),
-        passed: false,
-        outcomes: Vec::new(),
-    });
+    // Bind the result to the base used by the candidate, not a tracking ref
+    // that the background fetch can advance independently of verification.
+    let base_commit = state
+        .base_sync
+        .as_ref()
+        .map(|s| s.tip.clone())
+        .filter(|tip| !tip.is_empty())
+        .or_else(|| (!state.base_commit.is_empty()).then(|| state.base_commit.clone()));
+    state.head_e2e = Some(crate::run::GateRepairE2e::new(
+        head.clone(),
+        false,
+        Vec::new(),
+    ));
     state.save()?;
     let commands = state.config.verify.e2e.clone();
     let shell = state.config.shell();
@@ -13238,11 +13246,16 @@ pub(crate) async fn verify_current_head(
     if !outcomes.is_empty() && !unresolved {
         state.record_base_progress(&head);
     }
-    state.head_e2e = Some(crate::run::GateRepairE2e {
-        head: head.clone(),
-        passed,
-        outcomes,
-    });
+    let generation = Some(state.verification_history.len());
+    let pass = state.passes.last().map(|p| p.index);
+    let recorded_at = Some(Timestamp::now());
+    let resumption_generation = state.entry_resumption_generation;
+    let mut record = crate::run::GateRepairE2e::new(head.clone(), passed, outcomes);
+    record.base_commit = base_commit;
+    record.generation = generation;
+    record.pass = pass;
+    record.recorded_at = recorded_at;
+    record.resumption_generation = resumption_generation;
     if !passed && !unresolved {
         let detail = state
             .head_e2e
@@ -13255,7 +13268,9 @@ pub(crate) async fn verify_current_head(
             "e2e",
             format!("verify.e2e failed on head {head}{detail}; nothing published"),
         );
+        record.recorded_events = Some(state.events.len());
     }
+    state.head_e2e = Some(record);
     state.save()?;
     Ok(passed)
 }
@@ -13285,11 +13300,11 @@ pub(crate) async fn check_gate_repair_e2e(
             return Ok(GateFix::Stop);
         }
     }
-    state.gate_repair_e2e = Some(crate::run::GateRepairE2e {
-        head: head.clone(),
-        passed: false,
-        outcomes: Vec::new(),
-    });
+    state.gate_repair_e2e = Some(crate::run::GateRepairE2e::new(
+        head.clone(),
+        false,
+        Vec::new(),
+    ));
     state.save()?;
     let commands = state.config.verify.e2e.clone();
     let outcomes = if commands.is_empty() {
@@ -13327,11 +13342,7 @@ pub(crate) async fn check_gate_repair_e2e(
     let deferred = verify_inconclusive(&outcomes);
     let passed = outcomes.iter().all(CommandOutcome::ok)
         && git::rev_parse(&winner.worktree, "HEAD").await? == head;
-    state.gate_repair_e2e = Some(crate::run::GateRepairE2e {
-        head,
-        passed,
-        outcomes,
-    });
+    state.gate_repair_e2e = Some(crate::run::GateRepairE2e::new(head, passed, outcomes));
     state.save()?;
     if deferred {
         Ok(GateFix::Defer)
@@ -19028,6 +19039,42 @@ esac
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn current_head_e2e_keeps_synchronized_base_when_tracking_ref_moves() {
+        let (_tmp, mut runner, _) = resumed_gate_fixture().await;
+        runner.sync_to_base().await.unwrap();
+        let winner = runner.state.winner().unwrap().clone();
+        let head = git::rev_parse(&winner.worktree, "HEAD").await.unwrap();
+        let base = runner.state.base_sync.as_ref().unwrap().tip.clone();
+        assert_ne!(head, base);
+        runner.state.config.verify.e2e = vec![format!(
+            "git update-ref refs/remotes/origin/main {head} && false"
+        )];
+        let wait = repository_wait(&runner.state, None);
+        assert!(
+            !verify_current_head(&mut runner.state, &winner, &wait)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            git::rev_parse(&runner.state.repo, "refs/remotes/origin/main")
+                .await
+                .unwrap(),
+            head
+        );
+        assert_eq!(
+            runner
+                .state
+                .head_e2e
+                .as_ref()
+                .unwrap()
+                .base_commit
+                .as_deref(),
+            Some(base.as_str())
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn resumed_gate_rebase_verifies_new_head_without_refilling_repairs() {
         for (e2e_ok, gate_ok) in [(true, true), (true, false), (false, true)] {
             let (tmp, mut runner, old) = resumed_gate_fixture().await;
@@ -19161,11 +19208,11 @@ esac
                 ..Default::default()
             }],
         ] {
-            runner.state.head_e2e = Some(crate::run::GateRepairE2e {
-                head: head.clone(),
-                passed: false,
+            runner.state.head_e2e = Some(crate::run::GateRepairE2e::new(
+                head.clone(),
+                false,
                 outcomes,
-            });
+            ));
             runner.state.gate_ran = false;
             runner.state.gate.clear();
             runner.state.save().unwrap();
@@ -19200,11 +19247,11 @@ esac
             let head = git::rev_parse(&runner.state.repo, "HEAD").await.unwrap();
             runner.state.reconcile_verification_head(&head);
             if waiting_on_gate {
-                runner.state.head_e2e = Some(crate::run::GateRepairE2e {
-                    head: head.clone(),
-                    passed: true,
-                    outcomes: Vec::new(),
-                });
+                runner.state.head_e2e = Some(crate::run::GateRepairE2e::new(
+                    head.clone(),
+                    true,
+                    Vec::new(),
+                ));
             }
             let cache = tmp.path().join("cache");
             runner.state.config.verify.e2e =
@@ -21482,11 +21529,11 @@ esac
         assert!(gate.iter().all(CommandOutcome::ok), "{gate:?}");
         // An interrupted repair must recheck e2e from saved state. Landing
         // reuses that state and must run both pre-gate and gate again.
-        runner.state.gate_repair_e2e = Some(crate::run::GateRepairE2e {
-            head: git::rev_parse(&repo, "HEAD").await.unwrap(),
-            passed: false,
-            outcomes: Vec::new(),
-        });
+        runner.state.gate_repair_e2e = Some(crate::run::GateRepairE2e::new(
+            git::rev_parse(&repo, "HEAD").await.unwrap(),
+            false,
+            Vec::new(),
+        ));
         runner.state.save().unwrap();
         let mut resumed = RunState::load(&runner.state.id).unwrap();
         let wait = crate::repo_lock::WaitPolicy::default();
