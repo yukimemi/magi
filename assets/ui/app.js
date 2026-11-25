@@ -6527,9 +6527,7 @@ function renderTalks() {
   const kind = searching
     ? renderSearchStatus("chats", $("talks-search-status"), "conversations", searchMatched.length)
     : (show($("talks-search-status"), false), "idle");
-  const visible = !searching ? unreadTalks
-    : kind === "error" ? []
-    : searchMatched;
+  const visible = kind === "error" ? [] : searchMatched;
 
   const open = talks.filter((t) => t.status === "open").length;
   const countText = talks.length === 0
