@@ -250,10 +250,9 @@ pub fn start(
     }
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP: no console to inherit,
-        // and the calling agent's terminal must not end supervision.
-        cmd.creation_flags(0x0000_0008 | 0x0000_0200);
+        // CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP: detach from the calling
+        // agent's terminal and give the supervisor its own hidden console.
+        crate::proc::configure_detached_hidden_console(&mut cmd, 0);
     }
     let mut supervisor = match cmd.spawn() {
         Ok(child) => child,
@@ -816,15 +815,15 @@ pub(crate) mod windows {
             UnlockFileEx(file, 0, 1, 0, &mut overlapped);
         }
     }
-    /// Detach from the console and request breakaway only when the host allows
-    /// it. An external ancestor job can still contain and terminate workers.
-    pub(crate) fn detached_flags() -> std::io::Result<u32> {
+    /// Request job breakaway only when the host allows it. An external
+    /// ancestor job can still contain and terminate workers.
+    pub(crate) fn detached_breakaway_flags() -> std::io::Result<u32> {
         let mut in_job = 0;
         if unsafe { IsProcessInJob(GetCurrentProcess(), std::ptr::null_mut(), &mut in_job) } == 0 {
             return Err(std::io::Error::last_os_error());
         }
         if in_job == 0 {
-            return Ok(0x0000_0008 | 0x0000_0200);
+            return Ok(0);
         }
         let mut limits = BasicLimits::default();
         if unsafe {
@@ -839,16 +838,15 @@ pub(crate) mod windows {
         {
             return Err(std::io::Error::last_os_error());
         }
-        let detached = 0x0000_0008 | 0x0000_0200;
         if limits.flags & 0x1000 != 0 {
-            return Ok(detached);
+            return Ok(0);
         } // SILENT_BREAKAWAY_OK
         if limits.flags & 0x0800 != 0 {
-            return Ok(detached | 0x0100_0000);
+            return Ok(0x0100_0000);
         } // BREAKAWAY_OK
         // Inheriting an external job does not tie a child to this launcher's
         // lifetime. Do not reject nested launches or bypass that job's limits.
-        Ok(detached)
+        Ok(0)
     }
 
     pub struct Containment(Handle);

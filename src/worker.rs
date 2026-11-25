@@ -1003,12 +1003,10 @@ fn detached_command(home: &Path, job: &Job, generation: &Generation) -> Result<C
     }
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
         detached_standard_handles().context("exclude caller pipes from detached worker")?;
-        command.creation_flags(
-            crate::chat_watch::windows::detached_flags()
-                .context("prepare independent Windows worker")?,
-        );
+        let breakaway = crate::chat_watch::windows::detached_breakaway_flags()
+            .context("prepare independent Windows worker")?;
+        crate::proc::configure_detached_hidden_console(&mut command, breakaway);
     }
     Ok(command)
 }

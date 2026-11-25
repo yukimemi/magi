@@ -1358,6 +1358,13 @@ fn main() -> Result<std::process::ExitCode> {
                 .context(magi::incremental::BLOCKED)?,
         );
     }
+    #[cfg(windows)]
+    {
+        let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+        if should_init_hidden_console(&args) {
+            magi::proc::init_hidden_console();
+        }
+    }
     std::thread::Builder::new()
         .stack_size(STACK_SIZE)
         .spawn(run)
@@ -1365,6 +1372,17 @@ fn main() -> Result<std::process::ExitCode> {
         .join()
         .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
         .map(|()| std::process::ExitCode::SUCCESS)
+}
+
+/// Skip hidden-console setup for trivial help/version invocations so a detached
+/// `--version` probe never allocates a console host it will not reuse.
+#[cfg(any(windows, test))]
+fn should_init_hidden_console(args: &[std::ffi::OsString]) -> bool {
+    !args
+        .iter()
+        .skip(1)
+        .take_while(|a| *a != "--")
+        .any(|a| a == "-h" || a == "--help" || a == "-V" || a == "--version")
 }
 
 /// Build the async runtime and run the CLI on it. Kept separate from `main`
@@ -9227,5 +9245,27 @@ command = ['sh', '-c', 'cat >/dev/null; printf "%s" "{\"duplicate\":true,\"reaso
             "prefix/suffix resolution succeeds"
         );
         assert!(!dir_unfd.exists(), "run directory is removed");
+    }
+
+    #[test]
+    fn should_init_hidden_console_skips_help_and_version_flags() {
+        let os = |items: &[&str]| -> Vec<std::ffi::OsString> {
+            items.iter().map(std::ffi::OsString::from).collect()
+        };
+        assert!(!should_init_hidden_console(&os(&["magi", "--version"])));
+        assert!(!should_init_hidden_console(&os(&["magi", "-V"])));
+        assert!(!should_init_hidden_console(&os(&["magi", "--help"])));
+        assert!(!should_init_hidden_console(&os(&["magi", "web", "-h"])));
+        assert!(should_init_hidden_console(&os(&["magi", "web"])));
+        assert!(should_init_hidden_console(&os(&[
+            "magi", "__worker", "--home", "h", "id"
+        ])));
+        assert!(should_init_hidden_console(&os(&["magi", "serve"])));
+        assert!(should_init_hidden_console(&os(&[
+            "magi",
+            "run",
+            "--",
+            "--version"
+        ])));
     }
 }

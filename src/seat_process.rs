@@ -117,7 +117,7 @@ impl Running {
         };
         #[cfg(windows)]
         if isolated {
-            command.creation_flags(0x0800_0004); // CREATE_NO_WINDOW | CREATE_SUSPENDED
+            crate::proc::apply_isolated_child_flags(&mut command);
         }
         #[cfg(not(windows))]
         let _ = isolated;

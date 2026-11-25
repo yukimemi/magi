@@ -1900,10 +1900,11 @@ fn spawn_successor(home: &FsPath, port: u16, exe: &FsPath) -> Result<u32> {
         .stderr(err);
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt as _;
-        // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP: no console to inherit,
-        // and Ctrl-C in the old terminal must not reach the successor.
-        cmd.creation_flags(0x0000_0008 | 0x0000_0200);
+        // CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP: detach from the old
+        // terminal and give the successor one private hidden console for its
+        // lifetime so its children inherit it without spawning conhost.exe per
+        // child.
+        crate::proc::configure_detached_hidden_console(&mut cmd, 0);
     }
     let child = cmd.spawn().context("start the successor")?;
     Ok(child.id())
@@ -2003,11 +2004,13 @@ pub async fn serve(opts: Opts) -> Result<()> {
     let mut served = tokio::spawn(axum::serve(listener, ui.shared_router()).into_future());
     let recheck = tokio::spawn(run_update_recheck(recheck_ui));
     let interrupted = async {
-        if tokio::signal::ctrl_c().await.is_err() {
-            // No handler on this platform, so there is no signal to act on.
-            // Never resolving is the safe answer: a failed registration must
-            // not masquerade as the operator asking for a shutdown and take
-            // the UI down on startup.
+        if crate::proc::using_shared_hidden_console() || tokio::signal::ctrl_c().await.is_err() {
+            // Either this detached process shares a hidden console with its
+            // children (so console Ctrl-C cannot come from an operator terminal
+            // and must not let a child's broadcast shut down the UI), or no
+            // handler exists on this platform. Never resolving is the safe
+            // answer: a failed registration must not masquerade as the operator
+            // asking for a shutdown and take the UI down on startup.
             std::future::pending::<()>().await;
         }
     };
