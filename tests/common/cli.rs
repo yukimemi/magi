@@ -6,7 +6,7 @@ use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest as _, Sha256};
 
@@ -28,9 +28,6 @@ pub(super) const SEAT_ENV: [&str; 3] = ["MAGI_RUN", "MAGI_NODE", "MAGI_SEAT"];
 pub(super) const WORKER_ENV: [&str; 4] = magi::worker::INVOCATION_ENV;
 
 const PIN_DIR_NAME: &str = "magi-test-cli";
-const MAX_RETAINED_PINS: usize = 8;
-const PIN_RECLAIM_AGE: Duration = Duration::from_secs(60 * 60);
-const STAGING_RECLAIM_AGE: Duration = Duration::from_secs(10 * 60);
 
 static STAGING_NONCE: AtomicU64 = AtomicU64::new(0);
 
@@ -334,7 +331,6 @@ pub(super) fn pin_executable(source: &Path, pin_root: &Path) -> Result<PathBuf, 
                 existing_exe.display()
             ));
         }
-        touch_used(&existing_dir);
         return Ok(existing_exe);
     }
 
@@ -410,11 +406,9 @@ pub(super) fn pin_executable(source: &Path, pin_root: &Path) -> Result<PathBuf, 
     let final_dir = pin_root.join(&copied_digest);
     let final_exe = final_dir.join(&bin_name);
     match std::fs::rename(&staging_dir, &final_dir) {
-        Ok(()) => {
-            touch_used(&final_dir);
-            reclaim_stale_pins(pin_root, &copied_digest);
-            Ok(final_exe)
-        }
+        // Fixtures retain these paths for their entire process lifetime, including
+        // gaps between child launches. Only external cache maintenance may prune them.
+        Ok(()) => Ok(final_exe),
         Err(rename_err) => {
             remove_tree_best_effort(&staging_dir);
             if final_exe.is_file() {
@@ -427,7 +421,6 @@ pub(super) fn pin_executable(source: &Path, pin_root: &Path) -> Result<PathBuf, 
                         final_exe.display()
                     ));
                 }
-                touch_used(&final_dir);
                 return Ok(final_exe);
             }
             Err(format!(
@@ -498,58 +491,6 @@ fn hex_digest(hasher: Sha256) -> String {
         let _ = write!(out, "{byte:02x}");
     }
     out
-}
-
-fn touch_used(dir: &Path) {
-    let _ = std::fs::write(dir.join(".used"), b"");
-}
-
-fn reclaim_stale_pins(pin_root: &Path, keep_digest: &str) {
-    let now = SystemTime::now();
-    let Ok(entries) = std::fs::read_dir(pin_root) else {
-        return;
-    };
-    let mut generations = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = entry.file_name();
-        let Some(name_str) = name.to_str() else {
-            continue;
-        };
-        if name_str.starts_with(".staging-") {
-            let stale = std::fs::metadata(&path)
-                .and_then(|meta| meta.modified())
-                .ok()
-                .and_then(|mtime| now.duration_since(mtime).ok())
-                .is_some_and(|age| age > STAGING_RECLAIM_AGE);
-            if stale {
-                remove_tree_best_effort(&path);
-            }
-            continue;
-        }
-        if name_str == keep_digest
-            || name_str.len() != 64
-            || !name_str.bytes().all(|b| b.is_ascii_hexdigit())
-        {
-            continue;
-        }
-        let last_used = std::fs::metadata(path.join(".used"))
-            .or_else(|_| std::fs::metadata(&path))
-            .and_then(|meta| meta.modified())
-            .unwrap_or(now);
-        generations.push((last_used, path));
-    }
-    // Keep the most recently used generations and anything still within the
-    // grace window so concurrent test processes and derived workers stay safe.
-    generations.sort_by_key(|a| std::cmp::Reverse(a.0));
-    for (last_used, path) in generations.into_iter().skip(MAX_RETAINED_PINS) {
-        if now
-            .duration_since(last_used)
-            .is_ok_and(|age| age > PIN_RECLAIM_AGE)
-        {
-            remove_tree_best_effort(&path);
-        }
-    }
 }
 
 fn remove_tree_best_effort(dir: &Path) {

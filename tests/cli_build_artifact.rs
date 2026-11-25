@@ -472,6 +472,27 @@ fn concurrent_pinning_reuses_one_content_addressed_copy_without_staging_leaks() 
 }
 
 #[test]
+fn old_pin_survives_other_generations_between_child_launches() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pin_root = tmp.path().join("pins");
+    let source = tmp.path().join("source");
+    std::fs::write(&source, b"original generation").unwrap();
+    let original = cli::pin_executable(&source, &pin_root).unwrap();
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+    let generation = original.parent().unwrap();
+    // Age the legacy usage marker without sleeping.
+    let marker = std::fs::File::create(generation.join(".used")).unwrap();
+    marker.set_modified(old).unwrap();
+    drop(marker);
+
+    for n in 0..10 {
+        std::fs::write(&source, format!("other generation {n}")).unwrap();
+        cli::pin_executable(&source, &pin_root).unwrap();
+    }
+    assert_eq!(std::fs::read(original).unwrap(), b"original generation");
+}
+
+#[test]
 fn build_identity_mismatch_refuses_cli_before_mutating_private_queue() {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("magi-home");
