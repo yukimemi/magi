@@ -1497,7 +1497,7 @@ impl Runner {
             &format!("{}/{}", state.config.merge.remote, state.base_branch),
         )
         .await?;
-        let preparation_digest = state.preparation_digest(&head, &approved_tip);
+        let preparation_digest = state.preparation_digest(&head);
         anyhow::ensure!(
             preparation
                 || (terminal_digest.is_none()
@@ -1530,7 +1530,13 @@ impl Runner {
                 git::is_ancestor(&state.repo, &stop.tip, &approved_tip).await,
                 "current base does not descend from the stopped base"
             );
-            git::probe_rebase_preparation(&state, &head, &home.join("runs").join(id)).await?;
+            git::probe_rebase_preparation(
+                &state,
+                &head,
+                &home.join("runs").join(id),
+                &repository_wait(&state, None),
+            )
+            .await?;
         }
         if let Some(control) = control.as_deref_mut() {
             let queue = crate::queue::Queue::at(home.join("queue"));
@@ -6010,7 +6016,7 @@ impl Runner {
             } else if authorization.stop.kind == crate::base_sync_recovery::StopKind::Unknown
                 && !authorization.scope.as_ref().is_some_and(|scope| {
                     scope.preparation_digest.is_some()
-                        && scope.preparation_digest == self.state.preparation_digest(&head, &tip)
+                        && scope.preparation_digest == self.state.preparation_digest(&head)
                 })
             {
                 Some("scratch preparation stop evidence changed")
@@ -6054,20 +6060,8 @@ impl Runner {
             {
                 return Ok(());
             }
-            if authorization.stop.kind == crate::base_sync_recovery::StopKind::Unknown
-                && let Err(error) =
-                    git::probe_rebase_preparation(&self.state, &head, &self.state.dir()).await
-            {
-                self.state
-                    .base_sync_recovery
-                    .authorizations
-                    .last_mut()
-                    .unwrap()
-                    .refuse(format!(
-                        "preparation proof failed: {error:#}; inspect and authorize again"
-                    ));
-                self.state.save()?;
-                return Ok(());
+            if authorization.stop.kind == crate::base_sync_recovery::StopKind::Unknown {
+                git::check_rebase_preparation(&self.state, &head, &self.state.dir()).await?;
             }
         }
         let recovery = conflicted && self.state.consume_base_recovery(&head);
@@ -18515,11 +18509,7 @@ esac
         state.event("land", detail);
         state.record_base_sync_stop_as(&head, Some(crate::base_sync_recovery::StopKind::Unknown));
         assert!(state.unknown_preparation_stop(&head));
-        let digest = state.preparation_digest(&head, &tip).unwrap();
-        assert_ne!(
-            state.preparation_digest(&head, "different").unwrap(),
-            digest
-        );
+        let digest = state.preparation_digest(&head).unwrap();
         state
             .base_sync_recovery
             .operations
@@ -18567,6 +18557,15 @@ esac
                 .is_err()
         );
         std::fs::remove_dir(&scratch).unwrap();
+        git::git(&state.repo, &["checkout", "main"]).await.unwrap();
+        git::git(
+            &state.repo,
+            &["commit", "--allow-empty", "-m", "base advanced after inspection"],
+        )
+        .await
+        .unwrap();
+        git::git(&state.repo, &["push", "origin", "main"]).await.unwrap();
+        git::git(&state.repo, &["checkout", "fix/retained"]).await.unwrap();
         let outcome = crate::base_recovery_control::recover(&queue, &home, request.clone())
             .await
             .unwrap();

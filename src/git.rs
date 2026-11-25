@@ -1283,16 +1283,20 @@ pub(crate) async fn probe_rebase_preparation(
     state: &crate::run::RunState,
     head: &str,
     dir: &Path,
+    wait: &crate::repo_lock::WaitPolicy,
 ) -> Result<()> {
-    let wait = crate::repo_lock::WaitPolicy::current();
     let _lease = crate::repo_lock::SeatLease::operation_with(
         &state.repo,
         state.config.coordination.as_ref(),
-        &wait,
+        wait,
     )
     .await?;
     check_rebase_preparation(state, head, dir).await?;
-    let scratch = dir.join("base-preparation-probe");
+    let scratch = dir.join(format!(
+        "base-sync-probe-{}-{:016x}",
+        std::process::id(),
+        crate::rng::entropy()
+    ));
     ensure!(
         !scratch.try_exists()?,
         "previous preparation probe requires inspection"

@@ -437,7 +437,7 @@ pub async fn inspect(
         result["next_step"] = "Compare the stop diagnostic and timestamp with the saved land event; inspect the finished operation, unchanged winner HEAD, stopped base tip and remaining episode budget. Only the exact Windows magi-rebase-heads spawn error (os error 267) is supported. Preserve the run and scratch; do not clear the stop or start a new competition.".into();
     }
     if assessment.class == Class::RecoverableUnknown {
-        let digest = state.preparation_digest(&head, &tip).unwrap();
+        let digest = state.preparation_digest(&head).unwrap();
         result["evidence_digest"] = digest.clone().into();
         let checks = async {
             ensure!(task.assignment_accepts(&state), "task assignment changed");

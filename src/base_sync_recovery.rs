@@ -595,7 +595,7 @@ impl RunState {
             && self.rebase_fixes.is_empty()
     }
 
-    pub(crate) fn preparation_digest(&self, head: &str, tip: &str) -> Option<String> {
+    pub(crate) fn preparation_digest(&self, head: &str) -> Option<String> {
         use sha2::{Digest, Sha256};
         self.unknown_preparation_stop(head).then(|| {
             let evidence = serde_json::json!({
@@ -605,7 +605,8 @@ impl RunState {
                 "sync": self.base_sync,
                 "episodes": self.base_sync_recovery.episodes,
                 "operations": self.base_sync_recovery.operations,
-                "tip": tip,
+                "task": self.origin.as_ref().and_then(|o| o.task.as_ref()),
+                "branch": self.winner().map(|w| &w.branch),
             });
             Sha256::digest(evidence.to_string())
                 .iter()
@@ -700,7 +701,7 @@ impl RunState {
                 a.stop.kind != StopKind::Unknown
                     || a.scope.as_ref().is_some_and(|scope| {
                         scope.preparation_digest.is_some()
-                            && scope.preparation_digest == self.preparation_digest(head, &scope.tip)
+                            && scope.preparation_digest == self.preparation_digest(head)
                     })
             });
         let a = self.base_sync_recovery.authorizations.last_mut().unwrap();

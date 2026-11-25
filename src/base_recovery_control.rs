@@ -64,6 +64,14 @@ pub(crate) async fn recover(queue: &Queue, home: &Path, request: Request) -> Res
             && request.head.bytes().all(|c| c.is_ascii_hexdigit()),
         "recovery needs a retained HEAD SHA or prefix of 7 to 40 hex digits"
     );
+    if let Some(digest) = &request.evidence_digest {
+        ensure!(
+            digest.len() == 64
+                && digest.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+            "preparation evidence must be a lowercase SHA-256 digest"
+        );
+        ensure!(request.head.len() == 40, "preparation recovery needs a full HEAD");
+    }
     let dir = home.join("base-recovery-controls").join(&request.actor);
     std::fs::create_dir_all(&dir)?;
     let lock = std::fs::OpenOptions::new()
@@ -179,7 +187,10 @@ impl Transaction {
                 "recovery decision names a stale stop or interval"
             );
         }
-        let binding = serde_json::json!({"task": task, "stop": state.base_sync_recovery.stop, "tip": tip, "episode": state.base_sync_recovery.episodes.last().map(|e| e.id)});
+        let mut binding = serde_json::json!({"task": task, "stop": state.base_sync_recovery.stop, "tip": tip, "episode": state.base_sync_recovery.episodes.last().map(|e| e.id)});
+        if let Some(digest) = &self.request.evidence_digest {
+            binding["evidence_digest"] = digest.clone().into();
+        }
         if let Some(receipt) = &self.receipt {
             ensure!(
                 receipt.binding == binding,
