@@ -13245,7 +13245,11 @@ pub(crate) async fn check_gate_repair_e2e(
         if record.passed {
             return Ok(GateFix::Retry);
         }
-        if !record.outcomes.is_empty() && !verify_inconclusive(&record.outcomes) {
+        if !record.outcomes.is_empty()
+            && record.outcomes.iter().all(|o| {
+                !o.resource_blocked && matches!(o.code, Some(code) if code != 126 && code != 127)
+            })
+        {
             return Ok(GateFix::Stop);
         }
     }

@@ -1961,7 +1961,9 @@ rerun).
   distinguish matching, distinct and unknown terminal failures; retry attempts,
   flaky passes and captured output are not final verdicts. Matching requires
   confirmed test binary identities. Completed red checks, including post-repair
-  checks, are reused on the same SHA rather than rerun on resume.
+  checks, are reused on the same SHA rather than rerun on resume. A post-repair
+  check interrupted by a timeout, launch failure or resource wait remains
+  retryable on resume.
 - **The second run passes:** the head is verified, but the failure is recorded
   as a flake — a `verify` event, `RunState::verify_flakes`, a "flaky
   verification" section in `magi show` and on the web run page, and the round

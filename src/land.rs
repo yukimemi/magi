@@ -7949,6 +7949,34 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         }
     }
 
+    #[tokio::test]
+    async fn landing_resumes_recheck_abnormal_repair_e2e_exit() {
+        for code in [None, Some(126), Some(127)] {
+            let (_tmp, mut state, old) = landing_git_fixture().await;
+            advance_landing_base(&state).await;
+            let head = resume_observed_head(&mut state, &old).await.unwrap();
+            state.land_sync_pending = true;
+            state.config.verify.e2e = vec!["true".into()];
+            state.gate_repair_e2e = Some(crate::run::GateRepairE2e {
+                head: head.clone(),
+                passed: false,
+                outcomes: vec![crate::run::CommandOutcome {
+                    command: state.config.verify.e2e[0].clone(),
+                    code,
+                    output_tail: "verification command did not complete".into(),
+                    ..Default::default()
+                }],
+            });
+            state.save().unwrap();
+            state = RunState::load(&state.id).unwrap();
+            assert_eq!(resume_observed_head(&mut state, &head).await.unwrap(), head);
+            let evidence = state.gate_repair_e2e.as_ref().unwrap();
+            assert_eq!(evidence.head, head);
+            assert!(evidence.passed);
+            assert_eq!(evidence.outcomes[0].code, Some(0));
+        }
+    }
+
     async fn interrupt_landing_rebase(state: &mut RunState) {
         state.land_rebase_from = Some(git::rev_parse(&state.repo, "HEAD").await.unwrap());
         state.save().unwrap();
