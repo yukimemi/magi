@@ -599,6 +599,18 @@ impl Drop for FixClaim {
     }
 }
 
+#[doc(hidden)]
+pub struct ExecutionLeaseGuard {
+    _lease: crate::driver::ExecutionLease,
+}
+
+#[doc(hidden)]
+pub fn hold_execution_lease_for_test(home: &Path, run_id: &str) -> Result<ExecutionLeaseGuard> {
+    Ok(ExecutionLeaseGuard {
+        _lease: crate::driver::maintenance(home, run_id)?,
+    })
+}
+
 /// Holds the mutable runner as well as its durable lease: cancellation must
 /// clear both copies of ownership, including state a caller may save later.
 struct DriverExecution<'a> {
@@ -19383,6 +19395,139 @@ esac
             pause: Pause::new(),
             interrupt: Pause::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn targeted_fix_refuses_independent_ownership_conflicts() {
+        crate::run::pin_test_home();
+        let home = crate::run::home();
+        let mut runner = runner_at(RunStatus::Ready);
+        runner.state.driver_exited = true;
+        runner.state.save().unwrap();
+        let id = runner.state.id.clone();
+        let path = runner.state.dir().join("run.json");
+        let ids = ["R1-1-1".into()];
+        let lease = crate::driver::maintenance(&home, &id).unwrap();
+        for (guard, expected) in [
+            (Some(lease), "currently being worked on"),
+            (None, "ownership is being updated"),
+        ] {
+            let owner = if guard.is_none() {
+                Some(crate::pr_head::owner_lock(&home, &id).unwrap())
+            } else {
+                None
+            };
+            let before = std::fs::read(&path).unwrap();
+            let err = runner
+                .fix_selected(&ids, "ownership conflict", false)
+                .await
+                .unwrap_err();
+            assert!(format!("{err:#}").contains(expected), "{err:#}");
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            assert!(!runner.state.dir().join("fix.lock").exists());
+            drop(owner);
+            drop(guard);
+        }
+        let mut disk = RunState::load(&id).unwrap();
+        disk.driver_exited = false;
+        disk.driver_pid = Some(std::process::id());
+        disk.driver_started_at = Some(crate::proc::process_started_at(std::process::id()).unwrap());
+        disk.save().unwrap();
+        assert_eq!(
+            disk.liveness_under(&home, false),
+            crate::run::Liveness::Live
+        );
+        let before = std::fs::read(&path).unwrap();
+        let err = runner
+            .fix_selected(&ids, "live driver", false)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("currently being worked on"),
+            "{err:#}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(!runner.state.dir().join("fix.lock").exists());
+        disk.driver_exited = true;
+        disk.driver_pid = None;
+        disk.driver_started_at = None;
+        disk.status = RunStatus::Reviewing;
+        disk.save().unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let err = runner
+            .fix_selected(&ids, "stale state", false)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("run changed since it was loaded"),
+            "{err:#}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(!runner.state.dir().join("fix.lock").exists());
+        assert!(runner.state.operator_fixes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn targeted_fix_preflight_releases_owner_and_cancellation_releases_claims() {
+        use std::future::Future;
+        use std::task::Poll;
+
+        crate::run::pin_test_home();
+        let home = crate::run::home();
+        let repo = tempfile::tempdir().unwrap();
+        let mut runner = runner_at(RunStatus::Ready);
+        runner.state.repo = repo.path().to_path_buf();
+        runner.state.driver_exited = true;
+        runner.state.candidates.push(Candidate {
+            index: 0,
+            label: 'A',
+            agent: "mock".into(),
+            branch: "magi/test/A".into(),
+            worktree: repo.path().join("wt"),
+            summary: String::new(),
+            stat: String::new(),
+            files: 0,
+            commits: 0,
+            empty: false,
+            failed: None,
+            verified_noop: None,
+            duration_ms: 0,
+            folded: false,
+        });
+        runner.state.tally = Some(Tally {
+            first_choice: BTreeMap::from([('A', 1)]),
+            borda: BTreeMap::new(),
+            winner: 'A',
+            rankings: 1,
+            unanimous_initial: true,
+            deliberated: false,
+            changed_votes: 0,
+            unanimous_final: true,
+            tie_break: None,
+            judges: 1,
+            present: 1,
+            quorum: 1,
+            met_quorum: true,
+            uncontested: None,
+        });
+        runner.state.save().unwrap();
+        let id = runner.state.id.clone();
+        let dir = runner.state.dir();
+        let before = std::fs::read(dir.join("run.json")).unwrap();
+        let ids = ["R1-1-1".into()];
+        let mut fix = Box::pin(runner.fix_selected(&ids, "preflight lock check", false));
+        std::future::poll_fn(|cx| match fix.as_mut().poll(cx) {
+            Poll::Pending => Poll::Ready(()),
+            Poll::Ready(result) => panic!("preflight completed without yielding: {result:?}"),
+        })
+        .await;
+        assert!(FixClaim::acquire(&dir).is_err());
+        assert!(crate::driver::maintenance(&home, &id).is_err());
+        drop(crate::pr_head::owner_lock(&home, &id).unwrap());
+        drop(fix);
+        assert!(FixClaim::acquire(&dir).is_ok());
+        assert!(crate::driver::maintenance(&home, &id).is_ok());
+        assert_eq!(std::fs::read(dir.join("run.json")).unwrap(), before);
     }
 
     #[tokio::test]

@@ -892,18 +892,33 @@ pub(crate) fn running_fixture(
     key: &str,
     payload: serde_json::Value,
 ) -> Result<(Job, Lease)> {
-    let generation = Generation {
-        id: "a".repeat(64),
-        executable: PathBuf::from("unused"),
-    };
-    let (mut job, created) = reserve(home, &generation, "task", key, payload)?;
-    anyhow::ensure!(created, "fixture reservation already exists");
-    let dir = job_dir(home, &job.id)?;
-    let lease = try_lock(&dir.join("live.lock"))?.context("fixture lease unavailable")?;
-    job.status = Status::Running;
-    job.pid = Some(std::process::id());
-    save(&dir.join("job.json"), &job)?;
-    Ok((job, lease))
+    let _store = store_lock(home)?;
+    let id = nonce();
+    let dir = job_dir(home, &id)?;
+    std::fs::create_dir_all(&dir)?;
+    let result = (|| {
+        let lease = try_lock(&dir.join("live.lock"))?.context("fixture lease unavailable")?;
+        let job = Job {
+            id,
+            sequence: next_sequence(home)?,
+            kind: "task".into(),
+            key: key.into(),
+            payload,
+            generation: "a".repeat(64),
+            version: None,
+            status: Status::Running,
+            result: None,
+            pid: Some(std::process::id()),
+            created_at: now(),
+            finished_at: None,
+        };
+        save(&dir.join("job.json"), &job)?;
+        Ok((job, lease))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    result
 }
 
 fn prune_results(home: &Path) -> Result<()> {
