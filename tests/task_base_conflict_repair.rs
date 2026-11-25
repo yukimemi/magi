@@ -149,6 +149,7 @@ fn grant_output(request: &Request) -> std::process::Output {
             Kind::BaseConflict => "base-conflict",
             Kind::Gate => "gate",
             Kind::Review => "review",
+            Kind::Verify => "verify",
         },
         "--rounds",
         &request.rounds.to_string(),

@@ -8931,6 +8931,14 @@ impl Runner {
     /// commits any leftover change under the neutral identity and returns
     /// `false` when the tree is clean, so no empty commit is ever made.
     async fn run_pre_gate(state: &mut RunState, winner: &Candidate) {
+        // Verification-only recovery authorizes the retained SHA, not a
+        // mechanical rewrite. Also applies to catch-up and the final gate.
+        if state.repair_grants.last().is_some_and(|g| {
+            g.receipt.request.kind == crate::repair_budget::Kind::Verify
+                && g.phase != crate::repair_budget::Phase::Complete
+        }) {
+            return;
+        }
         let commands = state.config.verify.pre_gate.clone();
         if commands.is_empty() {
             return;

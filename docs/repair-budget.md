@@ -51,6 +51,9 @@ erased. Only a clean fresh review and E2E on that head continue to the fresh
 gate and the normal publication/approval path; a new failure or finding ends
 the grant `Blocked` and consumed. Standing chats cannot grant it, and it is
 distinct from `review` (exhausted budget) and post-gate-repair E2E recovery.
+The mechanical `verify.pre_gate` commands are not run during this grant,
+including its final gate, because they may commit changes to the authorized
+head. Mandatory E2E and `verify.gate` still run.
 
 The terminal command prints a JSON receipt. Authorized standing chats use
 `magi task control grant-repair` with the same arguments and the existing

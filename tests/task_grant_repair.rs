@@ -1131,6 +1131,7 @@ async fn verify_grant_runs_fresh_e2e_and_gate_on_the_unchanged_head() {
     let before = runner.state.reviews.clone();
     runner.state.config.verify.e2e = vec!["true".into()];
     runner.state.config.verify.gate = vec!["true".into()];
+    runner.state.config.verify.pre_gate = vec!["echo mechanical rewrite >> note.txt".into()];
     for agent in &mut runner.state.config.agents {
         agent.env.remove("MOCK_FINDING");
     }
@@ -1150,6 +1151,9 @@ async fn verify_grant_runs_fresh_e2e_and_gate_on_the_unchanged_head() {
     assert_eq!(last.e2e_status(), magi::run::E2eStatus::Passed);
     assert_eq!(runner.state.gate_head.as_deref(), Some(request.head.as_str()));
     assert!(runner.state.gate_allows_progress());
+    let worktree = &runner.state.winner().unwrap().worktree;
+    assert_eq!(magi::git::rev_parse(worktree, "HEAD").await.unwrap(), request.head);
+    assert!(magi::git::is_clean(worktree).await.unwrap());
     let mut again = Runner::resume(&request.run).unwrap();
     again.execute().await.unwrap();
     assert_eq!(again.state.repair_grants[0].spent, 1);
