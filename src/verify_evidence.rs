@@ -368,6 +368,17 @@ fn extract_line_streams(
         nextest_total.merge(nx);
     }
 
+    // Cargo writes binary announcements and libtest verdicts to different pipes.
+    // Without interleaving information, only a single announcement and a single
+    // libtest run can be associated unambiguously.
+    if libtest_total.runs == 1 && libtest_total.suites == 1 {
+        for failure in &mut libtest_total.failures {
+            if failure.suite.is_none() {
+                failure.suite.clone_from(&libtest_total.only_suite);
+            }
+        }
+    }
+
     let extraction = if code.is_none() {
         FailureExtraction::Unknown {
             reason: "command timed out or terminated without an exit code".to_owned(),
@@ -455,7 +466,11 @@ pub fn compare_attempts(
             FailureExtraction::Confirmed { failures: f1 },
             FailureExtraction::Confirmed { failures: f2 },
         ) if !f1.is_empty() && !f2.is_empty() => {
-            if f1 == f2 {
+            if f1.iter().chain(f2).any(|f| f.suite.is_none()) {
+                ComparisonVerdict::Unknown {
+                    reason: "terminal failure has no confirmed test binary".to_owned(),
+                }
+            } else if f1 == f2 {
                 ComparisonVerdict::Matching {
                     failures: f1.clone(),
                 }
@@ -505,6 +520,9 @@ pub fn compare_attempts(
 
 #[derive(Default)]
 struct LibtestSummary {
+    runs: usize,
+    suites: usize,
+    only_suite: Option<String>,
     failed_runs: usize,
     expected_failures: usize,
     failures: Vec<TerminalFailure>,
@@ -515,6 +533,11 @@ struct LibtestSummary {
 
 impl LibtestSummary {
     fn merge(&mut self, other: Self) {
+        self.runs += other.runs;
+        self.suites += other.suites;
+        if other.only_suite.is_some() {
+            self.only_suite = other.only_suite;
+        }
         self.failed_runs += other.failed_runs;
         self.expected_failures += other.expected_failures;
         self.failures.extend(other.failures);
@@ -560,6 +583,7 @@ fn parse_libtest_stream(
     let mut active: Option<ActiveLibtest> = None;
     let mut standalone_collecting = false;
     let mut standalone_list: Vec<String> = Vec::new();
+    let mut nextest_captured = false;
 
     let commit_active = |run: ActiveLibtest,
                          summary: &mut LibtestSummary,
@@ -600,6 +624,20 @@ fn parse_libtest_stream(
             commit_active(finished, &mut summary, &mut captured_ranges);
         }
 
+        if active.is_none() {
+            if is_nextest_captured_header(trimmed) {
+                nextest_captured = true;
+                continue;
+            }
+            if nextest_captured {
+                if trimmed == "------------" {
+                    nextest_captured = false;
+                } else {
+                    continue;
+                }
+            }
+        }
+
         if let Some(run) = active.as_mut() {
             if !run.in_failures_section {
                 if trimmed == "failures:" && !line.starts_with(' ') {
@@ -629,6 +667,7 @@ fn parse_libtest_stream(
                         commit_active(unfinished, &mut summary, &mut captured_ranges);
                     }
                     if let Some(total) = parse_libtest_running_header(trimmed) {
+                        summary.runs += 1;
                         active = Some(new_active_libtest(total, pending_suite.take()));
                     }
                 }
@@ -663,10 +702,13 @@ fn parse_libtest_stream(
 
         // Idle state (outside an active `running N tests` block).
         if let Some(suite) = parse_cargo_running_suite(trimmed) {
+            summary.suites += 1;
+            summary.only_suite = Some(suite.clone());
             pending_suite = Some(suite);
             standalone_collecting = false;
             standalone_list.clear();
         } else if let Some(total) = parse_libtest_running_header(trimmed) {
+            summary.runs += 1;
             standalone_collecting = false;
             standalone_list.clear();
             active = Some(new_active_libtest(total, pending_suite.take()));
@@ -743,6 +785,7 @@ fn record_standalone_libtest(
     list: &[String],
     summary: &mut LibtestSummary,
 ) {
+    summary.runs += 1;
     if res.ok && res.failed == 0 {
         return;
     }
@@ -765,11 +808,14 @@ fn record_standalone_libtest(
 }
 
 fn parse_cargo_running_suite(trimmed: &str) -> Option<String> {
-    if let Some(rest) = trimmed.strip_prefix("Running ") {
-        let label = rest.split(" (").next()?.trim();
-        if !label.is_empty() {
-            return Some(label.to_owned());
-        }
+    if let Some(rest) = trimmed.strip_prefix("Running ")
+        && let Some((label, binary)) = rest.split_once(" (")
+        && let Some(binary) = binary.strip_suffix(')')
+        && let Some(name) = binary.rsplit(['/', '\\']).next()
+        && !label.is_empty()
+        && !name.is_empty()
+    {
+        return Some(format!("{label} ({name})"));
     }
     if let Some(rest) = trimmed.strip_prefix("Doc-tests ") {
         let label = rest.trim();
@@ -1706,7 +1752,7 @@ error: test run failed
             ComparisonVerdict::Distinct {
                 common: vec![],
                 first_only: vec![TerminalFailure {
-                    suite: None,
+                    suite: Some("unittests src/lib.rs (magi-abc)".to_owned()),
                     test: "talk::tests::chat_timeout".to_owned(),
                 }],
                 second_only: vec![TerminalFailure {
@@ -1871,11 +1917,11 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
             ComparisonVerdict::Matching {
                 failures: vec![
                     TerminalFailure {
-                        suite: Some("tests/alpha.rs".to_owned()),
+                        suite: Some("tests/alpha.rs (alpha-1234)".to_owned()),
                         test: "a_fail".to_owned(),
                     },
                     TerminalFailure {
-                        suite: Some("tests/beta.rs".to_owned()),
+                        suite: Some("tests/beta.rs (beta-5678)".to_owned()),
                         test: "b_fail".to_owned(),
                     },
                 ]
@@ -1883,6 +1929,76 @@ test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
         );
         let event = rerun_event_message("round 1", "cargo test", &cmp);
         assert!(event.contains("the failure reproduced"), "{event}");
+    }
+
+    #[test]
+    fn split_cargo_streams_require_unambiguous_binary_identity() {
+        let raw = "\
+running 1 test
+test test_layout ... FAILED
+
+failures:
+    test_layout
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+";
+        let alpha = "Running tests/alpha.rs (target/debug/deps/alpha-1234)\n";
+        let beta = "Running tests/beta.rs (target/debug/deps/beta-5678)\n";
+        let make = |stderr: &str| {
+            let mut o = outcome(Some(101), raw, None);
+            o.failure_evidence = Some(extract_streams(Some(101), false, raw, stderr));
+            o
+        };
+        let a = make(alpha);
+        assert!(matches!(
+            compare_attempts("head", &a, &make(alpha)).verdict,
+            ComparisonVerdict::Matching { .. }
+        ));
+        assert!(matches!(
+            compare_attempts("head", &a, &make(beta)).verdict,
+            ComparisonVerdict::Distinct { .. }
+        ));
+        let same_label = "Running tests/alpha.rs (target/debug/deps/alpha-9999)\n";
+        assert!(matches!(
+            compare_attempts("head", &a, &make(same_label)).verdict,
+            ComparisonVerdict::Distinct { .. }
+        ));
+        let ambiguous = make(&format!("{alpha}{beta}"));
+        for unknown in [make(""), ambiguous] {
+            assert!(matches!(
+                compare_attempts("head", &unknown, &unknown).verdict,
+                ComparisonVerdict::Unknown { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn nextest_captured_libtest_failure_is_not_an_independent_run() {
+        let raw = "\
+Starting 1 test across 1 binary
+        FAIL [   0.100s] pkg::bin outer
+--- STDOUT: pkg::bin outer ---
+running 1 test
+test inner ... FAILED
+
+failures:
+    inner
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+------------
+     Summary [   0.100s] 1 tests run: 0 passed, 1 failed, 0 skipped
+        FAIL [   0.100s] pkg::bin outer
+error: test run failed
+";
+        assert_eq!(
+            extract_streams(Some(100), false, "", raw).extraction,
+            FailureExtraction::Confirmed {
+                failures: vec![TerminalFailure {
+                    suite: Some("pkg::bin".to_owned()),
+                    test: "outer".to_owned(),
+                }],
+            }
+        );
     }
 
     #[test]

@@ -13239,12 +13239,15 @@ pub(crate) async fn check_gate_repair_e2e(
         return Ok(GateFix::Retry);
     }
     let head = git::rev_parse(&winner.worktree, "HEAD").await?;
-    if state
-        .gate_repair_e2e
-        .as_ref()
-        .is_some_and(|r| r.head == head && r.passed)
+    if let Some(record) = &state.gate_repair_e2e
+        && record.head == head
     {
-        return Ok(GateFix::Retry);
+        if record.passed {
+            return Ok(GateFix::Retry);
+        }
+        if !record.outcomes.is_empty() && !verify_inconclusive(&record.outcomes) {
+            return Ok(GateFix::Stop);
+        }
     }
     state.gate_repair_e2e = Some(crate::run::GateRepairE2e {
         head: head.clone(),

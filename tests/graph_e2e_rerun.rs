@@ -135,6 +135,7 @@ async fn a_failure_that_reproduces_stands_with_the_second_runs_output() {
     // Red with a confirmed libtest terminal failure until the fixer's marker file exists.
     fx.config.verify.e2e = vec![format!(
         "echo run >> {}; test -f fixed.txt || {{ \
+         printf 'Running unittests src/lib.rs (target/debug/deps/magi-abc)\\n' >&2; \
          printf 'running 1 test\\ntest web::tests::layout ... FAILED\\n\\nfailures:\\n    web::tests::layout\\n\\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\\n'; \
          exit 1; }}",
         sh(&runs)
@@ -159,7 +160,7 @@ async fn a_failure_that_reproduces_stands_with_the_second_runs_output() {
         cmp.verdict,
         magi::verify_evidence::ComparisonVerdict::Matching {
             failures: vec![magi::verify_evidence::TerminalFailure {
-                suite: None,
+                suite: Some("unittests src/lib.rs (magi-abc)".to_owned()),
                 test: "web::tests::layout".to_owned(),
             }]
         }
@@ -209,6 +210,7 @@ async fn distinct_failures_a_then_b_stay_red_without_claiming_reproduction() {
     fx.config.verify.e2e = vec![format!(
         "n=$(cat {c} 2>/dev/null || echo 0); n=$((n+1)); echo $n > {c}; \
          if [ $n -eq 1 ]; then \
+           printf 'Running unittests src/lib.rs (target/debug/deps/magi-abc)\\n' >&2; \
            printf 'running 2 tests\\ntest ok_test ... ok\\ntest talk::tests::chat_timeout ... FAILED\\n\\nfailures:\\n\\n---- talk::tests::chat_timeout stdout ----\\ntimed out waiting for turn\\n\\nfailures:\\n    talk::tests::chat_timeout\\n\\ntest result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s\\n'; \
            exit 101; \
          else \
@@ -235,7 +237,7 @@ async fn distinct_failures_a_then_b_stay_red_without_claiming_reproduction() {
         magi::verify_evidence::ComparisonVerdict::Distinct {
             common: vec![],
             first_only: vec![magi::verify_evidence::TerminalFailure {
-                suite: None,
+                suite: Some("unittests src/lib.rs (magi-abc)".to_owned()),
                 test: "talk::tests::chat_timeout".to_owned(),
             }],
             second_only: vec![magi::verify_evidence::TerminalFailure {
