@@ -24,6 +24,10 @@ pub enum Kind {
     Gate,
     /// Repair the last exhausted review's findings or failed E2E.
     Review,
+    /// Re-run mandatory verification on the retained, unchanged head of a run
+    /// that stopped on repeated no-change fix rounds with a failed E2E and no
+    /// blocking review findings. No fixer is dispatched.
+    Verify,
     /// Resolve one retained textual base conflict without rewriting history.
     BaseConflict,
 }
@@ -397,6 +401,40 @@ fn evidence(state: &RunState, request: &Request) -> Result<()> {
                     && state.gate_head.as_deref() == Some(&request.head)
                     && crate::graph::gate_fixable(&state.gate),
                 "repair grant refused: no repairable gate failure at the expected head"
+            );
+        }
+        Kind::Verify => {
+            ensure!(
+                request.rounds == 1,
+                "verify recovery permits exactly one confirmation review"
+            );
+            ensure!(
+                state.reviews.len() < state.config.graph.review_rounds,
+                "verify recovery refused: review budget is exhausted; use --kind review"
+            );
+            let limit = crate::graph::STAGNANT_LIMIT;
+            ensure!(
+                state.reviews.len() >= limit
+                    && state
+                        .reviews
+                        .iter()
+                        .rev()
+                        .take(limit)
+                        .all(|r| !r.progressed),
+                "verify recovery refused: the run did not stop on an unchanged tree"
+            );
+            ensure!(
+                state.reviews.last().is_some_and(|r| r.head == request.head
+                    && !r.clean
+                    && r.blocking == 0
+                    && r.expected > 0
+                    && r.answered == r.expected
+                    && r.e2e_status() == crate::run::E2eStatus::Failed
+                    && r.verified_head.as_deref() == Some(request.head.as_str())
+                    && r.fix
+                        .as_ref()
+                        .is_some_and(|f| !f.committed && f.failed.is_none())),
+                "verify recovery refused: need a complete review with no blocking findings, a failed E2E and a recorded no-change fix at the expected head"
             );
         }
         Kind::Review => {

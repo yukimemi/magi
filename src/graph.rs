@@ -1889,6 +1889,34 @@ impl Runner {
         result
     }
 
+    /// Archive, never erase, the verification evidence a fresh check supersedes.
+    fn archive_verification(&mut self) {
+        self.state
+            .verification_history
+            .push(crate::run::VerificationEvidence {
+                superseded_by: None,
+                archived_at: Some(Timestamp::now()),
+                fixes_spent: Some(self.state.gate_fixes.len()),
+                gate_head: self.state.gate_head.take(),
+                gate_ran: std::mem::take(&mut self.state.gate_ran),
+                gate: std::mem::take(&mut self.state.gate),
+                e2e: self.state.head_e2e.take(),
+            });
+        if let Some(e2e) = self.state.gate_repair_e2e.take() {
+            self.state
+                .verification_history
+                .push(crate::run::VerificationEvidence {
+                    superseded_by: None,
+                    archived_at: Some(Timestamp::now()),
+                    fixes_spent: Some(self.state.gate_fixes.len()),
+                    gate_head: None,
+                    gate_ran: false,
+                    gate: Vec::new(),
+                    e2e: Some(e2e),
+                });
+        }
+    }
+
     /// A grant owns only these repair attempts. Confirmation reviews cannot
     /// create another fixer allowance, and every operation is restart-checkpointed.
     async fn execute_granted_repair(&mut self) -> Result<()> {
@@ -1903,6 +1931,33 @@ impl Runner {
             let grant = self.state.repair_grants[index].clone();
             match grant.phase {
                 Phase::Pending => {
+                    if grant.receipt.request.kind == Kind::Verify {
+                        // No fixer and no rescue commit: the owner authorized
+                        // verification of exactly this retained clean head.
+                        let head = git::rev_parse(&winner.worktree, "HEAD").await?;
+                        if head != grant.head
+                            || !git::is_clean(&winner.worktree).await?
+                            || self.state.reviews.last().is_none_or(|r| r.head != head)
+                        {
+                            self.state.repair_grants[index].phase = Phase::Complete;
+                            self.state.status = RunStatus::Blocked;
+                            self.state.event(
+                                "repair-grant",
+                                "retained head changed since verify recovery was authorized; held",
+                            );
+                            self.state.save()?;
+                            return Ok(());
+                        }
+                        // Reserve, archive and enter the one confirmation
+                        // review in a single checkpoint.
+                        self.state.repair_grants[index].spent += 1;
+                        self.archive_verification();
+                        self.state.repair_grants[index].review_start = self.state.reviews.len();
+                        self.state.repair_grants[index].head = head;
+                        self.state.repair_grants[index].phase = Phase::Reviewing;
+                        self.state.save()?;
+                        continue;
+                    }
                     if grant.spent >= grant.receipt.request.rounds {
                         self.state.repair_grants[index].phase = Phase::Complete;
                         self.state.status = RunStatus::Blocked;
@@ -1916,6 +1971,7 @@ impl Runner {
                     self.state.save()?;
                     match grant.receipt.request.kind {
                         Kind::BaseConflict => self.repair_base_conflict(true).await?,
+                        Kind::Verify => bail!("verify recovery never dispatches a fixer"),
                         Kind::Gate => {
                             let failed = self.state.gate.clone();
                             let _ = self.gate_fix_round(&winner, &failed).await?;
@@ -1963,30 +2019,7 @@ impl Runner {
                     self.state.note_withheld("repair-grant", &rescued.withheld);
                     // Fresh checks must supersede even a same-head failure.
                     // Archive rather than erase failure evidence or counters.
-                    self.state
-                        .verification_history
-                        .push(crate::run::VerificationEvidence {
-                            superseded_by: None,
-                            archived_at: Some(Timestamp::now()),
-                            fixes_spent: Some(self.state.gate_fixes.len()),
-                            gate_head: self.state.gate_head.take(),
-                            gate_ran: std::mem::take(&mut self.state.gate_ran),
-                            gate: std::mem::take(&mut self.state.gate),
-                            e2e: self.state.head_e2e.take(),
-                        });
-                    if let Some(e2e) = self.state.gate_repair_e2e.take() {
-                        self.state
-                            .verification_history
-                            .push(crate::run::VerificationEvidence {
-                                superseded_by: None,
-                                archived_at: Some(Timestamp::now()),
-                                fixes_spent: Some(self.state.gate_fixes.len()),
-                                gate_head: None,
-                                gate_ran: false,
-                                gate: Vec::new(),
-                                e2e: Some(e2e),
-                            });
-                    }
+                    self.archive_verification();
                     self.state.repair_grants[index].review_start = self.state.reviews.len();
                     self.state.repair_grants[index].head =
                         git::rev_parse(&winner.worktree, "HEAD").await?;

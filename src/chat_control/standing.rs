@@ -598,6 +598,10 @@ pub(super) async fn execute(
                 request.rounds == 1 && request.replace_request.is_none(),
                 "standing recovery permits one retained repair round, never replacement of a prior grant"
             );
+            ensure!(
+                request.kind != crate::repair_budget::Kind::Verify,
+                "verify recovery needs an explicit owner request, never standing recovery"
+            );
             format!(
                 "grant one {:?} repair round for run `{}`",
                 request.kind, request.run
