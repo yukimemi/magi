@@ -11796,16 +11796,19 @@ mod tests {
 
     #[tokio::test]
     async fn list_request_cost_is_independent_of_record_count() {
-        let (_tmp, repos, fx) = performance_fixture().await;
         let mut previous = None;
         for n in [4, 60] {
+            // Health refreshes configuration on a detached thread. Run it
+            // last and give each scale its own repository/cache so that
+            // refresh cannot warm the next measured cold extraction.
+            let (_tmp, repos, fx) = performance_fixture().await;
             seed_performance(&fx, &repos, n, n, n);
             let mut costs = Vec::new();
             for (path, discoveries) in [
                 ("/api/questions", 1),
                 ("/api/talks", 0),
-                ("/api/health", 0),
                 ("/api/stats", 1),
+                ("/api/health", 0),
             ] {
                 // Equal cold extraction caches at both scales; this also
                 // bounds first-request cost instead of only warmed requests.
@@ -11838,27 +11841,29 @@ mod tests {
     /// can also be checked in environments that prohibit binding sockets.
     #[tokio::test]
     async fn list_handler_cost_without_transport() {
-        let (_tmp, repos) = performance_repositories().await;
-        let fx = Fixture {
-            home: TempDir::new().unwrap(),
-            addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
-        };
-        let ui = Arc::new(
-            Ui::new(
-                fx.queue(),
-                fx.questions(),
-                fx.talks(),
-                fx.runs(),
-                fx.home.path().to_path_buf(),
-                repos[0].clone(),
-            )
-            .with_worktrees_root(fx.home.path().join("wt")),
-        );
         let mut previous = None;
         for (n, runs, items) in [(4, 4, 4), (60, 60, 60), (200, 300, 400)] {
+            // As in the transport test, isolate each scale from the previous
+            // health request's detached configuration refresh.
+            let (_tmp, repos) = performance_repositories().await;
+            let fx = Fixture {
+                home: TempDir::new().unwrap(),
+                addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+            };
+            let ui = Arc::new(
+                Ui::new(
+                    fx.queue(),
+                    fx.questions(),
+                    fx.talks(),
+                    fx.runs(),
+                    fx.home.path().to_path_buf(),
+                    repos[0].clone(),
+                )
+                .with_worktrees_root(fx.home.path().join("wt")),
+            );
             seed_performance(&fx, &repos, n, runs, items);
             let mut costs = Vec::new();
-            for endpoint in ["questions", "talks", "health", "stats"] {
+            for endpoint in ["questions", "talks", "stats", "health"] {
                 for repo in &repos {
                     let cache = repo.join(".git/magi/config");
                     if cache.exists() {
