@@ -5271,6 +5271,15 @@ mod tests {
         assert_eq!(saved.turns.len(), 2, "operator message and reply remain");
     }
 
+    struct ResumedTurnCleanup<'a>(&'a Path);
+
+    impl Drop for ResumedTurnCleanup<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::write(self.0, "go");
+            failpoint::force_put_failures(0);
+        }
+    }
+
     #[tokio::test]
     async fn posts_during_a_resumed_turn_are_replayed_once_even_after_a_reply_save_failure() {
         for lose_reply in [false, true] {
@@ -5300,18 +5309,33 @@ mod tests {
             let release = tmp.path().join("release");
             // Relative paths use the invocation's cwd on both Windows and Unix.
             let slow = "#!/bin/sh\nset -e\n: > started\ncat >/dev/null\n: > ready\nwhile [ ! -f release ]; do sleep 0.05; done\nprintf reply\n";
-            let mut slow_cfg = config(mock_agent(tmp.path(), slow, BTreeMap::new()));
+            let slow_dir = tmp.path().join("slow");
+            std::fs::create_dir(&slow_dir).expect("create slow mock directory");
+            let mut slow_cfg = config(mock_agent(&slow_dir, slow, BTreeMap::new()));
             slow_cfg.graph.timeout_talk = 90;
             let text = record(&mut talk, &talks, "keep going", Vec::new()).expect("record");
             let prompt_turns = talk.turns.len();
             let id = talk.id.clone();
             let artifacts = talks.artifacts_of(&id);
             let diagnostics = || {
+                let prompt = std::fs::metadata(artifacts.join("turn-2.prompt.md"));
+                let stage = if release.exists() {
+                    "after RELEASE, waiting for responder exit"
+                } else if ready.exists() {
+                    "after READY, awaiting RELEASE"
+                } else if started.exists() {
+                    "after STARTED, before stdin drain completed"
+                } else if prompt.is_ok() {
+                    "after prompt artifact, before STARTED"
+                } else {
+                    "before prompt artifact or shell start"
+                };
                 format!(
-                    "started={}, ready={}, prompt={}, stdout={:?}, stderr={:?}",
+                    "stage={stage}; STARTED={}, READY={}, RELEASE={}, prompt_bytes={:?}, out={:?}, err={:?}",
                     started.exists(),
                     ready.exists(),
-                    artifacts.join("turn-2.prompt.md").exists(),
+                    release.exists(),
+                    prompt.map(|m| m.len()),
                     std::fs::read_to_string(artifacts.join("turn-2.out")),
                     std::fs::read_to_string(artifacts.join("turn-2.err")),
                 )
@@ -5322,6 +5346,8 @@ mod tests {
                 let lease = talks.claim_turn(&id).unwrap().unwrap();
                 let running = respond(&lease, &mut talk, &talks, &slow_cfg, &text);
                 tokio::pin!(running);
+                // Drop before the scoped responder is cancelled on unwind.
+                let _cleanup = ResumedTurnCleanup(&release);
                 let acknowledged = tokio::select! {
                     biased;
                     result = &mut running => {
@@ -5346,7 +5372,7 @@ mod tests {
                     }
                     Ok(())
                 })();
-                let released = std::fs::write(release, "go");
+                let released = std::fs::write(&release, "go");
                 let result = tokio::time::timeout(Duration::from_secs(100), &mut running)
                     .await
                     .unwrap_or_else(|_| panic!("responder did not finish; {}", diagnostics()));
@@ -5372,7 +5398,7 @@ mod tests {
             assert_eq!(saved.turns[prompt_turns].body, "concurrent task result");
             assert_eq!(saved.turns[prompt_turns + 1].body, "second task result");
             assert!(posts_since_last_reply(&saved).is_some());
-            let cfg = config(mock_agent(tmp.path(), ECHO, BTreeMap::new()));
+            // Reuse the original echo script; the waiting mock has its own file.
             say(
                 &talks.claim_turn(&id).unwrap().unwrap(),
                 &mut saved,
