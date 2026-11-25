@@ -453,13 +453,25 @@ pub async fn invoke(
     seat: &mut SeatState,
     inv: &Invocation<'_>,
 ) -> Result<AgentOutput> {
-    Box::pin(invoke_on_heap(spec, seat, inv)).await
+    Box::pin(invoke_on_heap(spec, seat, inv, &mut false)).await
+}
+
+/// Record entry into spawning, not successful launch: a spawn error can
+/// occur after creating a process, so callers must treat it conservatively.
+pub(crate) async fn invoke_tracking_spawn(
+    spec: &AgentSpec,
+    seat: &mut SeatState,
+    inv: &Invocation<'_>,
+    spawn_attempted: &mut bool,
+) -> Result<AgentOutput> {
+    Box::pin(invoke_on_heap(spec, seat, inv, spawn_attempted)).await
 }
 
 async fn invoke_on_heap(
     spec: &AgentSpec,
     seat: &mut SeatState,
     inv: &Invocation<'_>,
+    spawn_attempted: &mut bool,
 ) -> Result<AgentOutput> {
     let home = crate::run::home();
     // Graph writers use their saved configuration on every turn.
@@ -761,6 +773,7 @@ async fn invoke_on_heap(
     } else {
         crate::seat_process::Running::spawn
     };
+    *spawn_attempted = true;
     let spawned = spawn(cmd, lease, outputs)
         .with_context(|| format!("spawn `{}` for seat {}", plan.argv[0], seat.key));
     let mut running = if isolated.is_some() {

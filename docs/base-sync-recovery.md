@@ -10,6 +10,38 @@ textual conflicts.
 
 ## Infrastructure interruptions
 
+Only a stopped pick with unmerged index entries can start a conflict fixer.
+`graph.review_rounds` limits actual fixer calls for that pick, including
+fallback agents and calls that report a quota or authentication failure.
+Staging or continuing an already resolved pick does not spend a call.
+起動処理に入る前の資源不足が確定した場合は枠を消費しません。
+起動有無が不明な中断や起動後の資源停止は、上限に数えます。
+On older runs, a fallback reused its round record. The saved round-start
+and handover events attribute those extra calls to their original pick.
+If the event history is incomplete, unattributed calls count conservatively
+when the active pick has a compatible legacy round.
+
+If Git stops with no unmerged paths, magi checks whether Git rescheduled its
+recording exec. When the scratch identity, todo and pick/HEAD records agree,
+magi lets Git retry the exec once and continue. It does not restart the rebase
+or write the missing HEAD itself: either could lose or misrepresent an earlier
+resolution. If the proof or retry fails, the scratch checkout, reservation
+and Git diagnostic remain available. Fix the infrastructure problem and
+resume the owning run normally. A later explicit task resumption can retry
+the verified exec once; restarting the daemon does not renew the retry.
+Neither `--recover-base` nor a base-conflict repair grant is needed.
+
+If the initial pick ledger cannot be saved, magi pauses before continuing Git
+or calling a fixer. A scratch-local marker created before Git starts lets
+ordinary resume finish capturing the ledger after the write problem is fixed.
+Magi clears the marker before allowing any fixer to run; it never reconstructs
+a missing ledger after that boundary.
+
+保存済みの Git 診断と空の競合パス記録が一致すれば、旧形式でも
+記録用 exec の失敗と判定します。通常の再開で同じ実行がキューに指定され、
+実行側がタスクの命令、保持された HEAD、作業ツリーを確認できた場合だけ、
+元の同期予約を再開します。停止履歴は保持し、同期枠の追加や競合修復の承認は行いません。
+
 A successful synchronization or an actually executed gate/current-head E2E check
 records progress. Saving a structured resource stop after progress atomically
 records an interruption boundary (including pass ordinal, head and time). Only a

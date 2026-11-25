@@ -253,11 +253,21 @@ magi task inspect-base-stop <task> --run <exact-run>
 ```
 
 This read-only command does not fetch, release a hold, edit records or start a
-worker. It reports `modern-textual-conflict`, `legacy-textual-conflict`,
-`movement-exhaustion` or `insufficient-evidence`, the retained branch HEAD,
-current tracking base, scratch presence, and precise admission blockers. Tracking
-refs are a local snapshot: the grant rechecks them and never silently retargets
-an approval. The launcher remains responsible for fetching the prepared base.
+worker. It reports the classification, retained branch HEAD, current tracking
+base, scratch presence, and admission blockers. The classifications are
+`modern-textual-conflict`, `legacy-textual-conflict`, `sequencer-infrastructure`,
+`movement-exhaustion`, and `insufficient-evidence`. Tracking refs are a local
+snapshot. The grant rechecks them and never silently changes its target.
+The launcher fetches the prepared base.
+
+`sequencer-infrastructure` does not authorize a conflict fixer. For a current
+resource stop, restore the resource and resume the retained run. Inspection
+also recognizes historical stops when Git reported a failed recording exec and
+the matching fixer records list no conflicted paths or stopped pick. Inspection
+is read-only. Ordinary resume can reopen the original reservation, without
+spending another synchronization attempt, after revalidating task ownership,
+the retained branch and the scratch Git state. If there is no matching
+reservation or the retained state cannot be verified, the stop stays blocked.
 
 Legacy compatibility requires the exact known terminal conflict diagnostic,
 matching terminal land event, saved base reservation, and a complete unambiguous

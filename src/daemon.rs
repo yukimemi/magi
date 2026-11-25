@@ -4780,9 +4780,20 @@ async fn attempt(
         && !task.fresh_start
         && task.pr_recovery.is_none()
     {
-        // Authorization still takes the owner lock and execution lease and
-        // rechecks liveness, retained HEAD and ownership before saving.
-        let authorized = if crate::repair_budget::conflict_pending(task, &held) {
+        // A pinned infrastructure resume continues the saved reservation;
+        // it does not authorize another base-sync interval.
+        let sequencer_resume = crate::repair_budget::legacy::resumable_sequencer_stop(&held)
+            && task.review_branch.is_none()
+            && task.assignment_accepts(&held)
+            && compatible_run_instruction(&held, task)
+            && task
+                .resume_override
+                .as_ref()
+                .is_some_and(|pin| pin.pinned_run.as_ref() == Some(&held.id));
+        // Exhaustion authorization still takes the owner lock and execution
+        // lease and rechecks liveness, retained HEAD and ownership.
+        let authorized = if sequencer_resume || crate::repair_budget::conflict_pending(task, &held)
+        {
             true
         } else if task.resumption.is_some() && compatible_run_instruction(&held, task) {
             let home = queue.root().parent().expect("queue has a home");
@@ -13433,6 +13444,50 @@ mod tests {
                 Some(state.id)
             );
         }
+    }
+
+    #[test]
+    fn sequencer_resource_resume_keeps_the_reserved_run_after_review_exhaustion() {
+        let home = tempfile::tempdir().unwrap();
+        let mut state = run_state(RunStatus::Blocked);
+        state.config.graph.review_rounds = 1;
+        let mut unresolved = review_round(1);
+        unresolved.blocking = 1;
+        unresolved.e2e.push(crate::run::CommandOutcome {
+            command: "verify".into(),
+            code: Some(1),
+            output_tail: "previous verification failed".into(),
+            duration_ms: 0,
+            resource_blocked: false,
+        });
+        state.reviews.push(unresolved);
+        state.base_sync = Some(crate::run::BaseSync {
+            tip: "base".into(),
+            behind: 1,
+            attempts: 0,
+            conflict: None,
+            already_in: None,
+        });
+        state.reserve_base_operation("winner", "base");
+        state.resource_block = Some(crate::run::ResourceBlock {
+            cause: crate::run::ResourceBlockCause::Other,
+            node: "rebase".into(),
+            kind: crate::rebase::SEQUENCER_INFRASTRUCTURE.into(),
+            detail: "recording exec failed".into(),
+            at: jiff::Timestamp::now(),
+        });
+        state.save_under(home.path()).unwrap();
+        assert_eq!(
+            crate::resume::validate(home.path(), &state.id).unwrap().id,
+            state.id
+        );
+        assert_eq!(
+            crate::repair_budget::legacy::classify(&state, "winner", "base").class,
+            crate::repair_budget::legacy::Class::SequencerInfrastructure
+        );
+        state.finish_base_operation(None);
+        state.save_under(home.path()).unwrap();
+        assert!(crate::resume::validate(home.path(), &state.id).is_err());
     }
 
     #[test]

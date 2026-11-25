@@ -283,11 +283,11 @@ fi
 # `git rebase --skip` once, on the first stop only, then resolves as usual. Both count their calls in
 # `rebase-fix.log` in the run's artifacts directory.
 if has "Your rebase stopped on a conflict"; then
+  echo "$seat" >> "$artifacts/rebase-fix.log"
   if [ -n "$MOCK_REBASE_AUTH" ]; then
     printf '%s\n' '{"is_error":true,"terminal_reason":"api_error","result":"Failed to authenticate: OAuth session expired and could not be refreshed"}'
     exit 1
   fi
-  echo "$seat" >> "$artifacts/rebase-fix.log"
   if [ -n "$MOCK_REBASE_FIX_NOOP" ]; then
     printf '{"addressed":[],"rejected":[],"notes":"changed nothing"}\n'
     exit 0

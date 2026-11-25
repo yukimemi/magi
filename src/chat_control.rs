@@ -2032,7 +2032,7 @@ fn retry_claimed(
             .is_some_and(|stop| stop.kind == crate::base_sync_recovery::StopKind::Conflict)
     {
         anyhow::bail!(
-            "retry cannot authorize editing a retained base-sync stop. {} Keep the retained review criteria and use a dedicated repair grant for the narrow resolution.",
+            "retry cannot authorize editing a retained base-sync stop. {}",
             state.base_sync_next_action()
         );
     }

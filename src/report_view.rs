@@ -1594,6 +1594,8 @@ pub fn build_with(
             ("already_in", Tone::Neutral)
         } else if state.resource_block.is_some() {
             ("resource_wait", Tone::Warn)
+        } else if crate::repair_budget::legacy::legacy_sequencer_head(state).is_some() {
+            ("sequencer-infrastructure", Tone::Warn)
         } else if bs.conflict.is_some() {
             (
                 match state.base_sync_recovery.stop.as_ref().map(|s| &s.kind) {

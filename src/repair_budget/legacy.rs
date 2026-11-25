@@ -1,4 +1,4 @@
-//! Read-only classification of textual stops, including diagnostic-only records.
+//! Read-only classification of base stops, including diagnostic-only records.
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -23,6 +23,8 @@ pub enum Class {
     Recorded,
     /// 旧形式の診断と修復履歴から停止を導出できる。
     LegacyTextual,
+    /// Git stopped the recording exec without a textual conflict.
+    SequencerInfrastructure,
     /// 通常のベース移動予算の枯渇。
     MovementExhausted,
     /// 停止を安全に証明する証拠が不足している。
@@ -50,6 +52,9 @@ impl Assessment {
             Class::MovementExhausted => anyhow::bail!(
                 "ordinary movement exhaustion; use task control recover-base, not base-conflict repair"
             ),
+            Class::SequencerInfrastructure => anyhow::bail!(
+                "the rebase sequencer failed without a textual conflict; base-conflict repair is not applicable"
+            ),
             Class::Insufficient => anyhow::bail!("{}", self.missing.unwrap_or_default()),
         }
     }
@@ -60,6 +65,7 @@ impl Assessment {
             "classification": match self.class {
                 Class::Recorded => "modern-textual-conflict",
                 Class::LegacyTextual => "legacy-textual-conflict",
+                Class::SequencerInfrastructure => "sequencer-infrastructure",
                 Class::MovementExhausted => "movement-exhaustion",
                 Class::Insufficient => "insufficient-evidence",
             },
@@ -70,9 +76,97 @@ impl Assessment {
     }
 }
 
+const NO_PATHS: &str = "; remaining conflicted path(s): none recorded";
+pub(crate) const LEGACY_EXEC_ACTION: &str = "The saved Git output and empty conflict paths identify a failed recording exec. Restore Git and explicitly resume the retained run. Resume can reopen the original reservation only if ownership and Git state still match; neither conflict repair nor movement recovery applies.";
+
+/// Older versions clipped Git's output to 250 characters. Accept a clipped
+/// command only after the known Git-for-Windows shell crash, at that boundary.
+fn failed_recording_exec(said: &str) -> bool {
+    said.lines().any(|line| {
+        let Some(command) = line
+            .trim_start()
+            .strip_prefix("warning: execution failed: ")
+        else {
+            return false;
+        };
+        command == crate::git::REBASE_EXEC
+            || (said.chars().count() == 250
+                && said.ends_with(command)
+                && command.starts_with("git re")
+                && crate::git::REBASE_EXEC.starts_with(command)
+                && said.contains("sh.exe: *** fatal error - add_item")
+                && said.contains("failed, errno "))
+    })
+}
+
+/// Identify the retained HEAD from the failed exec and its repair records.
+/// A missing stop SHA by itself also occurs in genuine legacy conflicts.
+pub(crate) fn legacy_sequencer_head(state: &RunState) -> Option<&str> {
+    let sync = state.base_sync.as_ref()?;
+    let detail = sync.conflict.as_deref()?;
+    let (summary, said) = detail.split_once(NO_PATHS)?;
+    let said = said.strip_prefix("; git said: ")?;
+    let head = state.rebase_fixes.last()?.from.as_deref()?;
+    if head.is_empty()
+        || !failed_recording_exec(said)
+        || !summary.starts_with(&format!(
+            "{} conflicts with {}/{} and did not rebase: conflict not resolved after ",
+            state.winner()?.branch,
+            state.config.merge.remote,
+            state.base_branch
+        ))
+        || !state
+            .rebase_fixes
+            .iter()
+            .filter(|r| r.from.as_deref() == Some(head))
+            .all(|r| {
+                r.paths.is_empty()
+                    && r.stop.is_none()
+                    && r.launcher.is_none()
+                    && r.onto.as_ref().is_none_or(|tip| tip == &sync.tip)
+            })
+        || state
+            .base_sync_recovery
+            .operations
+            .last()
+            .is_some_and(|op| op.head != head || op.tip != sync.tip || op.validated_head.is_some())
+        || state.base_sync_recovery.stop.as_ref().is_some_and(|stop| {
+            stop.kind != StopKind::Conflict
+                || stop.head != head
+                || stop.tip != sync.tip
+                || stop.detail != detail
+                || stop.attempts != sync.attempts
+        })
+    {
+        return None;
+    }
+    Some(head)
+}
+
+pub(crate) fn resumable_sequencer_stop(state: &RunState) -> bool {
+    state.foreign_checkout.is_none()
+        && state
+            .base_sync_recovery
+            .operations
+            .last()
+            .is_some_and(|op| op.finished)
+        && legacy_sequencer_head(state).is_some()
+}
+
 /// Match both historical and current movement diagnostics exactly. Leftover
 /// legacy repair records do not turn this diagnostic into a textual conflict.
 pub fn classify(state: &RunState, head: &str, tip: &str) -> Assessment {
+    let current = state.resource_block.as_ref().is_some_and(|block| {
+        block.node == "rebase" && block.kind == crate::rebase::SEQUENCER_INFRASTRUCTURE
+    });
+    if current || legacy_sequencer_head(state) == Some(head) {
+        return Assessment {
+            class: Class::SequencerInfrastructure,
+            stop: state.base_sync_recovery.stop.clone(),
+            legacy: None,
+            missing: None,
+        };
+    }
     if let (Some(sync), Some(winner)) = (&state.base_sync, state.winner()) {
         let exhausted = sync.attempts >= crate::graph::BASE_SYNC_ROUNDS
             && [("rebase(s)", "rebasing"), ("synchronization(s)", "synchronizing")]
@@ -133,6 +227,17 @@ fn derive_textual(state: &RunState, head: &str, tip: &str) -> Result<(Stop, Opti
         .conflict
         .as_ref()
         .context("missing stopped synchronization diagnostic")?;
+    if detail
+        .split_once(NO_PATHS)
+        .is_some_and(|(_, tail)| tail.is_empty() || tail.starts_with("; git said: "))
+    {
+        // "none recorded" is also a possible literal filename.
+        ensure!(
+            state.rebase_fixes.iter().any(|r| r.from.as_deref() == Some(head)
+                && r.paths.as_slice() == ["none recorded"]),
+            "no conflict paths were recorded; cannot establish a textual stop from the saved Git output and repair records"
+        );
+    }
     let old: Vec<_> = state
         .rebase_fixes
         .iter()
@@ -298,6 +403,16 @@ pub async fn inspect(
         .as_object_mut()
         .unwrap()
         .extend(assessment.report().as_object().unwrap().clone());
+    if assessment.class == Class::SequencerInfrastructure {
+        let action = if legacy_sequencer_head(&state).is_some() {
+            LEGACY_EXEC_ACTION
+        } else {
+            result["resource_block"] = serde_json::to_value(&state.resource_block)?;
+            "Restore the required resource and explicitly resume the retained run. No conflict repair is needed."
+        };
+        result["next_step"] = action.into();
+        return Ok(result);
+    }
     if assessment.class == Class::MovementExhausted {
         result["next_step"] = format!(
             "Use task control recover-base {} --request <unique-id> --head {head}",
