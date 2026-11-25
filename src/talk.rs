@@ -5295,45 +5295,67 @@ mod tests {
 
             post(&talks, &talk.id, "already available", "task-earlier").expect("earlier post");
             talk = talks.get(&talk.id).expect("reload earlier post");
+            let started = tmp.path().join("started");
             let ready = tmp.path().join("ready");
             let release = tmp.path().join("release");
-            let slow = "#!/bin/sh\ncat >/dev/null\ntouch \"$READY\"\nn=0\nwhile [ ! -f \"$RELEASE\" ] && [ \"$n\" -lt 200 ]; do sleep 0.01; n=$((n + 1)); done\nprintf reply\n";
-            let slow_cfg = config(mock_agent(
-                tmp.path(),
-                slow,
-                BTreeMap::from([
-                    ("READY".to_owned(), ready.to_string_lossy().into_owned()),
-                    ("RELEASE".to_owned(), release.to_string_lossy().into_owned()),
-                ]),
-            ));
+            // Relative paths use the invocation's cwd on both Windows and Unix.
+            let slow = "#!/bin/sh\nset -e\n: > started\ncat >/dev/null\n: > ready\nwhile [ ! -f release ]; do sleep 0.05; done\nprintf reply\n";
+            let mut slow_cfg = config(mock_agent(tmp.path(), slow, BTreeMap::new()));
+            slow_cfg.graph.timeout_talk = 90;
             let text = record(&mut talk, &talks, "keep going", Vec::new()).expect("record");
             let prompt_turns = talk.turns.len();
             let id = talk.id.clone();
-            let response_talks = talks.clone();
-            let running = tokio::spawn(async move {
-                respond(
-                    &response_talks.claim_turn(&talk.id).unwrap().unwrap(),
-                    &mut talk,
-                    &response_talks,
-                    &slow_cfg,
-                    &text,
+            let artifacts = talks.artifacts_of(&id);
+            let diagnostics = || {
+                format!(
+                    "started={}, ready={}, prompt={}, stdout={:?}, stderr={:?}",
+                    started.exists(),
+                    ready.exists(),
+                    artifacts.join("turn-2.prompt.md").exists(),
+                    std::fs::read_to_string(artifacts.join("turn-2.out")),
+                    std::fs::read_to_string(artifacts.join("turn-2.err")),
                 )
-                .await
-            });
-            tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                while !ready.exists() {
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                }
-            })
-            .await
-            .expect("CLI read its prompt");
-            post(&talks, &id, "concurrent task result", "task-one").expect("post");
-            post(&talks, &id, "second task result", "task-two").expect("second post");
-            if lose_reply {
-                failpoint::force_put_failures(PUT_RETRIES);
-            }
-            std::fs::write(release, "go").expect("release CLI");
-            let result = running.await.expect("join");
+            };
+            // Keep the responder scoped to this test rather than detaching a
+            // task that could outlive a failed assertion.
+            let result = {
+                let lease = talks.claim_turn(&id).unwrap().unwrap();
+                let running = respond(&lease, &mut talk, &talks, &slow_cfg, &text);
+                tokio::pin!(running);
+                let acknowledged = tokio::select! {
+                    biased;
+                    result = &mut running => {
+                        panic!("responder exited before release: {result:?}; {}", diagnostics());
+                    }
+                    result = tokio::time::timeout(Duration::from_secs(60), async {
+                        while !ready.exists() {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                    }) => result,
+                };
+                // Release even when a post or the acknowledgement fails, then
+                // finish the responder before reporting the failure.
+                let posts = (|| -> anyhow::Result<()> {
+                    acknowledged.with_context(|| {
+                        format!("CLI did not acknowledge prompt; {}", diagnostics())
+                    })?;
+                    post(&talks, &id, "concurrent task result", "task-one")?;
+                    post(&talks, &id, "second task result", "task-two")?;
+                    if lose_reply {
+                        failpoint::force_put_failures(PUT_RETRIES);
+                    }
+                    Ok(())
+                })();
+                let released = std::fs::write(release, "go");
+                let result = tokio::time::timeout(Duration::from_secs(100), &mut running)
+                    .await
+                    .unwrap_or_else(|_| panic!("responder did not finish; {}", diagnostics()));
+                posts.unwrap_or_else(|err| {
+                    panic!("{err:#}; responder={result:?}; {}", diagnostics())
+                });
+                released.expect("release CLI");
+                result
+            };
             if lose_reply {
                 assert!(
                     result
@@ -5364,6 +5386,8 @@ mod tests {
             let prompt = &saved.turns.last().unwrap().body;
             assert!(prompt.contains("# Posted by a task"), "{prompt}");
             assert!(!prompt.contains("already available"), "{prompt}");
+            assert_eq!(prompt.matches("concurrent task result").count(), 1);
+            assert_eq!(prompt.matches("second task result").count(), 1);
             assert!(
                 prompt
                     .find("concurrent task result")
