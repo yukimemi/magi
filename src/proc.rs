@@ -43,6 +43,9 @@
 //!   `MAGI_HIDDEN_CONSOLE`). Each child gets its own process group (isolating
 //!   targeted `CTRL_BREAK_EVENT` and suppressing broadcast `CTRL_C_EVENT` on
 //!   siblings) while inheriting the single hidden console.
+//!   Cancellation uses process/job termination, not console-wide events.
+//!   A child explicitly broadcasting `CTRL_BREAK_EVENT` to group 0 can
+//!   still interrupt siblings: process groups are not console isolation.
 //!
 //! - **Terminal invocations** (`magi run`, `magi review`, interactive `magi
 //!   web` / `magi serve` from a shell): these keep shared hidden-console mode
@@ -966,6 +969,14 @@ mod tests {
                     let gc_vis = any_visible_window_for_pids(&[std::process::id(), gc_pid]);
                     let out = gc.wait_with_output().expect("wait grandchild");
                     assert!(out.status.success());
+                    assert!(
+                        String::from_utf8_lossy(&out.stdout).lines().any(|line| {
+                            line.trim_end()
+                                .ends_with(&format!("SLEEP_PID={gc_pid} VIS=false"))
+                        }),
+                        "grandchild did not report a hidden console: {}",
+                        String::from_utf8_lossy(&out.stdout)
+                    );
                     assert_eq!(gc_conhosts, 0, "grandchild spawned conhost.exe");
                     assert!(!gc_vis, "grandchild opened a visible window");
                     println!("GRANDCHILD_OK");
