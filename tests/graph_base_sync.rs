@@ -147,6 +147,23 @@ fn sync_only_cli(fx: &common::Fixture, id: &str, sync_only: bool) -> std::proces
     cli.output().expect("run resume CLI")
 }
 
+fn exhaust_sync_budget(run: &mut magi::run::RunState, head: &str) {
+    run.base_sync = Some(magi::run::BaseSync {
+        tip: run.base_commit.clone(),
+        behind: 0,
+        attempts: 4,
+        conflict: None,
+        already_in: None,
+    });
+    run.base_sync_recovery = serde_json::from_value(serde_json::json!({
+        "episodes": [{"id": 0, "reason": "initial", "used": 4}],
+        "authorizations": [],
+        "operations": [{"id": 0, "episode": 0, "head": head, "tip": run.base_commit, "finished": true}]
+    }))
+    .unwrap();
+    run.save().unwrap();
+}
+
 fn assert_sync_only_held(fx: &common::Fixture, id: &str, run: &magi::run::RunState) {
     let task = magi::queue::Queue::open().get(id).unwrap();
     assert_eq!(task.status, magi::queue::TaskStatus::Held);
@@ -259,9 +276,11 @@ common::e2e! {
 async fn sync_base_only_detects_squashed_work_without_creating_a_merge_commit() {
     let mut fx = fixture(home_lock().await, Judges::Unanimous, false);
     let origin = wire_origin(&fx);
-    let (task, run) = sync_only_fixture(&mut fx).await;
-    let worktree = &run.winner().unwrap().worktree;
-    let head = magi::git::rev_parse(worktree, "HEAD").await.unwrap();
+    let (task, mut run) = sync_only_fixture(&mut fx).await;
+    let worktree = run.winner().unwrap().worktree.clone();
+    let head = magi::git::rev_parse(&worktree, "HEAD").await.unwrap();
+    exhaust_sync_budget(&mut run, &head);
+    let recovery = serde_json::to_value(&run.base_sync_recovery).unwrap();
     land_on_origin(&origin.sideline, "note.txt", "retained change\n");
     land_on_origin(&origin.sideline, "upstream.txt", "additional upstream change\n");
     let tip = magi::git::rev_parse(&origin.sideline, "HEAD").await.unwrap();
@@ -272,7 +291,10 @@ async fn sync_base_only_detects_squashed_work_without_creating_a_merge_commit() 
     let saved = magi::run::RunState::load(&run.id).unwrap();
     assert_eq!(saved.status, RunStatus::AlreadyInBase);
     assert_eq!(saved.base_sync.as_ref().unwrap().already_in.as_ref().unwrap().tip, tip);
-    assert_eq!(magi::git::rev_parse(worktree, "HEAD").await.unwrap(), head);
+    assert_eq!(magi::git::rev_parse(&worktree, "HEAD").await.unwrap(), head);
+    assert_eq!(saved.base_sync.as_ref().unwrap().attempts, 4);
+    assert_eq!(serde_json::to_value(&saved.base_sync_recovery).unwrap(), recovery);
+    assert!(saved.base_sync_recovery.stop.is_none());
     let task = magi::queue::Queue::open().get(&task.id).unwrap();
     assert_eq!(task.status, magi::queue::TaskStatus::Done);
     let [event] = task.completion_history.as_slice() else {
@@ -289,6 +311,27 @@ async fn sync_base_only_detects_squashed_work_without_creating_a_merge_commit() 
     assert!(!fx.tmp.path().join("verification").exists());
     assert!(!saved.dir().join("artifacts/prompts.log").exists());
     assert!(saved.pr.is_none());
+}
+}
+
+common::e2e! {
+async fn sync_base_only_refuses_exhausted_budget_when_work_remains() {
+    let mut fx = fixture(home_lock().await, Judges::Unanimous, false);
+    let origin = wire_origin(&fx);
+    let (task, mut run) = sync_only_fixture(&mut fx).await;
+    let worktree = run.winner().unwrap().worktree.clone();
+    let head = magi::git::rev_parse(&worktree, "HEAD").await.unwrap();
+    exhaust_sync_budget(&mut run, &head);
+    land_on_origin(&origin.sideline, "upstream.txt", "additional upstream change\n");
+
+    let out = sync_only_cli(&fx, &run.id, true);
+    assert!(!out.status.success());
+    let saved = magi::run::RunState::load(&run.id).unwrap();
+    assert_sync_only_held(&fx, &task.id, &saved);
+    assert_eq!(serde_json::to_value(saved.base_sync_recovery.stop.as_ref().unwrap()).unwrap()["kind"], "exhausted");
+    assert_eq!(saved.base_sync_recovery.episodes[0].used, 4);
+    assert_eq!(saved.base_sync_recovery.operations.len(), 1);
+    assert_eq!(magi::git::rev_parse(&worktree, "HEAD").await.unwrap(), head);
 }
 }
 

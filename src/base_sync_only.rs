@@ -508,6 +508,30 @@ pub(crate) async fn sync(state: &mut RunState) -> Result<Outcome> {
     };
     let behind = git::commits_ahead(&checkout.path, &head, &tip).await?;
     let attempts = state.base_sync.as_ref().map_or(0, |sync| sync.attempts);
+    let tree = if behind != 0
+        && state
+            .sync_only_passes
+            .last()
+            .unwrap()
+            .prepared_head
+            .is_none()
+    {
+        let tree = checkout
+            .raw(&["merge-tree", "--write-tree", &head, &tip])
+            .await?;
+        if tree.ok()
+            && head != state.base_commit
+            && tree.stdout
+                == checkout
+                    .git(&["rev-parse", &format!("{tip}^{{tree}}")])
+                    .await?
+        {
+            return already_integrated(&checkout, state, &head, tip, behind).await;
+        }
+        Some(tree)
+    } else {
+        None
+    };
     if behind != 0 && !saved {
         state.ensure_base_episode();
         if state.base_episode_used() >= crate::graph::BASE_SYNC_ROUNDS {
@@ -543,9 +567,7 @@ pub(crate) async fn sync(state: &mut RunState) -> Result<Outcome> {
             if let Some(commit) = state.sync_only_passes.last().unwrap().prepared_head.clone() {
                 commit
             } else {
-                let tree = checkout
-                    .raw(&["merge-tree", "--write-tree", &head, &tip])
-                    .await?;
+                let tree = tree.expect("merge tree computed for an unprepared synchronization");
                 if tree.code == Some(1) {
                     let why = format!(
                         "base merge conflicted; winner left unchanged ({})",
@@ -568,14 +590,6 @@ pub(crate) async fn sync(state: &mut RunState) -> Result<Outcome> {
                     bail!("{why}");
                 }
                 ensure!(tree.ok(), "Git merge-tree failed: {}", tree.stderr);
-                if head != state.base_commit
-                    && tree.stdout
-                        == checkout
-                            .git(&["rev-parse", &format!("{tip}^{{tree}}")])
-                            .await?
-                {
-                    return already_integrated(&checkout, state, &head, tip, behind).await;
-                }
                 let prepared = checkout
                     .git(&[
                         "-c",

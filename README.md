@@ -1026,6 +1026,7 @@ requires a fresh fetch. An interrupted sync with a saved reservation reuses
 its recorded base without spending another slot. Neither rewrites the
 winner's commits. A conflict leaves the checkout unchanged. If the base
 already contains the winner's changes, the pass reports `AlreadyInBase`
+without spending a synchronization slot (even if the budget is exhausted),
 only after confirming that its public branch is absent or also integrated
 into the fetched base. Unintegrated public changes stop synchronization;
 an unreadable public branch requires retrying the Git-only pass.
