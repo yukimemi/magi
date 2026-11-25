@@ -1779,7 +1779,10 @@ impl ReviewRound {
                 .iter()
                 .filter(|o| !o.ok())
                 .map(|o| {
-                    crate::verify_evidence::format_command_prompt_section(o, crate::run::VERIFY_SUMMARY)
+                    crate::verify_evidence::format_command_prompt_section(
+                        o,
+                        crate::run::VERIFY_SUMMARY,
+                    )
                 })
                 .collect::<String>()
         });
