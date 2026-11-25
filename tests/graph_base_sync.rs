@@ -293,6 +293,113 @@ async fn sync_base_only_detects_squashed_work_without_creating_a_merge_commit() 
 }
 
 common::e2e! {
+async fn sync_base_only_refuses_unintegrated_public_branch() {
+    let mut fx = fixture(home_lock().await, Judges::Unanimous, false);
+    let origin = wire_origin(&fx);
+    let (task, run) = sync_only_fixture(&mut fx).await;
+    let worktree = &run.winner().unwrap().worktree;
+    let head = magi::git::rev_parse(worktree, "HEAD").await.unwrap();
+    let branch = run.pr_branch().unwrap();
+    land_on_origin(&origin.sideline, "note.txt", "retained change\n");
+    run_git(&origin.sideline, &["switch", "-c", branch]);
+    std::fs::write(origin.sideline.join("public.txt"), "public-only change\n").unwrap();
+    run_git(&origin.sideline, &["add", "public.txt"]);
+    run_git(&origin.sideline, &["commit", "-m", "Public change"]);
+    run_git(&origin.sideline, &["push", "origin", branch]);
+    let public_head = magi::git::rev_parse(&origin.sideline, "HEAD").await.unwrap();
+
+    let out = sync_only_cli(&fx, &run.id, true);
+    assert!(!out.status.success());
+    let saved = magi::run::RunState::load(&run.id).unwrap();
+    assert_sync_only_held(&fx, &task.id, &saved);
+    assert!(saved.base_sync.as_ref().unwrap().already_in.is_none());
+    assert_eq!(serde_json::to_value(saved.base_sync_recovery.stop.as_ref().unwrap()).unwrap()["kind"],
+        "divergence");
+    assert_eq!(magi::git::rev_parse(worktree, "HEAD").await.unwrap(), head);
+    assert_eq!(magi::git::git(&fx.repo, &["ls-remote", "origin", &format!("refs/heads/{branch}")]).await.unwrap(),
+        format!("{public_head}\trefs/heads/{branch}"));
+
+    let url = magi::git::git(&fx.repo, &["remote", "get-url", "origin"]).await.unwrap();
+    let missing = fx.tmp.path().join("missing.git");
+    run_git(&fx.repo, &["remote", "set-url", "origin", missing.to_str().unwrap()]);
+    let mut runner = Runner::resume(&run.id).unwrap();
+    runner.execute().await.unwrap();
+    let resumed = magi::run::RunState::load(&run.id).unwrap();
+    assert!(resumed.events.iter().any(|e| e.message.contains("cannot recheck recorded public branch divergence")));
+    assert_eq!(resumed.status, RunStatus::Blocked);
+    assert_eq!(serde_json::to_value(&resumed.base_sync_recovery.stop).unwrap(),
+        serde_json::to_value(&saved.base_sync_recovery.stop).unwrap());
+    assert!(resumed.base_sync.as_ref().unwrap().already_in.is_none());
+    assert_ne!(magi::queue::Queue::open().get(&task.id).unwrap().status, magi::queue::TaskStatus::Done);
+    assert_eq!(magi::git::rev_parse(worktree, "HEAD").await.unwrap(), head);
+    assert!(!fx.tmp.path().join("verification").exists());
+    run_git(&fx.repo, &["remote", "set-url", "origin", &url]);
+    assert_eq!(magi::git::git(&fx.repo, &["ls-remote", "origin", &format!("refs/heads/{branch}")]).await.unwrap(),
+        format!("{public_head}\trefs/heads/{branch}"));
+}
+}
+
+common::e2e! {
+async fn sync_base_only_rechecks_public_branch_after_interruption() {
+    use magi::base_sync_only::{Outcome, Request};
+
+    let mut fx = fixture(home_lock().await, Judges::Unanimous, false);
+    let origin = wire_origin(&fx);
+    let (task, mut run) = sync_only_fixture(&mut fx).await;
+    let worktree = run.winner().unwrap().worktree.clone();
+    let head = magi::git::rev_parse(&worktree, "HEAD").await.unwrap();
+    let branch = run.pr_branch().unwrap().to_owned();
+    land_on_origin(&origin.sideline, "note.txt", "retained change\n");
+    let public_head = magi::git::rev_parse(&origin.sideline, "HEAD").await.unwrap();
+    run_git(&origin.sideline, &["push", "origin", &format!("HEAD:refs/heads/{branch}")]);
+    land_on_origin(&origin.sideline, "upstream.txt", "upstream change\n");
+    let tip = magi::git::rev_parse(&origin.sideline, "HEAD").await.unwrap();
+    run_git(&fx.repo, &["fetch", "origin", "main"]);
+    let request = Request { run: run.id.clone(), at: jiff::Timestamp::now() };
+    let pass_index = run.passes.len();
+    run.begin_pass();
+    run.base_sync = Some(magi::run::BaseSync {
+        tip: tip.clone(), behind: 2, attempts: 1, conflict: None, already_in: None,
+    });
+    run.base_sync_recovery = serde_json::from_value(serde_json::json!({
+        "episodes": [{"id": 0, "reason": "initial", "used": 1}],
+        "authorizations": [],
+        "operations": [{"id": 0, "episode": 0, "head": head, "tip": tip, "finished": true}]
+    })).unwrap();
+    run.sync_only_passes.push(serde_json::from_value(serde_json::json!({
+        "request": request, "pass_index": pass_index, "required_base": "origin/main",
+        "head_before": head, "head_after": head, "tip": tip,
+        "reservation": 0, "result": "incomplete", "verification_allowed": false
+    })).unwrap());
+    run.save().unwrap();
+    let url = magi::git::git(&fx.repo, &["remote", "get-url", "origin"]).await.unwrap();
+    let missing = fx.tmp.path().join("missing.git");
+    run_git(&fx.repo, &["remote", "set-url", "origin", missing.to_str().unwrap()]);
+    let out = sync_only_cli(&fx, &run.id, true);
+    assert!(!out.status.success());
+    let saved = magi::run::RunState::load(&run.id).unwrap();
+    assert_sync_only_held(&fx, &task.id, &saved);
+    assert!(saved.base_sync_recovery.stop.is_none());
+    assert_eq!(saved.base_sync_recovery.episodes[0].used, 1);
+    assert_eq!(saved.sync_only_passes[0].request, request);
+    assert_eq!(magi::git::rev_parse(&worktree, "HEAD").await.unwrap(), head);
+
+    run_git(&fx.repo, &["remote", "set-url", "origin", &url]);
+    let out = sync_only_cli(&fx, &run.id, true);
+    assert!(out.status.success(), "{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    let saved = magi::run::RunState::load(&run.id).unwrap();
+    assert_eq!(saved.status, RunStatus::AlreadyInBase);
+    assert_eq!(saved.sync_only_passes[0].result, Outcome::AlreadyInBase);
+    assert_eq!(saved.base_sync_recovery.episodes[0].used, 1);
+    assert_eq!(magi::queue::Queue::open().get(&task.id).unwrap().status, magi::queue::TaskStatus::Done);
+    assert_eq!(magi::git::rev_parse(&worktree, "HEAD").await.unwrap(), head);
+    assert_eq!(magi::git::git(&fx.repo, &["ls-remote", "origin", &format!("refs/heads/{branch}")]).await.unwrap(),
+        format!("{public_head}\trefs/heads/{branch}"));
+    assert!(!fx.tmp.path().join("verification").exists());
+}
+}
+
+common::e2e! {
 async fn sync_base_only_stops_on_fetch_failure_and_conflict_without_running_any_seat() {
     let mut fx = fixture(home_lock().await, Judges::Unanimous, false);
     let origin = wire_origin(&fx);

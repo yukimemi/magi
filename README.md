@@ -1025,7 +1025,10 @@ From a terminal, use `magi run --resume <run> --sync-base-only`. A new sync
 requires a fresh fetch. An interrupted sync with a saved reservation reuses
 its recorded base without spending another slot. Neither rewrites the
 winner's commits. A conflict leaves the checkout unchanged. If the base
-already contains the winner's changes, the pass reports `AlreadyInBase`.
+already contains the winner's changes, the pass reports `AlreadyInBase`
+only after confirming that its public branch is absent or also integrated
+into the fetched base. Unintegrated public changes stop synchronization;
+an unreadable public branch requires retrying the Git-only pass.
 The pass runs no setup, reviewers, fixers, or verification. It does not
 publish or approve a merge. `magi show <run>` and the Web run report show the
 required base, observed HEADs, and outcome. If work remains after a successful

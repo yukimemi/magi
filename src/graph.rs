@@ -5596,6 +5596,21 @@ impl Runner {
 
         let fetched_base =
             matches!(git::fetch(&repo, &remote, &base_branch).await, Ok(o) if o.ok());
+        if !fetched_base
+            && self
+                .state
+                .base_sync_recovery
+                .stop
+                .as_ref()
+                .is_some_and(|stop| stop.kind == crate::base_sync_recovery::StopKind::Divergence)
+        {
+            self.state.event(
+                "land",
+                "cannot recheck recorded public branch divergence without a fresh base",
+            );
+            self.state.save()?;
+            return Ok(());
+        }
         // No network, or the remote never had this branch: the run already
         // started from a fetched `<remote>/<base>` (`resolve_base` refuses
         // otherwise), and one that got this far is not blocked by a fetch
@@ -6279,14 +6294,31 @@ impl Runner {
         let mut verified = vec![head.to_owned()];
         let public_branch = self.state.pr_branch().unwrap_or(branch).to_owned();
         let fetched = git::fetch(&repo, &remote, &public_branch).await;
-        if matches!(&fetched, Ok(o) if o.ok())
-            && let Ok(theirs) = git::rev_parse(&repo, &format!("{remote}/{public_branch}")).await
-            && theirs != head
-        {
-            match crate::already::classify(&repo, tip, &theirs, Some(&start)).await {
-                Ok(Some(_)) => verified.push(theirs),
-                _ => return Ok(false),
+        let divergence = self
+            .state
+            .base_sync_recovery
+            .stop
+            .as_ref()
+            .is_some_and(|stop| stop.kind == crate::base_sync_recovery::StopKind::Divergence);
+        if matches!(&fetched, Ok(o) if o.ok()) {
+            match git::rev_parse(&repo, &format!("{remote}/{public_branch}")).await {
+                Ok(theirs) if theirs != head => {
+                    match crate::already::classify(&repo, tip, &theirs, Some(&start)).await {
+                        Ok(Some(_)) => verified.push(theirs),
+                        _ => return Ok(false),
+                    }
+                }
+                Err(_) if divergence => return Ok(false),
+                _ => {}
             }
+        } else if divergence
+            && !matches!(
+                git::remote_has_branch(&repo, &remote, &public_branch).await,
+                Ok(false)
+            )
+        {
+            // A failed fetch cannot discharge a recorded divergence.
+            return Ok(false);
         }
         let base_branch = self.state.base_branch.clone();
         let message = format!(
