@@ -20,8 +20,13 @@ pub(crate) fn of(state: &RunState, latest: Option<(&str, RunStatus)>) -> Option<
         .count();
     let current = (state.gate_head.is_some()
         || state.head_e2e.is_some()
+        || state.gate_repair_e2e.is_some()
         || state.resource_block.is_some()
-        || state.base_sync_blocked())
+        || state.base_sync_blocked()
+        || state
+            .reviews
+            .last()
+            .is_some_and(|r| r.e2e_status() == crate::run::E2eStatus::Failed))
     .then(|| state.verification_blocking_cause())
     .flatten();
     let reason = if let Some(reason) = current {
@@ -110,6 +115,34 @@ fn one_line(text: &str) -> String {
 
 /// Name the failing command and any test identified in its output.
 pub(crate) fn command_failure(kind: &str, command: &CommandOutcome) -> String {
+    if let Some(c) = &command.rerun_comparison {
+        return format!(
+            "{kind} failed: {} — {}",
+            command.command,
+            crate::verify_evidence::comparison_headline(c)
+        );
+    }
+    if crate::verify_evidence::legacy_failed_twice(&command.output_tail) {
+        return format!(
+            "{kind} failed: {} — exited non-zero twice (legacy record; comparison unknown)",
+            command.command
+        );
+    }
+    if let Some(ev) = &command.failure_evidence {
+        return match &ev.extraction {
+            crate::verify_evidence::FailureExtraction::Confirmed { failures }
+                if !failures.is_empty() =>
+            {
+                let first = failures[0].display_name();
+                format!(
+                    "{kind} failed: {} — {first} ({} failed)",
+                    command.command,
+                    failures.len()
+                )
+            }
+            _ => format!("{kind} failed: {}", command.command),
+        };
+    }
     let mut name = None;
     let mut failed = None;
     let mut failures = false;
@@ -183,6 +216,7 @@ mod tests {
             output_tail: output.into(),
             duration_ms: 0,
             resource_blocked: false,
+            ..Default::default()
         }
     }
 

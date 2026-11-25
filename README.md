@@ -1956,8 +1956,14 @@ a base sync, at publication) and the gate-repair check. A verification runs at
 most three times for one decision (the existing build/link retry, then this
 rerun).
 
-- **The second run fails:** the failure stands, and the fixer receives the
-  second run's output, marked as the output of a command that failed twice.
+- **The second run fails:** verification stays red. Both attempts retain
+  bounded evidence and artifact references. The fixer, reports and task chat
+  distinguish matching, distinct and unknown terminal failures; retry attempts,
+  flaky passes and captured output are not final verdicts. Matching requires
+  confirmed test binary identities. Completed red checks, including post-repair
+  checks, are reused on the same SHA rather than rerun on resume. A post-repair
+  check interrupted by a timeout, launch failure or resource wait remains
+  retryable on resume.
 - **The second run passes:** the head is verified, but the failure is recorded
   as a flake — a `verify` event, `RunState::verify_flakes`, a "flaky
   verification" section in `magi show` and on the web run page, and the round

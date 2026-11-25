@@ -694,6 +694,7 @@ async fn granted_confirmation_review_recovers_cleanliness_after_unresolved_e2e_o
         command: "test -f gatefix.txt".into(), code: None,
         output_tail: "shared build cache is busy".into(), duration_ms: 0,
         resource_blocked: true,
+        ..Default::default()
     }];
     if deferred {
         round.e2e.clear();

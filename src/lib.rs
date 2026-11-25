@@ -120,6 +120,7 @@ pub mod triage;
 pub mod tui;
 pub mod updater;
 pub mod verdict;
+pub mod verify_evidence;
 pub mod waiter;
 pub mod web;
 pub mod worker;

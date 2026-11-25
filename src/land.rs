@@ -7862,6 +7862,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             vec!["grep -q fixed change || { echo 'change needs repair'; exit 1; }".into()];
         // The repair makes the gate green while breaking an e2e invariant.
         state.config.verify.e2e = vec!["grep -q '^change$' change".into()];
+        let mut saved_comparison = None;
         for resume in 0..3 {
             assert!(resume_observed_head(&mut state, &old).await.is_err());
             state = RunState::load(&state.id).unwrap();
@@ -7870,6 +7871,12 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             assert_eq!(evidence.head, head);
             assert!(!evidence.passed);
             assert!(evidence.outcomes.iter().any(|o| !o.ok()));
+            let comparison = evidence.outcomes[0].rerun_comparison.as_ref().unwrap();
+            if let Some(saved) = &saved_comparison {
+                assert_eq!(comparison, saved);
+            } else {
+                saved_comparison = Some(comparison.clone());
+            }
             assert_eq!(state.gate_fixes.len(), 1);
             assert_eq!(
                 git::remote_head(&state.repo, "origin", "task-head")
@@ -7884,20 +7891,13 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
                 );
             }
         }
-        // Once e2e genuinely succeeds on the same SHA, the saved requirement
-        // can be satisfied without another fixer or approval bypass.
+        // A changed command is not new evidence about the already checked SHA.
         state.config.verify.e2e = vec!["grep -q fixed change".into()];
-        let head = resume_observed_head(&mut state, &old).await.unwrap();
-        assert!(state.gate_repair_e2e.as_ref().unwrap().passed);
-        assert_eq!(state.gate_repair_e2e.as_ref().unwrap().head, head);
-        assert_eq!(state.gate_fixes.len(), 1);
-        let forge = Scripted::new(vec![seen(&head, Checks::Green, "CLEAN", false)], vec![]);
-        land_with(&mut state, &green_pr().url, &forge)
-            .await
-            .unwrap();
-        assert!(state.parked);
-        assert_eq!(state.land_approval.as_ref().unwrap().head, head);
-        assert!(forge.argvs().is_empty());
+        assert!(resume_observed_head(&mut state, &old).await.is_err());
+        assert_eq!(
+            state.gate_repair_e2e.as_ref().unwrap().outcomes[0].rerun_comparison,
+            saved_comparison
+        );
     }
 
     #[tokio::test]
@@ -7924,6 +7924,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
                         output_tail: "verification resource unavailable".into(),
                         duration_ms: 0,
                         resource_blocked: true,
+                        ..Default::default()
                     }]
                 } else {
                     Vec::new()
@@ -7945,6 +7946,34 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
                 );
                 assert!(state.land_sync_pending);
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn landing_resumes_recheck_abnormal_repair_e2e_exit() {
+        for code in [None, Some(126), Some(127)] {
+            let (_tmp, mut state, old) = landing_git_fixture().await;
+            advance_landing_base(&state).await;
+            let head = resume_observed_head(&mut state, &old).await.unwrap();
+            state.land_sync_pending = true;
+            state.config.verify.e2e = vec!["true".into()];
+            state.gate_repair_e2e = Some(crate::run::GateRepairE2e {
+                head: head.clone(),
+                passed: false,
+                outcomes: vec![crate::run::CommandOutcome {
+                    command: state.config.verify.e2e[0].clone(),
+                    code,
+                    output_tail: "verification command did not complete".into(),
+                    ..Default::default()
+                }],
+            });
+            state.save().unwrap();
+            state = RunState::load(&state.id).unwrap();
+            assert_eq!(resume_observed_head(&mut state, &head).await.unwrap(), head);
+            let evidence = state.gate_repair_e2e.as_ref().unwrap();
+            assert_eq!(evidence.head, head);
+            assert!(evidence.passed);
+            assert_eq!(evidence.outcomes[0].code, Some(0));
         }
     }
 

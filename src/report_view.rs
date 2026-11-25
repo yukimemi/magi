@@ -199,6 +199,20 @@ pub enum Section {
         /// Mechanical fixes commit, abbreviated.
         committed: Option<String>,
     },
+    /// Head-bound e2e verification (`head_e2e` or `gate_repair_e2e`).
+    Verification {
+        /// Title, tone and default state.
+        #[serde(flatten)]
+        head: Head,
+        /// Section key (`head_e2e` or `gate_repair_e2e`).
+        key: &'static str,
+        /// Commit SHA verified, abbreviated.
+        commit: String,
+        /// Whether all commands passed on that commit.
+        passed: bool,
+        /// Per-command results.
+        commands: Vec<CommandView>,
+    },
     /// The final gate.
     Gate {
         /// Title, tone and default state.
@@ -528,6 +542,15 @@ pub struct CommandView {
     pub duration_ms: u64,
     /// The last of the output; only for a command that did not pass.
     pub output_tail: Option<String>,
+    /// Saved artifact reference, when recorded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<String>,
+    /// Concise summary of a rerun comparison or terminal failure extraction.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comparison_summary: Option<String>,
+    /// Structured two-attempt comparison when the command failed twice on one commit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rerun_comparison: Option<crate::verify_evidence::RerunComparison>,
 }
 
 /// An operator-requested fix.
@@ -705,6 +728,11 @@ fn command(o: &CommandOutcome, warn_instead_of_fail: bool) -> CommandView {
         code: o.code,
         duration_ms: o.duration_ms,
         output_tail: (!o.ok()).then(|| crate::run::summarize_verify(&o.output_tail, OUTPUT_TAIL)),
+        artifact: o.artifact.clone(),
+        comparison_summary: (!o.ok())
+            .then(|| crate::verify_evidence::outcome_comparison_summary(o))
+            .flatten(),
+        rerun_comparison: (!o.ok()).then(|| o.rerun_comparison.clone()).flatten(),
     }
 }
 
@@ -1615,6 +1643,38 @@ pub fn build_with(
         });
     }
 
+    if let Some(e) = &state.head_e2e
+        && !e.outcomes.is_empty()
+    {
+        sections.push(Section::Verification {
+            head: head(
+                "current head e2e",
+                if e.passed { Tone::Ok } else { Tone::Fail },
+                !e.passed,
+            ),
+            key: "head_e2e",
+            commit: short(&e.head),
+            passed: e.passed,
+            commands: e.outcomes.iter().map(|o| command(o, false)).collect(),
+        });
+    }
+
+    if let Some(e) = &state.gate_repair_e2e
+        && !e.outcomes.is_empty()
+    {
+        sections.push(Section::Verification {
+            head: head(
+                "gate repair e2e",
+                if e.passed { Tone::Ok } else { Tone::Fail },
+                !e.passed,
+            ),
+            key: "gate_repair_e2e",
+            commit: short(&e.head),
+            passed: e.passed,
+            commands: e.outcomes.iter().map(|o| command(o, false)).collect(),
+        });
+    }
+
     match state.gate_status() {
         GateStatus::NotRun => {}
         gs => {
@@ -1876,6 +1936,7 @@ mod tests {
             output_tail: "boom\n".repeat(1_000),
             duration_ms: 5,
             resource_blocked: blocked,
+            ..Default::default()
         }
     }
 

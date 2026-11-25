@@ -1645,6 +1645,7 @@ async fn blocked_run_header_shows_the_failed_gate_reason() {
         output_tail: "failures:\n    web::tests::talks_report_independent_thinking_claims_and_queue_a_second_message\n\ntest result: FAILED. 1813 passed; 1 failed; 0 ignored;".into(),
         duration_ms: 0,
         resource_blocked: false,
+        ..Default::default()
     });
     run.save_under(&home).unwrap();
     let base = serve(

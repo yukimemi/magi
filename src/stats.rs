@@ -1633,6 +1633,7 @@ mod tests {
             output_tail: "boom".to_owned(),
             duration_ms: 1,
             resource_blocked: false,
+            ..Default::default()
         };
         let sole = ReviewRound {
             round: 1,

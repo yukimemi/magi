@@ -1347,7 +1347,7 @@ pub enum JobStatus {
 }
 
 /// Outcome of one shell command.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CommandOutcome {
     /// The command, as configured.
     pub command: String,
@@ -1371,6 +1371,18 @@ pub struct CommandOutcome {
     /// was.
     #[serde(default)]
     pub resource_blocked: bool,
+    /// Run-relative artifact path (e.g. `artifacts/e2e-1.out`), recorded
+    /// whenever the full output was written to disk regardless of compression.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<String>,
+    /// Raw-output terminal failure extraction and separated non-terminal notes
+    /// (TRY failures, FLAKY passes, cancellations), recorded on failing runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_evidence: Option<crate::verify_evidence::FailureEvidence>,
+    /// Structured comparison recorded when this command failed twice on the
+    /// same commit during `run_e2e_with_retry`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rerun_comparison: Option<crate::verify_evidence::RerunComparison>,
 }
 
 /// Substrings that mark a Cargo/rustc/link failure: the toolchain could not
@@ -1766,7 +1778,12 @@ impl ReviewRound {
             self.e2e
                 .iter()
                 .filter(|o| !o.ok())
-                .map(|o| format!("$ {}\n{}\n", o.command, o.output_tail))
+                .map(|o| {
+                    crate::verify_evidence::format_command_prompt_section(
+                        o,
+                        crate::run::VERIFY_SUMMARY,
+                    )
+                })
                 .collect::<String>()
         });
         Some(VerificationSummary { label, tail })
@@ -3329,17 +3346,28 @@ impl RunState {
         if crate::graph::review_conclusion(&self.reviews, self.config.graph.review_rounds)
             == Some(RunStatus::Blocked)
         {
-            return self.reviews.last().map(|r| format!(
-                "review blocked on reviewed head {} ({} blocking finding(s), {}/{} reviewers answered)",
-                r.head, r.blocking, r.answered, r.expected
-            ));
+            return self.reviews.last().map(|r| {
+                let mut base = format!(
+                    "review blocked on reviewed head {} ({} blocking finding(s), {}/{} reviewers answered)",
+                    r.head, r.blocking, r.answered, r.expected
+                );
+                if r.e2e_status() == E2eStatus::Failed
+                    && let Some(detail) = crate::verify_evidence::summarize_failed_outcomes(&r.e2e)
+                {
+                    base.push_str(&format!("; e2e failed: {detail}"));
+                }
+                base
+            });
         }
         if let Some(e) = &self.head_e2e
             && !e.passed
             && e.outcomes.iter().any(|o| !o.ok())
         {
+            let detail = crate::verify_evidence::summarize_failed_outcomes(&e.outcomes)
+                .map(|d| format!(" ({d})"))
+                .unwrap_or_default();
             return Some(format!(
-                "verify.e2e failed on head {}; nothing published",
+                "verify.e2e failed on head {}{detail}; nothing published",
                 e.head
             ));
         }
@@ -3347,8 +3375,11 @@ impl RunState {
             && !e.passed
             && e.outcomes.iter().any(|o| !o.ok())
         {
+            let detail = crate::verify_evidence::summarize_failed_outcomes(&e.outcomes)
+                .map(|d| format!(" ({d})"))
+                .unwrap_or_default();
             return Some(format!(
-                "verify.e2e failed on head {} after gate repair; nothing published",
+                "verify.e2e failed on head {} after gate repair{detail}; nothing published",
                 e.head
             ));
         }
@@ -5490,6 +5521,7 @@ mod tests {
                 .to_owned(),
             duration_ms: 500,
             resource_blocked: false,
+            ..Default::default()
         };
         assert!(!link_race.ok());
         assert!(link_race.build_failed());
@@ -5506,6 +5538,7 @@ mod tests {
             output_tail: "thread 'it_works' panicked at 'assertion failed'".to_owned(),
             duration_ms: 500,
             resource_blocked: false,
+            ..Default::default()
         };
         assert!(!failing_test.ok());
         assert!(
@@ -5519,6 +5552,7 @@ mod tests {
             output_tail: String::new(),
             duration_ms: 500,
             resource_blocked: false,
+            ..Default::default()
         };
         assert!(passing.ok());
         assert!(!passing.build_failed());
@@ -5719,6 +5753,7 @@ mod tests {
             output_tail: String::new(),
             duration_ms: 0,
             resource_blocked: false,
+            ..Default::default()
         }];
         assert_eq!(
             r.e2e_status(),
@@ -5736,6 +5771,7 @@ mod tests {
             output_tail: "boom".to_owned(),
             duration_ms: 0,
             resource_blocked: false,
+            ..Default::default()
         }];
         assert_eq!(r.e2e_status(), E2eStatus::Failed);
     }
@@ -5752,6 +5788,7 @@ mod tests {
             output_tail: "contended".to_owned(),
             duration_ms: 0,
             resource_blocked: true,
+            ..Default::default()
         }];
         assert_eq!(
             r.e2e_status(),
@@ -5774,6 +5811,7 @@ mod tests {
             output_tail: String::new(),
             duration_ms: 0,
             resource_blocked: false,
+            ..Default::default()
         }];
         assert!(
             r.verification_summary("h").is_none(),
@@ -5791,6 +5829,7 @@ mod tests {
             output_tail: "boom".to_owned(),
             duration_ms: 0,
             resource_blocked: false,
+            ..Default::default()
         }];
         r.verified_head = Some("h1".to_owned());
         r.verified_at = Some(Timestamp::now());
@@ -5821,6 +5860,7 @@ mod tests {
             output_tail: "contended".to_owned(),
             duration_ms: 0,
             resource_blocked: true,
+            ..Default::default()
         }];
         let blocked = r
             .verification_summary("h")
@@ -5852,6 +5892,7 @@ mod tests {
             output_tail: "boom".to_owned(),
             duration_ms: 0,
             resource_blocked: false,
+            ..Default::default()
         }];
         // verified_head/verified_at left at their default `None` — exactly
         // the shape a schema-7 round with no reconstructable timestamp has.
@@ -5878,6 +5919,7 @@ mod tests {
             output_tail: String::new(),
             duration_ms: 0,
             resource_blocked: false,
+            ..Default::default()
         }];
         assert_eq!(s.gate_status(), GateStatus::Passed);
 

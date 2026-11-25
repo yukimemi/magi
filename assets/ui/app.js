@@ -8133,11 +8133,51 @@ function routput(text) {
   return el("details", { class: "rout" }, el("summary", { text: "output" }), el("pre", { class: "rpre", text }));
 }
 
+function rcomparison(c) {
+  const cmp = c.rerun_comparison;
+  if (!cmp) {
+    return c.comparison_summary
+      ? el("p", { class: "rmeta rwide", text: c.comparison_summary })
+      : null;
+  }
+  const formatAttempt = (a) => {
+    if (!a) return null;
+    const code = a.code == null ? "none" : String(a.code);
+    const meta = [
+      `attempt ${a.attempt}`,
+      `exit ${code}`,
+      `${a.duration_ms || 0}ms`,
+      a.artifact || null,
+    ].filter(Boolean).join(" · ");
+    const ex = a.extraction || {};
+    const verdict = ex.kind === "confirmed"
+      ? `terminal: ${(ex.failures || []).map((f) => f.suite ? `${f.suite} ${f.test}` : f.test).join(", ")}`
+      : `terminal: unknown${ex.reason ? ` (${ex.reason})` : ""}`;
+    const inter = a.intermediate || {};
+    const notes = [];
+    if (inter.try_failure_count) notes.push(`${inter.try_failure_count} TRY failure(s)`);
+    if (inter.flaky_count) notes.push(`${inter.flaky_count} FLAKY`);
+    if (inter.cancelled) notes.push(inter.not_run_count ? `cancelled (${inter.not_run_count} not run)` : "cancelled");
+    if ((inter.long_running || []).length) notes.push(`long-running: ${inter.long_running.join(", ")}`);
+    return el("div", { class: "rblock" },
+      el("p", { class: "rmeta", text: `${meta} — ${verdict}${notes.length ? ` [${notes.join("; ")}]` : ""}` }),
+      a.excerpt ? el("pre", { class: "rpre", text: a.excerpt }) : null);
+  };
+  return el("div", { class: "rwide" },
+    c.comparison_summary ? el("p", { class: "rmeta", text: c.comparison_summary }) : null,
+    el("details", { class: "rout" },
+      el("summary", { text: "attempts 1 & 2 comparison" }),
+      formatAttempt(cmp.first),
+      formatAttempt(cmp.second)));
+}
+
 function rcommands(list) {
   return el("ul", { class: "rlist" }, (list || []).map((c) => el("li", { class: "rrow" },
     rtag(c.state === "pass" ? "pass" : c.state === "blocked" ? "blocked" : c.state === "warn" ? "warn" : "FAIL",
       c.state === "pass" ? "ok" : c.state === "fail" ? "fail" : "warn"),
     el("code", { class: "rmono", text: c.command }),
+    c.artifact ? el("span", { class: "rmeta rmono", text: c.artifact }) : null,
+    rcomparison(c),
     routput(c.output_tail))));
 }
 
@@ -8376,6 +8416,10 @@ function renderSection(runId, s) {
     case "pre_gate":
       return card([rtag((s.commands || []).every((c) => c.state === "pass") ? "pass" : "warn", s.tone)],
         rcommands(s.commands), s.committed ? el("p", { class: "rmeta", text: `committed mechanical fixes @ ${s.committed}` }) : null);
+    case "verification":
+      return card([rtag(s.passed ? "pass" : "fail", s.tone)],
+        s.commit ? el("p", { class: "rmeta", text: `@ ${s.commit}` }) : null,
+        rcommands(s.commands));
     case "gate":
       return card([rtag(s.status.replace(/_/g, " "), s.tone)],
         s.commands && s.commands.length ? rcommands(s.commands) : el("p", { class: "rmeta", text: "no gate commands configured" }));
@@ -10188,12 +10232,18 @@ function commandList(heading, commands) {
          about the patch, so it must never read the same as an actual fail. */
       const blocked = !!command.resource_blocked;
       const passed = !blocked && command.code === 0;
+      const cmp = command.rerun_comparison;
+      const cmpText = cmp && cmp.verdict
+        ? `rerun comparison: ${cmp.verdict.kind}${cmp.first && cmp.first.artifact ? ` (attempt 1: ${cmp.first.artifact}` : ""}${cmp.second && cmp.second.artifact ? `${cmp.first && cmp.first.artifact ? ", " : " ("}attempt 2: ${cmp.second.artifact})` : cmp.first && cmp.first.artifact ? ")" : ""}`
+        : null;
       return el("div", { class: "finding", "data-sev": blocked ? "major" : passed ? null : "blocker" },
         el("div", { class: "finding-top" },
           el("span", { class: "tag", "data-tone": blocked ? "gold" : passed ? "teal" : "rust", text: blocked ? "could not run" : passed ? "pass" : "fail" }),
           el("span", { class: "finding-where", text: command.command || "" }),
+          command.artifact ? el("span", { class: "finding-id", text: command.artifact }) : null,
           blocked ? null : el("span", { class: "finding-id", text: command.code === null || command.code === undefined ? "timeout" : `exit ${command.code}` }),
         ),
+        !passed && cmpText ? el("p", { class: "rmeta", text: cmpText }) : null,
         !passed && command.output_tail
           ? el("pre", { class: "stat", text: command.output_tail })
           : null,

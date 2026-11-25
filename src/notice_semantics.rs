@@ -51,6 +51,8 @@ fn run_evidence(home: &Path, run: Option<&str>) -> Value {
         "release_bump",
         "tally",
         "reviews",
+        "head_e2e",
+        "gate_repair_e2e",
         "gate",
         "gate_head",
     ] {
@@ -383,5 +385,50 @@ mod tests {
         let next = outcome(home.path(), &task);
         assert!(!covers(&first, &next));
         assert!(!covers(&next, &first));
+    }
+
+    #[test]
+    fn unchanged_e2e_rerun_stop_keeps_semantic_receipt_and_distinguishes_new_verdict() {
+        let home = tempfile::tempdir().unwrap();
+        let task = fixture(home.path());
+        let write_e2e = |verdict_kind: &str, dur: u64| {
+            std::fs::write(
+                home.path().join("runs/run/run.json"),
+                json!({
+                    "status": "blocked",
+                    "head_e2e": {
+                        "head": "0b11aaaa",
+                        "passed": false,
+                        "outcomes": [{
+                            "command": "cargo make test",
+                            "code": 100,
+                            "duration_ms": dur,
+                            "resource_blocked": false,
+                            "artifact": "artifacts/e2e-4.out",
+                            "rerun_comparison": {
+                                "head": "0b11aaaa",
+                                "verdict": { "kind": verdict_kind, "reason": "unknown" },
+                                "first": { "attempt": 1, "code": 1, "duration_ms": dur, "artifact": "artifacts/e2e-3.out", "excerpt": "a", "extraction": { "kind": "unknown", "reason": "x" }, "intermediate": {} },
+                                "second": { "attempt": 2, "code": 100, "duration_ms": dur, "artifact": "artifacts/e2e-4.out", "excerpt": "b", "extraction": { "kind": "unknown", "reason": "y" }, "intermediate": {} }
+                            }
+                        }]
+                    },
+                    "passes": [{"index": 0}],
+                    "events": [{"message": "verify.e2e failed", "at": "t1"}]
+                })
+                .to_string(),
+            )
+            .unwrap();
+        };
+        write_e2e("unknown", 1000);
+        let first = outcome(home.path(), &task);
+        // Same saved stop facts (even if only duration_ms differs): duplicate suppressed.
+        write_e2e("unknown", 2500);
+        let unchanged = outcome(home.path(), &task);
+        assert!(covers(&first, &unchanged) && covers(&unchanged, &first));
+        // Distinct verdict changes the semantic receipt.
+        write_e2e("distinct", 2500);
+        let changed = outcome(home.path(), &task);
+        assert!(!covers(&first, &changed));
     }
 }

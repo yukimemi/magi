@@ -15291,6 +15291,7 @@ mod tests {
             run: Some("run-123"),
             pr: None,
             summary: Some("Merge state unknown"),
+            verification: None,
             completion: None,
         });
         talk::record(&mut conversation, &ui.talks, &body, vec![]).unwrap();
@@ -21636,6 +21637,7 @@ mod tests {
             output_tail: "test web::tests::talks_report_independent_thinking_claims_and_queue_a_second_message ... FAILED\ntest result: FAILED. 1813 passed; 1 failed; 0 ignored;".into(),
             duration_ms: 0,
             resource_blocked: false,
+            ..Default::default()
         });
         let view = RunDetailView::of(
             state,

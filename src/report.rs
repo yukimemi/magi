@@ -327,6 +327,40 @@ fn jobs_section(state: &RunState) -> String {
     s
 }
 
+fn write_command_outcome(s: &mut String, indent: &str, o: &CommandOutcome) {
+    let label = if o.resource_blocked {
+        yellow("blocked")
+    } else if o.ok() {
+        green("pass")
+    } else {
+        red("FAIL")
+    };
+    let _ = writeln!(s, "{indent}{label}  {}", o.command);
+    if !o.ok() {
+        for line in crate::verify_evidence::format_outcome_cli_lines(o) {
+            let _ = writeln!(s, "{indent}  {line}");
+        }
+        if let Some(c) = &o.rerun_comparison {
+            let first_excerpt = crate::run::summarize_verify(&c.first.excerpt, 1_200);
+            if !first_excerpt.trim().is_empty() {
+                let _ = writeln!(s, "{indent}  --- attempt 1 excerpt ---");
+                let _ = writeln!(s, "{}", dim(&first_excerpt));
+            }
+            let second_excerpt = crate::run::summarize_verify(&o.output_tail, 1_200);
+            if !second_excerpt.trim().is_empty() {
+                let _ = writeln!(s, "{indent}  --- attempt 2 excerpt ---");
+                let _ = writeln!(s, "{}", dim(&second_excerpt));
+            }
+        } else {
+            let _ = writeln!(
+                s,
+                "{}",
+                dim(&crate::run::summarize_verify(&o.output_tail, 2_000))
+            );
+        }
+    }
+}
+
 /// Full report for one run.
 pub fn run(state: &RunState) -> String {
     let mut s = String::new();
@@ -819,21 +853,7 @@ pub fn run(state: &RunState) -> String {
             // `run.json` by hand — the same gap `gate`'s own per-command
             // listing above already closes for the final gate.
             for o in &r.e2e {
-                let label = if o.resource_blocked {
-                    yellow("blocked")
-                } else if o.ok() {
-                    green("pass")
-                } else {
-                    red("FAIL")
-                };
-                let _ = writeln!(s, "    {label}  {}", o.command);
-                if !o.ok() {
-                    let _ = writeln!(
-                        s,
-                        "{}",
-                        dim(&crate::run::summarize_verify(&o.output_tail, 2_000))
-                    );
-                }
+                write_command_outcome(&mut s, "    ", o);
             }
             for rec in &r.reviews {
                 if let Some(vote) = rec.vote {
@@ -1091,6 +1111,36 @@ pub fn run(state: &RunState) -> String {
         }
         if let Some(c) = &state.pre_gate_commit {
             let _ = writeln!(s, "  committed mechanical fixes @ {}", short(c));
+        }
+    }
+
+    if let Some(e) = &state.head_e2e
+        && !e.outcomes.is_empty()
+    {
+        let _ = writeln!(
+            s,
+            "\n{} @ {}  {}",
+            bold("current head e2e"),
+            short(&e.head),
+            if e.passed { green("pass") } else { red("FAIL") }
+        );
+        for o in &e.outcomes {
+            write_command_outcome(&mut s, "  ", o);
+        }
+    }
+
+    if let Some(e) = &state.gate_repair_e2e
+        && !e.outcomes.is_empty()
+    {
+        let _ = writeln!(
+            s,
+            "\n{} @ {}  {}",
+            bold("gate repair e2e"),
+            short(&e.head),
+            if e.passed { green("pass") } else { red("FAIL") }
+        );
+        for o in &e.outcomes {
+            write_command_outcome(&mut s, "  ", o);
         }
     }
 
@@ -2306,6 +2356,7 @@ mod tests {
                 output_tail: "LINK : fatal error LNK1104: cannot open file".to_owned(),
                 duration_ms: 100,
                 resource_blocked: false,
+                ..Default::default()
             }],
             verify_retried: true,
             e2e_deferred: false,
@@ -2342,6 +2393,7 @@ mod tests {
                 output_tail: "held by run x node e2e seat e2e".to_owned(),
                 duration_ms: 100,
                 resource_blocked: true,
+                ..Default::default()
             }],
             verify_retried: false,
             e2e_deferred: false,
@@ -2383,6 +2435,7 @@ mod tests {
                     output_tail: String::new(),
                     duration_ms: 0,
                     resource_blocked: false,
+                    ..Default::default()
                 },
                 CommandOutcome {
                     command: "cargo make check".to_owned(),
@@ -2390,6 +2443,7 @@ mod tests {
                     output_tail: "clippy: unused import".to_owned(),
                     duration_ms: 0,
                     resource_blocked: false,
+                    ..Default::default()
                 },
             ],
             verify_retried: false,
@@ -2446,6 +2500,7 @@ mod tests {
                 output_tail: String::new(),
                 duration_ms: 0,
                 resource_blocked: false,
+                ..Default::default()
             }],
             verify_retried: false,
             e2e_deferred: false,
@@ -2494,6 +2549,7 @@ mod tests {
             output_tail: "error[E0308]: mismatched types".to_owned(),
             duration_ms: 0,
             resource_blocked: false,
+            ..Default::default()
         }];
         s.gate_ran = true;
 

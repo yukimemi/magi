@@ -1176,6 +1176,28 @@ fn recovery_rounds(s: &mut String, rec: &crate::recovery::RecoveryRecord) {
 
 fn recovery_evidence(rec: &crate::recovery::RecoveryRecord) -> String {
     rec.evidence.as_ref().map_or_else(String::new, |e| {
+        let outcome = crate::run::CommandOutcome {
+            command: e.command.clone(),
+            code: e.code,
+            output_tail: e.output_tail.clone(),
+            duration_ms: 0,
+            resource_blocked: false,
+            artifact: e.artifact.clone(),
+            failure_evidence: e.failure_evidence.clone(),
+            rerun_comparison: e.rerun_comparison.clone(),
+        };
+        let body = if e.rerun_comparison.is_some()
+            || crate::verify_evidence::legacy_failed_twice(&e.output_tail)
+            || e.artifact.is_some()
+            || e.failure_evidence.is_some()
+        {
+            crate::verify_evidence::format_command_prompt_section(
+                &outcome,
+                crate::recovery::TAIL_MAX,
+            )
+        } else {
+            e.output_tail.clone()
+        };
         format!(
             "a failed {} (`{}`, exit {}) run against commit {}:\n\n```\n{}\n```\n",
             match e.source {
@@ -1185,7 +1207,7 @@ fn recovery_evidence(rec: &crate::recovery::RecoveryRecord) -> String {
             e.command,
             e.code.map_or("none".to_owned(), |c| c.to_string()),
             e.head.get(..8).unwrap_or(&e.head),
-            e.output_tail.trim()
+            body.trim()
         )
     })
 }
@@ -1840,6 +1862,8 @@ pub struct ChatTaskNotice<'a> {
     pub pr: Option<&'a str>,
     /// A short summary of the result.
     pub summary: Option<&'a str>,
+    /// Structured verification / rerun comparison fact for the active failure, if any.
+    pub verification: Option<&'a str>,
     /// The exact audited completion; absent on holds and legacy records.
     pub completion: Option<&'a crate::queue::CompletionEvent>,
 }
@@ -1887,6 +1911,9 @@ fn task_report_with(
     }
     if let Some(m) = n.summary.filter(|m| !m.trim().is_empty()) {
         s.push_str(&format!("- Result: {}\n", clean(m, 600)));
+    }
+    if let Some(v) = n.verification.filter(|v| !v.trim().is_empty()) {
+        s.push_str(&format!("- Verification: {}\n", clean(v, 600)));
     }
     if let Some(event) = n.completion {
         let actor = match &event.actor {
@@ -2029,6 +2056,7 @@ pub fn legacy_notice_display(body: &str) -> Option<NoticeDisplay> {
             run,
             pr: fields[2],
             summary: fields[3],
+            verification: None,
             completion: None,
         };
         // Older task templates bounded prose but did not scrub it. Validate that
@@ -4248,9 +4276,16 @@ mod notification_display_tests {
             run: Some("\t"),
             pr: Some("\n"),
             summary: Some(""),
+            verification: Some(" "),
             completion: None,
         });
-        for label in ["- Reason:", "- Run:", "- Pull request:", "- Result:"] {
+        for label in [
+            "- Reason:",
+            "- Run:",
+            "- Pull request:",
+            "- Result:",
+            "- Verification:",
+        ] {
             assert!(!body.contains(label));
             assert!(!display.facts.contains(label));
         }
@@ -4267,6 +4302,7 @@ mod notification_display_tests {
             run: None,
             pr: None,
             summary: None,
+            verification: None,
             completion: None,
         };
         let (body, display) = chat_task_report(&notice);
@@ -4287,6 +4323,7 @@ mod notification_display_tests {
             run: Some("abcd"),
             pr: Some("https://example.invalid/pull/1"),
             summary: Some("PR created; merge unknown"),
+            verification: None,
             completion: None,
         });
         assert!(body.contains("Tell the operator"));
