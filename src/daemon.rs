@@ -2655,6 +2655,26 @@ struct TaskWorker {
     standalone: bool,
 }
 
+/// Reserve a task worker without launching a process, for integration tests.
+#[doc(hidden)]
+pub fn live_task_fixture(
+    home: &Path,
+    task: &str,
+) -> Result<(crate::worker::Job, crate::worker::Lease)> {
+    let request = TaskWorker {
+        opts: Opts::default(),
+        queue: home.join("queue"),
+        task: task.to_owned(),
+        lane: PermitKind::default(),
+        standalone: true,
+    };
+    crate::worker::running_fixture(
+        home,
+        &format!("task:{task}"),
+        serde_json::to_value(request)?,
+    )
+}
+
 fn task_jobs(home: &Path) -> Result<Vec<crate::worker::Job>> {
     Ok(crate::worker::active(home)?
         .into_iter()

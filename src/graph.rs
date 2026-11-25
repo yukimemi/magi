@@ -6404,6 +6404,30 @@ impl Runner {
         // the canonical run identity inside it, before preflight or any await.
         let _claim = FixClaim::acquire(&self.state.dir())?;
         crate::task_reassign::ensure_current(&crate::queue::Queue::open(), &self.state.id)?;
+        let home = crate::run::home();
+        // The ordinary driver takes these same locks at admission. Keep the
+        // execution lease through the fix, but never the owner lock across Git
+        // or agent awaits.
+        let execution = {
+            let _owner = crate::pr_head::owner_lock(&home, &self.state.id)?;
+            let disk = RunState::load(&self.state.id)?;
+            crate::pr_head::ensure_owner(&disk)?;
+            anyhow::ensure!(
+                disk.status == self.state.status && disk.released_to.is_none(),
+                "run changed since it was loaded; reload before fixing"
+            );
+            let claimed = crate::daemon::is_working_on(&home, &disk.id, Timestamp::now());
+            anyhow::ensure!(
+                disk.liveness_under(&home, claimed) == crate::run::Liveness::Dead,
+                "run {} is currently being worked on or its ownership is unknown",
+                disk.id
+            );
+            let lease = crate::driver::maintenance(&home, &disk.id).context(
+                "run is currently being worked on or its execution lease is unavailable",
+            )?;
+            self.state = disk;
+            lease
+        };
         let Some(winner) = self.state.winner().cloned() else {
             bail!("run {} has no winning candidate to fix", self.state.id);
         };
@@ -6411,13 +6435,6 @@ impl Runner {
             bail!(
                 "branch `{}` no longer exists; this run cannot be extended",
                 winner.branch
-            );
-        }
-        let home = crate::run::home();
-        if crate::daemon::is_working_on(&home, &self.state.id, Timestamp::now()) {
-            bail!(
-                "run {} is currently being worked on by another magi process",
-                self.state.id
             );
         }
         // Resolve every id before spending anything — an unknown id refuses
@@ -6789,6 +6806,24 @@ impl Runner {
                     short(&after)
                 ),
             );
+            self.state.save()?;
+            drop(execution);
+            // The new review owns its own execution. Update only its audit link
+            // afterwards, since publication may have changed the old record.
+            let event_count = self.state.events.len();
+            let save_follow_up = |state: &mut RunState| -> Result<()> {
+                let _owner = crate::pr_head::owner_lock(&home, &state.id)?;
+                let _execution = crate::driver::maintenance(&home, &state.id)?;
+                let mut disk = RunState::load(&state.id)?;
+                disk.events.extend(state.events.drain(event_count..));
+                let follow_up = state.operator_fixes[request_index]
+                    .follow_up_review_run
+                    .clone();
+                disk.operator_fixes[request_index].follow_up_review_run = follow_up;
+                disk.save()?;
+                *state = disk;
+                Ok(())
+            };
             // The operator asked for the fix, and the follow-up serves whatever
             // task the run it follows served.
             let origin =
@@ -6833,7 +6868,7 @@ impl Runner {
                                     "follow-up review {follow_up_id} got no owning task and was not executed: {e:#}"
                                 ),
                             );
-                            self.state.save()?;
+                            save_follow_up(&mut self.state)?;
                             return Ok(());
                         }
                     };
@@ -6860,7 +6895,7 @@ impl Runner {
                     );
                 }
             }
-            self.state.save()?;
+            save_follow_up(&mut self.state)?;
         }
 
         Ok(())

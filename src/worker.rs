@@ -202,8 +202,8 @@ fn try_lock(path: &Path) -> Result<Option<Lease>> {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn execution_lease_for_test(path: &Path) -> Lease {
+#[doc(hidden)]
+pub fn execution_lease_for_test(path: &Path) -> Lease {
     try_lock(path)
         .expect("execution lease")
         .expect("free execution lease")
@@ -885,6 +885,25 @@ fn reserve(
         .with_context(|| format!("publish worker {id} reservation from {}", staging.display()))?;
     sync_dir(&jobs_dir)?;
     Ok((job, true))
+}
+
+pub(crate) fn running_fixture(
+    home: &Path,
+    key: &str,
+    payload: serde_json::Value,
+) -> Result<(Job, Lease)> {
+    let generation = Generation {
+        id: "a".repeat(64),
+        executable: PathBuf::from("unused"),
+    };
+    let (mut job, created) = reserve(home, &generation, "task", key, payload)?;
+    anyhow::ensure!(created, "fixture reservation already exists");
+    let dir = job_dir(home, &job.id)?;
+    let lease = try_lock(&dir.join("live.lock"))?.context("fixture lease unavailable")?;
+    job.status = Status::Running;
+    job.pid = Some(std::process::id());
+    save(&dir.join("job.json"), &job)?;
+    Ok((job, lease))
 }
 
 fn prune_results(home: &Path) -> Result<()> {
