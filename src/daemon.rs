@@ -3002,7 +3002,8 @@ pub async fn serve_until(opts: Opts, stop: Stop) -> Result<()> {
     let signal = {
         let stop = stop.clone();
         tokio::spawn(async move {
-            if tokio::signal::ctrl_c().await.is_ok() {
+            if !crate::proc::using_shared_hidden_console() && tokio::signal::ctrl_c().await.is_ok()
+            {
                 stop.stop();
                 tracing::info!("scheduler shutdown requested; independent workers continue");
             }
