@@ -1875,9 +1875,9 @@ test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; 
             FailureExtraction::Unknown { .. }
         ));
 
-        let mut many = format!(
+        let mut many =
             "------------\n     Summary [   1.000s] 40 tests run: 0 passed, 40 failed, 0 skipped\n"
-        );
+                .to_owned();
         for i in 0..40 {
             let _ = writeln!(many, "        FAIL [   0.010s] pkg::bin test_{i}");
         }
