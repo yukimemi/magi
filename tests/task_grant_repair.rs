@@ -1182,3 +1182,59 @@ async fn verify_grant_stops_safely_when_the_fresh_e2e_fails_again() {
     assert_eq!(again.state.repair_grants[0].spent, 1);
 }
 }
+
+async fn dirty_verify_grant(e2e_writes: bool) {
+    let (_fx, request) = stagnant_stop().await;
+    accepted(&request);
+    let mut runner = Runner::resume(&request.run).unwrap();
+    let edit = "echo unexpected change >> note.txt";
+    runner.state.config.verify.e2e = vec![if e2e_writes { edit } else { "true" }.into()];
+    runner.state.config.verify.gate = vec![if e2e_writes { "exit 99" } else { edit }.into()];
+    for agent in &mut runner.state.config.agents {
+        agent.env.remove("MOCK_FINDING");
+    }
+    runner.state.save().unwrap();
+    let mut runner = Runner::resume(&request.run).unwrap();
+    runner.execute().await.unwrap();
+    let grant = &runner.state.repair_grants[0];
+    assert_eq!(grant.phase, Phase::Complete);
+    assert_eq!(grant.spent, 1);
+    assert!(!grant.succeeded);
+    assert_eq!(runner.state.status, RunStatus::Blocked);
+    assert!(!runner.state.pr_publication_pending && runner.state.merge.is_none());
+    assert!(!runner.state.gate_ran);
+    let worktree = &runner.state.winner().unwrap().worktree;
+    assert_eq!(
+        magi::git::rev_parse(worktree, "HEAD").await.unwrap(),
+        request.head
+    );
+    assert!(!magi::git::is_clean(worktree).await.unwrap());
+    if e2e_writes {
+        assert!(!runner.state.reviews.last().unwrap().clean);
+        assert!(!runner.state.verification_history.iter().any(|e| e.gate_ran));
+    } else {
+        assert!(
+            runner
+                .state
+                .verification_history
+                .iter()
+                .any(|e| { e.gate_ran && e.gate.iter().any(|o| o.command == edit && o.ok()) })
+        );
+    }
+    let mut again = Runner::resume(&request.run).unwrap();
+    again.execute().await.unwrap();
+    assert_eq!(again.state.status, RunStatus::Blocked);
+    assert_eq!(again.state.repair_grants[0].spent, 1);
+}
+
+common::e2e! {
+async fn verify_grant_refuses_dirty_e2e_success() {
+    dirty_verify_grant(true).await;
+}
+}
+
+common::e2e! {
+async fn verify_grant_refuses_dirty_gate_success() {
+    dirty_verify_grant(false).await;
+}
+}
