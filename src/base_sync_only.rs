@@ -410,7 +410,14 @@ async fn public_integrated(
     let budget = std::time::Duration::from_secs(state.config.graph.timeout_resource_wait);
     let observed = tokio::time::timeout(
         budget,
-        checkout.raw(&["ls-remote", "--exit-code", "--refs", "--", remote, &reference]),
+        checkout.raw(&[
+            "ls-remote",
+            "--exit-code",
+            "--refs",
+            "--",
+            remote,
+            &reference,
+        ]),
     )
     .await
     .context("checking the public branch timed out")??;
@@ -458,7 +465,11 @@ async fn public_integrated(
     if tree.code == Some(1) {
         return Ok(false);
     }
-    ensure!(tree.ok(), "public branch merge-tree failed: {}", tree.stderr);
+    ensure!(
+        tree.ok(),
+        "public branch merge-tree failed: {}",
+        tree.stderr
+    );
     Ok(tree.stdout
         == checkout
             .git(&["rev-parse", &format!("{tip}^{{tree}}")])
