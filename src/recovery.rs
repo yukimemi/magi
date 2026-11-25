@@ -81,6 +81,15 @@ pub struct Evidence {
     pub output_tail: String,
     /// The commit it was run against.
     pub head: String,
+    /// Saved artifact reference, when recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<String>,
+    /// Extracted terminal failure set and intermediate notes, when recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_evidence: Option<crate::verify_evidence::FailureEvidence>,
+    /// Structured two-attempt comparison when the command failed twice on the same commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rerun_comparison: Option<crate::verify_evidence::RerunComparison>,
 }
 
 /// One earlier review round, reduced to its decision.
@@ -209,17 +218,37 @@ fn evidence_from(round: &ReviewRound, prior: &RunState) -> Option<Evidence> {
             &crate::scrub::Identity::current(),
         )
     };
+    let build = |source: Source, o: &CommandOutcome, head: &str| Evidence {
+        source,
+        command: o.command.clone(),
+        code: o.code,
+        output_tail: scrub(&o.output_tail),
+        head: head.to_owned(),
+        artifact: o.artifact.clone(),
+        failure_evidence: o.failure_evidence.clone(),
+        rerun_comparison: o.rerun_comparison.as_ref().map(|c| c.scrubbed(scrub)),
+    };
     let failed = |o: &&CommandOutcome| !o.ok() && !o.resource_blocked;
-    if round.e2e_status() == E2eStatus::Failed
+    // Current head / gate-repair e2e takes precedence when present and red on a head;
+    // when it already passed, do not carry an older resolved round failure forward.
+    if let Some(e) = &prior.head_e2e
+        && !e.passed
+        && let Some(o) = e.outcomes.iter().find(failed)
+    {
+        return Some(build(Source::E2e, o, &e.head));
+    }
+    if let Some(e) = &prior.gate_repair_e2e
+        && !e.passed
+        && let Some(o) = e.outcomes.iter().find(failed)
+    {
+        return Some(build(Source::E2e, o, &e.head));
+    }
+    if prior.head_e2e.as_ref().is_none_or(|e| !e.passed)
+        && prior.gate_repair_e2e.as_ref().is_none_or(|e| !e.passed)
+        && round.e2e_status() == E2eStatus::Failed
         && let (Some(o), Some(head)) = (round.e2e.iter().find(failed), &round.verified_head)
     {
-        return Some(Evidence {
-            source: Source::E2e,
-            command: o.command.clone(),
-            code: o.code,
-            output_tail: scrub(&o.output_tail),
-            head: head.clone(),
-        });
+        return Some(build(Source::E2e, o, head));
     }
     // The gate runs on the tree the last round left; it is only evidence about
     // that round's head while no gate fix moved the tree afterwards.
@@ -227,13 +256,7 @@ fn evidence_from(round: &ReviewRound, prior: &RunState) -> Option<Evidence> {
         && prior.gate_fixes.is_empty()
         && let Some(o) = prior.gate.iter().find(failed)
     {
-        return Some(Evidence {
-            source: Source::Gate,
-            command: o.command.clone(),
-            code: o.code,
-            output_tail: scrub(&o.output_tail),
-            head: round.head.clone(),
-        });
+        return Some(build(Source::Gate, o, &round.head));
     }
     None
 }
@@ -419,6 +442,7 @@ mod tests {
             output_tail: tail.to_owned(),
             duration_ms: 1,
             resource_blocked: false,
+            ..Default::default()
         }
     }
 
@@ -619,5 +643,66 @@ mod tests {
         assert!(tail_of(&s, 10).len() < 30);
         assert!(head_of(&s, 10).starts_with('あ'));
         assert_eq!(tail_of("ok", 10), "ok");
+    }
+
+    #[test]
+    fn recovery_carries_rerun_comparison_and_artifacts_into_fix_prompt() {
+        use crate::verify_evidence::{
+            AttemptEvidence, ComparisonVerdict, FailureExtraction, IntermediateNotes,
+            RerunComparison, TerminalFailure,
+        };
+        let mut o = outcome(100, "nextest isolated_build_cache failure");
+        o.artifact = Some("artifacts/e2e-4.out".to_owned());
+        o.rerun_comparison = Some(RerunComparison {
+            head: "aaa111".to_owned(),
+            first: AttemptEvidence {
+                attempt: 1,
+                code: Some(101),
+                duration_ms: 1000,
+                artifact: Some("artifacts/e2e-3.out".to_owned()),
+                excerpt: "chat unit test failed".to_owned(),
+                extraction: FailureExtraction::Confirmed {
+                    failures: vec![TerminalFailure {
+                        suite: None,
+                        test: "talk::tests::chat_timeout".to_owned(),
+                    }],
+                },
+                intermediate: IntermediateNotes::default(),
+            },
+            second: AttemptEvidence {
+                attempt: 2,
+                code: Some(100),
+                duration_ms: 2000,
+                artifact: Some("artifacts/e2e-4.out".to_owned()),
+                excerpt: "isolated_build_cache failed".to_owned(),
+                extraction: FailureExtraction::Confirmed {
+                    failures: vec![TerminalFailure {
+                        suite: Some("magi-cli::isolated_build_cache".to_owned()),
+                        test: "test_cache".to_owned(),
+                    }],
+                },
+                intermediate: IntermediateNotes::default(),
+            },
+            verdict: ComparisonVerdict::Distinct {
+                common: vec![],
+                first_only: vec![TerminalFailure {
+                    suite: None,
+                    test: "talk::tests::chat_timeout".to_owned(),
+                }],
+                second_only: vec![TerminalFailure {
+                    suite: Some("magi-cli::isolated_build_cache".to_owned()),
+                    test: "test_cache".to_owned(),
+                }],
+            },
+        });
+        let p = prior(round("aaa111", vec![o]));
+        let r = assess("r1", Some(&p), "base1", Relation::Same);
+        assert_eq!(r.mode, Mode::VerifyRepair);
+        let prompt = crate::prompt::recovery_fix("repair", &r, 2, "en");
+        assert!(prompt.contains("distinct terminal failure(s)"), "{prompt}");
+        assert!(prompt.contains("talk::tests::chat_timeout"), "{prompt}");
+        assert!(prompt.contains("isolated_build_cache"), "{prompt}");
+        assert!(prompt.contains("artifacts/e2e-3.out"), "{prompt}");
+        assert!(prompt.contains("artifacts/e2e-4.out"), "{prompt}");
     }
 }

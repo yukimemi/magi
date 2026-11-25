@@ -8477,8 +8477,11 @@ impl Runner {
                     .iter()
                     .filter(|o| !o.ok())
                     .map(|o| {
+                        let comparison = crate::verify_evidence::outcome_comparison_summary(o)
+                            .map(|c| format!(" ({c})"))
+                            .unwrap_or_default();
                         format!(
-                            "`{}` -> {:?}\n{}",
+                            "`{}` -> {:?}{comparison}\n{}",
                             o.command,
                             o.code,
                             summarize_verify(&o.output_tail, EVENT_OUTPUT_TAIL)
@@ -12138,6 +12141,7 @@ where
                         output_tail: format!("{error:#}"),
                         duration_ms: 0,
                         resource_blocked: true,
+                        ..Default::default()
                     }],
                     false,
                 ));
@@ -12178,6 +12182,7 @@ where
                         output_tail: e.to_string(),
                         duration_ms: started.elapsed().as_millis() as u64,
                         resource_blocked: true,
+                        ..Default::default()
                     }],
                     false,
                 ));
@@ -12218,6 +12223,7 @@ where
                     output_tail: e.to_string(),
                     duration_ms: started.elapsed().as_millis() as u64,
                     resource_blocked: true,
+                    ..Default::default()
                 }],
                 false,
             ));
@@ -12357,11 +12363,6 @@ fn rerunnable_failure(outcomes: &[CommandOutcome]) -> bool {
         })
 }
 
-/// Said at the top of the output a fixer gets when the same command failed on
-/// both attempts, so it reads as a reproduced failure and not a one-off.
-const FAILED_TWICE: &str = "[this command failed twice on the same commit; the output below is \
-                            the second attempt's]";
-
 /// Run `verify.e2e`, retrying once if the first attempt could not build or
 /// link — a build/link failure is frequently a race against a shared
 /// `CARGO_TARGET_DIR` (see AGENTS.md), not a verdict on the patch. Emits one
@@ -12378,9 +12379,12 @@ const FAILED_TWICE: &str = "[this command failed twice on the same commit; the o
 /// (`[graph] rerun_failed_e2e`). A command that passes the second time is a
 /// flake: the head is verified, the first failure is recorded and filed
 /// (`crate::flake`, `RunState::verify_flakes`). A command that fails again
-/// stands, carrying the second attempt's output. One verification is therefore
-/// run at most three times: the build/link retry, then this one rerun.
-/// `round` is the review round the verification belongs to, if any.
+/// stays red and records a structured [`crate::verify_evidence::RerunComparison`]
+/// preserving bounded evidence and artifact references for both attempts;
+/// it claims a matching reproduction only when both attempts yield identical
+/// confirmed terminal test failures. One verification is therefore run at most
+/// three times: the build/link retry, then this one rerun. `round` is the
+/// review round the verification belongs to, if any.
 async fn run_e2e_with_retry(
     state: &mut RunState,
     shell: &[String],
@@ -12470,7 +12474,6 @@ async fn run_e2e_with_retry(
                 ),
             );
         }
-        let mut reproduced = false;
         for (slot, &i) in failed.iter().enumerate() {
             let Some(again) = second.get(slot) else {
                 break;
@@ -12492,15 +12495,15 @@ async fn run_e2e_with_retry(
                 };
                 crate::flake::record(state, flake, &signature.label, &crate::queue::Queue::open());
             } else if !again.resource_blocked {
-                reproduced = true;
-                e2e[i].output_tail = format!("{FAILED_TWICE}\n{}", again.output_tail);
+                let comparison = crate::verify_evidence::compare_attempts(&head, &first, again);
+                let message = crate::verify_evidence::rerun_event_message(
+                    context,
+                    &e2e[i].command,
+                    &comparison,
+                );
+                e2e[i].rerun_comparison = Some(comparison);
+                state.event("verify", message);
             }
-        }
-        if reproduced {
-            state.event(
-                "verify",
-                format!("{context}: the failure reproduced on the second run — it stands"),
-            );
         }
     }
     (e2e, verify_retried, timed_out_pids)
@@ -12541,6 +12544,7 @@ async fn run_commands(
                 output_tail: block.description(),
                 duration_ms: 0,
                 resource_blocked: true,
+                ..Default::default()
             }],
             Vec::new(),
         );
@@ -12646,6 +12650,7 @@ async fn run_commands(
                 output_tail: detail,
                 duration_ms: 0,
                 resource_blocked: true,
+                ..Default::default()
             });
             break;
         }
@@ -12654,7 +12659,7 @@ async fn run_commands(
         } else {
             crate::seat_process::Running::spawn(cmd, None, outputs)
         };
-        let (code, body) = match spawned {
+        let (code, out_text, err_text, body) = match spawned {
             Ok(mut running) => {
                 let pid = running.child().id();
                 let (stdout, out_reader) = agent::drain(running.child().stdout.take());
@@ -12712,16 +12717,19 @@ async fn run_commands(
                         output_tail: reason,
                         duration_ms: started.elapsed().as_millis() as u64,
                         resource_blocked: true,
+                        ..Default::default()
                     });
                     break;
                 }
-                let mut body = agent::collect(&stdout, out_reader, Duration::from_secs(2)).await;
-                body.push_str(&agent::collect(&stderr, err_reader, Duration::from_secs(2)).await);
+                let out_text = agent::collect(&stdout, out_reader, Duration::from_secs(2)).await;
+                let err_text = agent::collect(&stderr, err_reader, Duration::from_secs(2)).await;
+                let mut body = out_text.clone();
+                body.push_str(&err_text);
                 if let Some(failure) = failure {
                     body.push('\n');
                     body.push_str(&failure);
                 }
-                (code, body)
+                (code, out_text, err_text, body)
             }
             Err(e) if isolated => {
                 let e = anyhow::Error::new(e)
@@ -12733,21 +12741,31 @@ async fn run_commands(
                     output_tail: format!("{e:#}"),
                     duration_ms: 0,
                     resource_blocked: true,
+                    ..Default::default()
                 });
                 break;
             }
-            Err(e) => (None, format!("failed to spawn `{}`: {e}", shell[0])),
+            Err(e) => (
+                None,
+                String::new(),
+                String::new(),
+                format!("failed to spawn `{}`: {e}", shell[0]),
+            ),
         };
         let mut summary = summarize_verify(&body, crate::run::VERIFY_SUMMARY);
+        let mut artifact = None;
         if !body.is_empty() {
             // The full text is kept whatever the summary dropped. A fresh
             // name per command so a resume or retry never overwrites an
             // earlier run's output. A failed write changes no verdict.
             match crate::run::write_verification_artifact(state, task, &body) {
-                Ok(name) if summary != body => {
-                    summary = format!("[full output: artifacts/{name}]\n{summary}");
+                Ok(name) => {
+                    let rel = format!("artifacts/{name}");
+                    if summary != body {
+                        summary = format!("[full output: {rel}]\n{summary}");
+                    }
+                    artifact = Some(rel);
                 }
-                Ok(_) => {}
                 Err(e) => {
                     let warning = format!("could not save the full {task} output: {e:#}");
                     tracing::warn!("{warning}");
@@ -12759,13 +12777,25 @@ async fn run_commands(
             }
         }
         let resource_blocked = code != Some(0) && body.contains(crate::incremental::BLOCKED);
-        out.push(CommandOutcome {
+        let mut outcome = CommandOutcome {
             command: command.clone(),
             code,
             output_tail: summary,
             duration_ms: started.elapsed().as_millis() as u64,
             resource_blocked,
-        });
+            artifact,
+            failure_evidence: None,
+            rerun_comparison: None,
+        };
+        if !outcome.ok() && !outcome.resource_blocked {
+            outcome.failure_evidence = Some(crate::verify_evidence::extract_streams(
+                code,
+                outcome.build_failed(),
+                &out_text,
+                &err_text,
+            ));
+        }
+        out.push(outcome);
         if resource_blocked {
             state.resource_block = Some(crate::run::ResourceBlock {
                 cause: crate::run::ResourceBlockCause::Other,
@@ -13182,10 +13212,16 @@ pub(crate) async fn verify_current_head(
         outcomes,
     });
     if !passed && !unresolved {
+        let detail = state
+            .head_e2e
+            .as_ref()
+            .and_then(|e| crate::verify_evidence::summarize_failed_outcomes(&e.outcomes))
+            .map(|d| format!(" ({d})"))
+            .unwrap_or_default();
         state.status = RunStatus::Blocked;
         state.event(
             "e2e",
-            format!("verify.e2e failed on head {head}; nothing published"),
+            format!("verify.e2e failed on head {head}{detail}; nothing published"),
         );
     }
     state.save()?;
@@ -13261,9 +13297,15 @@ pub(crate) async fn check_gate_repair_e2e(
     if deferred {
         Ok(GateFix::Defer)
     } else if !passed {
+        let detail = state
+            .gate_repair_e2e
+            .as_ref()
+            .and_then(|e| crate::verify_evidence::summarize_failed_outcomes(&e.outcomes))
+            .map(|d| format!(" ({d})"))
+            .unwrap_or_default();
         state.event(
             "gate",
-            "verify.e2e failed after gate repair; nothing published",
+            format!("verify.e2e failed after gate repair{detail}; nothing published"),
         );
         Ok(GateFix::Stop)
     } else {
@@ -13330,6 +13372,7 @@ pub(crate) async fn run_landing_gate(
             command: "gate head stability".into(), code: None,
             output_tail: "winner changed during gate, or checked head is unknown; fresh verification required".into(),
             duration_ms: 0, resource_blocked: false,
+            ..Default::default()
         });
         return Ok(outcomes);
     }
@@ -14788,6 +14831,7 @@ mod tests {
             output_tail: String::new(),
             duration_ms: 0,
             resource_blocked,
+            ..Default::default()
         }
     }
 
@@ -14925,6 +14969,7 @@ mod tests {
                 output_tail: String::new(),
                 duration_ms: 0,
                 resource_blocked: false,
+                ..Default::default()
             }],
             verify_retried: false,
             e2e_deferred: false,
@@ -18923,6 +18968,7 @@ esac
             output_tail: "old failure".into(),
             duration_ms: 0,
             resource_blocked: false,
+            ..Default::default()
         }];
         runner.state.gate_head = Some(head.clone());
         runner.state.gate_ran = true;
@@ -19073,6 +19119,7 @@ esac
                 output_tail: "cache unavailable".into(),
                 duration_ms: 0,
                 resource_blocked: true,
+                ..Default::default()
             }],
         ] {
             runner.state.head_e2e = Some(crate::run::GateRepairE2e {
@@ -19229,6 +19276,7 @@ esac
             output_tail: "timed out after 2400s".into(),
             duration_ms: 2_400_000,
             resource_blocked: false,
+            ..Default::default()
         }];
         runner.state.gate_ran = true;
         runner.state.gate_head = Some(head.clone());
@@ -20813,6 +20861,7 @@ esac
             output_tail: String::new(),
             duration_ms: 0,
             resource_blocked: false,
+            ..Default::default()
         }];
         state.gate_ran = true;
         // Reached its conclusion already — e.g. `land` closing the PR without
@@ -21188,6 +21237,7 @@ esac
             output_tail: String::new(),
             duration_ms: 0,
             resource_blocked: false,
+            ..Default::default()
         }];
         let mut runner = Runner {
             state,
@@ -22250,6 +22300,7 @@ esac
                 output_tail: "waiting for the shared build cache".to_owned(),
                 duration_ms: 0,
                 resource_blocked: true,
+                ..Default::default()
             }],
             fix: None,
             blocking: 1,
@@ -22432,6 +22483,7 @@ esac
             output_tail: String::new(),
             duration_ms: 0,
             resource_blocked: false,
+            ..Default::default()
         }];
         state.gate_ran = true;
         // A first pass through `merge` already pushed and opened this pull
@@ -22546,6 +22598,7 @@ esac
                 output_tail: String::new(),
                 duration_ms: 0,
                 resource_blocked: false,
+                ..Default::default()
             }],
             verify_retried: false,
             e2e_deferred: false,
@@ -23464,6 +23517,7 @@ esac
             output_tail: String::new(),
             duration_ms: 0,
             resource_blocked: false,
+            ..Default::default()
         }];
         state.gate_ran = true;
         state.gate_head = head.map(str::to_owned);

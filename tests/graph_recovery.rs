@@ -37,6 +37,7 @@ fn red(tail: &str) -> Vec<CommandOutcome> {
         output_tail: tail.to_owned(),
         duration_ms: 1,
         resource_blocked: false,
+        ..Default::default()
     }]
 }
 

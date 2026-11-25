@@ -1963,6 +1963,7 @@ async fn semantic_automatic_sources_share_receipts_without_settling_decisions() 
                 output_tail: String::from_utf8(output.stdout).unwrap(),
                 duration_ms: 0,
                 resource_blocked: false,
+                ..Default::default()
             }];
             run.event("gate", "gate failed; not merging");
             assert!(run.verification_blocking_cause().is_some());

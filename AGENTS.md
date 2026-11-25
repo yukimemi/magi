@@ -3923,9 +3923,24 @@ more distinct runs, almost always while other runs shared the machine.
   section. `ReviewRound::e2e_status()` still says `Passed`: the round record
   itself is not changed, the ledger is the record, matched to a round by
   `VerifyFlake::round`.
-- **Second run fails: the failure stands.** The second outcome replaces the
-  first and its `output_tail` starts with `FAILED_TWICE`, so the fixer's
-  prompt (`ReviewRound::verification_summary`) says both attempts failed.
+- **Second run fails: verification stays red, with structured attempt comparison.**
+  `src/verify_evidence.rs` extracts confirmed, count-reconciled terminal test
+  failures from raw output before `summarize_verify` reduces it, separating
+  intermediate `TRY` failures, `FLAKY` passes, cancellations, and captured test
+  stdout/stderr from final verdicts. `CommandOutcome` keeps additive
+  `artifact` (recorded whenever an artifact write succeeds, compressed or not),
+  `failure_evidence`, and `rerun_comparison` (`RerunComparison`: target commit,
+  both attempts' exit codes, durations, bounded excerpts, artifact refs,
+  extractions, intermediate notes, and a `Matching` / `Distinct` / `Unknown`
+  verdict). Only identical confirmed non-empty terminal failure sets report a
+  reproduced match; distinct sets list attempt-1-only, attempt-2-only, and
+  common failures; anything incomplete, unconfirmed, or legacy (`FAILED_TWICE`)
+  reports an unknown comparison. Events, `ReviewRound::verification_summary`,
+  fixer/recovery prompts, CLI/web run reports (including `head_e2e` and
+  `gate_repair_e2e`), stop reasons, and automatic task chat reports all share
+  this saved record and reuse it on unchanged stops without re-running e2e or
+  resurfacing resolved earlier failures. `flake::signature` is never used for
+  terminal-failure comparison.
 - **A flake is filed once, by `src/flake.rs`.** A failure is identified without
   knowing the test framework: the lines of the saved excerpt that mention a
   failure word (`FAILURE_WORDS`), minus `test result: ok` lines, with numbers,

@@ -7924,6 +7924,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
                         output_tail: "verification resource unavailable".into(),
                         duration_ms: 0,
                         resource_blocked: true,
+                        ..Default::default()
                     }]
                 } else {
                     Vec::new()

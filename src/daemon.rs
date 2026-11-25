@@ -9422,6 +9422,7 @@ mod tests {
             output_tail: String::new(),
             duration_ms: 0,
             resource_blocked: false,
+            ..Default::default()
         });
         failed.event("review", "stopped; e2e failed: cargo test");
         let ja = describe(&failed);
@@ -9532,6 +9533,7 @@ mod tests {
                 output_tail: "ok".to_owned(),
                 duration_ms: 0,
                 resource_blocked: false,
+                ..Default::default()
             },
             CommandOutcome {
                 command: "cargo test".to_owned(),
@@ -9539,6 +9541,7 @@ mod tests {
                 output_tail: "thread 'x' panicked: assertion failed".to_owned(),
                 duration_ms: 0,
                 resource_blocked: false,
+                ..Default::default()
             },
         ];
         let d = diagnostic(&state).expect("a failing gate must produce a diagnostic");
@@ -9591,6 +9594,7 @@ mod tests {
             ),
             duration_ms: 1,
             resource_blocked: false,
+            ..Default::default()
         });
         let d = diagnostic(&state).unwrap();
         assert!(d.contains("panicked at widget.rs:12"), "{d}");
@@ -9645,6 +9649,7 @@ mod tests {
                 output_tail: "x".repeat(50_000),
                 duration_ms: 0,
                 resource_blocked: false,
+                ..Default::default()
             },
             CommandOutcome {
                 command: "cargo clippy".to_owned(),
@@ -9652,6 +9657,7 @@ mod tests {
                 output_tail: "y".repeat(50_000),
                 duration_ms: 0,
                 resource_blocked: false,
+                ..Default::default()
             },
         ];
         state.candidates = vec![
@@ -9756,6 +9762,7 @@ mod tests {
             output_tail: "assertion failed".to_owned(),
             duration_ms: 0,
             resource_blocked: false,
+            ..Default::default()
         }];
         let verdict = Verdict {
             status: RunStatus::Blocked,
@@ -13301,6 +13308,7 @@ mod tests {
                 output_tail: "gate failed after repair budget exhausted".into(),
                 duration_ms: 0,
                 resource_blocked: false,
+                ..Default::default()
             }];
             state.save_under(home.path()).unwrap();
             assert!(!crate::handover::has_resume_checkpoint(&state, home.path()));
@@ -13364,6 +13372,7 @@ mod tests {
                     output_tail: "resource wait expired".into(),
                     duration_ms: 0,
                     resource_blocked: true,
+                    ..Default::default()
                 }];
             } else if stage == "no-reviews" {
                 state.config.graph.review_rounds = 0;
@@ -13380,6 +13389,7 @@ mod tests {
                     output_tail: String::new(),
                     duration_ms: 0,
                     resource_blocked: false,
+                    ..Default::default()
                 }];
             }
             state.gate_ran = false;

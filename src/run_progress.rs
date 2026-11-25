@@ -525,6 +525,7 @@ mod tests {
             output_tail: String::new(),
             duration_ms: 1,
             resource_blocked: false,
+            ..Default::default()
         });
         let p = build(&s, Liveness::Dead, false);
         assert_eq!(p.activity, "blocked");
