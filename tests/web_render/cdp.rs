@@ -111,6 +111,7 @@ pub struct Browser<S = MaybeTlsStream<TcpStream>> {
     requests: Option<diag::Requests>,
     heartbeat: diag::Heartbeat,
     event_trace: std::collections::VecDeque<Value>,
+    sampler: diag::Sampler,
     /// Events that arrived while a command was waiting for its answer, as
     /// `(sessionId, message)`.
     events: Vec<(Option<String>, Value)>,
@@ -180,6 +181,7 @@ impl Browser {
                 requests: None,
                 heartbeat: diag::Heartbeat::start(),
                 event_trace: Default::default(),
+                sampler: diag::os_samples,
                 events: Vec::new(),
             }),
             Err(why) => {
@@ -311,11 +313,16 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> Browser<S> {
                 .cloned().collect::<Vec<_>>()});
         // An OS query cannot be cancelled. Keep it off Tokio's blocking pool:
         // runtime shutdown otherwise waits forever for a stuck diagnostic query.
-        let (sender, os) = tokio::sync::oneshot::channel();
+        // Each snapshot is streamed as it is taken, so a late one cannot cost
+        // the evidence of an earlier one.
+        let (sender, mut os) = tokio::sync::mpsc::unbounded_channel();
+        let sample = self.sampler;
         let sampler = std::thread::Builder::new()
             .name("chrome-diagnostics".to_owned())
             .spawn(move || {
-                let _ = sender.send(diag::os_samples(pid.unwrap_or(0)));
+                sample(pid.unwrap_or(0), &mut |value| {
+                    let _ = sender.send(value);
+                });
             });
         let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
         let mut probes = Vec::new();
@@ -341,13 +348,19 @@ impl<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin> Browser<S> {
                 Err(_) => json!({"error": "diagnostic probe timed out"}),
             }}));
         }
-        let os = match tokio::time::timeout_at(deadline, os).await {
-            Ok(Ok(value)) => value,
-            Ok(Err(error)) => {
-                json!({"error": format!("OS sampler disconnected: {error}; spawn: {sampler:?}")})
+        let mut samples = Vec::new();
+        let ended = loop {
+            match tokio::time::timeout_at(deadline, os.recv()).await {
+                Ok(Some(value)) => samples.push(value),
+                Ok(None) => break "sampler finished",
+                Err(_) => break "diagnostic deadline reached",
             }
-            Err(_) => json!({"error": "OS sampling exceeded diagnostic deadline"}),
         };
+        let os = json!({
+            "status": if samples.len() >= diag::OS_SAMPLE_COUNT { "complete" }
+                else if samples.is_empty() { "unavailable" } else { "partial" },
+            "ended": ended, "spawn": format!("{sampler:?}"),
+            "samples": samples});
         format!(
             "{before}\n browser probes: {}\n OS samples: {os}\n HTTP after probes: {}\n Chrome stderr tail: {}\n Chrome debug tail: {}",
             json!(probes),
@@ -561,7 +574,7 @@ fn tail_lines(text: &str, n: usize) -> String {
 mod tests {
     use super::*;
 
-    async fn exercise_timeout(respond: bool) -> String {
+    async fn exercise_timeout(respond: bool, sampler: diag::Sampler) -> String {
         use tokio_tungstenite::tungstenite::protocol::Role;
         let (client, server) = tokio::io::duplex(16 * 1024);
         let server = tokio::spawn(async move {
@@ -614,6 +627,7 @@ mod tests {
             requests: None,
             heartbeat: diag::Heartbeat::start(),
             event_trace: Default::default(),
+            sampler,
             events: Vec::new(),
         };
         let started = Instant::now();
@@ -629,7 +643,6 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(8));
         assert!(error.starts_with("Page.navigate: no answer within 20ms"));
         assert!(error.contains("fake-CDP"));
-        assert!(error.contains("cpu_ms"));
         assert_eq!(
             server.await.unwrap(),
             [
@@ -643,17 +656,58 @@ mod tests {
         error
     }
 
+    fn fake_complete(_pid: u32, emit: &mut dyn FnMut(Value)) {
+        for _ in 0..diag::OS_SAMPLE_COUNT {
+            emit(json!({"processes": [{"pid": 1, "cpu_ms": 7}]}));
+        }
+    }
+
+    fn fake_partial(_pid: u32, emit: &mut dyn FnMut(Value)) {
+        emit(json!({"processes": [{"pid": 1, "cpu_ms": 7}]}));
+    }
+
+    fn fake_unavailable(_pid: u32, _emit: &mut dyn FnMut(Value)) {}
+
     #[tokio::test]
     async fn timeout_probes_browser_without_retrying_page_command() {
-        let error = exercise_timeout(true).await;
+        let error = exercise_timeout(true, fake_complete).await;
         assert!(error.contains("\"probe\":\"SystemInfo.getProcessInfo\""));
+        assert!(error.contains("cpu_ms"));
+        assert!(error.contains("\"status\":\"complete\""));
     }
 
     #[tokio::test]
     async fn unresponsive_browser_probes_are_bounded_and_do_not_recurse() {
-        let error = exercise_timeout(false).await;
+        let error = exercise_timeout(false, fake_complete).await;
         assert_eq!(error.matches("diagnostic probe timed out").count(), 4);
         assert_eq!(error.matches("browser probes:").count(), 1);
+        assert!(error.contains("cpu_ms"));
+    }
+
+    #[tokio::test]
+    async fn a_partial_os_observation_keeps_the_snapshot_it_has() {
+        let error = exercise_timeout(true, fake_partial).await;
+        assert!(error.contains("cpu_ms"));
+        assert!(error.contains("\"status\":\"partial\""));
+    }
+
+    #[tokio::test]
+    async fn an_unavailable_os_observation_is_reported_as_such() {
+        let error = exercise_timeout(true, fake_unavailable).await;
+        assert!(!error.contains("cpu_ms"));
+        assert!(error.contains("\"status\":\"unavailable\""));
+    }
+
+    #[test]
+    fn the_real_sampler_reports_processes_without_a_timing_bound() {
+        let mut first = None;
+        diag::os_samples(std::process::id(), &mut |v| {
+            first.get_or_insert(v);
+        });
+        let first = first.expect("at least one snapshot");
+        assert!(first["process_count"].as_u64().unwrap() > 0);
+        assert!(first["refresh_ms"].is_u64());
+        assert!(first["processes"].is_array());
     }
 
     #[tokio::test]
