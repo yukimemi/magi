@@ -13405,6 +13405,9 @@ mod tests {
             output_tail: "verification failed".into(),
             duration_ms: 0,
             resource_blocked: false,
+            artifact: None,
+            failure_evidence: None,
+            rerun_comparison: None,
         };
         state.gate_ran = true;
         state.gate_head = Some("1".repeat(40));
