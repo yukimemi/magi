@@ -1,5 +1,9 @@
 //! Exercise the real Cargo -> existing wrapper -> compiler chain in isolation.
 #![cfg(unix)]
+#[allow(dead_code)]
+#[path = "common/cli.rs"]
+mod cli;
+
 use std::{fs, os::unix::fs::PermissionsExt, process::Command};
 
 #[tokio::test]
@@ -59,8 +63,10 @@ async fn setup_timeout_joins_compiler_groups_with_and_without_incremental() {
         fs::write(
             worktree.join("manager-wrapper.sh"),
             format!(
-                "#!/bin/sh\nexec {} __magi_incremental \"$@\"\n",
-                quote(std::path::Path::new(env!("CARGO_BIN_EXE_magi")))
+                "#!/bin/sh\nexport {}='{}'\nexec {} __magi_incremental \"$@\"\n",
+                magi::build_id::EXPECT_ENV,
+                magi::build_id::BUILD_ID,
+                quote(cli::magi_executable())
             ),
         )
         .unwrap();
@@ -264,7 +270,8 @@ fn explicit_incremental_uses_proven_generations_and_keeps_existing_wrappers() {
         .env("RUSTC_WORKSPACE_WRAPPER", workspace)
         .env("MAGI_PREVIOUS_RUSTC_WRAPPER", previous)
         .env("MAGI_INCREMENTAL_WORKTREE", &root)
-        .env("FIXTURE_MAGI", env!("CARGO_BIN_EXE_magi"))
+        .env("FIXTURE_MAGI", cli::magi_executable())
+        .env(magi::build_id::EXPECT_ENV, magi::build_id::BUILD_ID)
         .env("FIXTURE_WRAPPER_LOG", root.join("wrapper.log"))
         .env("FIXTURE_ENTRY_LOG", &entries)
         .args([
@@ -409,12 +416,13 @@ while :; do echo writing >> "$FIXTURE_PULSE"; sleep 0.02; done
     }
     let mut cleanup = OwnedProcesses(Vec::new());
     let mut unrelated = Command::new("sleep").arg("30").spawn().unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_magi"))
+    let mut child = Command::new(cli::magi_executable())
         .arg("__magi_incremental")
         .arg(&compiler)
         .arg("-C")
         .arg(format!("incremental={}", parent.display()))
         .env("MAGI_INCREMENTAL_WORKTREE", &root)
+        .env(magi::build_id::EXPECT_ENV, magi::build_id::BUILD_ID)
         .env("MAGI_PREVIOUS_RUSTC_WRAPPER", previous)
         .env("FIXTURE_WRAPPER_PID", &wrapper_pid)
         .env("FIXTURE_COMPILER_PID", &compiler_pid)

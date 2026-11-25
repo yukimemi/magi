@@ -1341,6 +1341,14 @@ fn main() -> Result<std::process::ExitCode> {
     if let Some(code) = magi::build_target::command::shim() {
         return Ok(code);
     }
+    debug_assert_eq!(env!("MAGI_BUILD_ID"), magi::build_id::BUILD_ID);
+    if magi::build_id::handle_probe_arg() {
+        return Ok(std::process::ExitCode::SUCCESS);
+    }
+    if let Err(error) = magi::build_id::verify_expected_env() {
+        eprintln!("{error}");
+        return Ok(std::process::ExitCode::FAILURE);
+    }
     if std::env::args_os()
         .nth(1)
         .is_some_and(|s| s == "__magi_incremental")

@@ -12569,6 +12569,7 @@ async fn run_commands(
         for key in crate::worker::INVOCATION_ENV {
             cmd.env_remove(key);
         }
+        cmd.env_remove(crate::build_id::EXPECT_ENV);
         cmd.args(&shell[1..])
             .current_dir(cwd)
             .stdin(std::process::Stdio::null())

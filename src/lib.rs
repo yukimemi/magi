@@ -33,6 +33,8 @@ mod base_sync_recovery;
 pub mod blind;
 pub mod blockers;
 #[doc(hidden)]
+pub mod build_id;
+#[doc(hidden)]
 pub mod build_target;
 pub mod bump;
 pub mod cache;
