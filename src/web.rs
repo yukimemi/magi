@@ -2659,41 +2659,43 @@ fn auto_upgrade_decision(
 /// Refresh the shared cache and optionally request the same handover as the UI.
 async fn run_update_recheck(ui: Arc<Ui>) {
     loop {
-        let cfg = match Config::discover(&ui.repo, None) {
-            Ok((cfg, _)) => cfg,
-            Err(e) => {
-                updater::log_warn(
-                    &ui.home,
-                    &format!("auto-upgrade: config unavailable: {e:#}"),
-                );
-                tokio::time::sleep(UPDATE_RECHECK_POLL_MAX).await;
-                continue;
-            }
-        };
-        if should_spawn_recheck(&cfg.update)
-            && let Some(checker) = updater::Checker::new(&cfg.update)
-        {
-            let progress = updater::read_progress(&ui.home);
-            let mut latest = checker.cached_update();
-            if update_recheck_due(&checker, progress.as_ref()) {
-                match checker.newer_release().await {
-                    Ok(found) => latest = found,
-                    Err(e) => tracing::warn!("background update recheck failed: {e:#}"),
-                }
-            }
-            if cfg.update.auto_restart
-                && let Some(latest) = latest
-            {
-                let response =
-                    begin_upgrade(&ui, updater::UpgradeTrigger::Auto, Some(latest)).await;
-                updater::log_step(
-                    &ui.home,
-                    &format!("auto-upgrade: request status {}", response.status()),
-                );
+        tokio::time::sleep(update_recheck_once(&ui).await).await;
+    }
+}
+
+async fn update_recheck_once(ui: &Arc<Ui>) -> Duration {
+    let cfg = match Config::discover(&ui.repo, None) {
+        Ok((cfg, _)) => cfg,
+        Err(e) => {
+            updater::log_warn(
+                &ui.home,
+                &format!("auto-upgrade: config unavailable: {e:#}"),
+            );
+            return UPDATE_RECHECK_POLL_MAX;
+        }
+    };
+    if should_spawn_recheck(&cfg.update)
+        && let Some(checker) = updater::Checker::new(&cfg.update)
+    {
+        let progress = updater::read_progress(&ui.home);
+        let mut latest = checker.cached_update();
+        if update_recheck_due(&checker, progress.as_ref()) {
+            match checker.newer_release().await {
+                Ok(found) => latest = found,
+                Err(e) => tracing::warn!("background update recheck failed: {e:#}"),
             }
         }
-        tokio::time::sleep(recheck_poll_period(&cfg.update)).await;
+        if cfg.update.auto_restart
+            && let Some(latest) = latest
+        {
+            let response = begin_upgrade(ui, updater::UpgradeTrigger::Auto, Some(latest)).await;
+            updater::log_step(
+                &ui.home,
+                &format!("auto-upgrade: request status {}", response.status()),
+            );
+        }
     }
+    recheck_poll_period(&cfg.update)
 }
 
 /// [`UpdateView`] from the same throttled, disk-only state
@@ -11912,6 +11914,108 @@ mod tests {
             }
             previous = Some(costs);
         }
+    }
+
+    #[tokio::test]
+    async fn monitor_and_periodic_update_recheck_git_cost() {
+        let (tmp, repos) = performance_repositories().await;
+        let fx = Fixture {
+            home: TempDir::new().unwrap(),
+            addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        };
+        let ui = Arc::new(
+            Ui::new(
+                fx.queue(),
+                fx.questions(),
+                fx.talks(),
+                fx.runs(),
+                fx.home.path().to_path_buf(),
+                repos[0].clone(),
+            )
+            .with_worktrees_root(fx.home.path().join("wt")),
+        );
+        let cache = repos[0].join(".git/magi/config");
+        if cache.exists() {
+            std::fs::remove_dir_all(&cache).unwrap();
+        }
+
+        let (_, monitor_cost) = request_cost::measure(async {
+            let mut snapshot = None;
+            for _ in 0..20 {
+                let state = Arc::clone(&ui);
+                snapshot = Some(
+                    tokio::task::spawn_blocking(request_cost::carry(move || {
+                        monitor_scan(&state, snapshot)
+                    }))
+                    .await
+                    .unwrap(),
+                );
+            }
+        })
+        .await;
+        assert_eq!(monitor_cost, (0, 0));
+
+        // The idle update worker, unlike the revision monitor, reads config.
+        let (_, cold_cost) = request_cost::measure(async {
+            for _ in 0..20 {
+                assert_eq!(update_recheck_once(&ui).await, UPDATE_RECHECK_POLL_MAX);
+            }
+        })
+        .await;
+        assert_eq!(cold_cost, (20, 21));
+
+        // Move `origin/main` via a separate clone without touching `repos[0]`'s
+        // working tree, then fetch; the next scan must immediately observe the
+        // new committed `magi.toml`.
+        let origin = tmp.path().join("one.git");
+        let pusher = tmp.path().join("pusher-one");
+        crate::git::git(
+            tmp.path(),
+            &[
+                "clone",
+                "-b",
+                "main",
+                origin.to_str().unwrap(),
+                pusher.to_str().unwrap(),
+            ],
+        )
+        .await
+        .unwrap();
+        std::fs::write(
+            pusher.join("magi.toml"),
+            format!("{MOCK_AGENT_TOML}\n[graph]\nimplementers = 3\n[repos]\nroots = []\n[update]\nmode = \"off\"\ninterval = \"1m\"\n[verify]\ne2e = []\ngate = []\n"),
+        )
+        .unwrap();
+        crate::git::git(&pusher, &["add", "magi.toml"])
+            .await
+            .unwrap();
+        crate::git::git(
+            &pusher,
+            &[
+                "-c",
+                "user.name=fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-m",
+                "bump implementers",
+            ],
+        )
+        .await
+        .unwrap();
+        crate::git::git(&pusher, &["push", "origin", "main"])
+            .await
+            .unwrap();
+        crate::git::git(&repos[0], &["fetch", "origin"])
+            .await
+            .unwrap();
+
+        let (observed, moved_cost) = request_cost::measure(update_recheck_once(&ui)).await;
+        assert_eq!(observed, UPDATE_RECHECK_POLL_MIN);
+        assert_eq!(moved_cost, (1, 2));
+        let (observed_again, warm_cost) = request_cost::measure(update_recheck_once(&ui)).await;
+        assert_eq!(observed_again, observed);
+        assert_eq!(warm_cost, (1, 1));
     }
 
     #[tokio::test]

@@ -10,12 +10,15 @@
 //! working tree.** A primary checkout is often stale or on a detached HEAD, so
 //! a gate read from it can be older than the one the branch under review is
 //! cut from (run ce6e failed on a gate step `origin/main` had already
-//! dropped). `git show <sha>:magi.toml` of the remote-tracking ref's commit is
-//! written to a content-addressed directory under the git common dir
-//! (`<common>/magi/config/<sha>-<hash of repo>/`, temp dir when that is not
-//! writable) and loaded from there. Reviewed branches may additionally enable
-//! literal owner-hold switches; these never weaken base policy or load other
-//! branch settings, includes or templates.
+//! dropped). Standard `files`-backend repositories resolve the remote-tracking
+//! ref directly from the common git directory without spawning `git`, then
+//! reuse a manifest-verified, content-addressed generation under the git common
+//! dir (`<common>/magi/config/<sha>-<hash of repo>-v2/`, user cache directory
+//! when that is not writable). On a cache miss, a single `git cat-file --batch`
+//! verifies the commit and reads both repository layers together before
+//! atomically publishing the generation. Reviewed branches may additionally
+//! enable literal owner-hold switches; these never weaken base policy or load
+//! other branch settings, includes or templates.
 //!
 //! `remote` and `base` are themselves in the file, so they are resolved in a
 //! fixed order, first hit wins:
@@ -2122,9 +2125,15 @@ impl Config {
     /// defaults. The repository layers come from the remote-tracking ref as it
     /// stands (see the module doc); use [`Config::discover_fetched`] where a
     /// stale ref would matter.
+    #[track_caller]
     pub fn discover(repo: &Path, explicit: Option<&Path>) -> Result<(Self, Vec<PathBuf>)> {
         #[cfg(test)]
         crate::web::request_cost::discovery();
+        tracing::trace!(
+            caller = %std::panic::Location::caller(),
+            explicit = explicit.is_some(),
+            "discovering configuration"
+        );
         if let Some(p) = explicit {
             let paths = vec![p.to_path_buf()];
             return Ok((Self::load_layers(&paths)?, paths));
@@ -2142,7 +2151,7 @@ impl Config {
         repo: &Path,
         explicit: Option<&Path>,
     ) -> Result<(Self, Vec<PathBuf>)> {
-        if explicit.is_none() && is_git_worktree(repo) {
+        if explicit.is_none() && is_git_repo(repo) {
             // A checkout that was never cloned from the remote has no
             // `<remote>/HEAD`; learn it here (refs/remotes only) so an
             // ordinary start recovers instead of failing in `discover`.
@@ -2184,9 +2193,6 @@ impl Config {
 
     /// [`Config::layers`], but an unreadable remote ref is an error.
     fn layers_checked(repo: &Path) -> Result<Vec<PathBuf>> {
-        if !is_git_worktree(repo) {
-            return Ok(Self::layers(repo));
-        }
         let mut paths: Vec<PathBuf> = Self::machine_layer()
             .into_iter()
             .filter(|p| p.is_file())
@@ -2215,16 +2221,11 @@ impl Config {
     /// Only the repository layers (lowest first), from `<remote>/<base>` in a
     /// git working tree and from disk elsewhere.
     pub(crate) fn repo_layers(repo: &Path) -> Result<Vec<PathBuf>> {
-        if !is_git_worktree(repo) {
-            return Ok([
-                repo.join(".magi").join("config.toml"),
-                repo.join("magi.toml"),
-            ]
-            .into_iter()
-            .filter(|p| p.is_file())
-            .collect());
+        match inspect_git_repo(repo) {
+            RepoKind::NotGit => Ok(local_repo_layers(repo)),
+            RepoKind::Found(dirs) => remote_layers_with_git(repo, Some(dirs)),
+            RepoKind::Fallback => remote_layers_fallback(repo),
         }
-        remote_layers(repo)
     }
 
     /// Environment variable that relocates the machine-wide config layer.
@@ -2731,11 +2732,414 @@ fn find_program_in(
 /// Sidecar naming the checkout an extracted layer stands for.
 const REPO_MARKER: &str = ".magi-repo";
 
-fn git_out(repo: &Path, args: &[&str]) -> Option<String> {
-    use crate::proc::Quiet as _;
+/// Completion manifest written inside each materialised commit cache directory
+/// before it is atomically renamed into place.
+const CACHE_MANIFEST: &str = ".magi-cache-manifest.json";
+const CACHE_MANIFEST_VERSION: u32 = 3;
+const REPO_LAYER_RELS: [&str; 2] = [".magi/config.toml", "magi.toml"];
+
+/// Git environment overrides that alter repository discovery or ref storage.
+/// When any of these are set, pure-filesystem inspection steps aside and
+/// delegates to the `git` CLI.
+const GIT_OVERRIDE_ENVS: &[&str] = &[
+    "GIT_DIR",
+    "GIT_COMMON_DIR",
+    "GIT_WORK_TREE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_NAMESPACE",
+];
+
+fn has_git_env_override() -> bool {
+    GIT_OVERRIDE_ENVS
+        .iter()
+        .any(|key| std::env::var_os(key).is_some_and(|v| !v.is_empty()))
+}
+
+#[derive(Debug, Clone)]
+struct GitDirs {
+    common_dir: PathBuf,
+    files_ref_backend: bool,
+}
+
+#[derive(Debug, Clone)]
+enum RepoKind {
+    NotGit,
+    Found(GitDirs),
+    Fallback,
+}
+
+fn local_repo_layers(repo: &Path) -> Vec<PathBuf> {
+    [
+        repo.join(".magi").join("config.toml"),
+        repo.join("magi.toml"),
+    ]
+    .into_iter()
+    .filter(|p| p.is_file())
+    .collect()
+}
+
+fn inspect_git_repo(repo: &Path) -> RepoKind {
+    if has_git_env_override() || !repo.is_dir() {
+        return RepoKind::Fallback;
+    }
+    let start = match repo.canonicalize() {
+        Ok(p) => p,
+        Err(_) => {
+            if repo.is_absolute() {
+                repo.to_path_buf()
+            } else {
+                match std::env::current_dir() {
+                    Ok(cwd) => cwd.join(repo),
+                    Err(_) => return RepoKind::Fallback,
+                }
+            }
+        }
+    };
+
+    for dir in start.ancestors() {
+        let dot_git = dir.join(".git");
+        match std::fs::symlink_metadata(&dot_git) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // A bare repository (or inside `.git` itself) has no `.git`
+                // entry, yet `git rev-parse --git-dir` succeeds there.
+                if dir.join("HEAD").is_file()
+                    && dir.join("objects").is_dir()
+                    && (dir.join("refs").is_dir() || dir.join("reftable").is_dir())
+                {
+                    return RepoKind::Fallback;
+                }
+                continue;
+            }
+            Err(_) => return RepoKind::Fallback,
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    return RepoKind::Fallback;
+                }
+                let git_dir = if meta.is_dir() {
+                    if !dot_git.join("HEAD").is_file() {
+                        return RepoKind::Fallback;
+                    }
+                    dot_git
+                } else if meta.is_file() {
+                    let Ok(raw) = std::fs::read_to_string(&dot_git) else {
+                        return RepoKind::Fallback;
+                    };
+                    let Some(target) = raw
+                        .trim_end_matches(['\r', '\n'])
+                        .strip_prefix("gitdir:")
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    else {
+                        return RepoKind::Fallback;
+                    };
+                    let target_path = PathBuf::from(target);
+                    let resolved = if target_path.is_absolute() {
+                        target_path
+                    } else {
+                        dir.join(target_path)
+                    };
+                    if !resolved.is_dir() || !resolved.join("HEAD").is_file() {
+                        return RepoKind::Fallback;
+                    }
+                    resolved
+                } else {
+                    return RepoKind::Fallback;
+                };
+
+                let commondir_file = git_dir.join("commondir");
+                let common_dir = match std::fs::symlink_metadata(&commondir_file) {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        git_dir.canonicalize().unwrap_or(git_dir)
+                    }
+                    Ok(m) if m.is_file() => {
+                        let Ok(raw) = std::fs::read_to_string(&commondir_file) else {
+                            return RepoKind::Fallback;
+                        };
+                        let target = raw.trim();
+                        if target.is_empty() {
+                            return RepoKind::Fallback;
+                        }
+                        let target_path = PathBuf::from(target);
+                        let joined = if target_path.is_absolute() {
+                            target_path
+                        } else {
+                            git_dir.join(target_path)
+                        };
+                        let Ok(canonical) = joined.canonicalize() else {
+                            return RepoKind::Fallback;
+                        };
+                        if !canonical.is_dir() {
+                            return RepoKind::Fallback;
+                        }
+                        canonical
+                    }
+                    _ => return RepoKind::Fallback,
+                };
+
+                let files_ref_backend = is_standard_files_ref_backend(&common_dir);
+                return RepoKind::Found(GitDirs {
+                    common_dir,
+                    files_ref_backend,
+                });
+            }
+        }
+    }
+    RepoKind::NotGit
+}
+
+fn is_git_repo(repo: &Path) -> bool {
+    match inspect_git_repo(repo) {
+        RepoKind::NotGit => false,
+        RepoKind::Found(_) => true,
+        RepoKind::Fallback => is_git_worktree(repo),
+    }
+}
+
+fn strip_git_config_value(raw: &str) -> String {
+    let mut out = String::new();
+    let mut in_quotes = false;
+    let mut escaped = false;
+    for ch in raw.chars() {
+        if escaped {
+            out.push(ch);
+            escaped = false;
+            continue;
+        }
+        if in_quotes {
+            match ch {
+                '\\' => escaped = true,
+                '"' => in_quotes = false,
+                _ => out.push(ch),
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_quotes = true,
+            '#' | ';' => break,
+            _ => out.push(ch),
+        }
+    }
+    out.trim().to_owned()
+}
+
+/// True only when `common_dir` uses the standard SHA-1 + `files` ref backend
+/// with no unknown `[extensions]` or config includes that could change ref
+/// storage semantics.
+fn is_standard_files_ref_backend(common_dir: &Path) -> bool {
+    if common_dir.join("reftable").exists() || !common_dir.join("refs").is_dir() {
+        return false;
+    }
+    let Ok(config) = std::fs::read_to_string(common_dir.join("config")) else {
+        return false;
+    };
+    let mut section = String::new();
+    for raw_line in config.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if line.ends_with('\\') {
+            return false;
+        }
+        if let Some(rest) = line.strip_prefix('[') {
+            let Some(end) = rest.find(']') else {
+                return false;
+            };
+            let trailing = rest[end + 1..].trim();
+            if !trailing.is_empty() && !trailing.starts_with('#') && !trailing.starts_with(';') {
+                return false;
+            }
+            let header = &rest[..end];
+            section = header
+                .split(|c: char| c.is_ascii_whitespace() || c == '"')
+                .next()
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if matches!(section.as_str(), "include" | "includeif") {
+                return false;
+            }
+            continue;
+        }
+        let (key, val) = match line.split_once('=') {
+            Some((k, v)) => (
+                k.trim().to_ascii_lowercase(),
+                strip_git_config_value(v).to_ascii_lowercase(),
+            ),
+            None => (
+                strip_git_config_value(line).to_ascii_lowercase(),
+                "true".to_owned(),
+            ),
+        };
+        match section.as_str() {
+            "core" if key == "repositoryformatversion" => {
+                if !matches!(val.as_str(), "0" | "1") {
+                    return false;
+                }
+            }
+            "extensions" => match key.as_str() {
+                "refstorage" if val == "files" => {}
+                "objectformat" if val == "sha1" => {}
+                "worktreeconfig" | "relativeworktrees" | "partialclone" | "promisor"
+                | "preciousobjects" | "noop" | "manyfiles" => {}
+                _ => return false,
+            },
+            _ => {}
+        }
+    }
+    true
+}
+
+fn is_safe_ref_name(name: &str) -> bool {
+    if !name.starts_with("refs/")
+        || name.ends_with('/')
+        || name.starts_with("refs/bisect/")
+        || name.starts_with("refs/worktree/")
+        || name.starts_with("refs/rewritten/")
+    {
+        return false;
+    }
+    name.split('/').all(|part| {
+        !part.is_empty()
+            && part != "."
+            && part != ".."
+            && !part.contains('\\')
+            && !part.bytes().any(|b| b <= 0x20 || b == 0x7f)
+    })
+}
+
+fn join_rel_path(base: &Path, rel: &str) -> PathBuf {
+    let mut path = base.to_path_buf();
+    for part in rel.split('/') {
+        path.push(part);
+    }
+    path
+}
+
+fn is_sha1_hex(s: &str) -> bool {
+    s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn is_hex_oid(s: &str) -> bool {
+    (s.len() == 40 || s.len() == 64) && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+enum LooseRef {
+    Missing,
+    Oid(String),
+    Symref(String),
+    Unknown,
+}
+
+fn read_loose_ref(common_dir: &Path, ref_name: &str) -> LooseRef {
+    if !is_safe_ref_name(ref_name) {
+        return LooseRef::Unknown;
+    }
+    let path = join_rel_path(common_dir, ref_name);
+    match std::fs::symlink_metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return LooseRef::Missing,
+        Err(_) => return LooseRef::Unknown,
+        Ok(meta) if !meta.is_file() => return LooseRef::Unknown,
+        Ok(_) => {}
+    }
+    match std::fs::read_to_string(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => LooseRef::Missing,
+        Err(_) => LooseRef::Unknown,
+        Ok(raw) => {
+            let trimmed = raw.trim();
+            if let Some(target) = trimmed.strip_prefix("ref:") {
+                let target = target.trim();
+                if is_safe_ref_name(target) {
+                    LooseRef::Symref(target.to_owned())
+                } else {
+                    LooseRef::Unknown
+                }
+            } else if is_sha1_hex(trimmed) {
+                LooseRef::Oid(trimmed.to_ascii_lowercase())
+            } else {
+                LooseRef::Unknown
+            }
+        }
+    }
+}
+
+enum PackedRef {
+    Missing,
+    Oid(String),
+    Unknown,
+}
+
+fn read_packed_ref(common_dir: &Path, ref_name: &str) -> PackedRef {
+    let raw = match std::fs::read_to_string(common_dir.join("packed-refs")) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return PackedRef::Missing,
+        Err(_) => return PackedRef::Unknown,
+        Ok(raw) => raw,
+    };
+    let mut lines = raw.lines().peekable();
+    while let Some(line) = lines.next() {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() || line.starts_with('#') || line.starts_with('^') {
+            continue;
+        }
+        let Some((oid, name)) = line.split_once(' ') else {
+            return PackedRef::Unknown;
+        };
+        if name == ref_name {
+            if !is_sha1_hex(oid) {
+                return PackedRef::Unknown;
+            }
+            if lines
+                .peek()
+                .is_some_and(|next| next.trim_end_matches('\r').starts_with('^'))
+            {
+                // Peeled tag entry: let `git` peel and verify `^{commit}`.
+                return PackedRef::Unknown;
+            }
+            return PackedRef::Oid(oid.to_ascii_lowercase());
+        }
+    }
+    PackedRef::Missing
+}
+
+fn resolve_remote_head_files(common_dir: &Path, remote: &str) -> Option<String> {
+    let head = format!("refs/remotes/{remote}/HEAD");
+    match read_loose_ref(common_dir, &head) {
+        LooseRef::Symref(target) => crate::git::remote_head_branch(remote, &target),
+        _ => None,
+    }
+}
+
+fn resolve_ref_oid_files(common_dir: &Path, start_ref: &str) -> Option<String> {
+    let mut current = start_ref.to_owned();
+    for _ in 0..8 {
+        match read_loose_ref(common_dir, &current) {
+            LooseRef::Oid(oid) => return Some(oid),
+            LooseRef::Symref(next) => current = next,
+            LooseRef::Missing => {
+                return match read_packed_ref(common_dir, &current) {
+                    PackedRef::Oid(oid) => Some(oid),
+                    PackedRef::Missing | PackedRef::Unknown => None,
+                };
+            }
+            LooseRef::Unknown => return None,
+        }
+    }
+    None
+}
+
+fn repository_git() -> std::process::Command {
     #[cfg(test)]
     crate::web::request_cost::git();
-    let out = std::process::Command::new("git")
+    let mut command = std::process::Command::new("git");
+    command.arg("--no-replace-objects");
+    command
+}
+
+fn git_out(repo: &Path, args: &[&str]) -> Option<String> {
+    use crate::proc::Quiet as _;
+    let out = repository_git()
         .args(args)
         .quiet()
         .current_dir(repo)
@@ -2904,18 +3308,39 @@ fn resolve_remote_base(repo: &Path) -> Result<(String, String)> {
     let base = match base {
         Some(b) => b,
         None => {
-            let head = format!("refs/remotes/{remote}/HEAD");
-            git_out(repo, &["symbolic-ref", "--quiet", &head])
-                .and_then(|s| crate::git::remote_head_branch(&remote, &s))
-                .with_context(|| {
-                    format!(
-                        "cannot tell which branch of `{remote}` holds magi.toml: \
-                         set [merge] base, or run `git remote set-head {remote} -a`"
-                    )
-                })?
+            let from_files = match inspect_git_repo(repo) {
+                RepoKind::Found(dirs) if dirs.files_ref_backend => {
+                    resolve_remote_head_files(&dirs.common_dir, &remote)
+                }
+                _ => None,
+            };
+            match from_files {
+                Some(b) => b,
+                None => {
+                    let head = format!("refs/remotes/{remote}/HEAD");
+                    git_out(repo, &["symbolic-ref", "--quiet", &head])
+                        .and_then(|s| crate::git::remote_head_branch(&remote, &s))
+                        .with_context(|| missing_remote_head_msg(&remote))?
+                }
+            }
         }
     };
     Ok((remote, base))
+}
+
+fn missing_remote_head_msg(remote: &str) -> String {
+    format!(
+        "cannot tell which branch of `{remote}` holds magi.toml: \
+         set [merge] base, or run `git remote set-head {remote} -a`"
+    )
+}
+
+fn missing_tracking_ref_msg(remote: &str, base: &str) -> String {
+    format!(
+        "`{remote}/{base}` does not exist in this checkout; fetch it \
+         (`git fetch {remote} {base}`) or set [merge] base/remote. magi will not read \
+         a possibly stale local magi.toml instead"
+    )
 }
 
 fn fnv_hex(text: &str) -> String {
@@ -2949,9 +3374,7 @@ fn declares_include(text: &str) -> bool {
 /// repository layer resolve against the same commit.
 fn extract_tree(repo: &Path, sha: &str, dest: &Path) -> Result<()> {
     use crate::proc::Quiet as _;
-    #[cfg(test)]
-    crate::web::request_cost::git();
-    let mut archive = std::process::Command::new("git")
+    let mut archive = repository_git()
         .args(["archive", "--format=tar", sha])
         .quiet()
         .current_dir(repo)
@@ -2978,90 +3401,476 @@ fn extract_tree(repo: &Path, sha: &str, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-/// The repository layers (`.magi/config.toml`, `magi.toml`; lowest first) of
-/// `<remote>/<base>`, extracted from one commit so both files agree.
-fn remote_layers(repo: &Path) -> Result<Vec<PathBuf>> {
-    let (remote, base) = resolve_remote_base(repo)?;
-    let tracking = format!("refs/remotes/{remote}/{base}");
-    let spec = format!("{tracking}^{{commit}}");
-    let sha = git_out(repo, &["rev-parse", "--verify", "--quiet", &spec])
-        .map(|s| s.trim().to_owned())
-        .filter(|s| !s.is_empty())
-        .with_context(|| {
-            format!(
-                "`{remote}/{base}` does not exist in this checkout; fetch it \
-                 (`git fetch {remote} {base}`) or set [merge] base/remote. magi will not read \
-                 a possibly stale local magi.toml instead"
-            )
-        })?;
-    let key = format!("{sha}-{}", fnv_hex(&repo.to_string_lossy()));
-    let rels = [".magi/config.toml", "magi.toml"];
-    let mut texts: Vec<(&str, String)> = Vec::new();
-    for rel in rels {
-        let object = format!("{sha}:{rel}");
-        if git_out(repo, &["cat-file", "-e", &object]).is_none() {
+fn write_extracted(path: &Path, bytes: impl AsRef<[u8]>) -> Result<()> {
+    use std::io::Write as _;
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    std::fs::File::create_new(path)?.write_all(bytes.as_ref())?;
+    Ok(())
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CacheManifest {
+    version: u32,
+    sha: String,
+    repo: String,
+    layers: Vec<String>,
+    extracted_tree: bool,
+}
+
+fn read_cached_layers(dir: &Path, sha: &str, repo: &Path) -> Option<Vec<PathBuf>> {
+    let raw = std::fs::read(dir.join(CACHE_MANIFEST)).ok()?;
+    let manifest: CacheManifest = serde_json::from_slice(&raw).ok()?;
+    if manifest.version != CACHE_MANIFEST_VERSION
+        || manifest.sha != sha
+        || manifest.repo != repo.to_string_lossy()
+        || manifest.layers.len() > REPO_LAYER_RELS.len()
+    {
+        return None;
+    }
+    let mut out = Vec::with_capacity(manifest.layers.len());
+    let mut last_idx: Option<usize> = None;
+    for rel in &manifest.layers {
+        let idx = REPO_LAYER_RELS.iter().position(|allowed| *allowed == rel)?;
+        if last_idx.is_some_and(|prev| idx <= prev) {
+            return None;
+        }
+        last_idx = Some(idx);
+        let file = join_rel_path(dir, rel);
+        if !file.is_file() || !file.parent().is_some_and(|p| p.join(REPO_MARKER).is_file()) {
+            return None;
+        }
+        out.push(file);
+    }
+    Some(out)
+}
+
+enum BatchEntry {
+    Missing,
+    Object {
+        oid: String,
+        kind: String,
+        content: Vec<u8>,
+    },
+}
+
+fn parse_cat_file_batch(mut buf: &[u8], expected: usize) -> Result<Vec<BatchEntry>> {
+    let mut entries = Vec::with_capacity(expected);
+    for _ in 0..expected {
+        let Some(nl) = buf.iter().position(|&b| b == b'\n') else {
+            bail!("unexpected EOF in git cat-file --batch header");
+        };
+        let line = std::str::from_utf8(&buf[..nl])
+            .context("non-UTF-8 git cat-file --batch header")?
+            .trim_end_matches('\r');
+        buf = &buf[nl + 1..];
+        if line.ends_with(" missing") || line.ends_with(" ambiguous") {
+            entries.push(BatchEntry::Missing);
             continue;
         }
-        let Some(text) = git_out(repo, &["show", &object]) else {
-            bail!("cannot read {rel} from {remote}/{base} ({sha})");
+        let mut parts = line.split_whitespace();
+        let (Some(oid), Some(kind), Some(size_str), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            bail!("unexpected git cat-file --batch header: {line}");
         };
-        texts.push((rel, text));
+        let size: usize = size_str
+            .parse()
+            .with_context(|| format!("invalid git cat-file --batch size: {size_str}"))?;
+        if buf.len() < size + 1 || buf[size] != b'\n' {
+            bail!("truncated git cat-file --batch body for {oid}");
+        }
+        let content = buf[..size].to_vec();
+        buf = &buf[size + 1..];
+        entries.push(BatchEntry::Object {
+            oid: oid.to_owned(),
+            kind: kind.to_owned(),
+            content,
+        });
     }
-    let wants_tree = texts.iter().any(|(_, t)| declares_include(t));
-    // Content-addressed and built beside the final name, then renamed in: a
-    // concurrent `discover` sees the whole directory or none of it, never a
-    // half-written file.
-    let build = |root: &Path| -> Result<PathBuf> {
-        let final_dir = root.join(&key);
-        if !final_dir.is_dir() {
-            std::fs::create_dir_all(root)?;
-            let tmp = root.join(format!(
-                "{key}.tmp-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos())
-                    .unwrap_or_default()
-            ));
-            let filled = (|| -> Result<()> {
-                std::fs::create_dir_all(&tmp)?;
-                if wants_tree {
-                    extract_tree(repo, &sha, &tmp)?;
+    Ok(entries)
+}
+
+/// Verify `<sha>^{commit}` and read `.magi/config.toml` and `magi.toml` from
+/// that commit in one `git cat-file --batch` invocation.
+fn read_commit_layers_batch(
+    repo: &Path,
+    sha: &str,
+    remote: &str,
+    base: &str,
+) -> Result<(String, Vec<(&'static str, String)>)> {
+    use crate::proc::Quiet as _;
+    use std::io::Write as _;
+
+    let mut child = repository_git()
+        .args(["cat-file", "--batch"])
+        .quiet()
+        .current_dir(repo)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("running git cat-file --batch")?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let mut query = format!("{sha}^{{commit}}\n");
+        for rel in REPO_LAYER_RELS {
+            query.push_str(&format!("{sha}:{rel}\n"));
+        }
+        if let Err(e) = stdin.write_all(query.as_bytes())
+            && e.kind() != std::io::ErrorKind::BrokenPipe
+        {
+            return Err(e).context("writing query to git cat-file --batch");
+        }
+    }
+    let out = child
+        .wait_with_output()
+        .context("waiting for git cat-file --batch")?;
+    if !out.status.success() {
+        bail!(
+            "cannot read config from {remote}/{base} ({sha}): {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let entries = parse_cat_file_batch(&out.stdout, 1 + REPO_LAYER_RELS.len())?;
+    let mut iter = entries.into_iter();
+    let commit_sha = match iter.next() {
+        Some(BatchEntry::Object { oid, kind, .. }) if kind == "commit" && is_hex_oid(&oid) => oid,
+        _ => bail!("{}", missing_tracking_ref_msg(remote, base)),
+    };
+    // Batch "missing" conflates absent paths with missing objects. Verify
+    // absence against the commit tree before publishing an immutable manifest.
+    let present_paths = if iter
+        .as_slice()
+        .iter()
+        .any(|e| matches!(e, BatchEntry::Missing))
+    {
+        let tree = git_out(
+            repo,
+            &[
+                "ls-tree",
+                "--full-tree",
+                "--name-only",
+                &commit_sha,
+                "--",
+                ".magi/config.toml",
+                "magi.toml",
+            ],
+        )
+        .context("cannot read repository configuration tree")?;
+        tree.lines().map(str::to_owned).collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let mut texts = Vec::new();
+    for (rel, entry) in REPO_LAYER_RELS.into_iter().zip(iter) {
+        match entry {
+            BatchEntry::Missing => {
+                if present_paths.iter().any(|path| path == rel) {
+                    bail!("cannot read {rel} from {remote}/{base} ({commit_sha}): missing object");
                 }
-                for (rel, text) in &texts {
-                    let file = tmp.join(rel);
-                    let parent = file.parent().unwrap_or(&tmp);
-                    std::fs::create_dir_all(parent)?;
-                    std::fs::write(&file, text)?;
-                    std::fs::write(parent.join(REPO_MARKER), repo.to_string_lossy().as_bytes())?;
-                }
-                Ok(())
-            })();
-            if let Err(e) = filled {
-                let _ = std::fs::remove_dir_all(&tmp);
-                return Err(e);
             }
-            if std::fs::rename(&tmp, &final_dir).is_err() {
-                // Lost the race to another process building the same commit.
-                let _ = std::fs::remove_dir_all(&tmp);
-                if !final_dir.is_dir() {
-                    bail!("cannot place {}", final_dir.display());
-                }
+            BatchEntry::Object { kind, content, .. } if kind == "blob" => {
+                texts.push((rel, String::from_utf8_lossy(&content).into_owned()));
+            }
+            BatchEntry::Object { kind, .. } => {
+                bail!(
+                    "cannot read {rel} from {remote}/{base} ({commit_sha}): expected blob, found {kind}"
+                );
             }
         }
-        Ok(final_dir)
-    };
+    }
+    Ok((commit_sha, texts))
+}
+
+fn resolve_common_and_commit_cli(
+    repo: &Path,
+    remote: &str,
+    base: &str,
+) -> Option<(PathBuf, String)> {
+    let spec = format!("refs/remotes/{remote}/{base}^{{commit}}");
+    if !remote.starts_with('-') && !base.starts_with('-') {
+        let out = git_out(
+            repo,
+            &[
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-common-dir",
+                &spec,
+            ],
+        )?;
+        let mut lines = out.lines().map(str::trim).filter(|l| !l.is_empty());
+        let common = lines.next()?;
+        let sha = lines.next()?;
+        if lines.next().is_none() && is_hex_oid(sha) {
+            return Some((PathBuf::from(common), sha.to_owned()));
+        }
+    }
+    let sha = git_out(repo, &["rev-parse", "--verify", "--quiet", &spec])
+        .map(|s| s.trim().to_owned())
+        .filter(|s| is_hex_oid(s))?;
     let common = git_out(
         repo,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
     )
-    .map(|s| PathBuf::from(s.trim()).join("magi").join("config"));
-    let dir = match common.map(|c| build(&c)) {
-        Some(Ok(d)) => d,
-        _ => build(&std::env::temp_dir().join("magi-config"))
-            .with_context(|| format!("extracting config from {remote}/{base}"))?,
+    .map(|s| PathBuf::from(s.trim()))?;
+    Some((common, sha))
+}
+
+/// Resolve `refs/remotes/<remote>/HEAD` and its target commit in one `git`
+/// process when the pure-filesystem fast path does not apply (e.g. reftable,
+/// sha256, peeled tags, or Git environment overrides).
+fn resolve_remote_head_and_commit_cli(repo: &Path, remote: &str) -> Result<(String, String)> {
+    let head = format!("refs/remotes/{remote}/HEAD");
+    if let Some(out) = git_out(
+        repo,
+        &[
+            "for-each-ref",
+            "--format=%(refname)%09%(symref)%09%(objecttype)%09%(objectname)%09%(*objecttype)%09%(*objectname)",
+            &head,
+        ],
+    ) {
+        for line in out.lines() {
+            let parts: Vec<&str> = line.trim_end_matches('\r').split('\t').collect();
+            if parts.len() != 6 || parts[0] != head {
+                continue;
+            }
+            let symref = parts[1];
+            if let Some(base) = crate::git::remote_head_branch(remote, symref) {
+                if parts[2] == "commit" && is_hex_oid(parts[3]) {
+                    return Ok((base, parts[3].to_owned()));
+                }
+                if parts[4] == "commit" && is_hex_oid(parts[5]) {
+                    return Ok((base, parts[5].to_owned()));
+                }
+                let spec = format!("refs/remotes/{remote}/{base}^{{commit}}");
+                let sha = git_out(repo, &["rev-parse", "--verify", "--quiet", &spec])
+                    .map(|s| s.trim().to_owned())
+                    .filter(|s| is_hex_oid(s))
+                    .with_context(|| missing_tracking_ref_msg(remote, &base))?;
+                return Ok((base, sha));
+            }
+        }
+    }
+    // `for-each-ref` omits dangling symrefs and non-matching refs. Distinguish
+    // a missing `HEAD` symref from a valid `HEAD` whose tracking branch is gone.
+    let base = git_out(repo, &["symbolic-ref", "--quiet", &head])
+        .and_then(|s| crate::git::remote_head_branch(remote, &s))
+        .with_context(|| missing_remote_head_msg(remote))?;
+    let spec = format!("refs/remotes/{remote}/{base}^{{commit}}");
+    let sha = git_out(repo, &["rev-parse", "--verify", "--quiet", &spec])
+        .map(|s| s.trim().to_owned())
+        .filter(|s| is_hex_oid(s))
+        .with_context(|| missing_tracking_ref_msg(remote, &base))?;
+    Ok((base, sha))
+}
+
+fn remote_layers_fallback(repo: &Path) -> Result<Vec<PathBuf>> {
+    let (remote, cfg_base) = probe_remote_base(repo);
+    if let Some(base) = cfg_base {
+        if let Some((common_dir, sha)) = resolve_common_and_commit_cli(repo, &remote, &base) {
+            return materialize_remote_layers(repo, Some(common_dir), &remote, &base, &sha, true);
+        }
+        if !is_git_worktree(repo) {
+            return Ok(local_repo_layers(repo));
+        }
+        bail!("{}", missing_tracking_ref_msg(&remote, &base));
+    }
+    if !is_git_worktree(repo) {
+        return Ok(local_repo_layers(repo));
+    }
+    remote_layers_with_git(repo, None)
+}
+
+/// The repository layers (`.magi/config.toml`, `magi.toml`; lowest first) of
+/// `<remote>/<base>`, extracted from one commit so both files agree.
+fn remote_layers_with_git(repo: &Path, git_dirs: Option<GitDirs>) -> Result<Vec<PathBuf>> {
+    let (remote, cfg_base) = probe_remote_base(repo);
+
+    // Fast path: standard SHA-1 + `files` ref backend resolves both the remote
+    // HEAD symref (when needed) and the tracking ref OID directly from the
+    // common git directory with zero subprocess spawns.
+    if let Some(dirs) = &git_dirs
+        && dirs.files_ref_backend
+    {
+        let base_from_files = match &cfg_base {
+            Some(b) => Some(b.clone()),
+            None => resolve_remote_head_files(&dirs.common_dir, &remote),
+        };
+        if let Some(base) = base_from_files {
+            let tracking = format!("refs/remotes/{remote}/{base}");
+            if let Some(sha) = resolve_ref_oid_files(&dirs.common_dir, &tracking) {
+                return materialize_remote_layers(
+                    repo,
+                    Some(dirs.common_dir.clone()),
+                    &remote,
+                    &base,
+                    &sha,
+                    false,
+                );
+            }
+        }
+    }
+
+    // Fallback path: non-`files` ref backend (e.g. reftable), SHA-256, peeled
+    // tags, env overrides, or missing/broken refs. Keep steady-state cost to at
+    // most one `git` process when the ref resolves.
+    let (common_dir, base, sha) = match (git_dirs, cfg_base) {
+        (Some(dirs), Some(base)) => {
+            let spec = format!("refs/remotes/{remote}/{base}^{{commit}}");
+            let sha = git_out(repo, &["rev-parse", "--verify", "--quiet", &spec])
+                .map(|s| s.trim().to_owned())
+                .filter(|s| is_hex_oid(s))
+                .with_context(|| missing_tracking_ref_msg(&remote, &base))?;
+            (Some(dirs.common_dir), base, sha)
+        }
+        (Some(dirs), None) => {
+            let (base, sha) = resolve_remote_head_and_commit_cli(repo, &remote)?;
+            (Some(dirs.common_dir), base, sha)
+        }
+        (None, Some(base)) => {
+            let (common_dir, sha) = resolve_common_and_commit_cli(repo, &remote, &base)
+                .with_context(|| missing_tracking_ref_msg(&remote, &base))?;
+            (Some(common_dir), base, sha)
+        }
+        (None, None) => {
+            let (base, sha) = resolve_remote_head_and_commit_cli(repo, &remote)?;
+            (None, base, sha)
+        }
     };
-    Ok(texts.iter().map(|(rel, _)| dir.join(rel)).collect())
+    materialize_remote_layers(repo, common_dir, &remote, &base, &sha, true)
+}
+
+fn materialize_remote_layers(
+    repo: &Path,
+    common_dir: Option<PathBuf>,
+    remote: &str,
+    base: &str,
+    sha: &str,
+    verified: bool,
+) -> Result<Vec<PathBuf>> {
+    let repo_key = repo.to_string_lossy();
+    let key_for = |commit_sha: &str| {
+        format!(
+            "{commit_sha}-{}-v{CACHE_MANIFEST_VERSION}",
+            fnv_hex(&repo_key)
+        )
+    };
+    let primary_root = common_dir.map(|c| c.join("magi").join("config"));
+    let fallback_root = dirs::cache_dir().map(|p| p.join("magi").join("config"));
+    let lookup = |commit_sha: &str| -> Option<Vec<PathBuf>> {
+        let key = key_for(commit_sha);
+        if let Some(root) = &primary_root
+            && let Some(layers) = read_cached_layers(&root.join(&key), commit_sha, repo)
+        {
+            return Some(layers);
+        }
+        read_cached_layers(&fallback_root.as_ref()?.join(&key), commit_sha, repo)
+    };
+    if let Some(layers) = lookup(sha) {
+        if !verified {
+            // Observing a ref and its cache key is not proof that the commit
+            // still exists. Git validates the object store (including packs
+            // and alternates); an unchanged ref or TTL cannot prove that.
+            let commit = git_out(
+                repo,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    &format!("{sha}^{{commit}}"),
+                ],
+            );
+            if !commit.is_some_and(|s| s.trim() == sha) {
+                bail!("{}", missing_tracking_ref_msg(remote, base));
+            }
+        }
+        return Ok(layers);
+    }
+
+    let (commit_sha, texts) = read_commit_layers_batch(repo, sha, remote, base)?;
+    if commit_sha != sha
+        && let Some(layers) = lookup(&commit_sha)
+    {
+        return Ok(layers);
+    }
+
+    let key = key_for(&commit_sha);
+    let wants_tree = texts.iter().any(|(_, t)| declares_include(t));
+    // Content-addressed and built beside the final name, then renamed in: a
+    // concurrent `discover` sees the whole directory (with manifest) or none
+    // of it, never a half-written file.
+    let build = |root: &Path| -> Result<Vec<PathBuf>> {
+        let final_dir = root.join(&key);
+        if let Some(layers) = read_cached_layers(&final_dir, &commit_sha, repo) {
+            return Ok(layers);
+        }
+        static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        std::fs::create_dir_all(root)?;
+        let tmp = root.join(format!(
+            "{key}.tmp-{}-{}-{seq}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        let filled = (|| -> Result<()> {
+            std::fs::create_dir_all(&tmp)?;
+            if wants_tree {
+                extract_tree(repo, &commit_sha, &tmp)?;
+            }
+            for (rel, text) in &texts {
+                let file = join_rel_path(&tmp, rel);
+                let parent = file.parent().unwrap_or(&tmp);
+                std::fs::create_dir_all(parent)?;
+                write_extracted(&file, text)?;
+                write_extracted(&parent.join(REPO_MARKER), repo.to_string_lossy().as_bytes())?;
+            }
+            let manifest = CacheManifest {
+                version: CACHE_MANIFEST_VERSION,
+                sha: commit_sha.clone(),
+                repo: repo.to_string_lossy().into_owned(),
+                layers: texts.iter().map(|(rel, _)| (*rel).to_owned()).collect(),
+                extracted_tree: wants_tree,
+            };
+            write_extracted(
+                &tmp.join(CACHE_MANIFEST),
+                serde_json::to_vec(&manifest).context("serialize config cache manifest")?,
+            )?;
+            Ok(())
+        })();
+        if let Err(e) = filled {
+            let _ = std::fs::remove_dir_all(&tmp);
+            return Err(e);
+        }
+        if std::fs::rename(&tmp, &final_dir).is_err() {
+            // Lost the race to another process building the same commit, or
+            // hit a preexisting unverified directory (rename cannot overwrite
+            // directories on Windows). Only reuse `final_dir` if its manifest
+            // validates; otherwise fail so the caller falls back cleanly.
+            let _ = std::fs::remove_dir_all(&tmp);
+            return read_cached_layers(&final_dir, &commit_sha, repo)
+                .with_context(|| format!("cannot place {}", final_dir.display()));
+        }
+        Ok(texts
+            .iter()
+            .map(|(rel, _)| join_rel_path(&final_dir, rel))
+            .collect())
+    };
+    let layers = match primary_root.as_deref().map(&build) {
+        Some(Ok(layers)) => layers,
+        _ => {
+            let root = fallback_root
+                .as_deref()
+                .context("no user config cache directory")?;
+            build(root).with_context(|| format!("extracting config from {remote}/{base}"))?
+        }
+    };
+    Ok(layers)
 }
 
 #[cfg(test)]
@@ -4716,9 +5525,28 @@ lock_file = "{{ vars.bad }}"
             git(&repo, &["commit", "-m", "y"]);
             git(&repo, &["push", "origin", "trunk"]);
             git(&repo, &["fetch", "origin"]);
-            let (cfg, layers) = Config::discover(&repo, None).unwrap();
+            let ((cfg, layers), (_, cold_git)) =
+                crate::web::request_cost::measure_sync(|| Config::discover(&repo, None).unwrap());
             assert_eq!((cfg.graph.implementers, cfg.graph.judges), (2, 3));
             assert_eq!(layers.len(), 2);
+            assert_eq!(cold_git, 1);
+            let common_cache = repo
+                .join(".git")
+                .canonicalize()
+                .unwrap()
+                .join("magi")
+                .join("config");
+            assert!(
+                layers.iter().all(|p| p.starts_with(&common_cache)),
+                "expected .magi/config.toml and magi.toml to cache under common git dir {}, got {layers:?}",
+                common_cache.display()
+            );
+
+            let ((cfg_warm, warm_layers), (_, warm_git)) =
+                crate::web::request_cost::measure_sync(|| Config::discover(&repo, None).unwrap());
+            assert_eq!((cfg_warm.graph.implementers, cfg_warm.graph.judges), (2, 3));
+            assert_eq!(warm_layers, layers);
+            assert_eq!(warm_git, 1);
         }
 
         #[test]
@@ -4847,8 +5675,404 @@ lock_file = "{{ vars.bad }}"
         fn a_non_git_directory_reads_its_files() {
             let dir = tempfile::tempdir().unwrap();
             std::fs::write(dir.path().join("magi.toml"), "[graph]\ncandidates = 4\n").unwrap();
-            let (cfg, _) = Config::discover(dir.path(), None).unwrap();
+            let (cfg, (discoveries, git_calls)) =
+                crate::web::request_cost::measure_sync(|| Config::discover(dir.path(), None));
+            assert_eq!(cfg.unwrap().0.graph.implementers, 4);
+            assert_eq!((discoveries, git_calls), (1, 0));
+        }
+
+        fn push_remote_config(bare: &Path, branch: &str, magi_toml: &str) {
+            let tmp = tempfile::tempdir().unwrap();
+            let clone = tmp.path().join("push");
+            git(
+                tmp.path(),
+                &["clone", "-b", branch, &bare.to_string_lossy(), "push"],
+            );
+            git(&clone, &["config", "user.name", "t"]);
+            git(&clone, &["config", "user.email", "t@example.com"]);
+            std::fs::write(clone.join("magi.toml"), magi_toml).unwrap();
+            git(&clone, &["add", "magi.toml"]);
+            git(&clone, &["commit", "-m", "update config"]);
+            git(&clone, &["push", "origin", branch]);
+        }
+
+        #[test]
+        fn repeated_discovers_stay_within_bounded_git_spawns() {
+            let (_t, repo) = fixture("[graph]\ncandidates = 2\n", "[graph]\ncandidates = 9\n");
+
+            // Cold cache: two processes to read the commit and prove absent
+            // paths, then one commit validation per subsequent load.
+            let (values, (discoveries, cold_git)) = crate::web::request_cost::measure_sync(|| {
+                (0..20)
+                    .map(|_| Config::discover(&repo, None).unwrap().0.graph.implementers)
+                    .collect::<Vec<_>>()
+            });
+            assert!(values.iter().all(|&n| n == 2));
+            assert_eq!(discoveries, 20);
+            assert_eq!(cold_git, 21);
+
+            // Warm cache: one validation per load, no layer extraction.
+            let (values, (discoveries, warm_git)) = crate::web::request_cost::measure_sync(|| {
+                (0..20)
+                    .map(|_| Config::discover(&repo, None).unwrap().0.graph.implementers)
+                    .collect::<Vec<_>>()
+            });
+            assert!(values.iter().all(|&n| n == 2));
+            assert_eq!(discoveries, 20);
+            assert_eq!(warm_git, 20);
+        }
+
+        #[test]
+        fn reftable_warm_discover_uses_one_git_process() {
+            let tmp = tempfile::tempdir().unwrap();
+            let repo = tmp.path();
+            git(repo, &["init", "--ref-format=reftable", "-b", "trunk"]);
+            git(repo, &["config", "user.name", "t"]);
+            git(repo, &["config", "user.email", "t@example.com"]);
+            std::fs::write(repo.join("magi.toml"), "[graph]\ncandidates = 2\n").unwrap();
+            git(repo, &["add", "magi.toml"]);
+            git(repo, &["commit", "-m", "config"]);
+            git(repo, &["update-ref", "refs/remotes/origin/trunk", "HEAD"]);
+            git(
+                repo,
+                &[
+                    "symbolic-ref",
+                    "refs/remotes/origin/HEAD",
+                    "refs/remotes/origin/trunk",
+                ],
+            );
+            assert_eq!(
+                Config::discover(repo, None).unwrap().0.graph.implementers,
+                2
+            );
+            let (values, (_, count)) = crate::web::request_cost::measure_sync(|| {
+                (0..10)
+                    .map(|_| Config::discover(repo, None).unwrap().0.graph.implementers)
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(values, vec![2; 10]);
+            assert_eq!(count, 10);
+        }
+
+        #[test]
+        fn zero_layer_repository_caches_empty_manifest() {
+            let tmp = tempfile::tempdir().unwrap();
+            let bare = tmp.path().join("o.git");
+            git(tmp.path(), &["init", "--bare", "-b", "trunk", "o.git"]);
+            let repo = tmp.path().join("repo");
+            std::fs::create_dir_all(&repo).unwrap();
+            git(&repo, &["init", "-b", "trunk"]);
+            git(&repo, &["config", "user.name", "t"]);
+            git(&repo, &["config", "user.email", "t@example.com"]);
+            std::fs::write(repo.join("README.md"), "hello\n").unwrap();
+            git(&repo, &["add", "-A"]);
+            git(&repo, &["commit", "-m", "no config"]);
+            git(&repo, &["remote", "add", "origin", &bare.to_string_lossy()]);
+            git(&repo, &["push", "origin", "trunk"]);
+            git(&repo, &["fetch", "origin"]);
+            git(&repo, &["remote", "set-head", "origin", "trunk"]);
+
+            let (layers, (_, cold_git)) = crate::web::request_cost::measure_sync(|| {
+                let mut last = Vec::new();
+                for _ in 0..20 {
+                    last = Config::discover(&repo, None).unwrap().1;
+                }
+                last
+            });
+            assert!(layers.is_empty());
+            assert_eq!(cold_git, 21);
+
+            let (layers, (_, warm_git)) = crate::web::request_cost::measure_sync(|| {
+                let mut last = Vec::new();
+                for _ in 0..20 {
+                    last = Config::discover(&repo, None).unwrap().1;
+                }
+                last
+            });
+            assert!(layers.is_empty());
+            assert_eq!(warm_git, 20);
+        }
+
+        #[test]
+        fn moved_loose_and_packed_refs_are_observed_immediately() {
+            let (t, repo) = fixture("[graph]\ncandidates = 2\n", "[graph]\ncandidates = 9\n");
+            let bare = t.path().join("o.git");
+
+            // Warm initial commit.
+            assert_eq!(
+                Config::discover(&repo, None).unwrap().0.graph.implementers,
+                2
+            );
+            let (_, (_, warm_git)) =
+                crate::web::request_cost::measure_sync(|| Config::discover(&repo, None).unwrap());
+            assert_eq!(warm_git, 1);
+
+            // Move loose ref without touching the working tree.
+            push_remote_config(&bare, "trunk", "[graph]\ncandidates = 3\n");
+            git(&repo, &["fetch", "origin"]);
+            let (cfg, (_, moved_git)) =
+                crate::web::request_cost::measure_sync(|| Config::discover(&repo, None).unwrap().0);
+            assert_eq!(cfg.graph.implementers, 3);
+            assert_eq!(moved_git, 2);
+            let (cfg, (_, warm_after_move)) =
+                crate::web::request_cost::measure_sync(|| Config::discover(&repo, None).unwrap().0);
+            assert_eq!(cfg.graph.implementers, 3);
+            assert_eq!(warm_after_move, 1);
+
+            // Pack all refs so the tracking ref lives only in `packed-refs`.
+            git(&repo, &["pack-refs", "--all"]);
+            let (cfg, (_, packed_warm)) =
+                crate::web::request_cost::measure_sync(|| Config::discover(&repo, None).unwrap().0);
+            assert_eq!(cfg.graph.implementers, 3);
+            assert_eq!(packed_warm, 1);
+
+            // Advance the remote again and pack-refs so only `packed-refs` moves.
+            push_remote_config(&bare, "trunk", "[graph]\ncandidates = 4\n");
+            git(&repo, &["fetch", "origin"]);
+            git(&repo, &["pack-refs", "--all"]);
+            let (cfg, (_, packed_move)) =
+                crate::web::request_cost::measure_sync(|| Config::discover(&repo, None).unwrap().0);
             assert_eq!(cfg.graph.implementers, 4);
+            assert_eq!(packed_move, 2);
+            let (cfg, (_, packed_warm_2)) =
+                crate::web::request_cost::measure_sync(|| Config::discover(&repo, None).unwrap().0);
+            assert_eq!(cfg.graph.implementers, 4);
+            assert_eq!(packed_warm_2, 1);
+
+            // Confirm working tree still holds the stale value and was never used.
+            assert!(
+                std::fs::read_to_string(repo.join("magi.toml"))
+                    .unwrap()
+                    .contains("candidates = 9")
+            );
+        }
+
+        #[test]
+        fn linked_worktree_reuses_common_dir_cache_with_one_warm_git_spawn() {
+            let (t, repo) = fixture("[graph]\ncandidates = 2\n", "[graph]\ncandidates = 9\n");
+            let bare = t.path().join("o.git");
+            let wt = t.path().join("linked-wt");
+            git(
+                &repo,
+                &["worktree", "add", "--detach", &wt.to_string_lossy()],
+            );
+
+            let (cfg, (_, cold_git)) =
+                crate::web::request_cost::measure_sync(|| Config::discover(&wt, None).unwrap().0);
+            assert_eq!(cfg.graph.implementers, 2);
+            assert_eq!(cold_git, 2);
+
+            let (values, (_, warm_git)) = crate::web::request_cost::measure_sync(|| {
+                (0..10)
+                    .map(|_| Config::discover(&wt, None).unwrap().0.graph.implementers)
+                    .collect::<Vec<_>>()
+            });
+            assert!(values.iter().all(|&n| n == 2));
+            assert_eq!(warm_git, 10);
+
+            push_remote_config(&bare, "trunk", "[graph]\ncandidates = 5\n");
+            git(&wt, &["fetch", "origin"]);
+            let (cfg, (_, moved_git)) =
+                crate::web::request_cost::measure_sync(|| Config::discover(&wt, None).unwrap().0);
+            assert_eq!(cfg.graph.implementers, 5);
+            assert_eq!(moved_git, 2);
+        }
+
+        #[test]
+        fn deleted_or_retargeted_refs_never_reuse_stale_cache() {
+            let (t, repo) = fixture("[graph]\ncandidates = 2\n", "[graph]\ncandidates = 9\n");
+            let bare = t.path().join("o.git");
+            assert_eq!(
+                Config::discover(&repo, None).unwrap().0.graph.implementers,
+                2
+            );
+
+            // Deleting the tracking ref after warming must error, not reuse cache.
+            git(&repo, &["update-ref", "-d", "refs/remotes/origin/trunk"]);
+            assert!(Config::discover(&repo, None).is_err());
+
+            // Restore tracking ref, create an alternate branch on remote, and
+            // move `origin/HEAD` to point at it.
+            git(&repo, &["fetch", "origin"]);
+            git(&repo, &["checkout", "-b", "alt"]);
+            std::fs::write(repo.join("magi.toml"), "[graph]\ncandidates = 6\n").unwrap();
+            git(&repo, &["add", "magi.toml"]);
+            git(&repo, &["commit", "-m", "alt"]);
+            git(&repo, &["push", "origin", "alt"]);
+            git(&repo, &["fetch", "origin"]);
+            let _ = bare;
+            git(&repo, &["remote", "set-head", "origin", "alt"]);
+            assert_eq!(
+                Config::discover(&repo, None).unwrap().0.graph.implementers,
+                6
+            );
+
+            // Deleting `origin/HEAD` (with no [merge] base) must error.
+            git(&repo, &["remote", "set-head", "origin", "-d"]);
+            assert!(Config::discover(&repo, None).is_err());
+        }
+
+        #[test]
+        fn include_repository_reuses_extracted_tree_with_one_warm_git_spawn() {
+            let (_t, repo) = fixture("include = [\"gate.toml\"]\n", "");
+            std::fs::write(repo.join("magi.toml"), "include = [\"gate.toml\"]\n").unwrap();
+            std::fs::write(repo.join("gate.toml"), "[graph]\ncandidates = 2\n").unwrap();
+            git(&repo, &["add", "-A"]);
+            git(&repo, &["commit", "-m", "inc"]);
+            git(&repo, &["push", "origin", "trunk"]);
+            git(&repo, &["fetch", "origin"]);
+            std::fs::write(repo.join("gate.toml"), "[graph]\ncandidates = 9\n").unwrap();
+
+            let (cfg, (_, cold_git)) =
+                crate::web::request_cost::measure_sync(|| Config::discover(&repo, None).unwrap().0);
+            assert_eq!(cfg.graph.implementers, 2);
+            // Batch read, absence proof and archive for the include tree.
+            assert_eq!(cold_git, 3);
+
+            let (values, (_, warm_git)) = crate::web::request_cost::measure_sync(|| {
+                (0..10)
+                    .map(|_| Config::discover(&repo, None).unwrap().0.graph.implementers)
+                    .collect::<Vec<_>>()
+            });
+            assert!(values.iter().all(|&n| n == 2));
+            assert_eq!(warm_git, 10);
+        }
+
+        #[test]
+        fn partial_clone_loads_promised_config_blob() {
+            let (tmp, source) = fixture("[graph]\ncandidates = 2\n", "");
+            let bare = tmp.path().join("o.git");
+            git(&bare, &["config", "uploadpack.allowFilter", "true"]);
+            let clone = tmp.path().join("partial");
+            git(
+                tmp.path(),
+                &[
+                    "clone",
+                    "--no-local",
+                    "--no-checkout",
+                    "--filter=blob:none",
+                    &bare.to_string_lossy(),
+                    &clone.to_string_lossy(),
+                ],
+            );
+            let oid = git_out(&source, &["rev-parse", "HEAD:magi.toml"]).unwrap();
+            let missing = repository_git()
+                .env("GIT_NO_LAZY_FETCH", "1")
+                .args(["cat-file", "-e", oid.trim()])
+                .current_dir(&clone)
+                .output()
+                .unwrap();
+            assert!(!missing.status.success(), "fixture must omit the blob");
+            assert_eq!(
+                Config::discover(&clone, None).unwrap().0.graph.implementers,
+                2
+            );
+        }
+
+        #[test]
+        fn missing_config_blob_is_not_cached_as_an_absent_layer() {
+            let (_tmp, repo) = fixture("[graph]\ncandidates = 2\n", "");
+            let oid = git_out(&repo, &["rev-parse", "HEAD:magi.toml"]).unwrap();
+            let oid = oid.trim();
+            let blob = repo.join(".git/objects").join(&oid[..2]).join(&oid[2..]);
+            let saved = blob.with_extension("saved");
+            std::fs::rename(&blob, &saved).unwrap();
+            assert!(Config::discover(&repo, None).is_err());
+            std::fs::rename(saved, blob).unwrap();
+            assert_eq!(
+                Config::discover(&repo, None).unwrap().0.graph.implementers,
+                2
+            );
+        }
+
+        #[test]
+        fn a_cached_config_does_not_hide_a_missing_base_commit() {
+            let (_tmp, repo) = fixture("[graph]\ncandidates = 2\n", "");
+            assert_eq!(
+                Config::discover(&repo, None).unwrap().0.graph.implementers,
+                2
+            );
+            let oid = git_out(&repo, &["rev-parse", "HEAD"]).unwrap();
+            let oid = oid.trim();
+            let commit = repo.join(".git/objects").join(&oid[..2]).join(&oid[2..]);
+            let saved = commit.with_extension("saved");
+            std::fs::rename(&commit, &saved).unwrap();
+            assert!(Config::discover(&repo, None).is_err());
+            std::fs::rename(saved, commit).unwrap();
+            assert_eq!(
+                Config::discover(&repo, None).unwrap().0.graph.implementers,
+                2
+            );
+        }
+
+        #[test]
+        fn corrupt_cache_directory_without_manifest_is_not_trusted() {
+            let (_t, repo) = fixture("[graph]\ncandidates = 2\n", "[graph]\ncandidates = 9\n");
+            let sha = git_out(&repo, &["rev-parse", "refs/remotes/origin/trunk^{commit}"])
+                .unwrap()
+                .trim()
+                .to_owned();
+            let key = format!(
+                "{sha}-{}-v{CACHE_MANIFEST_VERSION}",
+                fnv_hex(&repo.to_string_lossy())
+            );
+            let bad_dir = repo.join(".git/magi/config").join(&key);
+            std::fs::create_dir_all(&bad_dir).unwrap();
+            std::fs::write(bad_dir.join("magi.toml"), "[graph]\ncandidates = 9\n").unwrap();
+            std::fs::write(bad_dir.join(REPO_MARKER), repo.to_string_lossy().as_bytes()).unwrap();
+
+            // Must ignore the unmanifested directory and read the real commit.
+            let (cfg, _) = Config::discover(&repo, None).unwrap();
+            assert_eq!(cfg.graph.implementers, 2);
+        }
+
+        #[test]
+        fn resolve_remote_head_and_commit_cli_uses_one_git_process() {
+            let (_t, repo) = fixture("[graph]\ncandidates = 2\n", "[graph]\ncandidates = 9\n");
+            let expected = git_out(&repo, &["rev-parse", "refs/remotes/origin/trunk^{commit}"])
+                .unwrap()
+                .trim()
+                .to_owned();
+            let (resolved, (_, git_calls)) = crate::web::request_cost::measure_sync(|| {
+                resolve_remote_head_and_commit_cli(&repo, "origin").unwrap()
+            });
+            assert_eq!(resolved, ("trunk".to_owned(), expected));
+            assert_eq!(git_calls, 1);
+        }
+
+        #[test]
+        fn standard_files_ref_backend_rejects_nonstandard_git_config() {
+            let tmp = tempfile::tempdir().unwrap();
+            let common = tmp.path().join("git");
+            std::fs::create_dir_all(common.join("refs")).unwrap();
+
+            let check = |cfg: &str| {
+                std::fs::write(common.join("config"), cfg).unwrap();
+                is_standard_files_ref_backend(&common)
+            };
+
+            assert!(check("[core]\n\trepositoryformatversion = 0\n"));
+            assert!(check(
+                "[core]\n\trepositoryformatversion = 1\n[extensions]\n\tworktreeConfig = true\n\trefStorage = files\n\tobjectFormat = sha1\n"
+            ));
+            assert!(!check(
+                "[core]\n\trepositoryformatversion = 1\n[extensions]\n\trefStorage = reftable\n"
+            ));
+            assert!(!check(
+                "[core]\n\trepositoryformatversion = 1\n[extensions]\n\tobjectFormat = sha256\n"
+            ));
+            assert!(!check(
+                "[core]\n\trepositoryformatversion = 1\n[extensions]\n\tunknownExt\n"
+            ));
+            assert!(!check(
+                "[core]\n\trepositoryformatversion = 1\n[extensions] refStorage = reftable\n"
+            ));
+            assert!(!check(
+                "[core]\n\trepositoryformatversion = 0\n[include]\n\tpath = extra.cfg\n"
+            ));
+            assert!(!check(
+                "[core]\n\trepositoryformatversion = 0\n\tfoo = bar\\\nbaz\n"
+            ));
         }
     }
 
