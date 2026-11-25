@@ -67,10 +67,15 @@ pub(crate) async fn recover(queue: &Queue, home: &Path, request: Request) -> Res
     if let Some(digest) = &request.evidence_digest {
         ensure!(
             digest.len() == 64
-                && digest.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+                && digest
+                    .bytes()
+                    .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
             "preparation evidence must be a lowercase SHA-256 digest"
         );
-        ensure!(request.head.len() == 40, "preparation recovery needs a full HEAD");
+        ensure!(
+            request.head.len() == 40,
+            "preparation recovery needs a full HEAD"
+        );
     }
     let dir = home.join("base-recovery-controls").join(&request.actor);
     std::fs::create_dir_all(&dir)?;

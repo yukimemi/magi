@@ -18560,12 +18560,21 @@ esac
         git::git(&state.repo, &["checkout", "main"]).await.unwrap();
         git::git(
             &state.repo,
-            &["commit", "--allow-empty", "-m", "base advanced after inspection"],
+            &[
+                "commit",
+                "--allow-empty",
+                "-m",
+                "base advanced after inspection",
+            ],
         )
         .await
         .unwrap();
-        git::git(&state.repo, &["push", "origin", "main"]).await.unwrap();
-        git::git(&state.repo, &["checkout", "fix/retained"]).await.unwrap();
+        git::git(&state.repo, &["push", "origin", "main"])
+            .await
+            .unwrap();
+        git::git(&state.repo, &["checkout", "fix/retained"])
+            .await
+            .unwrap();
         let outcome = crate::base_recovery_control::recover(&queue, &home, request.clone())
             .await
             .unwrap();
