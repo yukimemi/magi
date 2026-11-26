@@ -23,6 +23,13 @@
 # across multiple `[[file]]` entries to the same dst, so the
 # layered seed works as the preset system was designed.
 
+# Opt into nextest for lib, bin, and integration tests (mirrored in
+# `Makefile.toml` `[env]`). Note that `.github/workflows/ci.yml` is marked
+# `ignored = true` in `.kata/applied.toml` and synchronized manually to match
+# this setting; keeping the top-level variable aligned ensures `kata` renders
+# the same runner split if CI is ever re-attached or inspected.
+PJ_RUST_TEST_RUNNER = "nextest-unit"
+
 [actions]
 # renovate: datasource=github-tags depName=actions/checkout
 checkout = "v7.0.1"
