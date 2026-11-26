@@ -552,21 +552,9 @@ fn recover_release_hold(home: &Path, st: &WatchState) -> Result<Option<String>> 
     if st.run.is_none() {
         return Ok(None);
     }
-    let queue = crate::queue::Queue::at(home.join("queue"));
-    let mut matching = queue
-        .list()
-        .into_iter()
-        .filter(|t| owns_release_hold(st, t));
-    let id = matching.next().map(|t| t.id);
-    anyhow::ensure!(
-        matching.next().is_none(),
-        "ambiguous release hold ownership"
-    );
-    anyhow::ensure!(
-        id.is_some() || queue.unreadable().is_empty(),
-        "unreadable queue may contain the release hold"
-    );
-    Ok(id)
+    Ok(crate::queue::Queue::at(home.join("queue"))
+        .find_unique_checked(|t| owns_release_hold(st, t))?
+        .map(|t| t.id))
 }
 
 /// Resolve a release notification through its saved watch record, never its prose.
@@ -3401,6 +3389,20 @@ mod tests {
         w.finish("o/r#7", &st);
         let question = w.questions().read_history(&id).unwrap();
         assert!(!quiet_effect_applied(d.path(), &question).unwrap());
+        // A directory read failure must not be interpreted as an empty queue.
+        let queue_dir = d.path().join("queue");
+        let backup = d.path().join("queue-backup");
+        std::fs::rename(&queue_dir, &backup).unwrap();
+        std::fs::write(&queue_dir, "not a directory").unwrap();
+        assert!(recover_release_hold(d.path(), &st).is_err());
+        w.lap(&[], 60, 1, &(|| false)).await;
+        assert!(!quiet_effect_applied(d.path(), &question).unwrap());
+        std::fs::remove_file(&queue_dir).unwrap();
+        std::fs::rename(&backup, &queue_dir).unwrap();
+        assert_eq!(
+            queue.get(&task.id).unwrap().status,
+            crate::queue::TaskStatus::Held
+        );
         w.lap(&[], 60, 1, &(|| false)).await;
         assert!(quiet_effect_applied(d.path(), &question).unwrap());
         let saved = queue.get(&task.id).unwrap();
