@@ -25438,7 +25438,8 @@ esac
         let method = "cargo test --lib retry_test";
         let empty = "running 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 42 filtered out";
         let ignored = "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out";
-        let failed = "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out";
+        let failed =
+            "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out";
         let passed = "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out";
         for output in [empty, ignored, failed] {
             let err = evaluate_noop_claim(true, &[evidence_with(method, Some(0), output)], &text)
@@ -25448,8 +25449,7 @@ esac
         // Multiple harnesses can legitimately include a filtered-out suite.
         let mixed = format!("{passed}\n{empty}");
         assert!(
-            verified_noop_claim(true, &[evidence_with(method, Some(0), &mixed)], &text)
-                .is_some()
+            verified_noop_claim(true, &[evidence_with(method, Some(0), &mixed)], &text).is_some()
         );
         // A later real rerun of the same command can establish success.
         assert!(

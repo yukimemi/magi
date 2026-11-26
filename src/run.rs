@@ -659,12 +659,9 @@ impl Candidate {
             && self.commits == 0
             && self.files == 0
             && self.failed.is_none()
-            && self
-                .verified_noop
-                .as_deref()
-                .is_some_and(|evidence| {
-                    matches!(crate::verdict::parse_verified_noop(evidence), Some(Ok(_)))
-                })
+            && self.verified_noop.as_deref().is_some_and(|evidence| {
+                matches!(crate::verdict::parse_verified_noop(evidence), Some(Ok(_)))
+            })
     }
 
     /// Human-readable evidence, including historical prose-only records.
