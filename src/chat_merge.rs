@@ -149,7 +149,7 @@ fn refuse_pending(home: &Path, url: &str) -> Result<()> {
     Ok(())
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Snapshot {
     url: String,
@@ -167,8 +167,11 @@ trait Forge {
 }
 
 struct Gh;
-async fn gh(cwd: &Path, args: Vec<String>) -> Result<(bool, String)> {
-    let mut command = tokio::process::Command::new("gh");
+async fn gh(cwd: &Path, args: Vec<String>) -> Result<crate::land::GhOutput> {
+    gh_with(Path::new("gh"), cwd, args).await
+}
+async fn gh_with(program: &Path, cwd: &Path, args: Vec<String>) -> Result<crate::land::GhOutput> {
+    let mut command = tokio::process::Command::new(program);
     command
         .args(args)
         .current_dir(cwd)
@@ -178,18 +181,12 @@ async fn gh(cwd: &Path, args: Vec<String>) -> Result<(bool, String)> {
     let output = tokio::time::timeout(std::time::Duration::from_secs(60), command.output())
         .await
         .context("forge operation timed out; outcome may be unknown")??;
-    Ok((
-        output.status.success(),
-        format!(
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        ),
-    ))
+    Ok(crate::land::GhOutput::from_output(output))
 }
-impl Forge for Gh {
-    async fn view(&self, cwd: &Path, url: &str) -> Result<Snapshot> {
-        let (ok, body) = gh(
+impl Gh {
+    async fn view_with(&self, program: &Path, cwd: &Path, url: &str) -> Result<Snapshot> {
+        let out = gh_with(
+            program,
             cwd,
             vec![
                 "pr".into(),
@@ -200,8 +197,13 @@ impl Forge for Gh {
             ],
         )
         .await?;
-        ensure!(ok, "PR lookup refused: {body}");
-        Ok(serde_json::from_str(&body)?)
+        ensure!(out.ok, "PR lookup refused: {}", out.combined());
+        Ok(serde_json::from_str(&out.stdout)?)
+    }
+}
+impl Forge for Gh {
+    async fn view(&self, cwd: &Path, url: &str) -> Result<Snapshot> {
+        self.view_with(Path::new("gh"), cwd, url).await
     }
     async fn merge(
         &self,
@@ -210,7 +212,8 @@ impl Forge for Gh {
         head: &str,
         title: &str,
     ) -> Result<(bool, String)> {
-        gh(cwd, merge_args(url, head, title)).await
+        let out = gh(cwd, merge_args(url, head, title)).await?;
+        Ok((out.ok, out.combined()))
     }
 }
 
@@ -895,5 +898,66 @@ mod tests {
         assert!(target_lock(home.path(), "https://github.com/TEAM/PROJECT/pull/7/").is_err());
         drop(guard);
         assert!(target_lock(home.path(), &request().url()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn gh_view_separates_json_stdout_from_stderr_diagnostics() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = request().url();
+        let head = request().head;
+        let hint = "hint: to listen to pull request events, run `gh pr view --web`\n";
+        let valid = format!(
+            r#"{{"url":"{url}","state":"OPEN","isDraft":false,"mergeable":"MERGEABLE","headRefOid":"{head}","title":"chore: test"}}"#
+        );
+
+        let ok_gh = crate::land::tests::fake_gh_script(
+            tmp.path(),
+            "chat-view-ok",
+            &format!("{valid}\n"),
+            hint,
+            0,
+        );
+        let snap = Gh.view_with(&ok_gh, tmp.path(), &url).await.unwrap();
+        assert_eq!(snap.url, url);
+        assert_eq!(snap.state, "OPEN");
+        assert_eq!(snap.head_ref_oid, head);
+
+        let malformed_gh = crate::land::tests::fake_gh_script(
+            tmp.path(),
+            "chat-view-bad",
+            &format!("{valid}\ntrailing garbage\n"),
+            "",
+            0,
+        );
+        assert!(
+            format!(
+                "{:#}",
+                Gh.view_with(&malformed_gh, tmp.path(), &url)
+                    .await
+                    .unwrap_err()
+            )
+            .contains("trailing characters")
+        );
+
+        let empty_gh =
+            crate::land::tests::fake_gh_script(tmp.path(), "chat-view-empty", "", hint, 0);
+        assert!(Gh.view_with(&empty_gh, tmp.path(), &url).await.is_err());
+
+        let failed_gh = crate::land::tests::fake_gh_script(
+            tmp.path(),
+            "chat-view-fail",
+            &format!("{valid}\n"),
+            "gh: HTTP 403 Forbidden\n",
+            1,
+        );
+        let err = Gh
+            .view_with(&failed_gh, tmp.path(), &url)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("PR lookup refused") && err.contains("HTTP 403 Forbidden"),
+            "{err}"
+        );
     }
 }

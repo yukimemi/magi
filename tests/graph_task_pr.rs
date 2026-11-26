@@ -60,20 +60,50 @@ fn forge(dir: &Path) -> std::path::PathBuf {
 printf '%s\n' "$1 $2" >> "$TASK_PR_FORGE/calls"
 case "$1 $2" in
   'pr list')
+    if test -f "$TASK_PR_FORGE/stderr-hint"; then
+      printf 'To listen to events, run: gh pr list --web\n' >&2
+    fi
     if test -f "$TASK_PR_FORGE/open"; then
       echo '[{"number":1,"url":"https://github.com/example/repo/pull/1","title":"Human title","baseRefName":"main"}]'
     else echo '[]'; fi ;;
   'pr view')
+    if test -f "$TASK_PR_FORGE/stderr-hint"; then
+      printf 'To listen to events, run: gh pr view --web\n' >&2
+    fi
+    if test -f "$TASK_PR_FORGE/view-fail"; then
+      sha=$(git ls-remote --refs origin refs/heads/magi/task-abcd-1234 2>/dev/null | cut -f1)
+      printf '{"headRefName":"magi/task-abcd-1234","headRefOid":"%s","baseRefName":"main","state":"OPEN","isCrossRepository":false}\n' "$sha"
+      printf 'gh: HTTP 500 simulated view failure\n' >&2
+      exit 1
+    fi
+    if test -f "$TASK_PR_FORGE/view-empty"; then
+      printf 'To listen to events, run: gh pr view --web\n' >&2
+      exit 0
+    fi
+    if test -f "$TASK_PR_FORGE/view-override"; then
+      cat "$TASK_PR_FORGE/view-override"
+      exit 0
+    fi
     sha=$(git ls-remote --refs origin refs/heads/magi/task-abcd-1234 2>/dev/null | cut -f1)
     lifecycle=OPEN
     if test -f "$TASK_PR_FORGE/merged"; then lifecycle=MERGED; fi
-    printf '{"url":"https://github.com/example/repo/pull/1","number":1,"title":"feat: existing work","reviews":[],"comments":[],"mergeStateStatus":"CLEAN","autoMergeRequest":null,"headRefName":"magi/task-abcd-1234","baseRefName":"main","isCrossRepository":false,"headRefOid":"%s","state":"%s"}\n' "$sha" "$lifecycle" ;;
+    printf '{"url":"https://github.com/example/repo/pull/1","number":1,"title":"feat: existing work","reviews":[],"comments":[],"mergeStateStatus":"CLEAN","autoMergeRequest":null,"headRefName":"magi/task-abcd-1234","baseRefName":"main","isCrossRepository":false,"headRefOid":"%s","state":"%s"}\n' "$sha" "$lifecycle"
+    if test -f "$TASK_PR_FORGE/view-malformed"; then
+      printf 'trailing non-json stdout\n'
+    fi ;;
   'pr create') touch "$TASK_PR_FORGE/open"; echo 'https://github.com/example/repo/pull/1' ;;
   'pr edit') test ! -f "$TASK_PR_FORGE/fail-edit" || exit 1; printf '%s\n' "$@" >> "$TASK_PR_FORGE/edits" ;;
   'api graphql')
+    if test -f "$TASK_PR_FORGE/stderr-hint"; then
+      printf 'To listen to events, run: gh api --help\n' >&2
+    fi
     sha=$(git ls-remote --refs origin refs/heads/magi/task-abcd-1234 2>/dev/null | cut -f1)
     printf '{"data":{"repository":{"pullRequest":{"commits":{"nodes":[{"commit":{"oid":"%s","statusCheckRollup":{"contexts":{"pageInfo":{"hasNextPage":false},"nodes":[{"__typename":"CheckRun","name":"ci","status":"COMPLETED","conclusion":"SUCCESS"}]}}}}]}}}}}\n' "$sha" ;;
-  'api repos/{owner}/{repo}/pulls/1/comments') echo '[]' ;;
+  'api repos/{owner}/{repo}/pulls/1/comments')
+    if test -f "$TASK_PR_FORGE/stderr-hint"; then
+      printf 'To listen to events, run: gh api --help\n' >&2
+    fi
+    echo '[]' ;;
   'pr merge') printf '%s\n' "$*" >> "$TASK_PR_FORGE/merges"; case "$*" in *--disable-auto*) : ;; *) test -f "$TASK_PR_FORGE/allow-merge" || exit 99; touch "$TASK_PR_FORGE/merged" ;; esac ;;
   'pr comment') : ;;
   *) exit 1 ;;
@@ -860,5 +890,169 @@ async fn roundtrip_reassignment_publishes_a_separate_head_without_adopting_histo
     assert_eq!(third.pr_branch(), second.pr_branch());
     assert_eq!(git::remote_head(&fx.repo, "origin", &original_head).await.unwrap().as_deref(), Some(original_tip.as_str()));
     assert_eq!(std::fs::read(merged.dir().join("run.json")).unwrap(), original_json);
+}
+}
+
+common::e2e! {
+async fn recover_pr_succeeds_when_gh_emits_stderr_hint_on_json_reads() {
+    let (fx, mut task, selected, bin) = Box::pin(selected_fixture()).await;
+    let queue = magi::queue::Queue::open();
+    queue.put(&mut task).unwrap();
+    let config_path = fx.tmp.path().join("recovery.toml");
+    std::fs::write(&config_path, toml::to_string(&fx.config).unwrap()).unwrap();
+    std::fs::write(bin.join("stderr-hint"), "").unwrap();
+
+    let output = common::magi_cli(&magi::run::home())
+        .args([
+            "task",
+            "recover-pr",
+            &task.id,
+            "--pr",
+            &selected.url,
+            "--head",
+            &selected.head,
+            "--source-head",
+            selected.source(),
+            "--disposition",
+            "land",
+            "--config",
+        ])
+        .arg(&config_path)
+        .env("MAGI_HOME", magi::run::home())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let mut task = queue.get(&task.id).unwrap();
+    assert_eq!(
+        task.pr_recovery.as_ref().and_then(|s| s.source_head.as_deref()),
+        Some(selected.source())
+    );
+    let opts = magi::daemon::Opts {
+        repo: fx.repo.clone(),
+        ..Default::default()
+    };
+    Box::pin(magi::daemon::run_claimed(&opts, &queue, &mut task)).await;
+    let runner = Runner::resume(task.runs.last().unwrap()).unwrap();
+    assert!(runner.state.parked, "{:?}", runner.state.events);
+    assert_eq!(
+        std::fs::read_to_string(
+            runner
+                .state
+                .winner()
+                .unwrap()
+                .worktree
+                .join("reviewed-fix.txt")
+        )
+        .unwrap(),
+        "preserved fix"
+    );
+    let approval = runner
+        .state
+        .land_approval
+        .as_ref()
+        .expect("fresh land approval wait");
+    assert_eq!(
+        Some(approval.head.as_str()),
+        runner.state.pr_pushed_head.as_deref()
+    );
+    assert_ne!(approval.head, selected.head);
+    assert!(!runner.state.public_delivery_complete());
+}
+}
+
+common::e2e! {
+async fn recover_pr_rejects_malformed_empty_failed_and_mismatched_gh_views_without_applying() {
+    let (fx, mut task, selected, bin) = Box::pin(selected_fixture()).await;
+    let queue = magi::queue::Queue::open();
+    queue.put(&mut task).unwrap();
+    let config_path = fx.tmp.path().join("recovery.toml");
+    std::fs::write(&config_path, toml::to_string(&fx.config).unwrap()).unwrap();
+    let run_recover = || {
+        common::magi_cli(&magi::run::home())
+            .args([
+                "task",
+                "recover-pr",
+                &task.id,
+                "--pr",
+                &selected.url,
+                "--head",
+                &selected.head,
+                "--source-head",
+                selected.source(),
+                "--disposition",
+                "land",
+                "--config",
+            ])
+            .arg(&config_path)
+            .env("MAGI_HOME", magi::run::home())
+            .output()
+            .unwrap()
+    };
+
+    // Malformed stdout fails strict JSON parsing and does not mutate task selection.
+    std::fs::write(bin.join("view-malformed"), "").unwrap();
+    let out = run_recover();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("trailing characters"), "{stderr}");
+    assert!(queue.get(&task.id).unwrap().pr_recovery.is_none());
+    std::fs::remove_file(bin.join("view-malformed")).unwrap();
+
+    // Empty stdout + nonempty stderr fails strictly without substituting stderr.
+    std::fs::write(bin.join("view-empty"), "").unwrap();
+    let out = run_recover();
+    assert!(!out.status.success());
+    assert!(queue.get(&task.id).unwrap().pr_recovery.is_none());
+    std::fs::remove_file(bin.join("view-empty")).unwrap();
+
+    // Non-zero gh exit fails with preserved diagnostics even if stdout had valid JSON.
+    std::fs::write(bin.join("view-fail"), "").unwrap();
+    let out = run_recover();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("HTTP 500 simulated view failure"), "{stderr}");
+    assert!(queue.get(&task.id).unwrap().pr_recovery.is_none());
+    std::fs::remove_file(bin.join("view-fail")).unwrap();
+
+    // Moved head, wrong branch, and cross-repository PR stay rejected with stderr hints active.
+    std::fs::write(bin.join("stderr-hint"), "").unwrap();
+    let other_sha = "b".repeat(40);
+    for (case, body, expect) in [
+        (
+            "moved-head",
+            format!(
+                r#"{{"headRefName":"magi/task-abcd-1234","headRefOid":"{other_sha}","baseRefName":"main","state":"OPEN","isCrossRepository":false}}"#
+            ),
+            "moved",
+        ),
+        (
+            "wrong-branch",
+            format!(
+                r#"{{"headRefName":"magi/task-other","headRefOid":"{}","baseRefName":"main","state":"OPEN","isCrossRepository":false}}"#,
+                selected.head
+            ),
+            "ownership or base changed",
+        ),
+        (
+            "cross-repo",
+            format!(
+                r#"{{"headRefName":"magi/task-abcd-1234","headRefOid":"{}","baseRefName":"main","state":"OPEN","isCrossRepository":true}}"#,
+                selected.head
+            ),
+            "ownership or base changed",
+        ),
+    ] {
+        std::fs::write(bin.join("view-override"), body).unwrap();
+        let out = run_recover();
+        assert!(!out.status.success(), "{case} unexpectedly succeeded");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains(expect), "{case}: {stderr}");
+        assert!(queue.get(&task.id).unwrap().pr_recovery.is_none(), "{case}");
+    }
 }
 }

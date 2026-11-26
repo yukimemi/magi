@@ -81,6 +81,24 @@ before requesting approval/merge. If a formatter, gate fixer, CI fixer or rebase
 changes the head, old evidence cannot authorize a merge: request a fresh recovery
 review using the retained new source. Unknown CI never proves a green check.
 
+## Forge CLI output separation (`gh` stdout vs. stderr)
+
+Newer `gh` releases (such as `gh` 2.105.0) can emit advisory notices like
+event-listen hints to `stderr` even when a read-only `gh pr view --json ...` or
+`gh api ...` invocation succeeds with exit status 0. `land::gh` (and
+`chat_merge::gh`) return `GhOutput { ok, stdout, stderr }` instead of merging
+both streams unconditionally:
+
+- **Successful structured reads (`ok == true`):** `--json`, REST `gh api`, and
+  GraphQL callers pass only `stdout` to their strict JSON parsers. Empty
+  `stdout` never falls back to `stderr`, and no hint-stripping or substring
+  JSON extraction is performed. Non-empty `stderr` on exit 0 is logged at debug
+  level without logging command arguments.
+- **Failed invocations (`ok == false`) and human-facing / mutating commands:**
+  callers use `GhOutput::combined()` so both `stdout` and `stderr` diagnostics
+  remain preserved (for example `404` branch-protection checks, refused merges,
+  failed `pr view` / `pr edit` / `pr close`, and `gh run view --log-failed`).
+
 ## Preserved delivery requiring real-broker validation
 
 The inspected target repository tracking base was

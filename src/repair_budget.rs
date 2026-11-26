@@ -310,7 +310,7 @@ async fn head_and_public(state: &RunState, head: &str) -> Result<()> {
 async fn public_lease(state: &RunState) -> Result<()> {
     let winner = state.winner().context("repair winner missing")?;
     if let Some(pr) = &state.pr {
-        let (ok, body) = crate::land::gh(
+        let view = crate::land::gh(
             &winner.worktree,
             &[
                 "pr".into(),
@@ -322,8 +322,12 @@ async fn public_lease(state: &RunState) -> Result<()> {
             ],
         )
         .await?;
-        ensure!(ok, "repair grant refused: cannot inspect PR: {body}");
-        let live: serde_json::Value = serde_json::from_str(&body)?;
+        ensure!(
+            view.ok,
+            "repair grant refused: cannot inspect PR: {}",
+            view.combined()
+        );
+        let live: serde_json::Value = serde_json::from_str(&view.stdout)?;
         ensure!(
             live["state"] == "OPEN"
                 && live["isCrossRepository"] == false
