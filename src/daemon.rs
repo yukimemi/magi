@@ -1952,7 +1952,10 @@ fn settle_in(
         RunStatus::Stalled | RunStatus::Failed => task.fail(detail, max_attempts),
         RunStatus::Blocked if verdict.left_pr => task.handed_off(detail),
         RunStatus::Blocked => task.fail(detail, max_attempts),
-        RunStatus::VerifiedNoop => task.handed_off(detail),
+        RunStatus::VerifiedNoop if state.is_none_or(RunState::all_candidates_verified_noop) => {
+            task.handed_off(detail)
+        }
+        RunStatus::VerifiedNoop => task.fail(detail, max_attempts),
         other => task.fail((p.graph_stopped)(label(other), detail), max_attempts),
     }
 }
@@ -2090,6 +2093,16 @@ fn settle_and_diagnose(
     max_attempts: usize,
     state: &RunState,
 ) {
+    let mut verdict = verdict;
+    let mut detail = detail;
+    if verdict.status == RunStatus::VerifiedNoop && !state.all_candidates_verified_noop() {
+        // Never allow an inconsistent or unsupported `VerifiedNoop` run state
+        // to bypass settlement into a no-change handoff, and never rewrite the
+        // historical run record on disk: settle the task as an ordinary failure.
+        verdict.status = RunStatus::Failed;
+        verdict.quota_hit = false;
+        detail = "no-change result lacks verified evidence";
+    }
     let p = phrases(&state.config.graph.language);
     // Shared by normal completion and crash recovery, under the task claim.
     // No new attempt can own the task until the old driver has exited.
@@ -7090,13 +7103,23 @@ fn diagnostic(state: &RunState) -> Option<String> {
     // human is expected to actually judge, not just skim.
     if state.viable().is_empty() {
         for c in &state.candidates {
-            if let Some(evidence) = &c.verified_noop {
+            if c.has_valid_verified_noop()
+                && let Some(evidence) = c.verified_noop_display()
+            {
                 parts.push(format!(
                     "candidate {} (agent-verified no-op, unconfirmed by magi): {evidence}",
                     c.label
                 ));
             } else if !c.summary.trim().is_empty() {
-                parts.push(format!("candidate {}: {}", c.label, c.summary.trim()));
+                if let Some(why) = &c.failed {
+                    parts.push(format!(
+                        "candidate {} ({why}): {}",
+                        c.label,
+                        c.summary.trim()
+                    ));
+                } else {
+                    parts.push(format!("candidate {}: {}", c.label, c.summary.trim()));
+                }
             } else if let Some(why) = &c.failed {
                 parts.push(format!("candidate {}: {why}", c.label));
             }
@@ -9888,6 +9911,15 @@ mod tests {
         assert!(d.contains("cargo test"), "{d}");
     }
 
+    fn verified_noop_run_state() -> RunState {
+        let mut state = run_state(RunStatus::VerifiedNoop);
+        let summary = r#"NO CHANGE NEEDED: {"status":"already_satisfied","requirements":[{"requirement":"requested fix already landed","satisfied":true,"evidence":["c1"]}],"checks":[{"id":"c1","kind":"commit","target":"b32cfc4","method":"git merge-base --is-ancestor b32cfc4 HEAD","observed":"exit 0; b32cfc4 is on main","passed":true}],"unresolved":[]}"#;
+        let mut c = candidate('A', summary, true, None);
+        c.verified_noop = Some(summary.to_owned());
+        state.candidates = vec![c];
+        state
+    }
+
     #[test]
     fn a_held_task_names_the_open_question_it_is_waiting_on() {
         // Task 20260928-191407-05fd's own bug: a verified no-op that filed a
@@ -9896,7 +9928,7 @@ mod tests {
         // append the question id to whatever `handed_off` already wrote.
         crate::run::pin_test_home();
         let home = crate::run::home();
-        let state = run_state(RunStatus::VerifiedNoop);
+        let state = verified_noop_run_state();
         let mut q = ask::Question::new(
             state.id.clone(),
             "implement".to_owned(),
@@ -9912,7 +9944,7 @@ mod tests {
             left_pr: false,
             quota_hit: false,
             parked: false,
-            no_viable_candidates: false,
+            no_viable_candidates: true,
         };
         let mut t = task();
         t.start(state.id.clone());
@@ -9933,14 +9965,14 @@ mod tests {
     #[test]
     fn a_held_task_with_no_open_question_keeps_its_plain_reason() {
         crate::run::pin_test_home();
-        let state = run_state(RunStatus::VerifiedNoop);
+        let state = verified_noop_run_state();
 
         let verdict = Verdict {
             status: RunStatus::VerifiedNoop,
             left_pr: false,
             quota_hit: false,
             parked: false,
-            no_viable_candidates: false,
+            no_viable_candidates: true,
         };
         let mut t = task();
         t.start(state.id.clone());
@@ -9952,6 +9984,80 @@ mod tests {
             Some("run ended agent-verified no-op"),
             "nothing to append when the question was already answered or never asked"
         );
+    }
+
+    #[test]
+    fn inconsistent_verified_noop_state_settles_and_reclaims_as_ordinary_failure() {
+        crate::run::pin_test_home();
+
+        // Case 1: Saved `VerifiedNoop` run carrying the exact operational
+        // regression prose instead of valid structured evidence.
+        let mut bad = run_state(RunStatus::VerifiedNoop);
+        let mut c = candidate(
+            'A',
+            "NO CHANGE NEEDED: Not established. No source changes, commit, or reproduction checks were completed. The reported Git configuration lock contention remains unresolved.",
+            true,
+            None,
+        );
+        c.verified_noop = Some("Not established.".to_owned());
+        bad.candidates = vec![c];
+
+        let mut t = task();
+        t.start(bad.id.clone());
+        let verdict = Verdict {
+            status: RunStatus::VerifiedNoop,
+            left_pr: false,
+            quota_hit: true,
+            parked: false,
+            no_viable_candidates: true,
+        };
+        settle_and_diagnose(&mut t, verdict, "run ended agent-verified no-op", 3, &bad);
+        assert_eq!(
+            t.status,
+            TaskStatus::Failed,
+            "inconsistent verified_noop must retry as Failed when attempts remain"
+        );
+        assert_eq!(t.attempts, 1);
+        assert_eq!(
+            t.last_error.as_deref(),
+            Some("no-change result lacks verified evidence")
+        );
+        assert!(t.hold_reason.is_none());
+
+        // Case 2: Reclaim on an inconsistent `VerifiedNoop` state with
+        // attempts exhausted holds as `failed`, never `verified_noop`, and
+        // never auto-closes to `Done`.
+        let mut t_exhausted = task();
+        t_exhausted.start(bad.id.clone());
+        reclaim(&mut t_exhausted, Some(bad.clone()), 1, "en");
+        assert_eq!(t_exhausted.status, TaskStatus::Held);
+        assert_eq!(t_exhausted.attempts, 1);
+        assert_eq!(
+            t_exhausted
+                .hold_notice_cause
+                .as_ref()
+                .map(|c| c.stage.as_str()),
+            Some("failed"),
+            "exhausted inconsistent verified_noop must not emit a verified_noop notice cause"
+        );
+        let diag = t_exhausted.diagnostic.as_deref().unwrap_or("");
+        assert!(
+            !diag.contains("agent-verified no-op"),
+            "diagnostic must not mislabel an invalid claim as verified no-op: {diag}"
+        );
+        assert!(diag.contains("Not established"), "{diag}");
+    }
+
+    #[test]
+    fn saved_noop_declaration_is_the_evidence_not_the_display_summary() {
+        let mut state = verified_noop_run_state();
+        let summary = state.candidates[0].summary.clone();
+        state.candidates[0].summary = "Already satisfied.".to_owned();
+        assert!(state.all_candidates_verified_noop());
+
+        state.candidates[0].summary = summary;
+        state.candidates[0].verified_noop = Some("Historical prose only.".to_owned());
+        assert!(!state.all_candidates_verified_noop());
     }
 
     #[test]

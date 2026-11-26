@@ -879,6 +879,26 @@ fn parse_libtest_result(trimmed: &str) -> Option<LibtestResultLine> {
     })
 }
 
+/// A bounded command-output tail can confirm a contradiction, but cannot
+/// establish that an unrecognized test runner actually ran tests.
+pub(crate) fn contradicts_passing_test(output: &str) -> bool {
+    let mut saw_result = false;
+    let mut saw_pass = false;
+    let mut saw_empty_run = false;
+    for line in output.lines().map(str::trim) {
+        if let Some(result) = parse_libtest_result(line) {
+            if !result.ok || result.failed != 0 {
+                return true;
+            }
+            saw_result = true;
+            saw_pass |= result.passed != 0;
+        } else if line == "running 0 tests" {
+            saw_empty_run = true;
+        }
+    }
+    !saw_pass && (saw_result || saw_empty_run)
+}
+
 // ---------------------------------------------------------------------------
 // Nextest parser
 // ---------------------------------------------------------------------------

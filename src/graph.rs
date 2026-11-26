@@ -3322,6 +3322,9 @@ impl Runner {
             && results
                 .iter()
                 .any(|(_, _, out)| FailClass::of(out).is_some());
+        let base_commit = self.state.base_commit.clone();
+        let blind_cfg = self.state.config.blind.clone();
+        let mut rejected_noops: Vec<(char, String)> = Vec::new();
         for (&i, (_wi, seat, out)) in todo.iter().zip(results) {
             if matches!(out, AgentOutcome::ResourceBlocked(_)) {
                 // Executed turns interrupted by disk pressure already carry
@@ -3349,9 +3352,10 @@ impl Runner {
             let exhausted_the_fallback_chain = FailClass::of(&out).is_some();
             self.state.seats.insert(seat.key.clone(), seat);
             let label = self.state.candidates[i].label;
+            let worktree = self.state.candidates[i].worktree.clone();
             self.state.interrupted_implementations.remove(&label);
 
-            let (summary, duration, failed, verified_claim) = match out {
+            let (sanitized_summary, duration, failed, verified_claim) = match out {
                 AgentOutcome::Ok(o) => {
                     let text = verdict::section(&o.text, "summary").unwrap_or(o.text.clone());
                     let failed = (!o.usable()).then(|| {
@@ -3364,8 +3368,37 @@ impl Runner {
                             )
                         }
                     });
-                    let verified_claim = verified_noop_claim(failed.is_none(), &o.commands, &text);
-                    (text, o.duration_ms, failed, verified_claim)
+                    let sanitized_summary = blind::sanitize_prose(&text, &blind_cfg);
+                    let verified_claim = match verified_noop_claim_in_worktree(
+                        failed.is_none(),
+                        &o.commands,
+                        &text,
+                        &worktree,
+                        &base_commit,
+                    )
+                    .await
+                    {
+                        NoopClaimVerdict::Accepted => {
+                            if matches!(
+                                verdict::parse_verified_noop(&sanitized_summary),
+                                Some(Ok(_))
+                            ) {
+                                Some(sanitized_summary.clone())
+                            } else {
+                                rejected_noops.push((
+                                    label,
+                                    "structured NO CHANGE NEEDED summary became invalid after blind sanitization".to_owned(),
+                                ));
+                                None
+                            }
+                        }
+                        NoopClaimVerdict::Rejected(reason) => {
+                            rejected_noops.push((label, reason));
+                            None
+                        }
+                        NoopClaimVerdict::Absent => None,
+                    };
+                    (sanitized_summary, o.duration_ms, failed, verified_claim)
                 }
                 // Left un-resumed by `resume_undelivered` (a dirty tree
                 // already rescues the work, or there was no session left to
@@ -3409,7 +3442,7 @@ impl Runner {
             if !exhausted_the_fallback_chain {
                 c.agent = agent;
             }
-            c.summary = blind::sanitize_prose(&summary, &self.state.config.blind);
+            c.summary = sanitized_summary;
             c.duration_ms = duration;
             c.failed = failed;
             c.verified_noop = verified_claim;
@@ -3419,6 +3452,28 @@ impl Runner {
         }
         self.state.save()?;
         self.persist_candidates().await?;
+
+        let mut recorded_rejection = false;
+        for (label, reason) in rejected_noops {
+            if self.state.interrupted_implementations.contains(&label) {
+                continue;
+            }
+            if let Some(c) = self.state.candidates.iter_mut().find(|c| c.label == label)
+                && c.empty
+            {
+                c.verified_noop = None;
+                c.failed
+                    .get_or_insert_with(|| format!("no-op claim rejected: {reason}"));
+                self.state.event(
+                    "implement",
+                    format!("candidate {label}: rejected NO CHANGE NEEDED claim: {reason}"),
+                );
+                recorded_rejection = true;
+            }
+        }
+        if recorded_rejection {
+            self.state.save()?;
+        }
 
         if resource_blocked {
             return self.stop_for_resource();
@@ -4182,6 +4237,28 @@ impl Runner {
                 }
                 self.state.leaks = leaks;
             }
+        }
+
+        // Re-verify any saved `verified_noop` claim on active/resumed runs so an
+        // incomplete or inconsistent saved state cannot bypass the strict contract.
+        let mut invalidated = Vec::new();
+        for c in &mut self.state.candidates {
+            if c.verified_noop.is_some() && !c.has_valid_verified_noop() {
+                c.verified_noop = None;
+                if c.empty && c.failed.is_none() {
+                    c.failed = Some(
+                        "no-op claim rejected: saved candidate does not satisfy structured verification requirements"
+                            .to_owned(),
+                    );
+                }
+                invalidated.push(c.label);
+            }
+        }
+        for label in invalidated {
+            self.state.event(
+                "implement",
+                format!("candidate {label}: invalidated inconsistent saved NO CHANGE NEEDED claim"),
+            );
         }
 
         if self.state.viable().is_empty() {
@@ -10974,26 +11051,229 @@ fn has_unconfirmed_command(commands: &[agent::CommandEvidence]) -> bool {
     commands.iter().any(|c| c.exit_code.is_none())
 }
 
+/// Outcome of evaluating a candidate's reply against the `NO CHANGE NEEDED:`
+/// adoption guard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum NoopClaimVerdict {
+    /// Reply did not open with `NO CHANGE NEEDED:`.
+    Absent,
+    /// Structured evidence passed schema, CLI command, and repository checks.
+    Accepted,
+    /// Reply opened with `NO CHANGE NEEDED:` but was disqualified with a
+    /// concrete reason.
+    Rejected(String),
+}
+
+fn command_matches_check(cmd: &agent::CommandEvidence, check: &verdict::NoopCheck) -> bool {
+    // Keep quoting and shell syntax intact: they can change the meaning of a command.
+    cmd.description.trim() == check.method.trim()
+}
+
+/// Checks cited by `requirements` plus the final check, deduplicated in order.
+fn checks_to_cross_verify(report: &verdict::VerifiedNoopReport) -> Vec<&verdict::NoopCheck> {
+    let mut out = report.cited_checks();
+    if let Some(last) = report.checks.last()
+        && !out
+            .iter()
+            .any(|c| c.id.trim().eq_ignore_ascii_case(last.id.trim()))
+    {
+        out.push(last);
+    }
+    out
+}
+
+/// Cross-check claimed passing checks against structured CLI [`agent::CommandEvidence`]
+/// when the backend reported commands. Empty `commands` is allowed because not
+/// every backend emits structured command events.
+fn check_command_evidence(
+    report: &verdict::VerifiedNoopReport,
+    commands: &[agent::CommandEvidence],
+) -> std::result::Result<(), String> {
+    if commands.is_empty() {
+        return Ok(());
+    }
+    for check in checks_to_cross_verify(report) {
+        let matching: Vec<&agent::CommandEvidence> = commands
+            .iter()
+            .filter(|cmd| command_matches_check(cmd, check))
+            .collect();
+        match check.kind {
+            verdict::NoopEvidenceKind::Command
+            | verdict::NoopEvidenceKind::Test
+            | verdict::NoopEvidenceKind::Path => {
+                let Some(last_cmd) = matching.last() else {
+                    return Err(format!(
+                        "contradictory command evidence: check `{}` (`{}`) claims `{}` passed, \
+                         but no matching command was recorded by the CLI",
+                        check.id.trim(),
+                        check.kind,
+                        check.target.trim()
+                    ));
+                };
+                if last_cmd.exit_code != Some(0) {
+                    return Err(format!(
+                        "contradictory command evidence: check `{}` claims `{}` passed, \
+                         but its last recorded CLI command (`{}`) exited with {}",
+                        check.id.trim(),
+                        check.target.trim(),
+                        last_cmd.description.trim(),
+                        crate::notices::exit_status(last_cmd.exit_code)
+                    ));
+                }
+                if check.kind == verdict::NoopEvidenceKind::Test
+                    && crate::verify_evidence::contradicts_passing_test(&last_cmd.result_summary)
+                {
+                    return Err(format!(
+                        "contradictory command evidence: test check `{}` claims `{}` passed, \
+                         but its last recorded CLI output reports failure or no passing tests",
+                        check.id.trim(),
+                        check.target.trim()
+                    ));
+                }
+            }
+            verdict::NoopEvidenceKind::Commit => {
+                if let Some(last_cmd) = matching.last()
+                    && last_cmd.exit_code != Some(0)
+                {
+                    return Err(format!(
+                        "contradictory command evidence: commit check `{}` claims `{}` passed, \
+                         but its last recorded CLI command (`{}`) exited with {}",
+                        check.id.trim(),
+                        check.target.trim(),
+                        last_cmd.description.trim(),
+                        crate::notices::exit_status(last_cmd.exit_code)
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Pure, synchronous half of the `NO CHANGE NEEDED:` adoption guard: clean CLI
+/// exit, confirmed commands, strict structured JSON validation, and
+/// `CommandEvidence` consistency.
+fn evaluate_noop_claim(
+    usable: bool,
+    commands: &[agent::CommandEvidence],
+    text: &str,
+) -> std::result::Result<Option<verdict::VerifiedNoopReport>, String> {
+    if !text
+        .trim_start()
+        .starts_with(verdict::NO_CHANGE_NEEDED_MARKER)
+    {
+        return Ok(None);
+    }
+    if !usable {
+        return Err("turn did not finish cleanly (non-zero exit or timeout)".to_owned());
+    }
+    if has_unconfirmed_command(commands) {
+        return Err("reply reported a command whose CLI never confirmed an exit status".to_owned());
+    }
+    let Some(parsed) = verdict::parse_verified_noop(text) else {
+        return Ok(None);
+    };
+    let report = parsed?;
+    check_command_evidence(&report, commands)?;
+    Ok(Some(report))
+}
+
+/// Cross-check verifiable commit SHAs and repository-relative paths cited by a
+/// structured no-op report against the candidate's real Git history and
+/// worktree. Existence alone never satisfies a requirement (the report still
+/// had to carry concrete passing checks), while a missing commit/path or a
+/// commit not on `base_commit` disqualifies the claim.
+async fn verify_noop_repo_evidence(
+    report: &verdict::VerifiedNoopReport,
+    worktree: &Path,
+    base_commit: &str,
+) -> std::result::Result<(), String> {
+    let wt_canon = std::fs::canonicalize(worktree).ok();
+    for check in checks_to_cross_verify(report) {
+        match check.kind {
+            verdict::NoopEvidenceKind::Commit => {
+                let target = check.target.trim();
+                let Some(sha) = git::commit_of(worktree, target).await else {
+                    return Err(format!(
+                        "check `{}` cites commit `{target}`, which does not exist in git history",
+                        check.id.trim()
+                    ));
+                };
+                if !git::is_ancestor(worktree, &sha, base_commit).await {
+                    return Err(format!(
+                        "check `{}` cites commit `{target}`, which is not an ancestor of base commit `{}`",
+                        check.id.trim(),
+                        short(base_commit)
+                    ));
+                }
+            }
+            verdict::NoopEvidenceKind::Path => {
+                let target = check.target.trim();
+                let rel = verdict::strip_path_locator(target);
+                let full = worktree.join(rel);
+                if !full.exists() {
+                    return Err(format!(
+                        "check `{}` cites path `{target}`, which does not exist in the worktree",
+                        check.id.trim()
+                    ));
+                }
+                if let (Some(wt_canon), Ok(path_canon)) = (&wt_canon, std::fs::canonicalize(&full))
+                    && !path_canon.starts_with(wt_canon)
+                {
+                    return Err(format!(
+                        "check `{}` cites path `{target}`, which resolves outside the worktree",
+                        check.id.trim()
+                    ));
+                }
+            }
+            verdict::NoopEvidenceKind::Test | verdict::NoopEvidenceKind::Command => {}
+        }
+    }
+    Ok(())
+}
+
+/// Full adoption guard for an implementer reply, including real Git history and
+/// worktree path verification.
+async fn verified_noop_claim_in_worktree(
+    usable: bool,
+    commands: &[agent::CommandEvidence],
+    text: &str,
+    worktree: &Path,
+    base_commit: &str,
+) -> NoopClaimVerdict {
+    let report = match evaluate_noop_claim(usable, commands, text) {
+        Ok(Some(r)) => r,
+        Ok(None) => return NoopClaimVerdict::Absent,
+        Err(reason) => return NoopClaimVerdict::Rejected(reason),
+    };
+    if let Err(reason) = verify_noop_repo_evidence(&report, worktree, base_commit).await {
+        return NoopClaimVerdict::Rejected(reason);
+    }
+    NoopClaimVerdict::Accepted
+}
+
 /// Whether a `NO CHANGE NEEDED` marker in an implementer's reply should be
-/// trusted as a verified no-op — the adoption guard's own text-level half.
+/// trusted as a verified no-op — the adoption guard's pure text-and-command
+/// half (repository history/path verification runs in
+/// [`verified_noop_claim_in_worktree`]).
 ///
 /// `usable` is the caller's `AgentOutput::usable()` (a clean CLI exit, not
 /// timed out): a marker only earns the benefit of the doubt from a turn the
 /// CLI itself vouches for finishing properly, the same house style
 /// `resume_unconfirmed_commands` and `continue_fix_report` already hold a
 /// *fix* report to for `commands`. A candidate that timed out, exited
-/// non-zero, or left a command unconfirmed is read as the ordinary loss it
-/// is, whatever prose it wrote — this returns `None` before it ever looks at
-/// `text`. The remaining guards (the tree really is empty, the evidence is
-/// non-empty) are the caller's: this only reads what the reply *claimed*.
+/// non-zero, left a command unconfirmed, contradicted its CLI command evidence,
+/// or failed structured validation returns `None`.
+#[cfg(test)]
 fn verified_noop_claim(
     usable: bool,
     commands: &[agent::CommandEvidence],
     text: &str,
 ) -> Option<String> {
-    (usable && !has_unconfirmed_command(commands))
-        .then(|| verdict::verified_noop(text))
+    evaluate_noop_claim(usable, commands, text)
+        .ok()
         .flatten()
+        .map(|report| report.summary_text())
 }
 
 fn short(commit: &str) -> String {
@@ -25030,34 +25310,252 @@ esac
         ]));
     }
 
+    fn evidence_with(
+        description: &str,
+        exit_code: Option<i32>,
+        result_summary: &str,
+    ) -> agent::CommandEvidence {
+        agent::CommandEvidence {
+            id: "item1".to_owned(),
+            description: description.to_owned(),
+            exit_code,
+            result_summary: result_summary.to_owned(),
+            source: "codex".to_owned(),
+        }
+    }
+
+    fn valid_noop_summary(commit: &str, test_name: &str) -> String {
+        format!(
+            r#"NO CHANGE NEEDED: {{"status":"already_satisfied","requirements":[{{"requirement":"requested fix already landed","satisfied":true,"evidence":["c1","c2"]}}],"checks":[{{"id":"c1","kind":"commit","target":"{commit}","method":"git merge-base --is-ancestor {commit} HEAD","observed":"exit 0; {commit} is on base","passed":true}},{{"id":"c2","kind":"test","target":"{test_name}","method":"cargo test --lib {test_name}","observed":"test result: ok. 1 passed; 0 failed","passed":true}}],"unresolved":[]}}"#
+        )
+    }
+
     #[test]
     fn a_clean_usable_reply_with_the_marker_is_a_verified_claim() {
-        let text = "NO CHANGE NEEDED: already fixed by b32cfc4, on main.";
-        assert_eq!(
-            verified_noop_claim(true, &[], text).as_deref(),
-            Some("already fixed by b32cfc4, on main.")
-        );
+        let text = valid_noop_summary("b32cfc4", "retry_test");
+        let claim = verified_noop_claim(true, &[], &text)
+            .expect("valid structured report with no CommandEvidence must be accepted");
+        assert!(claim.contains("b32cfc4"), "{claim}");
+        assert!(claim.contains("retry_test"), "{claim}");
+    }
+
+    #[test]
+    fn operational_regression_and_legacy_noop_claims_are_rejected() {
+        let regression = "NO CHANGE NEEDED: Not established. No source changes, commit, or reproduction checks were completed. The reported Git configuration lock contention remains unresolved.";
+        assert!(verified_noop_claim(true, &[], regression).is_none());
+        let err = evaluate_noop_claim(true, &[], regression).unwrap_err();
+        assert!(err.contains("single JSON object"), "{err}");
+
+        let legacy = "NO CHANGE NEEDED: already fixed by b32cfc4, on main.";
+        assert!(verified_noop_claim(true, &[], legacy).is_none());
     }
 
     #[test]
     fn an_unusable_reply_never_earns_the_benefit_of_the_doubt() {
         // A timeout or a bad exit code reads as the ordinary loss it is,
-        // whatever the reply's own prose claims.
-        let text = "NO CHANGE NEEDED: already fixed by b32cfc4, on main.";
-        assert!(verified_noop_claim(false, &[], text).is_none());
+        // whatever the reply's own structured JSON claims.
+        let text = valid_noop_summary("b32cfc4", "retry_test");
+        assert!(verified_noop_claim(false, &[], &text).is_none());
     }
 
     #[test]
     fn an_unconfirmed_command_disqualifies_the_claim_even_on_a_usable_reply() {
-        let text = "NO CHANGE NEEDED: already fixed by b32cfc4, on main.";
-        assert!(verified_noop_claim(true, &[evidence(None)], text).is_none());
-        // A confirmed command alongside the marker is fine.
-        assert!(verified_noop_claim(true, &[evidence(Some(0))], text).is_some());
+        let text = valid_noop_summary("b32cfc4", "retry_test");
+        assert!(verified_noop_claim(true, &[evidence(None)], &text).is_none());
+        // A matching confirmed command alongside the marker is fine.
+        assert!(
+            verified_noop_claim(
+                true,
+                &[evidence_with(
+                    "cargo test --lib retry_test",
+                    Some(0),
+                    "1 passed"
+                )],
+                &text
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn contradictory_or_unrelated_command_evidence_is_rejected_while_mid_investigation_retry_passes()
+     {
+        let text = valid_noop_summary("b32cfc4", "retry_test");
+
+        // Unrelated passing command cannot substantiate a claimed test run.
+        let err = evaluate_noop_claim(
+            true,
+            &[evidence_with("git status", Some(0), "nothing to commit")],
+            &text,
+        )
+        .unwrap_err();
+        assert!(err.contains("no matching command was recorded"), "{err}");
+
+        // Final matching command exited non-zero -> rejected even if an
+        // unrelated command succeeded afterward.
+        let err = evaluate_noop_claim(
+            true,
+            &[
+                evidence_with("cargo test --lib retry_test", Some(0), "ok"),
+                evidence_with("cargo test --lib retry_test", Some(101), "FAILED"),
+                evidence_with("rg retry_test src", Some(0), "retry_test"),
+            ],
+            &text,
+        )
+        .unwrap_err();
+        assert!(err.contains("exited with"), "{err}");
+
+        // A different invocation containing the entire method is not a rerun.
+        let err = evaluate_noop_claim(
+            true,
+            &[evidence_with(
+                "echo 'cargo test --lib retry_test'",
+                Some(0),
+                "retry_test",
+            )],
+            &text,
+        )
+        .unwrap_err();
+        assert!(err.contains("no matching command was recorded"), "{err}");
+
+        // Mid-investigation failure followed by a passing re-run -> accepted!
+        assert!(
+            verified_noop_claim(
+                true,
+                &[
+                    evidence_with("cargo test --lib retry_test", Some(101), "FAILED"),
+                    evidence_with("cargo test --lib retry_test", Some(0), "1 passed"),
+                ],
+                &text
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn noop_test_claim_rejects_zero_tests_and_failed_results_despite_successful_exit() {
+        let text = valid_noop_summary("b32cfc4", "retry_test");
+        let method = "cargo test --lib retry_test";
+        let empty = "running 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 42 filtered out";
+        let ignored = "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out";
+        let failed =
+            "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out";
+        let passed = "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out";
+        for output in [empty, ignored, failed] {
+            let err = evaluate_noop_claim(true, &[evidence_with(method, Some(0), output)], &text)
+                .unwrap_err();
+            assert!(err.contains("failure or no passing tests"), "{err}");
+        }
+        // Multiple harnesses can legitimately include a filtered-out suite.
+        let mixed = format!("{passed}\n{empty}");
+        assert!(
+            verified_noop_claim(true, &[evidence_with(method, Some(0), &mixed)], &text).is_some()
+        );
+        // A later real rerun of the same command can establish success.
+        assert!(
+            verified_noop_claim(
+                true,
+                &[
+                    evidence_with(method, Some(0), empty),
+                    evidence_with(method, Some(0), passed),
+                ],
+                &text,
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn path_claim_requires_matching_successful_command_when_commands_are_recorded() {
+        let text = r#"NO CHANGE NEEDED: {"status":"already_satisfied","requirements":[{"requirement":"README includes the expected header","satisfied":true,"evidence":["p1"]}],"checks":[{"id":"p1","kind":"path","target":"README.md","method":"rg expected README.md","observed":"expected header found","passed":true}],"unresolved":[]}"#;
+        let failed = evidence_with("rg expected README.md", Some(1), "");
+        let unrelated = evidence_with("cat README.md", Some(0), "README");
+        let err =
+            evaluate_noop_claim(true, &[failed.clone(), unrelated.clone()], text).unwrap_err();
+        assert!(err.contains("exited with"), "{err}");
+        assert!(evaluate_noop_claim(true, &[unrelated], text).is_err());
+        assert!(
+            evaluate_noop_claim(
+                true,
+                &[
+                    failed,
+                    evidence_with("rg expected README.md", Some(0), "expected header"),
+                ],
+                text,
+            )
+            .unwrap()
+            .is_some()
+        );
     }
 
     #[test]
     fn an_ordinary_reply_with_no_marker_is_never_a_claim() {
         assert!(verified_noop_claim(true, &[], "- did the thing\n- tested it").is_none());
+        assert!(matches!(
+            evaluate_noop_claim(true, &[], "- did the thing\n- tested it"),
+            Ok(None)
+        ));
+    }
+
+    #[tokio::test]
+    async fn repo_cross_verification_validates_commits_and_worktree_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let run_git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed");
+            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        };
+        run_git(&["init", "-b", "main"]);
+        run_git(&["config", "user.name", "test"]);
+        run_git(&["config", "user.email", "test@example.com"]);
+        std::fs::write(repo.join("README.md"), "hello\n").unwrap();
+        run_git(&["add", "-A"]);
+        run_git(&["commit", "-m", "base commit"]);
+        let base = run_git(&["rev-parse", "HEAD"]);
+
+        // Create a commit on a side branch not on `base`.
+        run_git(&["checkout", "-b", "side"]);
+        std::fs::write(repo.join("side.txt"), "side\n").unwrap();
+        run_git(&["add", "-A"]);
+        run_git(&["commit", "-m", "side commit"]);
+        let side = run_git(&["rev-parse", "HEAD"]);
+        run_git(&["checkout", "main"]);
+
+        // Valid commit on base + existing path -> Accepted.
+        let valid = format!(
+            r#"NO CHANGE NEEDED: {{"status":"already_satisfied","requirements":[{{"requirement":"readme exists","satisfied":true,"evidence":["c1","c2"]}}],"checks":[{{"id":"c1","kind":"commit","target":"{base}","method":"git merge-base --is-ancestor {base} HEAD","observed":"exit 0; base commit is on main","passed":true}},{{"id":"c2","kind":"path","target":"README.md:1","method":"read README.md","observed":"contains expected greeting","passed":true}}],"unresolved":[]}}"#
+        );
+        assert!(matches!(
+            verified_noop_claim_in_worktree(true, &[], &valid, &repo, &base).await,
+            NoopClaimVerdict::Accepted
+        ));
+
+        // Non-existent commit SHA -> Rejected.
+        let missing_sha = valid.replace(&base, "deadbeef");
+        assert!(matches!(
+            verified_noop_claim_in_worktree(true, &[], &missing_sha, &repo, &base).await,
+            NoopClaimVerdict::Rejected(ref r) if r.contains("does not exist in git history")
+        ));
+
+        // Commit on unmerged side branch -> Rejected.
+        let side_sha = valid.replace(&base, &side);
+        assert!(matches!(
+            verified_noop_claim_in_worktree(true, &[], &side_sha, &repo, &base).await,
+            NoopClaimVerdict::Rejected(ref r) if r.contains("not an ancestor of base commit")
+        ));
+
+        // Missing file path -> Rejected.
+        let missing_path = valid.replace("README.md:1", "src/does_not_exist.rs");
+        assert!(matches!(
+            verified_noop_claim_in_worktree(true, &[], &missing_path, &repo, &base).await,
+            NoopClaimVerdict::Rejected(ref r) if r.contains("does not exist in the worktree")
+        ));
     }
 
     /// Sets `runner.state.candidates` to one candidate per `(empty, verified)`
@@ -25066,21 +25564,27 @@ esac
         runner.state.candidates = shape
             .iter()
             .enumerate()
-            .map(|(i, &(empty, verified))| Candidate {
-                index: i,
-                label: (b'A' + i as u8) as char,
-                agent: "sonnet".to_owned(),
-                branch: format!("magi/x/{}", (b'A' + i as u8) as char),
-                worktree: PathBuf::from(format!("/wt/{i}")),
-                summary: String::new(),
-                stat: String::new(),
-                files: 0,
-                commits: 0,
-                empty,
-                failed: None,
-                verified_noop: verified.map(str::to_owned),
-                duration_ms: 0,
-                folded: false,
+            .map(|(i, &(empty, verified))| {
+                let (summary, verified_noop) = match verified {
+                    Some(raw) => (raw.to_owned(), Some(raw.to_owned())),
+                    None => (String::new(), None),
+                };
+                Candidate {
+                    index: i,
+                    label: (b'A' + i as u8) as char,
+                    agent: "sonnet".to_owned(),
+                    branch: format!("magi/x/{}", (b'A' + i as u8) as char),
+                    worktree: PathBuf::from(format!("/wt/{i}")),
+                    summary,
+                    stat: String::new(),
+                    files: 0,
+                    commits: 0,
+                    empty,
+                    failed: None,
+                    verified_noop,
+                    duration_ms: 0,
+                    folded: false,
+                }
             })
             .collect();
     }
@@ -25089,12 +25593,11 @@ esac
     fn after_implement_reads_all_candidates_verified_as_a_noop_not_a_failure() {
         ask_test_home();
         let mut runner = runner_at(RunStatus::Implementing);
+        let a = valid_noop_summary("b32cfc4", "test_a");
+        let b = valid_noop_summary("b32cfc4", "test_b");
         set_candidates(
             &mut runner,
-            &[
-                (true, Some("already on main at b32cfc4")),
-                (true, Some("same fix, see the existing test")),
-            ],
+            &[(true, Some(a.as_str())), (true, Some(b.as_str()))],
         );
 
         runner
@@ -25108,13 +25611,11 @@ esac
     fn after_implement_does_not_accept_one_candidates_claim_next_to_an_ordinary_loss() {
         ask_test_home();
         let mut runner = runner_at(RunStatus::Implementing);
+        let a = valid_noop_summary("b32cfc4", "test_a");
         // Candidate A declares a verified no-op; candidate B simply wrote
         // nothing and said nothing about why. One candidate's claim is not
         // the whole run's agreement.
-        set_candidates(
-            &mut runner,
-            &[(true, Some("already on main at b32cfc4")), (true, None)],
-        );
+        set_candidates(&mut runner, &[(true, Some(a.as_str())), (true, None)]);
 
         let err = runner
             .after_implement()
@@ -25125,6 +25626,54 @@ esac
             "{err}"
         );
         assert_eq!(runner.state.status, RunStatus::Failed);
+    }
+
+    #[test]
+    fn after_implement_invalidates_inconsistent_or_legacy_saved_noop_claims() {
+        ask_test_home();
+        let mut runner = runner_at(RunStatus::Implementing);
+        // Simulate a saved incomplete run that stored a legacy/incomplete
+        // `verified_noop` string before this build's strict contract.
+        set_candidates(
+            &mut runner,
+            &[(
+                true,
+                Some(
+                    "NO CHANGE NEEDED: Not established. The reported Git configuration lock contention remains unresolved.",
+                ),
+            )],
+        );
+
+        let err = runner
+            .after_implement()
+            .expect_err("invalid saved noop claim must fail the run");
+        assert!(
+            err.to_string().contains("no candidate produced a change"),
+            "{err}"
+        );
+        assert_eq!(runner.state.status, RunStatus::Failed);
+        assert!(runner.state.candidates[0].verified_noop.is_none());
+        assert!(runner.state.candidates[0].failed.is_some());
+        assert!(runner.state.events.iter().any(|e| {
+            e.message
+                .contains("invalidated inconsistent saved NO CHANGE NEEDED")
+        }));
+    }
+
+    #[test]
+    fn after_implement_rejects_candidate_with_failure_or_commits_on_verified_noop() {
+        ask_test_home();
+        let mut runner = runner_at(RunStatus::Implementing);
+        let a = valid_noop_summary("b32cfc4", "test_a");
+        set_candidates(&mut runner, &[(true, Some(a.as_str()))]);
+        runner.state.candidates[0].failed = Some("agent timed out".to_owned());
+
+        let err = runner
+            .after_implement()
+            .expect_err("a failed candidate must never settle as verified no-op");
+        assert!(err.to_string().contains("no candidate produced a change"));
+        assert_eq!(runner.state.status, RunStatus::Failed);
+        assert!(runner.state.candidates[0].verified_noop.is_none());
     }
 
     #[test]

@@ -431,8 +431,8 @@ pub fn run(state: &RunState) -> String {
             c.duration_ms / 1000,
             crown
         );
-        if let Some(evidence) = &c.verified_noop {
-            let _ = writeln!(s, "      {}", dim(&first_line(evidence)));
+        if let Some(evidence) = c.verified_noop_display() {
+            let _ = writeln!(s, "      {}", dim(&first_line(&evidence)));
         } else if !c.summary.trim().is_empty() {
             // The candidate's own account of what it did and why — the
             // "## SUMMARY" `prompt::implement` asks for — was recorded on
