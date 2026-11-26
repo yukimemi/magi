@@ -454,6 +454,8 @@ pub(crate) struct SharedMonitor {
     disk_cache: Mutex<DiskCache>,
     talk_index: Mutex<HashMap<String, (FileIdentity, TalkListView)>>,
     talk_status_index: Mutex<TalkStatusIndex>,
+    /// Conversation status evidence, rebuilt only when a source store moved.
+    chat_inventory: Mutex<Option<(Revisions, Arc<crate::chat_status::Inventory>)>>,
     bulk_slots: Arc<tokio::sync::Semaphore>,
     talk_core_slots: Arc<tokio::sync::Semaphore>,
     #[cfg(test)]
@@ -653,6 +655,7 @@ impl SharedMonitor {
             disk_cache: Mutex::default(),
             talk_index: Mutex::default(),
             talk_status_index: Mutex::default(),
+            chat_inventory: Mutex::default(),
             bulk_slots: Arc::new(tokio::sync::Semaphore::new(2)),
             talk_core_slots: Arc::new(tokio::sync::Semaphore::new(2)),
             #[cfg(test)]
@@ -5347,7 +5350,16 @@ struct ListWalk {
 }
 
 fn page_ids(ui: &Ui, talks: bool, q: PageQuery) -> ApiResult<(Vec<String>, Option<String>)> {
-    page_ids_with(ui, talks, q, open_talk_ids)
+    page_ids_with(ui, talks, q, |ui, ids| {
+        // A conversation owing the owner a decision is listed with the open
+        // ones even when closed, so the Needs owner filter never depends on
+        // walking closed history.
+        let mut open = open_talk_ids(ui, ids);
+        let inventory = chat_inventory(ui);
+        let owing = inventory.needs_owner();
+        open.extend(ids.iter().filter(|id| owing.contains(id.as_str())).cloned());
+        open
+    })
 }
 
 fn page_ids_with(
@@ -5477,7 +5489,11 @@ struct TalkListView {
     context: talk::ContextUsage,
     #[serde(skip)]
     agent_times: Vec<Timestamp>,
+    #[serde(skip)]
+    goals: crate::chat_status::Goals,
     thinking: bool,
+    /// Display-only triage state derived from durable evidence.
+    chat_status: crate::chat_status::ChatStatus,
     created_at: Timestamp,
     updated_at: Timestamp,
 }
@@ -5489,12 +5505,49 @@ struct TalkListTurn {
     body: String,
 }
 
+/// Shared status evidence. Keyed by the monitor's queue, question, decision and
+/// loop revisions so a list read never re-parses the stores unless one moved;
+/// without a published revision (before the first scan) it is built per call.
+fn chat_inventory(ui: &Ui) -> Arc<crate::chat_status::Inventory> {
+    let key = ui
+        .monitor
+        .latest
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_ref()
+        .map(|(revisions, _)| *revisions);
+    if let Some(key) = key
+        && let Some((cached, inventory)) = ui
+            .monitor
+            .chat_inventory
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+        && (cached.0, cached.2, cached.4, cached.5) == (key.0, key.2, key.4, key.5)
+    {
+        return Arc::clone(inventory);
+    }
+    let inventory = Arc::new(crate::chat_status::Inventory::collect(
+        &ui.home,
+        &ui.queue.list(),
+        &ui.questions.list(),
+    ));
+    if let Some(key) = key {
+        *ui.monitor
+            .chat_inventory
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some((key, Arc::clone(&inventory)));
+    }
+    inventory
+}
+
 fn talk_rows(ui: &Ui, ids: Vec<String>, headers: &header::HeaderMap) -> Vec<TalkListView> {
     let reads: HashMap<String, Timestamp> = headers
         .get("x-talk-reads")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| serde_json::from_str(v).ok())
         .unwrap_or_default();
+    let inventory = chat_inventory(ui);
     let mut index = ui
         .monitor
         .talk_index
@@ -5546,6 +5599,8 @@ fn talk_rows(ui: &Ui, ids: Vec<String>, headers: &header::HeaderMap) -> Vec<Talk
                         .map(|t| t.at)
                         .collect(),
                     turn_count: talk.turns.len(),
+                    goals: crate::chat_status::Goals::of(&talk.goals),
+                    chat_status: crate::chat_status::ChatStatus::placeholder(),
                     unread_count: 0,
                     context: talk::context_usage(&talk, None),
                     turns,
@@ -5568,6 +5623,8 @@ fn talk_rows(ui: &Ui, ids: Vec<String>, headers: &header::HeaderMap) -> Vec<Talk
                     .filter(|at| reads.get(&id).is_none_or(|read| *at > read))
                     .count(),
                 agent_times: Vec::new(),
+                goals: row.goals,
+                chat_status: row.chat_status.clone(),
                 id: row.id.clone(),
                 repo: row.repo.clone(),
                 agent: row.agent.clone(),
@@ -5580,6 +5637,12 @@ fn talk_rows(ui: &Ui, ids: Vec<String>, headers: &header::HeaderMap) -> Vec<Talk
                 updated_at: row.updated_at,
             };
             row.thinking = ui.is_thinking(&id);
+            row.chat_status = inventory.status_of(
+                &id,
+                row.status.open(),
+                row.goals,
+                row.thinking,
+            );
             Some(row)
         })
         .collect()

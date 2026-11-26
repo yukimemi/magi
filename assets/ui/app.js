@@ -768,6 +768,7 @@ const state = {
   /* Whether the Chat list shows only unread conversations. Lives only in
      memory, same as talksSearch: a reload starts from the full list. */
   talksUnreadOnly: false,
+  talksOwnerOnly: false,
   search: {
     runs: { status: "idle", forText: "", seq: 0, timer: null, hits: new Map(), total: 0, truncated: false, unreadable: 0, error: "" },
     tasks: { status: "idle", forText: "", seq: 0, timer: null, hits: new Map(), total: 0, truncated: false, unreadable: 0, error: "" },
@@ -3691,6 +3692,14 @@ function setTalksSearch(value) {
   renderTalks();
 }
 
+function setTalksOwnerOnly(enabled) {
+  const next = Boolean(enabled);
+  if (state.talksOwnerOnly === next) return;
+  state.talksOwnerOnly = next;
+  renderTalks();
+  announce(next ? "Showing conversations that need you only." : "Showing all conversations.");
+}
+
 function setTalksUnreadOnly(enabled) {
   const next = Boolean(enabled);
   if (state.talksUnreadOnly === next) return;
@@ -6502,18 +6511,69 @@ function createTalkCard() {
   const meta = el("div", { class: "card-meta" }, agent, turns, tasks, context);
   const last = el("p", { class: "card-event" });
   const snippet = el("p", { class: "card-snippet" });
+  const stateIcon = el("span", { class: "talk-state-icon", "aria-hidden": "true" });
+  const stateLabel = el("span", { class: "talk-state-label" });
+  const stateReason = el("span", { class: "talk-state-reason" });
+  const state = el("p", { class: "talk-state" }, stateIcon, stateLabel, stateReason);
+  /* A sibling of the card, never inside it: links do not nest. */
+  const stateLink = el("a", { class: "talk-state-link" });
 
   const card = el("a", { class: "card" },
     el("div", { class: "card-top" }, chipSlot, thinking, whenSlot, unread),
-    title, meta, last, snippet,
+    title, meta, state, last, snippet,
   );
-  const row = el("li", {}, card);
-  row.refs = { card, chipSlot, thinking, whenSlot, unread, title, agent, turns, tasks, context, last, snippet };
+  const row = el("li", {}, card, stateLink);
+  row.refs = { card, chipSlot, thinking, whenSlot, unread, title, agent, turns, tasks, context, last, snippet, state, stateIcon, stateLabel, stateReason, stateLink };
   return row;
+}
+
+/* Server-derived triage state. Words and a glyph carry the meaning; colour only
+   reinforces it. Unknown is a state of its own, never rendered as idle. */
+const TALK_STATE = {
+  needs_owner: { label: "Needs owner", icon: "!", tone: "rust" },
+  needs_attention: { label: "Needs attention", icon: "▲", tone: "rust" },
+  unknown: { label: "Unknown", icon: "?", tone: "gold" },
+  working: { label: "Working", icon: "●", tone: "blue" },
+  waiting: { label: "Waiting", icon: "◔", tone: "teal" },
+  closed: { label: "Closed", icon: "■", tone: "ink" },
+  completed: { label: "Completed", icon: "✓", tone: "teal" },
+  idle: { label: "Idle", icon: "–", tone: "ink" },
+};
+function talkState(talk) {
+  const st = talk.chat_status;
+  const known = st && TALK_STATE[st.kind];
+  return known ? { ...st, ...known } : { kind: "unknown", ...TALK_STATE.unknown, reason: "status unavailable", owner_count: 0 };
+}
+function talkStateHref(link) {
+  if (!link || typeof link.id !== "string" || !link.id) return null;
+  const id = encodeURIComponent(link.id);
+  if (link.kind === "decision") return `#/decisions`;
+  if (link.kind === "task") return `#/task/${id}`;
+  if (link.kind === "run") return `#/run/${id}`;
+  return null;
+}
+function renderTalkState(r, talk) {
+  const st = talkState(talk);
+  const count = st.kind === "needs_owner" && st.owner_count > 1 ? ` (${st.owner_count})` : "";
+  setAttr(r.state, "data-state", st.kind);
+  setAttr(r.state, "data-tone", st.tone);
+  setText(r.stateIcon, st.icon);
+  setText(r.stateLabel, `${st.label}${count}`);
+  setText(r.stateReason, st.reason || "");
+  show(r.stateReason, Boolean(st.reason));
+  setAttr(r.state, "aria-label", `${st.label}${count}${st.reason ? `: ${st.reason}` : ""}`);
+  const href = (st.kind === "needs_owner" || st.kind === "needs_attention") ? talkStateHref(st.link) : null;
+  show(r.stateLink, Boolean(href));
+  if (href) {
+    setAttr(r.stateLink, "href", href);
+    setText(r.stateLink, st.link.kind === "decision" ? "Open pending decisions" : `Open ${st.link.kind}`);
+  }
+  setAttr(r.row, "data-talk-state", st.kind);
 }
 
 function updateTalkCard(row, talk) {
   const r = row.refs;
+  r.row = row;
   const status = String(talk.status || "open");
   const turns = talkTurns(talk);
   const tone = toneOf(status, TALK_STATUS);
@@ -6568,6 +6628,7 @@ function updateTalkCard(row, talk) {
   setText(r.last, tail && tail.who === "agent" ? firstLine(tail.body) : "");
   show(r.last, Boolean(tail && tail.who === "agent"));
   renderSnippet(r.snippet, searchHit("chats", talk.id));
+  renderTalkState(r, talk);
 }
 
 function renderTalks() {
@@ -6575,6 +6636,14 @@ function renderTalks() {
   const talks = state.talks;
   renderTalkIndicators();
   const unreadOnly = Boolean(state.talksUnreadOnly);
+  const ownerOnly = Boolean(state.talksOwnerOnly);
+  const ownerToggle = $("talks-owner-only");
+  if (ownerToggle && typeof ownerToggle.setAttribute === "function") {
+    ownerToggle.setAttribute("aria-pressed", String(ownerOnly));
+    const owing = (talks || []).filter((t) => talkState(t).kind === "needs_owner").length;
+    setText($("talks-owner-count"), owing ? String(owing) : "");
+    show($("talks-owner-count"), owing > 0);
+  }
   const unreadToggle = $("talks-unread-only");
   if (unreadToggle && typeof unreadToggle.setAttribute === "function") {
     unreadToggle.setAttribute("aria-pressed", String(unreadOnly));
@@ -6589,7 +6658,8 @@ function renderTalks() {
   }
 
   const hasOlder = typeof talksNext === "string" && talksNext !== "";
-  const unreadTalks = unreadOnly ? talks.filter((t) => talkUnreadCount(t) > 0) : talks;
+  const ownerTalks = ownerOnly ? talks.filter((t) => talkState(t).kind === "needs_owner") : talks;
+  const unreadTalks = unreadOnly ? ownerTalks.filter((t) => talkUnreadCount(t) > 0) : ownerTalks;
   show($("talks-empty"), talks.length === 0);
   /* The box only makes sense once there is a conversation to search. While
      searching, the list is the server's hits within the loaded conversations. */
@@ -6612,12 +6682,12 @@ function renderTalks() {
       : open ? `${plural(open, "conversation open", "conversations open")}` : "nothing open";
   setText($("talks-count"), countText);
 
-  const unreadEmpty = talks.length > 0 && unreadOnly && visible.length === 0
+  const unreadEmpty = talks.length > 0 && (unreadOnly || ownerOnly) && visible.length === 0
     && (!searching || (kind === "ok" && state.search.chats.total > 0));
   if (unreadEmpty) {
     setText(
       $("talks-unread-empty-text"),
-      searching
+      ownerOnly && !unreadOnly ? "No conversations need your decision." : searching
         ? "No unread conversations match this search."
         : hasOlder
           ? "No unread conversations among loaded conversations. Older conversations are not loaded yet."
@@ -11463,6 +11533,10 @@ async function applyRevisions_(source) {
   const taskStale = queueRev !== state.rev.queue || runsRev !== state.rev.runs
     || questionsRev !== state.rev.questions;
   const talkStale = queueRev !== state.rev.queue || talksRev !== state.rev.talks;
+  /* Row status is derived from tasks, decisions and questions as well as the
+     transcript, so those moving refreshes the list with no new message. */
+  const talkStatusStale = queueRev !== state.rev.queue || questionsRev !== state.rev.questions
+    || notificationsRev !== state.rev.notifications;
 
   if (notificationsRev !== state.rev.notifications || questionsRev !== state.rev.questions) {
     state.rev.notifications = notificationsRev;
@@ -11500,8 +11574,12 @@ async function applyRevisions_(source) {
   }
   /* A turn landing on disk is what bumps this, so it is also how the reply
      reaches a phone whose own POST is still outstanding. */
-  if (talksRev !== state.rev.talks) {
+  if (talksRev !== state.rev.talks && !talkStatusStale) {
     jobs.push(loadTalks({ rev: talksRev, delta: source.talks_delta }));
+  } else if (talkStatusStale && state.talks !== null) {
+    /* A delta would only name changed transcripts; the whole window is cheap
+       because the server caches parsed rows and the status evidence. */
+    jobs.push(loadTalks({ rev: talksRev }));
   }
   if (talkStale && state.route.name === "talk" && state.talkDetail.id && !state.talkDetail.gone) {
     jobs.push(loadTalk(state.talkDetail.id, { background: true }));
@@ -13098,8 +13176,10 @@ function wire() {
 
   $("talk-start-go").addEventListener("click", startTalk);
   $("talks-unread-only").addEventListener("click", () => setTalksUnreadOnly(!state.talksUnreadOnly));
+  $("talks-owner-only").addEventListener("click", () => setTalksOwnerOnly(!state.talksOwnerOnly));
   $("talks-unread-clear").addEventListener("click", () => {
     setTalksUnreadOnly(false);
+    setTalksOwnerOnly(false);
     $("talks-unread-only").focus({ preventScroll: true });
   });
   $("talks-mark-all-read").addEventListener("click", markAllTalksRead);

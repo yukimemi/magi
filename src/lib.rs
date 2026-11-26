@@ -43,6 +43,7 @@ pub mod chat_goal;
 pub(crate) mod chat_goal_runtime;
 mod chat_merge;
 pub mod chat_notify;
+pub mod chat_status;
 pub mod chat_watch;
 pub mod chat_worker;
 pub mod clean;
