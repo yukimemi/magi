@@ -281,7 +281,7 @@ async fn candidate_with_real_changes_keeps_normal_review_path_despite_noop_marke
         r#"#!/bin/sh
 p="$1"
 if grep -q "You are implementing a change in an isolated git worktree" "$p"; then
-  echo "real change" > changed.txt
+  echo "real change" > note.txt
   git add -A >/dev/null 2>&1
   git commit -q -m "real change" >/dev/null 2>&1
   printf '## SUMMARY\nNO CHANGE NEEDED: Not established.\n'

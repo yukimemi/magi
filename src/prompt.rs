@@ -524,6 +524,7 @@ pub fn implement_in(
          - `status`: `\"already_satisfied\"` (only `\"already_satisfied\"` qualifies; `\"incomplete\"` or `\"failed\"` is rejected as an unfinished run).\n\
          - `requirements`: non-empty list; every requirement must have `satisfied: true` and cite passing check id(s) in `evidence`.\n\
          - `checks`: non-empty list with unique `id`, `kind` (`\"commit\"` | `\"test\"` | `\"command\"` | `\"path\"`), concrete `target`, `method`, `observed`, and `passed`; the final check must have `passed: true`. Commit targets must be 7-40 hex SHAs on base; path targets must be existing repository-relative paths.\n\
+         - For shell verification, `method` must be the exact recorded command description (including shell wrapper and quoting if present), not a test name, search term, paraphrase, or command output. When the CLI provides command records, test, command and path checks require a matching successful invocation.\n\
          - `unresolved`: must be `[]`.\n\n\
          3. **Incomplete or failed investigation** — if you hit a blocker, \
          could not complete verification or reproduction checks, or anything \

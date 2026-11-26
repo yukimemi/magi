@@ -11064,30 +11064,9 @@ enum NoopClaimVerdict {
     Rejected(String),
 }
 
-fn normalize_cmd_match(s: &str) -> String {
-    s.replace(['"', '\''], "")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 fn command_matches_check(cmd: &agent::CommandEvidence, check: &verdict::NoopCheck) -> bool {
-    let desc = normalize_cmd_match(&cmd.description);
-    let target = normalize_cmd_match(&check.target);
-    let method = normalize_cmd_match(&check.method);
-    if !target.is_empty() && desc.contains(&target) {
-        return true;
-    }
-    if !method.is_empty() && desc.contains(&method) {
-        return true;
-    }
-    if check.kind == verdict::NoopEvidenceKind::Test && !target.is_empty() {
-        let summary = normalize_cmd_match(&cmd.result_summary);
-        if !summary.is_empty() && summary.contains(&target) {
-            return true;
-        }
-    }
-    false
+    // Keep quoting and shell syntax intact: they can change the meaning of a command.
+    cmd.description.trim() == check.method.trim()
 }
 
 /// Checks cited by `requirements` plus the final check, deduplicated in order.
@@ -11119,7 +11098,9 @@ fn check_command_evidence(
             .filter(|cmd| command_matches_check(cmd, check))
             .collect();
         match check.kind {
-            verdict::NoopEvidenceKind::Command | verdict::NoopEvidenceKind::Test => {
+            verdict::NoopEvidenceKind::Command
+            | verdict::NoopEvidenceKind::Test
+            | verdict::NoopEvidenceKind::Path => {
                 let Some(last_cmd) = matching.last() else {
                     return Err(format!(
                         "contradictory command evidence: check `{}` (`{}`) claims `{}` passed, \
@@ -11154,7 +11135,6 @@ fn check_command_evidence(
                     ));
                 }
             }
-            verdict::NoopEvidenceKind::Path => {}
         }
     }
     Ok(())
@@ -25408,12 +25388,25 @@ esac
             &[
                 evidence_with("cargo test --lib retry_test", Some(0), "ok"),
                 evidence_with("cargo test --lib retry_test", Some(101), "FAILED"),
-                evidence_with("git status", Some(0), "clean"),
+                evidence_with("rg retry_test src", Some(0), "retry_test"),
             ],
             &text,
         )
         .unwrap_err();
         assert!(err.contains("exited with"), "{err}");
+
+        // A different invocation containing the entire method is not a rerun.
+        let err = evaluate_noop_claim(
+            true,
+            &[evidence_with(
+                "echo 'cargo test --lib retry_test'",
+                Some(0),
+                "retry_test",
+            )],
+            &text,
+        )
+        .unwrap_err();
+        assert!(err.contains("no matching command was recorded"), "{err}");
 
         // Mid-investigation failure followed by a passing re-run -> accepted!
         assert!(
@@ -25425,6 +25418,29 @@ esac
                 ],
                 &text
             )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn path_claim_requires_matching_successful_command_when_commands_are_recorded() {
+        let text = r#"NO CHANGE NEEDED: {"status":"already_satisfied","requirements":[{"requirement":"README includes the expected header","satisfied":true,"evidence":["p1"]}],"checks":[{"id":"p1","kind":"path","target":"README.md","method":"rg expected README.md","observed":"expected header found","passed":true}],"unresolved":[]}"#;
+        let failed = evidence_with("rg expected README.md", Some(1), "");
+        let unrelated = evidence_with("cat README.md", Some(0), "README");
+        let err =
+            evaluate_noop_claim(true, &[failed.clone(), unrelated.clone()], text).unwrap_err();
+        assert!(err.contains("exited with"), "{err}");
+        assert!(evaluate_noop_claim(true, &[unrelated], text).is_err());
+        assert!(
+            evaluate_noop_claim(
+                true,
+                &[
+                    failed,
+                    evidence_with("rg expected README.md", Some(0), "expected header"),
+                ],
+                text,
+            )
+            .unwrap()
             .is_some()
         );
     }
