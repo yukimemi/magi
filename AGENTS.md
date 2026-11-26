@@ -4029,3 +4029,20 @@ binding before fold removes its Git admin anchor; reclaim only proved idle
 outputs after the source is gone. Reserve isolated setup once before any step
 so an archived seat can roll back a pristine restoration on disk admission
 failure without replaying a started setup.
+
+### `gh` stdout and stderr separation (`land::GhOutput`)
+
+`gh` (for example `gh` 2.105.0) can print advisory hints on `stderr` even when a
+read-only `--json` or API command exits 0. `land::gh` and `chat_merge::gh`
+return `land::GhOutput { ok, stdout, stderr }` (keeping `GH_REPO` stripped):
+
+- Structured reads (`--json`, REST `gh api`, GraphQL) must check `ok` and pass
+  only `stdout` to a strict parser — never fall back to `stderr` on empty
+  `stdout`, never concatenate `stderr` into JSON, and never strip hint lines or
+  extract JSON substrings.
+- Failed invocations (`!ok`) and human-facing or mutating commands (`pr merge`,
+  `pr close`, `pr edit`, `pr comment`, `run rerun`, `run view --log-failed`)
+  must use `GhOutput::combined()` so actionable diagnostics from both streams
+  (including `404` responses and refused-merge output) are preserved.
+- Non-empty `stderr` on exit 0 is logged via `tracing::debug!` inside
+  `GhOutput::from_output` without recording command arguments.

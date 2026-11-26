@@ -2118,13 +2118,13 @@ pub async fn lifecycle(repo: &Path, pr_url: &str) -> Result<PrLifecycle> {
         ],
     )
     .await?;
-    if !view.0 {
-        bail!("gh pr view {pr_url}: {}", view.1);
+    if !view.ok {
+        bail!("gh pr view {pr_url}: {}", view.combined());
     }
     // `parse_pr` reads every other field of `GhPr` as its serde default
     // (empty string, empty vec, zero) when this narrower `--json` selection
     // does not carry them - harmless, since only `.state` is read back.
-    Ok(parse_pr(&view.1)?.state)
+    Ok(parse_pr(&view.stdout)?.state)
 }
 
 /// A pull request the operator merged outside of `land::land`'s own loop,
@@ -2264,7 +2264,17 @@ pub fn pick_open_pr(json: &str, base: &str) -> Result<OpenPr> {
 /// failing `gh` is an error carrying its own output, never "none": guessing
 /// there is how a duplicate gets created.
 pub async fn find_open_pr(repo: &Path, branch: &str, base: &str) -> Result<OpenPr> {
-    let (ok, out) = gh(
+    find_open_pr_with(Path::new("gh"), repo, branch, base).await
+}
+
+pub(crate) async fn find_open_pr_with(
+    program: &Path,
+    repo: &Path,
+    branch: &str,
+    base: &str,
+) -> Result<OpenPr> {
+    let out = gh_with(
+        program,
         repo,
         &[
             "pr".to_owned(),
@@ -2280,10 +2290,10 @@ pub async fn find_open_pr(repo: &Path, branch: &str, base: &str) -> Result<OpenP
         ],
     )
     .await?;
-    if !ok {
-        bail!("gh pr list failed: {out}");
+    if !out.ok {
+        bail!("gh pr list failed: {}", out.combined());
     }
-    pick_open_pr(&out, base)
+    pick_open_pr(&out.stdout, base)
 }
 
 #[derive(Debug, Deserialize)]
@@ -2462,7 +2472,7 @@ pub async fn close_superseded_pr(
             }
         },
     };
-    let (ok, view) = gh(
+    let view = gh(
         &repo,
         &[
             "pr".to_owned(),
@@ -2473,10 +2483,10 @@ pub async fn close_superseded_pr(
         ],
     )
     .await?;
-    if !ok {
-        bail!("gh pr view {url} failed: {view}");
+    if !view.ok {
+        bail!("gh pr view {url} failed: {}", view.combined());
     }
-    if let Err(refusal) = closable(&view, branch, &base, verified) {
+    if let Err(refusal) = closable(&view.stdout, branch, &base, verified) {
         // A pull request whose head cannot be tied to what was proven is not
         // one to walk away from: the caller keeps the run resumable.
         if refusal.retry {
@@ -2484,7 +2494,7 @@ pub async fn close_superseded_pr(
         }
         return Ok(Err(format!("left {url} open: {}", refusal.why)));
     }
-    let (ok, out) = gh(
+    let out = gh(
         &repo,
         &[
             "pr".to_owned(),
@@ -2495,8 +2505,8 @@ pub async fn close_superseded_pr(
         ],
     )
     .await?;
-    if !ok {
-        bail!("gh pr close {url} failed: {out}");
+    if !out.ok {
+        bail!("gh pr close {url} failed: {}", out.combined());
     }
     if let Some(p) = state.pr.as_mut().filter(|p| p.url == url) {
         p.state = "closed".to_owned();
@@ -2522,7 +2532,7 @@ pub async fn set_pr_title_verbatim(repo: &Path, url: &str, title: &str) -> Resul
 /// Post both fields of the owner's chosen rewrite to an adopted pull request,
 /// unmodified and without the posting gate.
 pub async fn set_pr_text_verbatim(repo: &Path, url: &str, title: &str, body: &str) -> Result<()> {
-    let (ok, _) = gh(
+    let out = gh(
         repo,
         &[
             "pr".to_owned(),
@@ -2536,7 +2546,7 @@ pub async fn set_pr_text_verbatim(repo: &Path, url: &str, title: &str, body: &st
     )
     .await
     .map_err(|_| anyhow::anyhow!("could not run gh pr edit for the chosen rewrite"))?;
-    if !ok {
+    if !out.ok {
         // Command output may echo the chosen text; keep it out of run events.
         bail!("gh pr edit failed while posting the chosen rewrite");
     }
@@ -2544,7 +2554,7 @@ pub async fn set_pr_text_verbatim(repo: &Path, url: &str, title: &str, body: &st
 }
 
 async fn edit_pr_title(repo: &Path, url: &str, title: &str) -> Result<()> {
-    let (ok, out) = gh(
+    let out = gh(
         repo,
         &[
             "pr".to_owned(),
@@ -2555,8 +2565,8 @@ async fn edit_pr_title(repo: &Path, url: &str, title: &str) -> Result<()> {
         ],
     )
     .await?;
-    if !ok {
-        bail!("gh pr edit failed: {out}");
+    if !out.ok {
+        bail!("gh pr edit failed: {}", out.combined());
     }
     Ok(())
 }
@@ -2618,13 +2628,13 @@ async fn find_external_merge_with(
         ],
     )
     .await?;
-    if !out.0 {
-        bail!("gh pr list --head {branch}: {}", out.1);
+    if !out.ok {
+        bail!("gh pr list --head {branch}: {}", out.combined());
     }
     if reject_ambiguous {
-        pick_merged_pr_with(&out.1, &state.base_branch, state.created_at, true)
+        pick_merged_pr_with(&out.stdout, &state.base_branch, state.created_at, true)
     } else {
-        pick_merged_pr(&out.1, &state.base_branch, state.created_at)
+        pick_merged_pr(&out.stdout, &state.base_branch, state.created_at)
     }
 }
 
@@ -2753,15 +2763,15 @@ async fn repo_slug(repo: &Path) -> Result<String> {
         ],
     )
     .await?;
-    if !out.0 {
-        bail!("gh repo view --json url: {}", out.1);
+    if !out.ok {
+        bail!("gh repo view --json url: {}", out.combined());
     }
     #[derive(Debug, Deserialize)]
     struct GhRepo {
         url: String,
     }
-    let parsed: GhRepo = serde_json::from_str(&out.1)
-        .with_context(|| format!("parse `gh repo view` output: {}", out.1))?;
+    let parsed: GhRepo = serde_json::from_str(&out.stdout)
+        .with_context(|| format!("parse `gh repo view` output: {}", out.stdout.trim()))?;
     slug_of_repo_url(&parsed.url)
         .with_context(|| format!("could not parse a host/owner/repo out of {}", parsed.url))
 }
@@ -3297,7 +3307,7 @@ pub async fn land(state: &mut RunState, pr_url: &str) -> Result<PrState> {
 /// to the next. Comments, logs and rebases stay on `gh` and `git` directly.
 trait Forge {
     async fn close(&self, repo: &Path, pr_url: &str, comment: &str) -> Result<()> {
-        let (ok, out) = gh(
+        let out = gh(
             repo,
             &[
                 "pr".into(),
@@ -3308,8 +3318,8 @@ trait Forge {
             ],
         )
         .await?;
-        if !ok {
-            bail!("PR closure failed: {out}");
+        if !out.ok {
+            bail!("PR closure failed: {}", out.combined());
         }
         Ok(())
     }
@@ -3348,7 +3358,8 @@ impl Forge for GhForge {
         observe(repo, pr_url).await
     }
     async fn merge(&self, repo: &Path, argv: &[String]) -> Result<(bool, String)> {
-        gh(repo, argv).await
+        let out = gh(repo, argv).await?;
+        Ok((out.ok, out.combined()))
     }
     async fn poll(&self) {
         tokio::time::sleep(POLL).await;
@@ -3360,9 +3371,9 @@ impl Forge for GhForge {
             run.to_owned(),
             "--failed".to_owned(),
         ];
-        let (ok, out) = gh(repo, &args).await?;
-        if !ok {
-            bail!("gh run rerun {run}: {out}");
+        let out = gh(repo, &args).await?;
+        if !out.ok {
+            bail!("gh run rerun {run}: {}", out.combined());
         }
         Ok(())
     }
@@ -3416,9 +3427,9 @@ async fn required_contexts_of(repo: &Path, base: &str) -> Option<BTreeSet<String
     )
     .await
     .ok()?;
-    if classic.0 {
-        all.extend(parse_classic_required(&classic.1)?);
-    } else if !classic.1.contains("404") {
+    if classic.ok {
+        all.extend(parse_classic_required(&classic.stdout)?);
+    } else if !classic.combined().contains("404") {
         return None;
     }
     let rules = gh(
@@ -3430,10 +3441,10 @@ async fn required_contexts_of(repo: &Path, base: &str) -> Option<BTreeSet<String
     )
     .await
     .ok()?;
-    if !rules.0 {
+    if !rules.ok {
         return None;
     }
-    all.extend(parse_ruleset_required(&rules.1)?);
+    all.extend(parse_ruleset_required(&rules.stdout)?);
     Some(all)
 }
 
@@ -5154,11 +5165,11 @@ impl CiEvidence {
 }
 
 async fn ci_json(repo: &Path, endpoint: String) -> Option<serde_json::Value> {
-    let (ok, body) = gh(repo, &["api".into(), endpoint]).await.ok()?;
-    if !ok {
+    let out = gh(repo, &["api".into(), endpoint]).await.ok()?;
+    if !out.ok {
         return None;
     }
-    serde_json::from_str(&body).ok()
+    serde_json::from_str(&out.stdout).ok()
 }
 
 async fn ci_annotations(repo: &Path, check: &serde_json::Value) -> Option<Vec<CiFailure>> {
@@ -5487,12 +5498,12 @@ async fn observe(repo: &Path, pr_url: &str) -> Result<Seen> {
         ],
     )
     .await?;
-    if !view.0 {
-        bail!("gh pr view {pr_url}: {}", view.1);
+    if !view.ok {
+        bail!("gh pr view {pr_url}: {}", view.combined());
     }
-    let number = parse_pr(&view.1)?.number;
+    let number = parse_pr(&view.stdout)?.number;
     let node = last_commit_node(repo, number).await;
-    let mut seen = seen_from(&view.1, node.as_deref())?;
+    let mut seen = seen_from(&view.stdout, node.as_deref())?;
 
     let inline = gh(
         repo,
@@ -5502,15 +5513,19 @@ async fn observe(repo: &Path, pr_url: &str) -> Result<Seen> {
         ],
     )
     .await?;
-    if inline.0 {
-        match parse_inline_comments(&inline.1) {
+    if inline.ok {
+        match parse_inline_comments(&inline.stdout) {
             Ok(mut comments) => seen.pr.review_comments.append(&mut comments),
             // An unreadable inline thread must not end a landing: the rollup
             // and the top-level thread are still real signal.
             Err(e) => tracing::warn!("inline review comments unreadable: {e}"),
         }
     } else {
-        tracing::warn!("gh api pulls/{}/comments: {}", seen.pr.number, inline.1);
+        tracing::warn!(
+            "gh api pulls/{}/comments: {}",
+            seen.pr.number,
+            inline.combined()
+        );
     }
     Ok(seen)
 }
@@ -5620,7 +5635,7 @@ async fn last_commit_node(repo: &Path, number: u64) -> Option<String> {
     )
     .await
     .ok()?;
-    out.0.then_some(out.1)
+    out.ok.then_some(out.stdout)
 }
 
 /// What a fix round did.
@@ -5891,10 +5906,10 @@ pub(crate) async fn repair_preflight(state: &RunState, url: &str, head: &str) ->
         ],
     )
     .await?;
-    if !view.0 {
-        bail!("cannot check auto-merge: {}", view.1);
+    if !view.ok {
+        bail!("cannot check auto-merge: {}", view.combined());
     }
-    let live: serde_json::Value = serde_json::from_str(&view.1)?;
+    let live: serde_json::Value = serde_json::from_str(&view.stdout)?;
     let public = state.pr_branch().unwrap_or(&winner.branch);
     if live["state"] != "OPEN"
         || live["headRefOid"] != head
@@ -5909,8 +5924,8 @@ pub(crate) async fn repair_preflight(state: &RunState, url: &str, head: &str) ->
         .context("cannot read the PR auto-merge reservation; repair held")?;
     if !auto_merge.is_null() {
         let out = gh(&state.repo, &disable_automerge_argv(seen.pr.number)).await?;
-        if !out.0 {
-            bail!("cannot disable auto-merge; repair held: {}", out.1);
+        if !out.ok {
+            bail!("cannot disable auto-merge; repair held: {}", out.combined());
         }
     }
     Ok(seen.pr)
@@ -6020,7 +6035,7 @@ async fn failing_logs(repo: &Path, failing: &[(String, String)]) -> String {
             (None, None) => continue,
         };
         let (ok, body) = match gh(repo, &args).await {
-            Ok(v) => v,
+            Ok(v) => (v.ok, v.combined()),
             Err(e) => (false, format!("{e:#}")),
         };
         if !ok && body.trim().is_empty() {
@@ -6078,8 +6093,8 @@ async fn stop(state: &mut RunState, repo: &Path, pr: &PrState, why: &str) -> Res
     )
     .await;
     match posted {
-        Ok((true, _)) => {}
-        Ok((false, out)) => tracing::warn!("could not comment on {}: {out}", pr.url),
+        Ok(out) if out.ok => {}
+        Ok(out) => tracing::warn!("could not comment on {}: {}", pr.url, out.combined()),
         Err(e) => tracing::warn!("could not comment on {}: {e:#}", pr.url),
     }
     state.status = RunStatus::Blocked;
@@ -6094,10 +6109,75 @@ async fn stop(state: &mut RunState, repo: &Path, pr: &PrState, why: &str) -> Res
     Ok(())
 }
 
-/// Run `gh` in `repo`, returning success and the combined output.
+/// Output of a `gh` subprocess, keeping machine-readable `stdout` separate from
+/// diagnostic `stderr`.
 ///
-/// Combined because `gh` reports a refused merge on stderr and the pull request
-/// json on stdout, and both are evidence.
+/// Newer `gh` releases (for example `gh` 2.105.0) can emit advisory hints on
+/// `stderr` even when a read-only `--json` or API command succeeds with exit
+/// status 0. Appending `stderr` onto `stdout` before deserialization breaks
+/// strict JSON parsing (for example `trailing characters at line 2 column 1`).
+///
+/// Output contract:
+/// - **Successful structured reads** (`--json`, REST `gh api`, GraphQL, etc.):
+///   check [`Self::ok`], then pass [`Self::stdout`] straight to a strict parser.
+///   Never fall back to [`Self::stderr`] when `stdout` is empty, and never strip
+///   specific hint text or heuristically extract JSON substrings.
+/// - **Failed invocations (`!ok`)**: use [`Self::combined`] so both `stdout`
+///   and `stderr` diagnostics stay actionable (for example `404` detection and
+///   refused-merge details).
+/// - **Human-facing or mutating commands** (`pr merge`, `pr close`, `pr edit`,
+///   `pr comment`, `run rerun`, `run view --log-failed`): use
+///   [`Self::combined`] for failure diagnostics or human-readable output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GhOutput {
+    /// Whether `gh` exited with status 0.
+    pub(crate) ok: bool,
+    /// Process `stdout`, decoded lossily as UTF-8.
+    pub(crate) stdout: String,
+    /// Process `stderr`, decoded lossily as UTF-8.
+    pub(crate) stderr: String,
+}
+
+impl GhOutput {
+    /// Build from a completed subprocess output and log non-empty `stderr`
+    /// emitted on exit status 0 at debug level without logging command
+    /// arguments.
+    pub(crate) fn from_output(output: std::process::Output) -> Self {
+        let parsed = Self {
+            ok: output.status.success(),
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        };
+        if parsed.ok && !parsed.stderr.trim().is_empty() {
+            tracing::debug!(
+                stderr = parsed.stderr.trim(),
+                "gh exited successfully with stderr diagnostics"
+            );
+        }
+        parsed
+    }
+
+    /// Combined trimmed `stdout` and `stderr` for failure diagnostics and
+    /// human-facing commands.
+    pub(crate) fn combined(&self) -> String {
+        let out = self.stdout.trim();
+        let err = self.stderr.trim();
+        match (out.is_empty(), err.is_empty()) {
+            (true, true) => String::new(),
+            (false, true) => out.to_owned(),
+            (true, false) => err.to_owned(),
+            (false, false) => format!("{out}\n{err}"),
+        }
+    }
+}
+
+/// Run `gh` in `cwd`, returning exit status with separated `stdout` and
+/// `stderr` in [`GhOutput`].
+///
+/// Structured callers must check [`GhOutput::ok`] and parse [`GhOutput::stdout`]
+/// strictly without substituting [`GhOutput::stderr`]. Failed invocations and
+/// human-facing or mutating commands should use [`GhOutput::combined`] so both
+/// streams remain available as diagnostics.
 ///
 /// `GH_REPO` is stripped from the child's environment: every call site here
 /// passes an explicit `cwd` (or a full pull request URL) meaning to operate
@@ -6109,8 +6189,12 @@ async fn stop(state: &mut RunState, repo: &Path, pr: &PrState, why: &str) -> Res
 /// for the same-repo guard in [`correct_manual_merge`] would mean the check
 /// could be made to agree with whatever repository a forged `--merged` URL
 /// claims, defeating it entirely.
-pub(crate) async fn gh(cwd: &Path, args: &[String]) -> Result<(bool, String)> {
-    let out = tokio::process::Command::new("gh")
+pub(crate) async fn gh(cwd: &Path, args: &[String]) -> Result<GhOutput> {
+    gh_with(Path::new("gh"), cwd, args).await
+}
+
+pub(crate) async fn gh_with(program: &Path, cwd: &Path, args: &[String]) -> Result<GhOutput> {
+    let out = tokio::process::Command::new(program)
         .args(args)
         .current_dir(cwd)
         .env_remove("GH_REPO")
@@ -6119,14 +6203,7 @@ pub(crate) async fn gh(cwd: &Path, args: &[String]) -> Result<(bool, String)> {
         .output()
         .await
         .with_context(|| format!("spawn gh {}", args.join(" ")))?;
-    let mut body = String::from_utf8_lossy(&out.stdout).into_owned();
-    let err = String::from_utf8_lossy(&out.stderr);
-    if body.trim().is_empty() {
-        body = err.into_owned();
-    } else if !err.trim().is_empty() {
-        body.push_str(&err);
-    }
-    Ok((out.status.success(), body.trim().to_owned()))
+    Ok(GhOutput::from_output(out))
 }
 
 /// Verdict of one entry in the status rollup.
@@ -11830,5 +11907,154 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         assert_eq!(state.land_armed_head.as_deref(), Some("a"));
         let why = state.merge.as_ref().unwrap().detail.clone();
         assert!(why.contains("disable exploded"), "{why}");
+    }
+
+    /// Create a cross-platform fake `gh` executable in `dir` backed by exact
+    /// fixture files, avoiding shell quoting differences and global `PATH`
+    /// mutation.
+    pub(crate) fn fake_gh_script(
+        dir: &Path,
+        name: &str,
+        stdout: &str,
+        stderr: &str,
+        exit_code: i32,
+    ) -> PathBuf {
+        let out_path = dir.join(format!("{name}.stdout"));
+        let err_path = dir.join(format!("{name}.stderr"));
+        std::fs::write(&out_path, stdout).unwrap();
+        std::fs::write(&err_path, stderr).unwrap();
+        #[cfg(windows)]
+        {
+            let script = dir.join(format!("{name}.cmd"));
+            let mut body = String::from("@echo off\r\n");
+            if !stdout.is_empty() {
+                body.push_str(&format!("type \"{}\"\r\n", out_path.display()));
+            }
+            if !stderr.is_empty() {
+                body.push_str(&format!("type \"{}\" 1>&2\r\n", err_path.display()));
+            }
+            body.push_str(&format!("exit /b {exit_code}\r\n"));
+            std::fs::write(&script, body).unwrap();
+            script
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let quote = |p: &Path| format!("'{}'", p.display().to_string().replace('\'', "'\\''"));
+            let script = dir.join(name);
+            let mut body = String::from("#!/bin/sh\n");
+            if !stdout.is_empty() {
+                body.push_str(&format!("cat {}\n", quote(&out_path)));
+            }
+            if !stderr.is_empty() {
+                body.push_str(&format!("cat {} >&2\n", quote(&err_path)));
+            }
+            body.push_str(&format!("exit {exit_code}\n"));
+            let status = std::process::Command::new("sh")
+                .args(["-c", "printf '%s' \"$2\" > \"$1\"", "fixture"])
+                .arg(&script)
+                .arg(&body)
+                .status()
+                .unwrap();
+            assert!(status.success());
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            script
+        }
+    }
+
+    #[test]
+    fn gh_output_combined_preserves_and_separates_both_streams() {
+        let mk = |ok, stdout: &str, stderr: &str| GhOutput {
+            ok,
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+        };
+        assert_eq!(mk(true, "  ", "\n").combined(), "");
+        assert_eq!(mk(true, "  only out \n", " \t ").combined(), "only out");
+        assert_eq!(mk(false, "", "  only err\n").combined(), "only err");
+        assert_eq!(
+            mk(false, "{\"status\":\"404\"}", "gh: Not Found (HTTP 404)\n").combined(),
+            "{\"status\":\"404\"}\ngh: Not Found (HTTP 404)"
+        );
+    }
+
+    #[tokio::test]
+    async fn gh_separates_json_stdout_from_stderr_diagnostics() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hint = "hint: to listen to pull request events, run `gh pr view --web`\n";
+        let valid_view = r#"{"url":"https://github.com/example/repo/pull/1","number":1,"state":"OPEN","title":"feat: test","reviews":[],"comments":[],"mergeStateStatus":"CLEAN","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","baseRefName":"main"}"#;
+        let valid_list = r#"[{"number":1,"url":"https://github.com/example/repo/pull/1","title":"feat: test","baseRefName":"main","isCrossRepository":false}]"#;
+
+        // Valid JSON stdout + nonempty stderr hint on exit 0: structured reads
+        // parse stdout cleanly while stderr remains available via `combined()`.
+        let ok_view = fake_gh_script(tmp.path(), "ok-view", &format!("{valid_view}\n"), hint, 0);
+        let out = gh_with(&ok_view, tmp.path(), &["pr".into(), "view".into()])
+            .await
+            .unwrap();
+        assert!(out.ok);
+        assert_eq!(parse_pr(&out.stdout).unwrap().state, PrLifecycle::Open);
+        assert!(out.stderr.contains("listen to pull request events"));
+        assert!(out.combined().contains("listen to pull request events"));
+        assert!(out.combined().contains("feat: test"));
+
+        let ok_list = fake_gh_script(tmp.path(), "ok-list", &format!("{valid_list}\n"), hint, 0);
+        assert_eq!(
+            find_open_pr_with(&ok_list, tmp.path(), "magi/task-t", "main")
+                .await
+                .unwrap(),
+            OpenPr::One {
+                url: "https://github.com/example/repo/pull/1".into(),
+                title: "feat: test".into(),
+            }
+        );
+
+        // Malformed stdout with trailing characters still fails strict JSON parsing.
+        let malformed = fake_gh_script(
+            tmp.path(),
+            "malformed",
+            &format!("{valid_view}\ntrailing garbage\n"),
+            "",
+            0,
+        );
+        let out = gh_with(&malformed, tmp.path(), &["pr".into(), "view".into()])
+            .await
+            .unwrap();
+        assert!(out.ok);
+        let err = parse_pr(&out.stdout).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("trailing characters"),
+            "{err:#}"
+        );
+
+        // Empty stdout + nonempty stderr on exit 0 never substitutes stderr.
+        let empty = fake_gh_script(tmp.path(), "empty", "", hint, 0);
+        let out = gh_with(&empty, tmp.path(), &["pr".into(), "view".into()])
+            .await
+            .unwrap();
+        assert!(out.ok);
+        assert!(out.stdout.trim().is_empty());
+        assert!(parse_pr(&out.stdout).is_err());
+
+        // Non-zero exit with valid JSON on stdout and error on stderr reports
+        // failure and preserves both streams in `combined()`.
+        let failed = fake_gh_script(
+            tmp.path(),
+            "failed",
+            &format!("{valid_view}\n"),
+            "gh: HTTP 404 Not Found\n",
+            1,
+        );
+        let out = gh_with(&failed, tmp.path(), &["pr".into(), "view".into()])
+            .await
+            .unwrap();
+        assert!(!out.ok);
+        let diag = out.combined();
+        assert!(diag.contains("HTTP 404 Not Found"), "{diag}");
+        assert!(diag.contains("feat: test"), "{diag}");
+        let list_err = find_open_pr_with(&failed, tmp.path(), "magi/task-t", "main")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(list_err.contains("HTTP 404 Not Found"), "{list_err}");
     }
 }

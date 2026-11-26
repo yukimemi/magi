@@ -673,11 +673,11 @@ impl ReleaseForge for GhForge {
                 "--json".to_owned(),
                 "url,number,state,headRefOid,statusCheckRollup".to_owned(),
             ];
-            let (ok, out) = land::gh(repo, &args).await?;
-            if !ok {
-                bail!("gh pr view {url}: {out}");
+            let out = land::gh(repo, &args).await?;
+            if !out.ok {
+                bail!("gh pr view {url}: {}", out.combined());
             }
-            land::parse_rollup(&out)
+            land::parse_rollup(&out.stdout)
         })
     }
 
@@ -689,9 +689,9 @@ impl ReleaseForge for GhForge {
                 run.to_owned(),
                 "--failed".to_owned(),
             ];
-            let (ok, out) = land::gh(repo, &args).await?;
-            if !ok {
-                bail!("gh run rerun {run}: {out}");
+            let out = land::gh(repo, &args).await?;
+            if !out.ok {
+                bail!("gh run rerun {run}: {}", out.combined());
             }
             Ok(())
         })
@@ -722,11 +722,11 @@ impl ReleaseForge for GhForge {
                 "--json".to_owned(),
                 "headRefName,mergeCommit,title".to_owned(),
             ];
-            let (ok, out) = land::gh(repo, &args).await?;
-            if !ok {
-                bail!("gh pr view {url}: {out}");
+            let out = land::gh(repo, &args).await?;
+            if !out.ok {
+                bail!("gh pr view {url}: {}", out.combined());
             }
-            parse_info(&out)
+            parse_info(&out.stdout)
         })
     }
 
@@ -747,17 +747,18 @@ impl ReleaseForge for GhForge {
             let mut argv = crate::bump::bump_merge_argv(url, &title);
             argv.push("--match-head-commit".to_owned());
             argv.push(head.to_owned());
-            let (ok, out) = land::gh(repo, &argv).await?;
-            if ok {
+            let out = land::gh(repo, &argv).await?;
+            if out.ok {
                 return Ok(true);
             }
+            let diag = out.combined();
             // jj keeps HEAD detached, so `--delete-branch` exits non-zero after
             // the merge happened: the forge decides.
             let after = land::lifecycle(repo, url).await.ok();
-            if land::merged_after_all(&argv, &out, after).is_some() {
+            if land::merged_after_all(&argv, &diag, after).is_some() {
                 return Ok(true);
             }
-            bail!("gh pr merge {url}: {out}")
+            bail!("gh pr merge {url}: {diag}")
         })
     }
 }

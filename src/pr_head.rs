@@ -356,7 +356,7 @@ pub(crate) async fn publish(
         _ => None,
     });
     if let land::OpenPr::One { ref url, .. } = found {
-        let (ok, raw) = land::gh(
+        let view = land::gh(
             &winner.worktree,
             &[
                 "pr".into(),
@@ -379,10 +379,10 @@ pub(crate) async fn publish(
             #[serde(default)]
             auto_merge_request: Option<serde_json::Value>,
         }
-        if !ok {
-            bail!("could not verify task PR head: {raw}");
+        if !view.ok {
+            bail!("could not verify task PR head: {}", view.combined());
         }
-        let pr_head: Head = serde_json::from_str(&raw).context("verify task PR head")?;
+        let pr_head: Head = serde_json::from_str(&view.stdout).context("verify task PR head")?;
         if pr_head.state != "OPEN"
             || pr_head.is_cross_repository
             || pr_head.head_ref_name != head
@@ -528,9 +528,9 @@ pub(crate) async fn publish(
 
 async fn checked_gh(repo: &Path, args: &[&str]) -> Result<()> {
     let args = args.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
-    let (ok, output) = land::gh(repo, &args).await?;
-    if !ok {
-        bail!("gh publication failed: {output}");
+    let out = land::gh(repo, &args).await?;
+    if !out.ok {
+        bail!("gh publication failed: {}", out.combined());
     }
     Ok(())
 }

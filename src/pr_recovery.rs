@@ -262,24 +262,8 @@ impl Selection {
                 land::ensure_same_repo(&remote_repo, &pr_repo)?;
             }
         }
-        let found = land::find_open_pr(repo, &self.branch, base).await?;
-        ensure!(
-            matches!(found, land::OpenPr::One { ref url, .. } if url == &self.url),
-            "selected PR is not the unique open task PR in this repository"
-        );
-        let (ok, raw) = land::gh(
-            repo,
-            &[
-                "pr".into(),
-                "view".into(),
-                self.url.clone(),
-                "--json".into(),
-                "headRefName,headRefOid,baseRefName,state,isCrossRepository".into(),
-            ],
-        )
-        .await?;
-        ensure!(ok, "could not verify selected PR: {raw}");
-        validate_view(&raw, &self.branch, base, lease)?;
+        self.verify_forge_with(Path::new("gh"), repo, base, lease)
+            .await?;
         let fetched = git::fetch(repo, remote, &self.branch).await?;
         ensure!(
             fetched.ok(),
@@ -300,6 +284,34 @@ impl Selection {
             "public head lease changed during recovery"
         );
         Ok(())
+    }
+
+    async fn verify_forge_with(
+        &self,
+        program: &Path,
+        repo: &Path,
+        base: &str,
+        lease: &str,
+    ) -> Result<()> {
+        let found = land::find_open_pr_with(program, repo, &self.branch, base).await?;
+        ensure!(
+            matches!(found, land::OpenPr::One { ref url, .. } if url == &self.url),
+            "selected PR is not the unique open task PR in this repository"
+        );
+        let view = land::gh_with(
+            program,
+            repo,
+            &[
+                "pr".into(),
+                "view".into(),
+                self.url.clone(),
+                "--json".into(),
+                "headRefName,headRefOid,baseRefName,state,isCrossRepository".into(),
+            ],
+        )
+        .await?;
+        ensure!(view.ok, "could not verify selected PR: {}", view.combined());
+        validate_view(&view.stdout, &self.branch, base, lease)
     }
 }
 
@@ -485,5 +497,228 @@ mod tests {
                 .is_err()
         );
         assert!(reassigned.check_task("t", "approved").is_err());
+    }
+
+    fn fake_recovery_gh(
+        dir: &Path,
+        name: &str,
+        list: (&str, &str, i32),
+        view: (&str, &str, i32),
+    ) -> std::path::PathBuf {
+        let list_out = dir.join(format!("{name}-list.stdout"));
+        let list_err = dir.join(format!("{name}-list.stderr"));
+        let view_out = dir.join(format!("{name}-view.stdout"));
+        let view_err = dir.join(format!("{name}-view.stderr"));
+        std::fs::write(&list_out, list.0).unwrap();
+        std::fs::write(&list_err, list.1).unwrap();
+        std::fs::write(&view_out, view.0).unwrap();
+        std::fs::write(&view_err, view.1).unwrap();
+        #[cfg(windows)]
+        {
+            let script = dir.join(format!("{name}.cmd"));
+            let mut body = String::from("@echo off\r\n");
+            body.push_str("if \"%~1 %~2\"==\"pr list\" (\r\n");
+            if !list.0.is_empty() {
+                body.push_str(&format!("  type \"{}\"\r\n", list_out.display()));
+            }
+            if !list.1.is_empty() {
+                body.push_str(&format!("  type \"{}\" 1>&2\r\n", list_err.display()));
+            }
+            body.push_str(&format!("  exit /b {}\r\n)\r\n", list.2));
+            body.push_str("if \"%~1 %~2\"==\"pr view\" (\r\n");
+            if !view.0.is_empty() {
+                body.push_str(&format!("  type \"{}\"\r\n", view_out.display()));
+            }
+            if !view.1.is_empty() {
+                body.push_str(&format!("  type \"{}\" 1>&2\r\n", view_err.display()));
+            }
+            body.push_str(&format!("  exit /b {}\r\n)\r\n", view.2));
+            body.push_str("exit /b 1\r\n");
+            std::fs::write(&script, body).unwrap();
+            script
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let quote = |p: &Path| format!("'{}'", p.display().to_string().replace('\'', "'\\''"));
+            let script = dir.join(name);
+            let emit = |out: &Path, err: &Path, has_out: bool, has_err: bool, code: i32| {
+                let mut s = String::new();
+                if has_out {
+                    s.push_str(&format!("cat {}; ", quote(out)));
+                }
+                if has_err {
+                    s.push_str(&format!("cat {} >&2; ", quote(err)));
+                }
+                s.push_str(&format!("exit {code}"));
+                s
+            };
+            let body = format!(
+                "#!/bin/sh\ncase \"$1 $2\" in\n  'pr list') {} ;;\n  'pr view') {} ;;\n  *) exit 1 ;;\nesac\n",
+                emit(
+                    &list_out,
+                    &list_err,
+                    !list.0.is_empty(),
+                    !list.1.is_empty(),
+                    list.2
+                ),
+                emit(
+                    &view_out,
+                    &view_err,
+                    !view.0.is_empty(),
+                    !view.1.is_empty(),
+                    view.2
+                ),
+            );
+            let status = std::process::Command::new("sh")
+                .args(["-c", "printf '%s' \"$2\" > \"$1\"", "fixture"])
+                .arg(&script)
+                .arg(&body)
+                .status()
+                .unwrap();
+            assert!(status.success());
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            script
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_forge_separates_json_stdout_from_stderr_hints_and_keeps_strict_guards() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sha = "a".repeat(40);
+        let selected = Selection {
+            url: "https://github.com/example/repo/pull/1".into(),
+            branch: "magi/task-t".into(),
+            head: sha.clone(),
+            source_head: None,
+            source_run: None,
+            source_proof: None,
+            disposition: Some(Disposition::Land),
+            instruction: "approved".into(),
+            approved_at: jiff::Timestamp::now(),
+        };
+        let hint = "To listen to events, run: gh pr view --web\n";
+        let list_json = r#"[{"number":1,"url":"https://github.com/example/repo/pull/1","title":"feat: recovered","baseRefName":"main","isCrossRepository":false}]"#;
+        let view_json = format!(
+            r#"{{"headRefName":"magi/task-t","headRefOid":"{sha}","baseRefName":"main","state":"OPEN","isCrossRepository":false}}"#
+        );
+
+        // Appending the stderr hint to stdout (pre-fix bug) still fails strictly.
+        let concatenated = format!("{view_json}\n{hint}");
+        let strict_err = validate_view(&concatenated, &selected.branch, "main", &sha).unwrap_err();
+        assert!(
+            format!("{strict_err:#}").contains("trailing characters"),
+            "{strict_err:#}"
+        );
+
+        // Valid JSON stdout + nonempty stderr hint on both pr list and pr view succeeds.
+        let ok_gh = fake_recovery_gh(
+            tmp.path(),
+            "ok",
+            (&format!("{list_json}\n"), hint, 0),
+            (&format!("{view_json}\n"), hint, 0),
+        );
+        selected
+            .verify_forge_with(&ok_gh, tmp.path(), "main", &sha)
+            .await
+            .unwrap();
+
+        // Malformed stdout still fails strict parsing.
+        let malformed_gh = fake_recovery_gh(
+            tmp.path(),
+            "malformed",
+            (&format!("{list_json}\n"), "", 0),
+            (&format!("{view_json}\ntrailing text\n"), "", 0),
+        );
+        let err = selected
+            .verify_forge_with(&malformed_gh, tmp.path(), "main", &sha)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("trailing characters"),
+            "{err:#}"
+        );
+
+        // Empty stdout + nonempty stderr on exit 0 never falls back to stderr.
+        let empty_gh = fake_recovery_gh(
+            tmp.path(),
+            "empty",
+            (&format!("{list_json}\n"), "", 0),
+            ("", hint, 0),
+        );
+        assert!(
+            selected
+                .verify_forge_with(&empty_gh, tmp.path(), "main", &sha)
+                .await
+                .is_err()
+        );
+
+        // Failed gh invocation with valid JSON stdout preserves stderr diagnostics.
+        let failed_gh = fake_recovery_gh(
+            tmp.path(),
+            "failed",
+            (&format!("{list_json}\n"), "", 0),
+            (
+                &format!("{view_json}\n"),
+                "gh: authentication required\n",
+                1,
+            ),
+        );
+        let err = selected
+            .verify_forge_with(&failed_gh, tmp.path(), "main", &sha)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("authentication required"), "{err}");
+
+        // Ownership and head guards remain strict when stderr hints are present.
+        assert!(
+            selected
+                .verify_forge_with(&ok_gh, tmp.path(), "main", &"b".repeat(40))
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("moved")
+        );
+        let wrong_branch_gh = fake_recovery_gh(
+            tmp.path(),
+            "wrong-branch",
+            (&format!("{list_json}\n"), hint, 0),
+            (
+                &format!(
+                    r#"{{"headRefName":"magi/task-other","headRefOid":"{sha}","baseRefName":"main","state":"OPEN","isCrossRepository":false}}"#
+                ),
+                hint,
+                0,
+            ),
+        );
+        assert!(
+            selected
+                .verify_forge_with(&wrong_branch_gh, tmp.path(), "main", &sha)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("ownership or base changed")
+        );
+        let fork_gh = fake_recovery_gh(
+            tmp.path(),
+            "fork",
+            (&format!("{list_json}\n"), hint, 0),
+            (
+                &format!(
+                    r#"{{"headRefName":"magi/task-t","headRefOid":"{sha}","baseRefName":"main","state":"OPEN","isCrossRepository":true}}"#
+                ),
+                hint,
+                0,
+            ),
+        );
+        assert!(
+            selected
+                .verify_forge_with(&fork_gh, tmp.path(), "main", &sha)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("ownership or base changed")
+        );
     }
 }
