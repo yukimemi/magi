@@ -11120,6 +11120,16 @@ fn check_command_evidence(
                         crate::notices::exit_status(last_cmd.exit_code)
                     ));
                 }
+                if check.kind == verdict::NoopEvidenceKind::Test
+                    && crate::verify_evidence::contradicts_passing_test(&last_cmd.result_summary)
+                {
+                    return Err(format!(
+                        "contradictory command evidence: test check `{}` claims `{}` passed, \
+                         but its last recorded CLI output reports failure or no passing tests",
+                        check.id.trim(),
+                        check.target.trim()
+                    ));
+                }
             }
             verdict::NoopEvidenceKind::Commit => {
                 if let Some(last_cmd) = matching.last()
@@ -25417,6 +25427,39 @@ esac
                     evidence_with("cargo test --lib retry_test", Some(0), "1 passed"),
                 ],
                 &text
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn noop_test_claim_rejects_zero_tests_and_failed_results_despite_successful_exit() {
+        let text = valid_noop_summary("b32cfc4", "retry_test");
+        let method = "cargo test --lib retry_test";
+        let empty = "running 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 42 filtered out";
+        let ignored = "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out";
+        let failed = "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out";
+        let passed = "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out";
+        for output in [empty, ignored, failed] {
+            let err = evaluate_noop_claim(true, &[evidence_with(method, Some(0), output)], &text)
+                .unwrap_err();
+            assert!(err.contains("failure or no passing tests"), "{err}");
+        }
+        // Multiple harnesses can legitimately include a filtered-out suite.
+        let mixed = format!("{passed}\n{empty}");
+        assert!(
+            verified_noop_claim(true, &[evidence_with(method, Some(0), &mixed)], &text)
+                .is_some()
+        );
+        // A later real rerun of the same command can establish success.
+        assert!(
+            verified_noop_claim(
+                true,
+                &[
+                    evidence_with(method, Some(0), empty),
+                    evidence_with(method, Some(0), passed),
+                ],
+                &text,
             )
             .is_some()
         );
