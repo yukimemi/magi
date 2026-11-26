@@ -120,6 +120,7 @@ pub struct Evidence {
 #[derive(Debug, Default)]
 pub struct Inventory {
     chats: HashMap<String, Evidence>,
+    busy_chats: HashSet<String>,
     /// Records that exist but could not be read or attributed to a chat.
     unattributed_unreadable: bool,
 }
@@ -153,7 +154,28 @@ impl Inventory {
     /// rather than to an empty (healthy-looking) answer.
     pub fn collect(home: &Path, tasks: &[Task], questions: &[Question]) -> Self {
         let mut inv = Self::default();
+        match crate::worker::observe_active(home) {
+            Ok(jobs) => {
+                for job in jobs.iter().filter(|job| job.kind == "chat") {
+                    if let Some(chat) = job.payload.get("talk").and_then(serde_json::Value::as_str)
+                    {
+                        inv.busy_chats.insert(chat.to_owned());
+                        // A reservation protects admission but is not proof
+                        // of a running turn. The row's turn lease supplies that.
+                        inv.evidence(chat).waiting.push(Item {
+                            reason: "reply queued".into(),
+                            link: None,
+                        });
+                    } else {
+                        inv.mark_unreadable();
+                    }
+                }
+            }
+            Err(_) => inv.mark_unreadable(),
+        }
         let by_id: HashMap<&str, &Task> = tasks.iter().map(|t| (t.id.as_str(), t)).collect();
+        let by_question: HashMap<&str, &Question> =
+            questions.iter().map(|q| (q.id.as_str(), q)).collect();
         let mut mirrored: HashSet<String> = HashSet::new();
 
         match Outbox::at(home).list_readable() {
@@ -174,7 +196,21 @@ impl Inventory {
                     let task = by_id.get(inquiry.task.as_str()).copied();
                     // A decision filed under an earlier repository assignment
                     // belongs to history, not to the task's current work.
-                    if task.is_some_and(|t| t.repo != inquiry.repo) {
+                    if task.is_some_and(|t| {
+                        t.repo != inquiry.repo
+                            || inquiry
+                                .key
+                                .strip_prefix("question:")
+                                .and_then(|id| by_question.get(id))
+                                .is_some_and(|q| t.stale_question(q))
+                            || t.reassignments
+                                .last()
+                                .is_some_and(|r| inquiry.created_at <= r.at)
+                            || inquiry
+                                .run
+                                .as_ref()
+                                .is_some_and(|run| !t.execution_run(run))
+                    }) {
                         continue;
                     }
                     let Some(chat) = inquiry
@@ -193,7 +229,6 @@ impl Inventory {
                         reason: reason.to_owned(),
                         link: link.clone(),
                     };
-                    let running = task.is_some_and(|t| t.status == TaskStatus::Running);
                     let ev = inv.evidence(chat);
                     match decision.status {
                         DecisionStatus::AwaitingOwner => ev.owner.push(Item {
@@ -201,9 +236,6 @@ impl Inventory {
                             link,
                         }),
                         DecisionStatus::Queued => ev.waiting.push(item("decision queued")),
-                        DecisionStatus::InProgress if running => {
-                            ev.working.push(item("applying decision"));
-                        }
                         DecisionStatus::InProgress => {
                             ev.waiting.push(item("decision in progress"));
                         }
@@ -231,6 +263,7 @@ impl Inventory {
             let task = tasks
                 .iter()
                 .find(|t| t.id == q.run || t.runs.iter().any(|r| *r == q.run));
+            let task = task.filter(|t| !t.stale_question(q));
             let Some(chat) = task.and_then(chat_of) else {
                 continue;
             };
@@ -258,15 +291,57 @@ impl Inventory {
             ev.tasks += 1;
             match task.status {
                 TaskStatus::Done => ev.tasks_done += 1,
-                TaskStatus::Running => ev.working.push(reason("running")),
+                TaskStatus::Running => {
+                    use crate::run::{Liveness, RunState, RunStatus};
+                    match task
+                        .execution_runs()
+                        .last()
+                        .and_then(|id| RunState::load_under(id, home).ok())
+                    {
+                        Some(run) if task.assignment_accepts(&run) => match run
+                            .liveness_under(home, false)
+                        {
+                            Liveness::Live
+                                if run.resource_wait.is_some()
+                                    || (run.status == RunStatus::Landing
+                                        && run.active.is_empty()) =>
+                            {
+                                ev.waiting.push(reason("waiting"))
+                            }
+                            Liveness::Live => ev.working.push(reason("running")),
+                            Liveness::Dead => ev.attention.push(reason("execution stopped")),
+                            Liveness::Unknown => ev.attention.push(reason("execution unverified")),
+                        },
+                        _ => ev.attention.push(reason("execution evidence unavailable")),
+                    }
+                }
                 TaskStatus::Queued | TaskStatus::Parked => ev.waiting.push(reason("queued")),
                 TaskStatus::Blocked => ev.waiting.push(reason("blocked")),
                 TaskStatus::Failed => ev.attention.push(reason("failed")),
                 TaskStatus::Held if task.operator_held() => ev.owner.push(reason("on hold")),
+                TaskStatus::Held
+                    if task.has_disk_capacity_cause()
+                        || task.hold_reason.as_deref().is_some_and(|r| {
+                            r.starts_with(crate::cache::RESOURCE_HOLD)
+                                || r.starts_with("[release] ")
+                        }) =>
+                {
+                    ev.waiting.push(reason("waiting for resources"))
+                }
                 TaskStatus::Held => ev.attention.push(reason("held")),
             }
         }
         inv
+    }
+
+    /// Mark incomplete source inventories without treating absence as idle.
+    pub fn mark_unreadable(&mut self) {
+        self.unattributed_unreadable = true;
+    }
+
+    /// A chat worker has reserved this conversation.
+    pub fn busy(&self, chat: &str) -> bool {
+        self.busy_chats.contains(chat)
     }
 }
 
@@ -320,6 +395,14 @@ pub fn derive(
         };
         return status(Kind::NeedsAttention, reason, 0, link);
     }
+    if unattributed_unreadable {
+        return status(
+            Kind::Unknown,
+            "some status records are unreadable".into(),
+            0,
+            None,
+        );
+    }
     if thinking || !ev.working.is_empty() {
         let (reason, link) = if ev.working.is_empty() {
             ("replying".to_owned(), None)
@@ -335,14 +418,6 @@ pub fn derive(
             pick(&ev.waiting, "waiting")
         };
         return status(Kind::Waiting, reason, 0, link);
-    }
-    if unattributed_unreadable {
-        return status(
-            Kind::Unknown,
-            "some decision records are unreadable".into(),
-            0,
-            None,
-        );
     }
     if !open {
         return status(Kind::Closed, String::new(), 0, None);
@@ -412,7 +487,10 @@ mod tests {
             waiting: vec![item("queued")],
             ..Evidence::default()
         };
-        assert_eq!(derive(true, Some(&ev), g, false, false).kind, Kind::NeedsAttention);
+        assert_eq!(
+            derive(true, Some(&ev), g, false, false).kind,
+            Kind::NeedsAttention
+        );
         ev.attention.clear();
         assert_eq!(derive(true, Some(&ev), g, false, false).kind, Kind::Working);
         ev.working.clear();
@@ -489,7 +567,9 @@ mod tests {
         // Filed under an earlier assignment: the task has since moved repo.
         let mut earlier = moved.clone();
         earlier.repo = "/old".into();
-        outbox.file(&earlier, None, "s".into(), "stale", "d").unwrap();
+        outbox
+            .file(&earlier, None, "s".into(), "stale", "d")
+            .unwrap();
 
         let inv = Inventory::collect(home.path(), &[a, b, moved], &[]);
         let s = inv.status_of("chat-a", false, Goals::default(), false);
@@ -498,6 +578,44 @@ mod tests {
         assert!(inv.needs_owner().contains("chat-a"));
         let other = inv.status_of("chat-b", true, Goals::default(), false);
         assert_eq!(other.kind, Kind::Waiting, "{other:?}");
+    }
+
+    #[test]
+    fn machine_wait_and_unverified_running_are_distinct() {
+        let home = tempfile::TempDir::new().unwrap();
+        let mut held = task("held", "/repo", TaskStatus::Queued);
+        held.hold_machine(Some("[resource] cache busy".into()));
+        let running = task("running", "/repo", TaskStatus::Running);
+        let inv = Inventory::collect(home.path(), &[held, running], &[]);
+        assert_eq!(
+            inv.status_of("held", true, Goals::default(), false).kind,
+            Kind::Waiting
+        );
+        assert_eq!(
+            inv.status_of("running", true, Goals::default(), false).kind,
+            Kind::NeedsAttention
+        );
+    }
+
+    #[test]
+    fn returning_to_same_repo_does_not_revive_old_decision() {
+        let home = tempfile::TempDir::new().unwrap();
+        let mut t = task("chat", "/repo", TaskStatus::Queued);
+        let inquiry = Outbox::at(home.path())
+            .file(&t, None, "s".into(), "old", "d")
+            .unwrap();
+        t.reassignments.push(crate::queue::Reassignment {
+            from: "/other".into(),
+            to: t.repo.clone(),
+            actor: "operator".into(),
+            at: inquiry.created_at,
+            run_boundary: 0,
+        });
+        let inv = Inventory::collect(home.path(), &[t], &[]);
+        assert_eq!(
+            inv.status_of("chat", true, Goals::default(), false).kind,
+            Kind::Waiting
+        );
     }
 
     #[test]

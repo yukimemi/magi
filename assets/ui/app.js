@@ -11536,7 +11536,7 @@ async function applyRevisions_(source) {
   /* Row status is derived from tasks, decisions and questions as well as the
      transcript, so those moving refreshes the list with no new message. */
   const talkStatusStale = queueRev !== state.rev.queue || questionsRev !== state.rev.questions
-    || notificationsRev !== state.rev.notifications;
+    || notificationsRev !== state.rev.notifications || runsRev !== state.rev.runs;
 
   if (notificationsRev !== state.rev.notifications || questionsRev !== state.rev.questions) {
     state.rev.notifications = notificationsRev;

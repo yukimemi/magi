@@ -454,6 +454,7 @@ pub(crate) struct SharedMonitor {
     disk_cache: Mutex<DiskCache>,
     talk_index: Mutex<HashMap<String, (FileIdentity, TalkListView)>>,
     talk_status_index: Mutex<TalkStatusIndex>,
+    closed_goal_index: Mutex<HashMap<String, (FileIdentity, bool)>>,
     /// Conversation status evidence, rebuilt only when a source store moved.
     chat_inventory: Mutex<Option<(Revisions, Arc<crate::chat_status::Inventory>)>>,
     bulk_slots: Arc<tokio::sync::Semaphore>,
@@ -638,6 +639,36 @@ fn monitor_scan(ui: &Ui, previous: MonitorSnapshot) -> (Revisions, [Stamps; 3]) 
         rev.4 = stamps_revision(&next);
     }
     rev.5 = ui.lock_loop().rev;
+    // Live worker ownership can change without any transcript write.
+    use std::hash::{Hash, Hasher};
+    let mut activity = std::collections::hash_map::DefaultHasher::new();
+    rev.3 = stamps_revision(&stamps[2]);
+    rev.3.hash(&mut activity);
+    let mut changed = false;
+    match crate::worker::observe_active(&ui.home) {
+        Ok(jobs) => {
+            let mut ids: Vec<_> = jobs
+                .iter()
+                .map(|job| (&job.id, job.status == crate::worker::Status::Running))
+                .collect();
+            ids.sort_unstable();
+            changed |= !ids.is_empty();
+            ids.hash(&mut activity);
+        }
+        Err(_) => {
+            changed = true;
+            "unknown workers".hash(&mut activity);
+        }
+    }
+    if let Ok(mut ids) = crate::queue::record_ids(ui.talks.root(), "turn") {
+        ids.retain(|id| ui.talks.turn_held(id));
+        ids.sort_unstable();
+        changed |= !ids.is_empty();
+        ids.hash(&mut activity);
+    }
+    if changed {
+        rev.3 = activity.finish();
+    }
     (rev, stamps)
 }
 
@@ -655,6 +686,7 @@ impl SharedMonitor {
             disk_cache: Mutex::default(),
             talk_index: Mutex::default(),
             talk_status_index: Mutex::default(),
+            closed_goal_index: Mutex::default(),
             chat_inventory: Mutex::default(),
             bulk_slots: Arc::new(tokio::sync::Semaphore::new(2)),
             talk_core_slots: Arc::new(tokio::sync::Semaphore::new(2)),
@@ -755,6 +787,14 @@ impl SharedMonitor {
                     .into_iter()
                     .enumerate()
                     {
+                        // Talk revisions also contain live ownership evidence.
+                        // A transcript-only delta cannot describe that change.
+                        if index == 2
+                            && (base.3 != stamps_revision(&prev[index])
+                                || revisions.3 != stamps_revision(&next_stamps[index]))
+                        {
+                            continue;
+                        }
                         let delta = diff_stamps(&prev[index], &next_stamps[index], rev);
                         if delta.changed.len() + delta.removed.len() > 0
                             && delta.changed.len() <= 50
@@ -5349,6 +5389,34 @@ struct ListWalk {
     initial_end: usize,
 }
 
+/// Read goal state only, without allocating transcript messages. Older files
+/// placed goals after turns; skip that field until the first cached read.
+fn read_owner_goal(reader: impl std::io::Read) -> bool {
+    use serde::de::{IgnoredAny, MapAccess, Visitor};
+    struct Header<'a>(&'a mut bool);
+    impl<'de> Visitor<'de> for Header<'_> {
+        type Value = ();
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("conversation goals")
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+            while let Some(key) = map.next_key::<String>()? {
+                if key == "goals" {
+                    let goals: Vec<crate::chat_goal::Goal> = map.next_value()?;
+                    *self.0 = crate::chat_status::Goals::of(&goals).owner > 0;
+                    return Err(serde::de::Error::custom("goals read"));
+                }
+                map.next_value::<IgnoredAny>()?;
+            }
+            Ok(())
+        }
+    }
+    let mut owner = false;
+    let mut json = serde_json::Deserializer::from_reader(std::io::BufReader::new(reader));
+    let _ = serde::Deserializer::deserialize_map(&mut json, Header(&mut owner));
+    owner
+}
+
 fn page_ids(ui: &Ui, talks: bool, q: PageQuery) -> ApiResult<(Vec<String>, Option<String>)> {
     page_ids_with(ui, talks, q, |ui, ids| {
         // A conversation owing the owner a decision is listed with the open
@@ -5358,6 +5426,37 @@ fn page_ids(ui: &Ui, talks: bool, q: PageQuery) -> ApiResult<(Vec<String>, Optio
         let inventory = chat_inventory(ui);
         let owing = inventory.needs_owner();
         open.extend(ids.iter().filter(|id| owing.contains(id.as_str())).cloned());
+        let mut goals = ui
+            .monitor
+            .closed_goal_index
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let present: HashSet<_> = ids.iter().collect();
+        goals.retain(|id, _| present.contains(id) && !open.contains(id));
+        for id in ids {
+            if open.contains(id) {
+                continue;
+            }
+            let path = ui.talks.path_of(id);
+            let Ok(identity) = file_identity(&path) else {
+                continue;
+            };
+            let owner = if cfg!(unix)
+                && let Some((old, owner)) = goals.get(id)
+                && *old == identity
+            {
+                *owner
+            } else {
+                let owner = std::fs::File::open(&path).ok().is_some_and(read_owner_goal);
+                if cfg!(unix) && file_identity(&path).is_ok_and(|after| after == identity) {
+                    goals.insert(id.clone(), (identity, owner));
+                }
+                owner
+            };
+            if owner {
+                open.insert(id.clone());
+            }
+        }
         open
     })
 }
@@ -5523,15 +5622,20 @@ fn chat_inventory(ui: &Ui) -> Arc<crate::chat_status::Inventory> {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .as_ref()
-        && (cached.0, cached.2, cached.4, cached.5) == (key.0, key.2, key.4, key.5)
+        && *cached == key
     {
         return Arc::clone(inventory);
     }
-    let inventory = Arc::new(crate::chat_status::Inventory::collect(
-        &ui.home,
-        &ui.queue.list(),
-        &ui.questions.list(),
-    ));
+    let tasks = ui.queue.list();
+    let questions = ui.questions.list();
+    let mut inventory = crate::chat_status::Inventory::collect(&ui.home, &tasks, &questions);
+    if crate::queue::record_ids(ui.queue.root(), "json").map_or(true, |ids| ids.len() > tasks.len())
+        || crate::queue::record_ids(ui.questions.root(), "json")
+            .map_or(true, |ids| ids.len() > questions.len())
+    {
+        inventory.mark_unreadable();
+    }
+    let inventory = Arc::new(inventory);
     if let Some(key) = key {
         *ui.monitor
             .chat_inventory
@@ -5636,13 +5740,9 @@ fn talk_rows(ui: &Ui, ids: Vec<String>, headers: &header::HeaderMap) -> Vec<Talk
                 created_at: row.created_at,
                 updated_at: row.updated_at,
             };
-            row.thinking = ui.is_thinking(&id);
-            row.chat_status = inventory.status_of(
-                &id,
-                row.status.open(),
-                row.goals,
-                row.thinking,
-            );
+            let turn_held = ui.talks.turn_held(&id);
+            row.thinking = turn_held || inventory.busy(&id);
+            row.chat_status = inventory.status_of(&id, row.status.open(), row.goals, turn_held);
             Some(row)
         })
         .collect()
@@ -27104,6 +27204,47 @@ mod tests {
         let (ids, next) = page_ids(&ui, true, PageQuery::default()).unwrap();
         assert_eq!(ids.len(), STORE_PAGE_SIZE + 5);
         assert!(next.is_none());
+    }
+
+    #[test]
+    fn chat_status_promotes_old_closed_owner_goal() {
+        let home = tempfile::tempdir().unwrap();
+        let ui = delta_test_ui(home.path());
+        for i in 0..STORE_PAGE_SIZE + 5 {
+            seed_talk_at(&ui.talks, &format!("new-{i:03}"), "closed");
+        }
+        let id = seed_talk_at(&ui.talks, "ancient", "closed");
+        let path = ui.talks.path_of(&id);
+        let mut raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        raw["goals"] = serde_json::json!([{
+            "id": "g", "purpose": "ship", "scope": "task",
+            "condition": {"description": "done", "kind": "tasks_done"},
+            "state": "owner", "step": "decision", "source_turn": 0,
+            "owner_input": "ship", "tasks": [], "runs": [], "watches": [],
+            "evidence": "", "wake": 0, "handled": 0, "started": null,
+            "wakes": 0, "last_checked": null, "fingerprint": ""
+        }]);
+        std::fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
+        let (ids, _) = page_ids(&ui, true, PageQuery::default()).unwrap();
+        assert!(ids.contains(&id));
+        let rows = talk_rows(&ui, ids, &header::HeaderMap::new());
+        let row = rows.iter().find(|row| row.id == id).unwrap();
+        assert_eq!(row.chat_status.kind, crate::chat_status::Kind::NeedsOwner);
+    }
+
+    #[test]
+    fn chat_status_revision_tracks_turn_lease_without_transcript_changes() {
+        let home = tempfile::tempdir().unwrap();
+        let ui = delta_test_ui(home.path());
+        let id = seed_talk_at(&ui.talks, "chat", "open");
+        let before = monitor_scan(&ui, None);
+        let lease = ui.talks.claim_turn(&id).unwrap().unwrap();
+        let during = monitor_scan(&ui, Some(before.clone()));
+        assert_ne!(during.0.3, before.0.3);
+        drop(lease);
+        let after = monitor_scan(&ui, Some(during));
+        assert_eq!(after.0.3, before.0.3);
     }
 
     #[test]

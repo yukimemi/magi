@@ -575,14 +575,14 @@ pub struct Talk {
     pub agent: String,
     /// Current state.
     pub status: TalkStatus,
+    /// Independent durable owner-authorized follow-through goals.
+    #[serde(default)]
+    pub goals: Vec<crate::chat_goal::Goal>,
     /// Everything said, oldest first.
     pub turns: Vec<Turn>,
     /// Durable title; absent records retain the opener display.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<ChatTitle>,
-    /// Independent durable owner-authorized follow-through goals.
-    #[serde(default)]
-    pub goals: Vec<crate::chat_goal::Goal>,
     /// Goal selected for compact presentation.
     #[serde(default)]
     pub selected_goal: Option<String>,

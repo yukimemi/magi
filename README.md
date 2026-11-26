@@ -741,6 +741,13 @@ search and updates as replies arrive or are marked read, including Mark all
 read. Use **Load older conversations** to include more history. Filtering
 does not mark messages read or close the conversation you are viewing.
 
+Each conversation also has a status badge based on saved decisions, tasks,
+goals and current execution evidence, not the wording of the transcript.
+**Needs owner** includes closed conversations with outstanding decisions or
+owner-waiting goals. Resource waits and queued replies are waiting, while
+unverified execution or incomplete records are surfaced as attention/unknown.
+The badges refresh on execution and store changes independently of new replies.
+
 While a reply is running, Chat accepts the next message as one durable pending
 draft instead of starting a second CLI turn. The web composer shows that draft;
 use **Resume queued draft** to run it unchanged, **Edit text** to replace only
