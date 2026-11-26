@@ -13459,6 +13459,7 @@ mod tests {
             output_tail: "previous verification failed".into(),
             duration_ms: 0,
             resource_blocked: false,
+            ..Default::default()
         });
         state.reviews.push(unresolved);
         state.base_sync = Some(crate::run::BaseSync {
