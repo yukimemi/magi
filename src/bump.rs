@@ -1500,21 +1500,38 @@ fn merged_change_from_pages(
 }
 
 async fn merged_change(repo: &Path, pr_url: &str) -> Result<MergedChange> {
-    let args = [
-        "pr",
-        "view",
-        pr_url,
-        "--json",
-        "state,mergeCommit,changedFiles,number,url",
-    ]
-    .map(str::to_owned);
-    let (ok, out) = land::gh(repo, &args).await?;
-    anyhow::ensure!(ok, "read merged PR metadata: {out}");
+    let out = merged_pr_json(
+        repo,
+        &[
+            "pr",
+            "view",
+            pr_url,
+            "--json",
+            "state,mergeCommit,changedFiles,number,url",
+        ],
+    )
+    .await?;
     let (merge, expected, endpoint) = merged_pr_metadata(&out)?;
-    let args = ["api", "--paginate", "--slurp", &endpoint].map(str::to_owned);
-    let (ok, out) = land::gh(repo, &args).await?;
-    anyhow::ensure!(ok, "read merged PR files: {out}");
+    let out = merged_pr_json(repo, &["api", "--paginate", "--slurp", &endpoint]).await?;
     parse_merged_pr_files(merge, expected, &out)
+}
+
+async fn merged_pr_json(repo: &Path, args: &[&str]) -> Result<String> {
+    let out = tokio::process::Command::new("gh")
+        .args(args)
+        .current_dir(repo)
+        .env_remove("GH_REPO")
+        .quiet()
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+        .context("read merged PR evidence")?;
+    anyhow::ensure!(
+        out.status.success(),
+        "read merged PR evidence: {}",
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    String::from_utf8(out.stdout).context("merged PR evidence is not UTF-8")
 }
 
 /// Decode forge metadata and build the canonical file endpoint. No I/O.
