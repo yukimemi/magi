@@ -18,10 +18,15 @@ keywords = ["ai", "agent", "code-review", "git", "worktree"]
 [lib]
 name = "magi"
 path = "src/lib.rs"
+# `cargo test --examples --benches` includes lib and bin benchmark harnesses by
+# default, which would re-run all lib/bin unit tests after nextest already ran
+# them. Neither target defines benchmarks.
+bench = false
 
 [[bin]]
 name = "magi"
 path = "src/main.rs"
+bench = false
 
 [dependencies]
 clap = { version = "4.6.7", features = ["derive"] }

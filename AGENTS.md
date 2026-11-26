@@ -1590,9 +1590,14 @@ timeout_minutes = 30                # per command
 
 The required check `test (windows-latest)` is not a matrix entry: it is the
 `test-windows` job (ubuntu, `if: always()`) that fails unless `test-windows-unit`
-(`cargo test --lib --bins` + `--doc`) and every `test-windows-shard` succeeded.
-Integration binaries run with `cargo nextest run --partition count:N/3`, because
-the Windows runner is CPU-bound (summed test time ~3.8x wall time). Changing the
+(`cargo nextest run --locked --no-tests=pass --profile ci -E 'kind(lib) | kind(bin)'`,
+`cargo test --locked --examples --benches`, and `--doc`) and every
+`test-windows-shard` succeeded.
+Integration binaries run with
+`cargo nextest run --locked --no-tests=pass --profile ci -E 'kind(test)' --partition count:N/3`,
+because the Windows runner is CPU-bound (summed test time ~3.8x wall time).
+`test-windows-unit` and `test-windows-shard` keep separate rust-cache keys
+(`windows-unit` vs `windows-shard`) and non-fatal JUnit uploads. Changing the
 shard count means changing the matrix, the job name and the `--partition`
 denominator together; the aggregate needs no edit, and its name must stay exactly
 `test (windows-latest)` or the branch protection waits forever. Do not raise
@@ -2262,14 +2267,18 @@ no commit is pushed or merged without the tests having passed on that exact
 SHA. `tests/verify_covers_check.rs` fails when the two halves stop adding up to
 `tasks.check`'s dependencies, or when a task is in both.
 
-`cargo make test` runs the integration binaries under cargo-nextest
-(`PJ_RUST_TEST_RUNNER = "nextest"` in `Makefile.toml`'s `[env]`, the same split
-CI uses): lib / bin unit tests on `cargo test`, integration tests in parallel
-under `.config/nextest.toml`'s group caps. Install cargo-nextest wherever
-verification runs; without it the task warns and falls back to the serial
-`cargo test` (measured locally: ~21 min serial against ~12 min with nextest for
-the same tests, on a loaded machine). The operator's Windows PC ran without it
-until 2026-11-21, and nothing but one warning line in the gate's output said so.
+`cargo make test` runs lib, bin, and integration tests under cargo-nextest
+(`PJ_RUST_TEST_RUNNER = "nextest-unit"` in `Makefile.toml`'s `[env]` and
+`.kata/vars.toml`, mirrored in `.github/workflows/ci.yml`): one nextest run over
+`kind(lib) | kind(bin) | kind(test)` under `.config/nextest.toml`'s group caps
+and retries, followed by `cargo test --locked --examples --benches` (`[lib]` and
+`[[bin]]` set `bench = false` in `Cargo.toml` so unit tests do not run twice)
+and `cargo test --locked --doc`. Install cargo-nextest wherever verification
+runs; without it the task warns and falls back to the serial
+`cargo test --locked --all-targets` (measured locally under the earlier
+integration-only split: ~21 min serial against ~12 min with nextest for the same
+tests, on a loaded machine). The operator's Windows PC ran without it until
+2026-11-21, and nothing but one warning line in the gate's output said so.
 
 **Never build by hand into the directory `verify` uses.** Two different source
 trees alternating through one `CARGO_TARGET_DIR` will link a test against the
@@ -3811,7 +3820,7 @@ or PR creation. Landing requires fresh confirmed merge of the recorded head.
 The existing Chat task-progress strip adds purpose, state and current step/wait,
 with a validated Run or Task link; detailed execution remains on Run.
 
-### Integration tests retry under nextest, locally and in CI
+### Unit and integration tests retry under nextest, locally and in CI
 
 `[profile.default]` in `.config/nextest.toml` (what `cargo make test`, and so
 `verify.e2e`, uses) and `[profile.ci]` (what `ci.yml` uses) both set
@@ -3833,62 +3842,57 @@ two counts equal.
   diff was the version number was then held by one timing-dependent test on
   one runner. Retrying a test takes seconds; rerunning the job takes its whole
   duration (about 17 minutes on macOS).
-- **Scope.** Lib / bin unit tests stay on `cargo test` (the kata-managed
-  `test-targets` task) and are never retried.
+- **Scope.** Under `PJ_RUST_TEST_RUNNER = "nextest-unit"`, lib, bin, and
+  integration tests all run under nextest and share the same `retries = 2`
+  policy locally and in CI. Examples, benches, and doc tests stay on
+  `cargo test` and are not retried.
 - **Known interaction.** `run::summarize_verify` treats `FAIL [` lines (so
   `TRY n FAIL [`) and the failed attempts' `panicked at` / `STDERR` blocks as
   failure excerpts when it has to reduce a long output. A passing command with a
   retried test can therefore show those excerpts; the final `FLAKY` line is not
   a trigger and nothing reads `FLAKY` as a failure.
 
-### Opt-in template change for nextest unit tests
+### Opt-in `nextest-unit` runner adoption
 
-This repository has not opted in yet. Keep `cargo make test`, `verify.e2e`,
-the CI unit jobs, and both retry counts unchanged until coordinated adoption.
-The upstream task is `20261124-192920-9c39` (`yukimemi/pj-rust`).
+Upstream `yukimemi/pj-rust` PR #42 added `PJ_RUST_TEST_RUNNER = "nextest-unit"`
+and magi has adopted it across local verification and CI while keeping both
+nextest profiles at `retries = 2` and keeping `verify.e2e` + `verify.gate`
+split unchanged:
 
-Windows measurement (base `cb49796`, 16 logical CPUs, stable toolchain,
-warm launcher-managed target): `cargo nextest run --locked --lib --no-fail-fast
---retries 0` ran 2,734 tests, with 7 skipped. On the base it failed one
-isolated-launcher setup in 33m55.824s; the run initially sampled 35% CPU
-and later overlapped two to three running tasks. After the changes it passed
-all 2,734 in 21m10.407s, versus 27m33.122s for `cargo test --locked --lib`
-(2,734 passed, 7 ignored). These are command wall times, not isolated process
-startup costs. The default nextest schedule was 6m22.715s faster in this
+- `Makefile.toml` `[env]` and top-level `.kata/vars.toml` both set
+  `PJ_RUST_TEST_RUNNER = "nextest-unit"`. `tasks.test-targets` (synced from
+  `pj-rust`) runs `cargo nextest run --locked --no-tests=pass -E "kind(lib) | kind(bin) | kind(test)"`
+  and `cargo test --locked --examples --benches`, falling back to
+  `cargo test --locked --all-targets` when `cargo-nextest` is absent.
+  `tasks.test-doc` still runs `cargo test --locked --doc`.
+- `Cargo.toml` sets `bench = false` on `[lib]` and `[[bin]]`. Without it,
+  `cargo test --locked --examples --benches` includes Cargo's default lib/bin
+  benchmark harnesses and re-runs every unit test a second time after nextest.
+- `.kata/applied.toml` keeps `.github/workflows/ci.yml` marked `ignored = true`;
+  `ci.yml` is synchronized manually with the rendered `nextest-unit` split:
+  Linux/macOS `test` runs the combined `kind(lib) | kind(bin) | kind(test)`
+  nextest filter, examples/benches, and guarded doctests; Windows splits into
+  `test-windows-unit` (`kind(lib) | kind(bin)`, examples/benches, guarded
+  doctests, non-fatal `junit-windows-unit` upload) and three
+  `test-windows-shard` integration-only jobs (`kind(test)`, `--partition
+  count:N/3`), with separate cache keys and the required aggregate check
+  `test (windows-latest)` unchanged.
+- `tests/verify_covers_check.rs` asserts alignment across `Makefile.toml`,
+  `.kata/vars.toml`, `Cargo.toml`, `.config/nextest.toml`, and
+  `.github/workflows/ci.yml` alongside the `verify.e2e` + `verify.gate` split.
+
+Historical Windows measurement before opt-in (base `cb49796`, 16 logical CPUs,
+stable toolchain, warm launcher-managed target): `cargo nextest run --locked
+--lib --no-fail-fast --retries 0` ran 2,734 tests, with 7 skipped. On the base
+it failed one isolated-launcher setup in 33m55.824s; the run initially sampled
+35% CPU and later overlapped two to three running tasks. After the changes it
+passed all 2,734 in 21m10.407s, versus 27m33.122s for `cargo test --locked
+--lib` (2,734 passed, 7 ignored). These are command wall times, not isolated
+process startup costs. The default nextest schedule was 6m22.715s faster in this
 comparison; it does not justify a unit-test thread cap.
 The baseline `cargo test --locked --lib` log ended before its summary.
 Running the preserved baseline libtest executable directly completed in
 29m37.995s (2,734 passed, 7 ignored; excludes Cargo startup and build time).
-
-- In `yukimemi/pj-rust`'s `Makefile.toml`, extend `tasks.test-targets` with
-  `PJ_RUST_TEST_RUNNER = "nextest-unit"` (the consumer sets it in `[env]`).
-  With nextest installed, run `cargo nextest run --locked --no-tests=pass -E
-  'kind(lib) | kind(bin) | kind(test)'` and `cargo test --locked --examples
-  --benches` once each. Filter by kind rather than requiring a library or
-  binary target. With nextest absent, warn and use `cargo test --locked
-  --all-targets`. Keep the unset and existing `nextest` branches and
-  `tasks.test-doc` unchanged.
-- In `.github/workflows/ci.yml.tera`, guard the optional
-  `vars.PJ_RUST_TEST_RUNNER` lookup and leave the existing workflow unchanged
-  without `nextest-unit`. On Linux/macOS, the opt-in `test` job installs
-  nextest and runs the same combined filter once with `--profile ci`, so one
-  JUnit result per OS covers both unit and integration tests. Run
-  `cargo test --locked --examples --benches` once, and retain the separate,
-  library-presence-guarded doctest step.
-- For opted-in Windows CI, `test-windows-unit` installs nextest and runs
-  `cargo nextest run --locked --profile ci --no-tests=pass -E
-  'kind(lib) | kind(bin)'`, uploads `target/nextest/ci/junit.xml` as
-  `junit-windows-unit` (non-fatal), and runs the Cargo examples/benches
-  and guarded doctest steps. `test-windows-shard` keeps integration tests
-  alone (`kind(test)`, `--partition count:N/3`), per-shard JUnit artifacts,
-  and a cache key separate from the unit job. `test-windows` remains
-  named `test (windows-latest)` and fails if either unit or any shard fails
-  or is skipped.
-- After upstream support lands, set the local and CI selectors together.
-  `.kata/applied.toml` ignores this repository's `.github/workflows/ci.yml`;
-  explicitly synchronize its existing split with the opted-in variant rather
-  than expecting `kata apply` to replace it. Check rendered opt-in and default
-  workflows, including a bin-only consumer, before enabling the new runner.
 
 ### Standing chat recovery
 

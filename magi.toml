@@ -52,10 +52,11 @@ cache = "{{ env.MAGI_CACHE | default(value='/tmp') }}"
 # `check`.
 #
 # The real-machine leg, run in the winner's worktree once a round has no
-# blocking finding left. `cargo make test` is the unit and doc tests on
-# `cargo test` plus the integration binaries under cargo-nextest, the way CI
-# runs them (`.config/nextest.toml`); without cargo-nextest on PATH it falls
-# back to one binary after another and takes about twice as long.
+# blocking finding left. `cargo make test` runs lib, bin, and integration tests
+# under cargo-nextest (`PJ_RUST_TEST_RUNNER = "nextest-unit"` in `Makefile.toml`
+# `[env]`, matching `.github/workflows/ci.yml` and `.config/nextest.toml`), plus
+# examples, benches, and doc tests via `cargo test`; without cargo-nextest on
+# PATH it warns and falls back to `cargo test --locked --all-targets`.
 #
 # CARGO_TARGET_DIR is shared on purpose: each candidate worktree would otherwise
 # compile this crate from scratch, which is by far the slowest thing in a run on

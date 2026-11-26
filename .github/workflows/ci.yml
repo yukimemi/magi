@@ -62,28 +62,21 @@ jobs:
         # on every rust-cache restore (transient GH Actions cache
         # backend flake on windows-latest).
         continue-on-error: true
-      # `cargo test --all-targets` covers lib / bins / tests / benches
-      # / examples but EXCLUDES doc tests, so run --doc separately.
-      # Doc-test step is gated on `src/lib.rs` presence: `cargo test
-      # --doc` errors with `no library targets found` on bin-only
-      # crates (yukimemi/todoke#50, yukimemi/rvpm#176 track the
-      # consumer-side refactor). Drop this `if:` once both land.
-      # The integration binaries (tests/*.rs, ~40 of them) used to run one
-      # binary after another, which dominated the Windows job. nextest runs
-      # them side by side, one process per test (config:
-      # .config/nextest.toml). Lib / bin unit tests keep `cargo test`: they
-      # share one process on purpose (a pinned magi home, the report colour
-      # flag) and fail when split one test per process. Together with the
-      # doc-test step below this covers everything `cargo test --all-targets`
-      # ran; examples hold no tests.
+      # Opt-in runner (`PJ_RUST_TEST_RUNNER = "nextest-unit"` in `.kata/vars.toml`
+      # and `Makefile.toml` `[env]`, mirrored here because `ci.yml` is ignored in
+      # `.kata/applied.toml`). Nextest runs lib, bin, and integration tests in
+      # one `--profile ci` invocation (`.config/nextest.toml` writes
+      # `target/nextest/ci/junit.xml`). Cargo runs examples, benches (lib/bin
+      # set `bench = false` in `Cargo.toml` so unit tests are not run twice),
+      # and doc tests (gated on `src/lib.rs`).
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest
-      - run: cargo test --lib --bins
-      - run: cargo nextest run --profile ci --test '*'
+      - run: cargo nextest run --locked --no-tests=pass --profile ci -E 'kind(lib) | kind(bin) | kind(test)'
+      - run: cargo test --locked --examples --benches
       - if: ${{ hashFiles('src/lib.rs') != '' }}
-        run: cargo test --doc
-      - if: always()
+        run: cargo test --locked --doc
+      - if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
           name: junit-${{ matrix.os }}
@@ -108,9 +101,22 @@ jobs:
           key: windows-unit
           save-if: ${{ github.ref == 'refs/heads/main' }}
         continue-on-error: true
-      - run: cargo test --lib --bins
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+      - run: cargo nextest run --locked --no-tests=pass --profile ci -E 'kind(lib) | kind(bin)'
+      - run: cargo test --locked --examples --benches
       - if: ${{ hashFiles('src/lib.rs') != '' }}
-        run: cargo test --doc
+        run: cargo test --locked --doc
+      - if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-windows-unit
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: ignore
+        # Non-fatal for the same reason as the junit upload in the
+        # test job above (transient artifact-service failure).
+        continue-on-error: true
 
   test-windows-shard:
     # The integration binaries are CPU-bound on a 4-vCPU Windows runner (the
@@ -137,8 +143,8 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest
-      - run: cargo nextest run --profile ci --test '*' --partition count:${{ matrix.shard }}/3
-      - if: always()
+      - run: cargo nextest run --locked --no-tests=pass --profile ci -E 'kind(test)' --partition count:${{ matrix.shard }}/3
+      - if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:
           name: junit-windows-${{ matrix.shard }}
