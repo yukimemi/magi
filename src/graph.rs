@@ -1757,15 +1757,18 @@ impl Runner {
         };
         let disk = RunState::load(&self.state.id)?;
         crate::pr_head::ensure_owner(&disk)?;
-        let claimed =
-            crate::daemon::is_working_on_other(&crate::run::home(), &disk.id, Timestamp::now())?;
+        let now = Timestamp::now();
+        let home = crate::run::home();
+        let claim = crate::daemon::other_claim_for_run(&home, &disk.id, now)?;
+        let assessment = disk.assess_liveness_under(&home, claim, now);
         // Only proven-live ownership refuses here. Unknown records (legacy runs
         // with no claim marker or process identity) fall through to the
         // exclusive execution lease taken just below, which is what actually
         // keeps a second driver out.
         anyhow::ensure!(
-            disk.liveness(claimed) != crate::run::Liveness::Live,
-            "run already has a live driver; wait for its execution to end"
+            assessment.verdict != crate::run::Liveness::Live,
+            "{}",
+            assessment.live_driver_refusal()
         );
         if let Some(to) = &disk.released_to {
             bail!(
@@ -20650,11 +20653,66 @@ esac
             .await
             .err()
             .expect("a live driver must refuse");
-        assert!(error.to_string().contains("live driver"), "{error:#}");
+        let message = error.to_string();
+        assert!(
+            message.starts_with("run already has a live driver: "),
+            "{message}"
+        );
+        assert!(message.contains(&format!("pid={pid}")), "{message}");
+        assert!(
+            message.contains(runner.state.driver_started_at.as_deref().unwrap()),
+            "{message}"
+        );
         let saved = RunState::load(&runner.state.id).unwrap();
         assert_eq!(saved.driver_pid, Some(pid));
         assert_eq!(saved.status, RunStatus::Reviewing);
         assert!(saved.passes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn driver_admission_refuses_another_worker_claim_with_shared_format() {
+        crate::run::pin_test_home();
+        let home = crate::run::home();
+        let mut runner = runner_at(RunStatus::Reviewing);
+        runner.state.driver_exited = true;
+        runner.state.driver_pid = None;
+        runner.state.driver_started_at = None;
+        runner.state.save().unwrap();
+
+        let queue = crate::queue::Queue::at(home.join("queue"));
+        let mut task = crate::queue::Task::new(
+            "task".into(),
+            "task".into(),
+            runner.state.repo.clone(),
+            crate::queue::Source::Human,
+        );
+        task.runs.push(runner.state.id.clone());
+        queue.put(&mut task).unwrap();
+        let payload = serde_json::json!({
+            "queue": home.join("queue"),
+            "task": task.id,
+            "opts": crate::daemon::Opts::default(),
+            "standalone": false,
+        });
+        let (job, lease) =
+            crate::worker::running_fixture(&home, &format!("task:{}", task.id), payload).unwrap();
+
+        let error = runner
+            .claim_driver(None)
+            .await
+            .err()
+            .expect("another active worker claim must refuse");
+        let message = error.to_string();
+        assert!(
+            message.starts_with("run already has a live driver: worker claim"),
+            "{message}"
+        );
+        assert!(message.contains(&job.id), "{message}");
+        assert!(message.contains("status=running"), "{message}");
+        assert!(message.contains("live.lock held"), "{message}");
+
+        drop(lease);
+        let _ = std::fs::remove_dir_all(home.join("workers").join("jobs").join(&job.id));
     }
 
     #[test]

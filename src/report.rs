@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::config::{MergeMode, MergeStyle};
 use crate::run::{
     CommandOutcome, ContinuationOutcome, E2eStatus, GateStatus, JobStatus, Liveness,
-    OperatorFixOutcome, RunState, RunStatus,
+    LivenessAssessment, OperatorFixOutcome, RunState, RunStatus,
 };
 use crate::stats::{RepoStats, Stats};
 use crate::verdict::ReviewVote;
@@ -363,6 +363,12 @@ fn write_command_outcome(s: &mut String, indent: &str, o: &CommandOutcome) {
 
 /// Full report for one run.
 pub fn run(state: &RunState) -> String {
+    run_with_liveness(state, None)
+}
+
+/// Full report for one run, optionally including a live read-only liveness
+/// assessment with its evidence and observation timestamp.
+pub fn run_with_liveness(state: &RunState, liveness: Option<&LivenessAssessment>) -> String {
     let mut s = String::new();
     let _ = writeln!(
         s,
@@ -399,6 +405,20 @@ pub fn run(state: &RunState) -> String {
         }
     }
     let _ = writeln!(s, "  state   {}", state.dir().display());
+    if let Some(assessment) = liveness {
+        let verdict = match assessment.verdict {
+            Liveness::Live => green(assessment.verdict.as_str()),
+            Liveness::Dead => dim(assessment.verdict.as_str()),
+            Liveness::Unknown => yellow(assessment.verdict.as_str()),
+        };
+        let _ = writeln!(
+            s,
+            "  liveness {} — {} [observed {}]",
+            verdict,
+            assessment.evidence,
+            assessment.observed_local()
+        );
+    }
     let _ = writeln!(s, "  build cache: {}", state.config.verify.build_cache);
     if !crate::build_target::isolated(&state.config)
         && let Some(target) = state.config.cache_dir()
@@ -3071,5 +3091,40 @@ mod tests {
         assert!(text.contains("implementation (solo runs, completion/adoption rate)"));
         assert!(text.contains("33%"));
         assert!(text.contains("low n"));
+    }
+
+    #[test]
+    fn run_with_liveness_renders_verdict_evidence_and_observed_time_for_all_states() {
+        let _guard = plain();
+        let s = state();
+        let observed_at = jiff::Timestamp::now();
+        for (verdict, evidence, expected_fragment) in [
+            (
+                Liveness::Live,
+                crate::run::LivenessEvidence::ProcessIdentity {
+                    pid: 4242,
+                    identity: "1790000000".to_owned(),
+                },
+                "liveness live — live driver process (pid=4242, identity=1790000000)",
+            ),
+            (
+                Liveness::Dead,
+                crate::run::LivenessEvidence::DriverExited,
+                "liveness dead — driver_exited=true in run.json and no active daemon/worker claim",
+            ),
+            (
+                Liveness::Unknown,
+                crate::run::LivenessEvidence::NoDriverPid,
+                "liveness unknown — no driver_pid recorded in run.json",
+            ),
+        ] {
+            let assessment = LivenessAssessment::new(verdict, evidence, observed_at);
+            let rendered = run_with_liveness(&s, Some(&assessment));
+            assert!(rendered.contains(expected_fragment), "{rendered}");
+            assert!(
+                rendered.contains(&format!("[observed {}]", assessment.observed_local())),
+                "{rendered}"
+            );
+        }
     }
 }

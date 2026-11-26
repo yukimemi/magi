@@ -47,6 +47,63 @@ pub enum Status {
     Failed,
 }
 
+impl Status {
+    /// Stable lowercase label matching the on-disk representation.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Starting => "starting",
+            Self::Running => "running",
+            Self::Finished => "finished",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+impl std::fmt::Display for Status {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Why an observed worker reservation counts as active.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActiveReason {
+    /// Reservation is still `starting` and has not been fenced by a writer.
+    UnfencedStartup,
+    /// Worker holds its OS execution lease (`live.lock`).
+    LiveLeaseHeld,
+    /// Worker is recorded `running`, but `live.lock` is missing (protected conservatively).
+    MissingLiveLease,
+}
+
+impl ActiveReason {
+    /// Short diagnostic description of why the worker counts as active.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::UnfencedStartup => "unfenced starting reservation",
+            Self::LiveLeaseHeld => "live.lock held",
+            Self::MissingLiveLease => "running job missing live.lock",
+        }
+    }
+}
+
+impl std::fmt::Display for ActiveReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// One active worker reservation paired with the reason it counts as active.
+#[derive(Clone, Debug)]
+pub struct ObservedActive {
+    /// Observed worker job record.
+    pub job: Job,
+    /// Why this job was judged active.
+    pub reason: ActiveReason,
+}
+
 /// An explicit owner control; upgrades do not send these to task workers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -320,10 +377,33 @@ pub fn get(home: &Path, id: &str) -> Result<Job> {
                 .with_context(|| format!("open retained worker record {}", retained.display()))?
         }
         Err(error) => {
-            return Err(error).with_context(|| format!("open worker record {}", path.display()));
+            let retained = root(home).join("results").join(id).join("job.json");
+            if let Ok(file) = open_record(&retained) {
+                file
+            } else {
+                return Err(error)
+                    .with_context(|| format!("open worker record {}", path.display()));
+            }
         }
     };
     serde_json::from_reader(file).with_context(|| format!("decode worker record {id}"))
+}
+
+fn confirmed_terminal_retained(home: &Path, id: &str) -> bool {
+    if !valid_id(id) {
+        return false;
+    }
+    let retained = root(home).join("results").join(id).join("job.json");
+    open_record(&retained)
+        .ok()
+        .and_then(|file| serde_json::from_reader::<_, Job>(file).ok())
+        .is_some_and(|job| matches!(job.status, Status::Finished | Status::Failed))
+}
+
+fn confirmed_terminal(home: &Path, id: &str) -> bool {
+    get(home, id)
+        .ok()
+        .is_some_and(|job| matches!(job.status, Status::Finished | Status::Failed))
 }
 
 /// Identify this detached invocation. Helpers inherit its identity, while a
@@ -509,6 +589,12 @@ pub fn active(home: &Path) -> Result<Vec<Job>> {
 /// handle for the OS lease probe. Starting reservations remain protected until
 /// an authorized writer fences them; a missing running lease is unknown.
 pub fn observe_active(home: &Path) -> Result<Vec<Job>> {
+    observe_active_detailed(home).map(|jobs| jobs.into_iter().map(|entry| entry.job).collect())
+}
+
+/// Same passive observation as [`observe_active`], retaining why each observed
+/// worker counts as active.
+pub fn observe_active_detailed(home: &Path) -> Result<Vec<ObservedActive>> {
     let entries = match std::fs::read_dir(root(home).join("jobs")) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -517,17 +603,30 @@ pub fn observe_active(home: &Path) -> Result<Vec<Job>> {
     let mut active = Vec::new();
     for entry in entries {
         let entry = entry?;
-        if !entry.file_type()?.is_dir() {
-            continue;
-        }
         let name = entry.file_name();
-        let id = name.to_str().context("invalid worker reservation name")?;
-        if id.starts_with('.') {
+        if name.to_str().is_some_and(|id| id.starts_with('.')) {
             continue;
         }
+        let is_dir = match entry.file_type() {
+            Ok(file_type) => file_type.is_dir(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if name
+                    .to_str()
+                    .is_some_and(|id| confirmed_terminal_retained(home, id))
+                {
+                    continue;
+                }
+                return Err(error.into());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if !is_dir {
+            continue;
+        }
+        let id = name.to_str().context("invalid worker reservation name")?;
         let job = get(home, id)?;
-        if observe_job_active(home, &job)? {
-            active.push(job);
+        if let Some(reason) = observe_job_active_reason(home, &job)? {
+            active.push(ObservedActive { job, reason });
         }
     }
     Ok(active)
@@ -535,29 +634,53 @@ pub fn observe_active(home: &Path) -> Result<Vec<Job>> {
 
 /// Passive lease observation for a single reservation already read by the caller.
 pub(crate) fn observe_job_active(home: &Path, job: &Job) -> Result<bool> {
+    Ok(observe_job_active_reason(home, job)?.is_some())
+}
+
+/// Same passive observation as [`observe_job_active`], naming why the job was
+/// judged active when it is.
+pub(crate) fn observe_job_active_reason(home: &Path, job: &Job) -> Result<Option<ActiveReason>> {
     match job.status {
-        Status::Starting => Ok(true),
+        Status::Starting => Ok(Some(ActiveReason::UnfencedStartup)),
         Status::Running => {
-            let file = match File::open(job_dir(home, &job.id)?.join("live.lock")) {
+            let lock_path = job_dir(home, &job.id)?.join("live.lock");
+            let file = match open_record(&lock_path) {
                 Ok(file) => file,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
-                Err(error) => return Err(error.into()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    if confirmed_terminal(home, &job.id) {
+                        return Ok(None);
+                    }
+                    return Ok(Some(ActiveReason::MissingLiveLease));
+                }
+                Err(error) => {
+                    if confirmed_terminal_retained(home, &job.id) {
+                        return Ok(None);
+                    }
+                    return Err(error)
+                        .with_context(|| format!("open worker lease {}", lock_path.display()));
+                }
             };
             match crate::pr_head::try_lock_file(&file) {
                 Ok(()) => {
                     drop(Lease { _file: file });
-                    Ok(false)
+                    Ok(None)
                 }
                 Err(error)
                     if error.kind() == std::io::ErrorKind::WouldBlock
                         || cfg!(windows) && error.raw_os_error() == Some(33) =>
                 {
-                    Ok(true)
+                    Ok(Some(ActiveReason::LiveLeaseHeld))
                 }
-                Err(error) => Err(error.into()),
+                Err(error) => {
+                    if confirmed_terminal_retained(home, &job.id) {
+                        return Ok(None);
+                    }
+                    Err(error)
+                        .with_context(|| format!("probe worker lease {}", lock_path.display()))
+                }
             }
         }
-        Status::Finished | Status::Failed => Ok(false),
+        Status::Finished | Status::Failed => Ok(None),
     }
 }
 
@@ -1837,5 +1960,62 @@ mod tests {
             RETAIN_FINISHED
         );
         assert!(jobs.iter().any(|job| job.id == live.id));
+    }
+
+    #[test]
+    fn observe_active_excludes_unarchived_terminal_jobs_and_preserves_unfenced_startup() {
+        let home = tempfile::tempdir().unwrap();
+        let starting = reservation(home.path(), "task:starting");
+        let mut finished = reservation(home.path(), "task:finished");
+        let mut failed = reservation(home.path(), "task:failed");
+        terminal(home.path(), &mut finished, Status::Finished, "done".into()).unwrap();
+        terminal(home.path(), &mut failed, Status::Failed, "boom".into()).unwrap();
+        // Both terminal directories are still in jobs/ (unarchived).
+        assert!(job_dir(home.path(), &finished.id).unwrap().exists());
+        assert!(job_dir(home.path(), &failed.id).unwrap().exists());
+
+        let observed = observe_active_detailed(home.path()).unwrap();
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].job.id, starting.id);
+        assert_eq!(observed[0].reason, ActiveReason::UnfencedStartup);
+        // Passive observation must never archive or mutate terminal records.
+        assert!(job_dir(home.path(), &finished.id).unwrap().exists());
+        assert!(job_dir(home.path(), &failed.id).unwrap().exists());
+    }
+
+    #[test]
+    fn observe_job_active_handles_archive_race_deterministically_and_protects_missing_live_lock() {
+        let home = tempfile::tempdir().unwrap();
+        let mut archived = reservation(home.path(), "task:archived-race");
+        let running_snapshot = Job {
+            status: Status::Running,
+            pid: Some(std::process::id()),
+            ..archived.clone()
+        };
+        terminal(home.path(), &mut archived, Status::Finished, "done".into()).unwrap();
+        archive(home.path(), &archived).unwrap();
+        assert!(!job_dir(home.path(), &archived.id).unwrap().exists());
+        // Caller read Running right before archive moved the directory to results/.
+        assert_eq!(
+            observe_job_active_reason(home.path(), &running_snapshot).unwrap(),
+            None
+        );
+
+        // Contrast: a still-Running job in jobs/ whose live.lock is missing
+        // must remain conservatively protected.
+        let mut missing_lock = reservation(home.path(), "task:missing-lock");
+        missing_lock.status = Status::Running;
+        missing_lock.pid = Some(std::process::id());
+        save(
+            &job_dir(home.path(), &missing_lock.id)
+                .unwrap()
+                .join("job.json"),
+            &missing_lock,
+        )
+        .unwrap();
+        assert_eq!(
+            observe_job_active_reason(home.path(), &missing_lock).unwrap(),
+            Some(ActiveReason::MissingLiveLease)
+        );
     }
 }

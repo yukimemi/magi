@@ -2027,26 +2027,7 @@ async fn dispatch(command: Command) -> Result<()> {
                 );
             } else {
                 let state = RunState::load(&id)?;
-                let daemon_claims = magi::daemon::is_working_on(
-                    &magi::run::home(),
-                    &state.id,
-                    jiff::Timestamp::now(),
-                );
-                let live = state.liveness(daemon_claims);
-                let superseded_by = state
-                    .pr_taken_over_by
-                    .clone()
-                    .or_else(|| Queue::at(magi::run::home().join("queue")).superseded_by(&id))
-                    .as_deref()
-                    .map(magi::run::short_of)
-                    .map(str::to_owned);
-                print!(
-                    "{}{}",
-                    report::superseded_notice(superseded_by.as_deref())
-                        + &report::liveness_notice(&state, live)
-                        + &report::run(&state),
-                    report::active_seats(&state, live)
-                );
+                print!("{}", render_show(&magi::run::home(), &state));
             }
             Ok(())
         }
@@ -5752,6 +5733,26 @@ async fn probe(program: &str, args: &[&str]) -> String {
     }
 }
 
+fn render_show(home: &Path, state: &RunState) -> String {
+    let now = jiff::Timestamp::now();
+    let claim = magi::daemon::claim_for_run(home, &state.id, now);
+    let assessment = state.assess_liveness_under(home, claim, now);
+    let superseded_by = state
+        .pr_taken_over_by
+        .clone()
+        .or_else(|| Queue::at(home.join("queue")).superseded_by(&state.id))
+        .as_deref()
+        .map(magi::run::short_of)
+        .map(str::to_owned);
+    format!(
+        "{}{}{}{}",
+        report::superseded_notice(superseded_by.as_deref()),
+        report::liveness_notice(state, assessment.verdict),
+        report::run_with_liveness(state, Some(&assessment)),
+        report::active_seats(state, assessment.verdict)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9227,5 +9228,58 @@ command = ['sh', '-c', 'cat >/dev/null; printf "%s" "{\"duplicate\":true,\"reaso
             "prefix/suffix resolution succeeds"
         );
         assert!(!dir_unfd.exists(), "run directory is removed");
+    }
+
+    #[test]
+    fn render_show_displays_liveness_evidence_without_mutating_run_or_worker_store() {
+        magi::report::set_color(false);
+        let home = tempfile::tempdir().unwrap();
+        let mut s = RunState::new(
+            PathBuf::from("/repo"),
+            "main".into(),
+            "base".into(),
+            "inspect liveness".into(),
+            Config::default(),
+        );
+        s.driver_claimed = Some(false);
+        s.save_under(home.path()).unwrap();
+
+        let lock_path = home.path().join("runs").join(&s.id).join("driver.lock");
+        let workers_dir = home.path().join("workers");
+        assert!(!lock_path.exists());
+        assert!(!workers_dir.exists());
+
+        let dead_text = render_show(home.path(), &s);
+        assert!(dead_text.contains("liveness dead —"), "{dead_text}");
+        assert!(dead_text.contains("never claimed"), "{dead_text}");
+        assert!(dead_text.contains("[observed "), "{dead_text}");
+        assert!(!lock_path.exists(), "magi show must not create driver.lock");
+        assert!(
+            !workers_dir.exists(),
+            "magi show must not create workers directory"
+        );
+
+        // Unknown state (no driver_pid and no driver_claimed marker)
+        s.driver_claimed = None;
+        s.save_under(home.path()).unwrap();
+        let unknown_text = render_show(home.path(), &s);
+        assert!(
+            unknown_text.contains("liveness unknown —"),
+            "{unknown_text}"
+        );
+        assert!(unknown_text.contains("no driver_pid"), "{unknown_text}");
+
+        // Live state (daemon heartbeat claim)
+        let mut beat = magi::daemon::Status::new();
+        beat.current.push(magi::daemon::Current {
+            worker: None,
+            task: "20261125-000000-0708".to_owned(),
+            run: s.id.clone(),
+        });
+        magi::daemon::write_status_to(&home.path().join("daemon.json"), &beat).unwrap();
+        let live_text = render_show(home.path(), &s);
+        assert!(live_text.contains("liveness live —"), "{live_text}");
+        assert!(live_text.contains("daemon heartbeat claim"), "{live_text}");
+        assert!(!lock_path.exists());
     }
 }
