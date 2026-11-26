@@ -1767,6 +1767,10 @@ async fn after_merge_inner(
             .as_ref()
             .is_some_and(|(before, after)| before == after)
     {
+        state.event(
+            "bump",
+            "the merged change touches only the release files; not treating it as a trigger",
+        );
         progress.skip = Some(Skip {
             reason: "the merged change touches only the release files; not a trigger".to_owned(),
             action: None,
@@ -1781,11 +1785,11 @@ async fn after_merge_inner(
         && before != after
     {
         state.event(
-                "bump",
-                format!(
-                    "the merged change already moved {primary} from v{before} to v{after}; leaving the release to the repository's auto-tag"
-                ),
-            );
+            "bump",
+            format!(
+                "the merged change already moved {primary} from v{before} to v{after}; leaving the release to the repository's auto-tag"
+            ),
+        );
         progress.skip = Some(Skip {
             reason: format!(
                 "the change itself raised {primary} from v{before} to v{after}; the repository's auto-tag releases it"
@@ -2958,6 +2962,14 @@ mod tests {
                 )
                 .await
                 .unwrap();
+                assert!(
+                    state
+                        .events
+                        .iter()
+                        .any(|e| e.node == "bump" && e.message.contains("only the release files")),
+                    "{:?}",
+                    state.events
+                );
                 assert!(
                     state
                         .release_bump
@@ -5080,7 +5092,7 @@ version = \"0.45.18\"\n";
             !state
                 .events
                 .iter()
-                .any(|e| e.message.contains("only the release manifest")),
+                .any(|e| e.message.contains("only the release files")),
             "{:?}",
             state.events
         );
