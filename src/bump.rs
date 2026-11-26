@@ -1415,7 +1415,7 @@ struct MergedChange {
     files: Vec<String>,
     stat: String,
     merge: String,
-    numstat: Vec<(String, u64, u64)>,
+    numstat: Vec<(String, Option<String>, u64, u64)>,
 }
 
 #[derive(Deserialize)]
@@ -1455,7 +1455,14 @@ fn merged_change_from_pages(
     let (mut added, mut removed) = (0_u64, 0_u64);
     let mut numstat: Vec<_> = entries
         .iter()
-        .map(|f| (f.filename.clone(), f.additions, f.deletions))
+        .map(|f| {
+            (
+                f.filename.clone(),
+                f.previous_filename.clone(),
+                f.additions,
+                f.deletions,
+            )
+        })
         .collect();
     numstat.sort();
     for file in entries {
@@ -1564,14 +1571,15 @@ async fn merged_versions(
             "diff",
             "--numstat",
             "-z",
-            "--no-renames",
+            "--find-renames=50%",
             &before,
             &change.merge,
         ],
     )
     .await?;
     let mut actual = Vec::new();
-    for entry in raw.split('\0').filter(|entry| !entry.is_empty()) {
+    let mut entries = raw.split_terminator('\0');
+    while let Some(entry) = entries.next() {
         let mut fields = entry.splitn(3, '\t');
         let count = |field: Option<&str>| -> Result<u64> {
             let field = field.context("missing merged diff count")?;
@@ -1583,11 +1591,17 @@ async fn merged_versions(
         };
         let additions = count(fields.next())?;
         let deletions = count(fields.next())?;
-        let path = fields
-            .next()
-            .context("missing merged diff path")?
-            .to_owned();
-        actual.push((path, additions, deletions));
+        let path = fields.next().context("missing merged diff path")?;
+        let (path, previous) = if path.is_empty() {
+            // With -z, rename records carry two separate NUL-delimited paths.
+            let previous = entries.next().context("missing rename source")?;
+            let path = entries.next().context("missing rename destination")?;
+            anyhow::ensure!(!previous.is_empty() && !path.is_empty(), "empty rename path");
+            (path, Some(previous.to_owned()))
+        } else {
+            (path, None)
+        };
+        actual.push((path.to_owned(), previous, additions, deletions));
     }
     actual.sort();
     anyhow::ensure!(
@@ -2985,6 +2999,30 @@ mod tests {
                 assert!(store.list().is_empty());
             }
         }
+    }
+
+    #[tokio::test]
+    async fn merged_versions_accepts_rename_and_checks_both_paths() {
+        let (_dir, repo) = origin_with(&[
+            ("Cargo.toml", "[package]\nname=\"x\"\nversion=\"0.1.0\"\n"),
+            ("old.rs", "fn main() {}\n"),
+        ])
+        .await;
+        git::git(&repo, &["mv", "old.rs", "new.rs"]).await.unwrap();
+        git::git(&repo, &["commit", "-m", "Rename source"]).await.unwrap();
+        let merge = git::rev_parse(&repo, "HEAD").await.unwrap();
+        let mut evidence = parse_merged_pr_files(
+            merge,
+            1,
+            r#"[[{"filename":"new.rs","previous_filename":"old.rs","additions":0,"deletions":0}]]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            merged_versions(&repo, &evidence, "Cargo.toml").await.unwrap(),
+            ("0.1.0".to_owned(), "0.1.0".to_owned())
+        );
+        evidence.numstat[0].1 = Some("unrelated.rs".to_owned());
+        assert!(merged_versions(&repo, &evidence, "Cargo.toml").await.is_err());
     }
 
     #[test]
