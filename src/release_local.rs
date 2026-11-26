@@ -72,6 +72,8 @@ pub struct Job {
     pub running: Option<String>,
     /// Why the job stopped. Held until the owner decides.
     pub failed: Option<String>,
+    /// Owner decision that stopped this release without retrying its steps.
+    pub abandoned: Option<String>,
     /// Everything ran.
     pub finished: bool,
     /// What each step that ran said, in order.

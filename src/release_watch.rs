@@ -471,8 +471,12 @@ pub(crate) fn quiet_effect_applied(home: &Path, q: &Question) -> Result<bool> {
         return Ok(false);
     }
     let watcher = Watcher::new(Box::new(GhForge), home.to_path_buf());
-    if watcher.stored().iter().any(|st| st.applied.contains(&q.id)) {
-        return Ok(true);
+    if let Some(st) = watcher
+        .stored()
+        .iter()
+        .find(|st| st.applied.contains(&q.id))
+    {
+        return abandonment_confirmed(home, q, st);
     }
     let bytes = match std::fs::read(
         home.join("release-watch-receipts")
@@ -483,7 +487,35 @@ pub(crate) fn quiet_effect_applied(home: &Path, q: &Question) -> Result<bool> {
         Err(e) => return Err(e.into()),
     };
     let st: WatchState = serde_json::from_slice(&bytes)?;
-    Ok(st.applied.contains(&q.id))
+    Ok(st.applied.contains(&q.id) && abandonment_confirmed(home, q, &st)?)
+}
+
+fn abandonment_confirmed(home: &Path, q: &Question, st: &WatchState) -> Result<bool> {
+    if q.resolution().as_deref() != Some(LEAVE_IT) || st.job.is_none() {
+        return Ok(true);
+    }
+    let Some(run) = &st.run else {
+        return Ok(st.held_task.is_none()
+            && st
+                .job
+                .as_ref()
+                .is_some_and(|j| j.abandoned.as_deref() == Some(&q.id)));
+    };
+    let state = RunState::load_under(run, home)?;
+    if state
+        .release_bump
+        .and_then(|b| b.release)
+        .and_then(|j| j.abandoned)
+        .as_deref()
+        != Some(&q.id)
+    {
+        return Ok(false);
+    }
+    let Some(task) = &st.held_task else {
+        return Ok(true);
+    };
+    let task = crate::queue::Queue::at(home.join("queue")).get(task)?;
+    Ok(task.decision_effects.get(&q.id) == Some(&format!("decision: {LEAVE_IT}")))
 }
 
 /// Resolve a release notification through its saved watch record, never its prose.
@@ -866,6 +898,44 @@ impl Watcher {
         halt: &(dyn Fn() -> bool + Sync),
     ) {
         let stored = self.stored();
+        // Retired watches may have recorded acceptance before restoring the task.
+        if let Ok(entries) = std::fs::read_dir(self.home.join("release-watch-receipts")) {
+            for entry in entries.flatten() {
+                if halt() {
+                    return;
+                }
+                if entry.path().extension().and_then(|e| e.to_str()) != Some("json") {
+                    continue;
+                }
+                let Ok(bytes) = std::fs::read(entry.path()) else {
+                    continue;
+                };
+                let Ok(mut st) = serde_json::from_slice::<WatchState>(&bytes) else {
+                    continue;
+                };
+                if !st.ignored || st.job.is_none() {
+                    continue;
+                }
+                if let Some(pr) = pr_key(&st.url)
+                    && !self.state_path(&pr).exists()
+                {
+                    let Some(id) = entry
+                        .path()
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .map(str::to_owned)
+                    else {
+                        continue;
+                    };
+                    let Ok(_claim) =
+                        crate::task_inquiry::Outbox::at(&self.home).execution_claim(&id)
+                    else {
+                        continue;
+                    };
+                    self.abandon_local(&pr, &mut st);
+                }
+            }
+        }
         // A repo with a watch record is covered even when nothing else names it.
         let mut repos = repos.to_vec();
         for s in &stored {
@@ -919,7 +989,11 @@ impl Watcher {
             return;
         };
         let mut st = self.load(&pr);
-        let _execution = if let Some(id) = &st.question {
+        let _execution = if let Some(id) = st
+            .question
+            .as_ref()
+            .or_else(|| st.job.as_ref().and_then(|j| j.abandoned.as_ref()))
+        {
             match crate::task_inquiry::Outbox::at(&self.home).execution_claim(id) {
                 Ok(claim) => Some(claim),
                 Err(error) => {
@@ -930,7 +1004,12 @@ impl Watcher {
         } else {
             None
         };
-        st.repo = repo.to_string_lossy().into_owned();
+        if st.repo.is_empty() {
+            st.repo = repo.to_string_lossy().into_owned();
+        }
+        if self.abandon_local(&pr, &mut st) {
+            return;
+        }
         st.url = url.to_owned();
 
         let snap = match self.forge.snapshot(repo, url).await {
@@ -1193,6 +1272,145 @@ impl Watcher {
         }
     }
 
+    /// Handle an accepted failed-job abandonment entirely from durable local evidence.
+    /// A true result fences every forge and release-command path, even on failure.
+    fn abandon_local(&self, pr: &str, st: &mut WatchState) -> bool {
+        let Some(job) = st.job.as_ref() else {
+            return false;
+        };
+        if job.finished || (job.failed.is_none() && !job.interrupted()) {
+            return false;
+        }
+        let id = job.abandoned.clone().or_else(|| {
+            st.question
+                .iter()
+                .chain(st.applied.iter().rev())
+                .find_map(|id| {
+                    let q = if st.ignored && st.applied.contains(id) {
+                        self.questions().read_history(id).ok()?
+                    } else {
+                        self.questions().get_for_effects(id).ok()?
+                    };
+                    (q.node == crate::bump::NOTICE_NODE
+                        && q.seat == "release-watch"
+                        && q.resolution().as_deref() == Some(LEAVE_IT))
+                    .then(|| id.clone())
+                })
+        });
+        let Some(id) = id else { return st.ignored };
+        let result = self.apply_abandonment(pr, st, &id);
+        if let Err(e) = result {
+            tracing::warn!("release abandonment {id} remains pending: {e:#}");
+        }
+        true
+    }
+
+    fn apply_abandonment(&self, pr: &str, st: &mut WatchState, id: &str) -> Result<()> {
+        let q = self.questions().read_history(id)?;
+        anyhow::ensure!(
+            q.node == crate::bump::NOTICE_NODE
+                && q.seat == "release-watch"
+                && q.resolution().as_deref() == Some(LEAVE_IT),
+            "missing abandonment answer"
+        );
+        let answered = q
+            .answered_at
+            .ok_or_else(|| anyhow::anyhow!("missing answer time"))?;
+        if !self.state_path(pr).exists() && abandonment_confirmed(&self.home, &q, st)? {
+            return Ok(());
+        }
+        let _owner = st
+            .run
+            .as_ref()
+            .map(|run| crate::pr_head::owner_lock(&self.home, run))
+            .transpose()?;
+        if let Some(run) = &st.run {
+            let state = RunState::load_under(run, &self.home)?;
+            anyhow::ensure!(
+                state.repo.canonicalize()? == Path::new(&st.repo).canonicalize()?,
+                "release run repository mismatch"
+            );
+            anyhow::ensure!(
+                state.status == crate::run::RunStatus::Merged
+                    && state
+                        .release_bump
+                        .as_ref()
+                        .and_then(|b| b.pr_url.as_deref())
+                        == Some(st.url.as_str()),
+                "release run target mismatch"
+            );
+        }
+        let job = st.job.as_mut().expect("failed job");
+        anyhow::ensure!(job.pr_url == st.url, "release target mismatch");
+        job.abandoned = Some(id.to_owned());
+        st.ignored = true;
+        st.question = None;
+        if !st.applied.iter().any(|a| a == id) {
+            st.applied.push(id.to_owned());
+        }
+        anyhow::ensure!(self.save(pr, st), "could not persist abandonment intent");
+        anyhow::ensure!(self.record_on_run(st), "could not record abandoned release");
+        if let Some(task) = &st.held_task {
+            let queue = crate::queue::Queue::at(self.home.join("queue"));
+            let _claim = queue.claim(task)?;
+            let run = st
+                .run
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("missing release run"))?;
+            let effect = format!("decision: {LEAVE_IT}");
+            let mut confirmed = false;
+            queue.modify(task, |t| {
+                if t.decision_effects.get(id) == Some(&effect) {
+                    confirmed = true;
+                    return false;
+                }
+                if !matches!((t.repo.canonicalize(), Path::new(&st.repo).canonicalize()),
+                    (Ok(a), Ok(b)) if a == b)
+                    || t.execution_runs().last() != Some(run)
+                    || t.status != crate::queue::TaskStatus::Held
+                    || t.hold_source != Some(crate::queue::HoldSource::Machine)
+                    || !t.held_at.is_some_and(|at| at <= answered)
+                    || !t.hold_notice_cause.as_ref().is_some_and(|cause| {
+                        cause.stage == "release-failed" && cause.run.as_ref() == Some(run)
+                    })
+                    || !t.hold_reason.as_deref().is_some_and(|reason| {
+                        st.job.as_ref().is_some_and(|job| {
+                            job.failed.as_ref().is_some_and(|why| {
+                                reason
+                                    == format!("{HOLD_PREFIX}release {} failed: {why}", job.tag())
+                                    || reason
+                                        == format!(
+                                            "{HOLD_PREFIX}release {} is on hold: {why}",
+                                            job.tag()
+                                        )
+                            })
+                        })
+                    })
+                {
+                    return false;
+                }
+                t.succeed(crate::queue::CompletionContext::new(
+                    crate::queue::CompletionActor::DaemonSettle,
+                    Some(
+                        "Implementation merged; owner intentionally abandoned the failed release"
+                            .into(),
+                    ),
+                    &self.home,
+                    t,
+                ));
+                t.decision_effects.insert(id.to_owned(), effect.clone());
+                confirmed = true;
+                true
+            })?;
+            anyhow::ensure!(
+                confirmed,
+                "release hold no longer matches accepted decision"
+            );
+        }
+        self.finish(pr, st);
+        Ok(())
+    }
+
     /// The pull request is merged: create the job once, then drive it.
     async fn release_merged(
         &self,
@@ -1342,7 +1560,9 @@ impl Watcher {
             format!(
                 "release {} {}",
                 job.tag(),
-                if job.finished {
+                if job.abandoned.is_some() {
+                    "intentionally abandoned after failure"
+                } else if job.finished {
                     "finished"
                 } else if let Some(why) = &job.failed {
                     why
@@ -3036,6 +3256,73 @@ mod tests {
             Some(Link::Url {
                 url: URL.to_owned(),
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn retired_failed_release_abandonment_restores_task_without_forge() {
+        let (d, _fake, w) = rig();
+        let repo = d.path().to_path_buf();
+        let mut run = RunState::new(
+            repo.clone(),
+            "main".into(),
+            "base".into(),
+            "task".into(),
+            crate::config::Config::default(),
+        );
+        run.status = crate::run::RunStatus::Merged;
+        run.release_bump = Some(crate::run::ReleaseBump {
+            pr_url: Some(URL.into()),
+            ..Default::default()
+        });
+        run.save_under(d.path()).unwrap();
+        let queue = crate::queue::Queue::at(d.path().join("queue"));
+        let mut task = crate::queue::Task::new(
+            "task".into(),
+            "task".into(),
+            repo.clone(),
+            crate::queue::Source::Human,
+        );
+        task.runs.push(run.id.clone());
+        task.status = crate::queue::TaskStatus::Done;
+        queue.put(&mut task).unwrap();
+        let mut job = Job::new("1.0.0", URL, "commit");
+        job.failed = Some("build exited 101".into());
+        job.tag_done = true;
+        let mut st = WatchState {
+            repo: repo.to_string_lossy().into_owned(),
+            url: URL.into(),
+            run: Some(run.id.clone()),
+            job: Some(job.clone()),
+            local: true,
+            ..Default::default()
+        };
+        w.hold_task(&mut st, "release v1.0.0 failed: build exited 101");
+        w.file_job_question("o/r#7", &mut st, &job);
+        let id = st.question.take().unwrap();
+        answer(&w, &id, LEAVE_IT);
+        st.ignored = true;
+        st.applied.push(id.clone());
+        w.finish("o/r#7", &st);
+        let question = w.questions().read_history(&id).unwrap();
+        assert!(!quiet_effect_applied(d.path(), &question).unwrap());
+        w.lap(&[], 60, 1, &(|| false)).await;
+        assert!(quiet_effect_applied(d.path(), &question).unwrap());
+        let saved = queue.get(&task.id).unwrap();
+        assert_eq!(saved.status, crate::queue::TaskStatus::Done);
+        job.abandoned = Some(id);
+        assert_eq!(
+            RunState::load_under(&run.id, d.path())
+                .unwrap()
+                .release_bump
+                .unwrap()
+                .release,
+            Some(job)
+        );
+        w.lap(&[], 60, 2, &(|| false)).await;
+        assert_eq!(
+            queue.get(&task.id).unwrap().completion_history,
+            saved.completion_history
         );
     }
 }
