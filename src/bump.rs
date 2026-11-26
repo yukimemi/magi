@@ -1596,7 +1596,10 @@ async fn merged_versions(
             // With -z, rename records carry two separate NUL-delimited paths.
             let previous = entries.next().context("missing rename source")?;
             let path = entries.next().context("missing rename destination")?;
-            anyhow::ensure!(!previous.is_empty() && !path.is_empty(), "empty rename path");
+            anyhow::ensure!(
+                !previous.is_empty() && !path.is_empty(),
+                "empty rename path"
+            );
             (path, Some(previous.to_owned()))
         } else {
             (path, None)
@@ -3009,7 +3012,9 @@ mod tests {
         ])
         .await;
         git::git(&repo, &["mv", "old.rs", "new.rs"]).await.unwrap();
-        git::git(&repo, &["commit", "-m", "Rename source"]).await.unwrap();
+        git::git(&repo, &["commit", "-m", "Rename source"])
+            .await
+            .unwrap();
         let merge = git::rev_parse(&repo, "HEAD").await.unwrap();
         let mut evidence = parse_merged_pr_files(
             merge,
@@ -3018,11 +3023,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            merged_versions(&repo, &evidence, "Cargo.toml").await.unwrap(),
+            merged_versions(&repo, &evidence, "Cargo.toml")
+                .await
+                .unwrap(),
             ("0.1.0".to_owned(), "0.1.0".to_owned())
         );
         evidence.numstat[0].1 = Some("unrelated.rs".to_owned());
-        assert!(merged_versions(&repo, &evidence, "Cargo.toml").await.is_err());
+        assert!(
+            merged_versions(&repo, &evidence, "Cargo.toml")
+                .await
+                .is_err()
+        );
     }
 
     #[test]
