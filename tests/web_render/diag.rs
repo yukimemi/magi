@@ -211,15 +211,22 @@ fn descendants(root: u32, parents: &BTreeMap<u32, u32>) -> BTreeSet<u32> {
     }
 }
 
+/// Sampler signature: calls `emit` once per OS snapshot, as soon as it exists,
+/// so a slow later snapshot never discards an earlier one.
+pub type Sampler = fn(u32, &mut dyn FnMut(Value));
+
+/// Number of snapshots a complete OS observation contains.
+pub const OS_SAMPLE_COUNT: usize = 2;
+
 /// Two OS snapshots on a blocking worker; no shell, PowerShell or extra process.
-pub fn os_samples(root: u32) -> Value {
+pub fn os_samples(root: u32, emit: &mut dyn FnMut(Value)) {
     use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
     let mut system = System::new();
-    let mut samples = Vec::new();
-    for sample in 0..2 {
+    for sample in 0..OS_SAMPLE_COUNT {
         if sample != 0 {
             std::thread::sleep(Duration::from_secs(1));
         }
+        let began = std::time::Instant::now();
         system.refresh_cpu_usage();
         system.refresh_memory();
         system.refresh_processes_specifics(
@@ -230,6 +237,7 @@ pub fn os_samples(root: u32) -> Value {
                 .with_memory()
                 .with_cmd(UpdateKind::Always),
         );
+        let refresh_ms = began.elapsed().as_millis() as u64;
         let parents = system
             .processes()
             .iter()
@@ -254,13 +262,13 @@ pub fn os_samples(root: u32) -> Value {
                 name.starts_with("sh") || name.starts_with("bash")
             })
             .count();
-        samples.push(json!({"at_ms": now(), "process_count": system.processes().len(),
+        emit(json!({"at_ms": now(), "refresh_ms": refresh_ms,
+            "process_count": system.processes().len(),
             "shell_processes": shells,
             "cpu_percent": system.global_cpu_usage(), "available_memory": system.available_memory(),
             "total_memory": system.total_memory(), "load_average": [load.one, load.five, load.fifteen],
             "processes": processes}));
     }
-    json!(samples)
 }
 
 #[cfg(test)]
