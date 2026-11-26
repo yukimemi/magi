@@ -622,8 +622,8 @@ pub struct Candidate {
     /// Why this candidate is not in the running.
     #[serde(default)]
     pub failed: Option<String>,
-    /// The validated evidence summary this candidate gave for writing no change
-    /// on purpose — parsed from the strict structured JSON `NO CHANGE NEEDED:`
+    /// The validated structured declaration this candidate gave for writing no
+    /// change on purpose — the strict JSON `NO CHANGE NEEDED:`
     /// contract `prompt::implement` documents. `Some` only when
     /// [`crate::graph`]'s adoption guard accepted the claim: the CLI exited
     /// cleanly, the tree really is empty, no command in the reply was left with
@@ -632,8 +632,8 @@ pub struct Candidate {
     /// final check passed, empty `unresolved`), and verifiable command/commit/
     /// path evidence matched. A candidate that wrote nothing without valid
     /// structured evidence — including incomplete or failed investigations —
-    /// always reads `None` here, same as one written before schema 10 ever
-    /// existed.
+    /// reads `None` here. Historical prose-only evidence remains readable
+    /// for display but cannot establish a verified no-op on settlement.
     #[serde(default)]
     pub verified_noop: Option<String>,
     /// Wall-clock time for the implementation.
@@ -662,11 +662,15 @@ impl Candidate {
             && self
                 .verified_noop
                 .as_deref()
-                .is_some_and(|evidence| !evidence.trim().is_empty())
-            && matches!(
-                crate::verdict::parse_verified_noop(&self.summary),
-                Some(Ok(_))
-            )
+                .is_some_and(|evidence| {
+                    matches!(crate::verdict::parse_verified_noop(evidence), Some(Ok(_)))
+                })
+    }
+
+    /// Human-readable evidence, including historical prose-only records.
+    pub fn verified_noop_display(&self) -> Option<String> {
+        let evidence = self.verified_noop.as_deref()?;
+        Some(crate::verdict::verified_noop(evidence).unwrap_or_else(|| evidence.to_owned()))
     }
 }
 

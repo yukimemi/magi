@@ -2094,17 +2094,15 @@ fn settle_and_diagnose(
     state: &RunState,
 ) {
     let mut verdict = verdict;
-    let mut inconsistent_noop_detail: Option<String> = None;
+    let mut detail = detail;
     if verdict.status == RunStatus::VerifiedNoop && !state.all_candidates_verified_noop() {
         // Never allow an inconsistent or unsupported `VerifiedNoop` run state
         // to bypass settlement into a no-change handoff, and never rewrite the
         // historical run record on disk: settle the task as an ordinary failure.
         verdict.status = RunStatus::Failed;
-        inconsistent_noop_detail = Some(format!(
-            "inconsistent verified_noop run state (not backed by valid empty-tree evidence): {detail}"
-        ));
+        verdict.quota_hit = false;
+        detail = "no-change result lacks verified evidence";
     }
-    let detail = inconsistent_noop_detail.as_deref().unwrap_or(detail);
     let p = phrases(&state.config.graph.language);
     // Shared by normal completion and crash recovery, under the task claim.
     // No new attempt can own the task until the old driver has exited.
@@ -7106,7 +7104,7 @@ fn diagnostic(state: &RunState) -> Option<String> {
     if state.viable().is_empty() {
         for c in &state.candidates {
             if c.has_valid_verified_noop()
-                && let Some(evidence) = &c.verified_noop
+                && let Some(evidence) = c.verified_noop_display()
             {
                 parts.push(format!(
                     "candidate {} (agent-verified no-op, unconfirmed by magi): {evidence}",
@@ -9917,7 +9915,7 @@ mod tests {
         let mut state = run_state(RunStatus::VerifiedNoop);
         let summary = r#"NO CHANGE NEEDED: {"status":"already_satisfied","requirements":[{"requirement":"requested fix already landed","satisfied":true,"evidence":["c1"]}],"checks":[{"id":"c1","kind":"commit","target":"b32cfc4","method":"git merge-base --is-ancestor b32cfc4 HEAD","observed":"exit 0; b32cfc4 is on main","passed":true}],"unresolved":[]}"#;
         let mut c = candidate('A', summary, true, None);
-        c.verified_noop = crate::verdict::verified_noop(summary);
+        c.verified_noop = Some(summary.to_owned());
         state.candidates = vec![c];
         state
     }
@@ -10009,7 +10007,7 @@ mod tests {
         let verdict = Verdict {
             status: RunStatus::VerifiedNoop,
             left_pr: false,
-            quota_hit: false,
+            quota_hit: true,
             parked: false,
             no_viable_candidates: true,
         };
@@ -10020,6 +10018,10 @@ mod tests {
             "inconsistent verified_noop must retry as Failed when attempts remain"
         );
         assert_eq!(t.attempts, 1);
+        assert_eq!(
+            t.last_error.as_deref(),
+            Some("no-change result lacks verified evidence")
+        );
         assert!(t.hold_reason.is_none());
 
         // Case 2: Reclaim on an inconsistent `VerifiedNoop` state with
@@ -10044,6 +10046,18 @@ mod tests {
             "diagnostic must not mislabel an invalid claim as verified no-op: {diag}"
         );
         assert!(diag.contains("Not established"), "{diag}");
+    }
+
+    #[test]
+    fn saved_noop_declaration_is_the_evidence_not_the_display_summary() {
+        let mut state = verified_noop_run_state();
+        let summary = state.candidates[0].summary.clone();
+        state.candidates[0].summary = "Already satisfied.".to_owned();
+        assert!(state.all_candidates_verified_noop());
+
+        state.candidates[0].summary = summary;
+        state.candidates[0].verified_noop = Some("Historical prose only.".to_owned());
+        assert!(!state.all_candidates_verified_noop());
     }
 
     #[test]

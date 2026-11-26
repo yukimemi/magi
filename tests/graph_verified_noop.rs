@@ -159,6 +159,10 @@ async fn valid_evidence_backed_noop_reaches_verified_noop_and_holds_for_owner_wi
         .expect("valid no-op must retain formatted evidence");
     assert!(evidence.contains(&base), "{evidence}");
     assert!(evidence.contains("README.md"), "{evidence}");
+    assert!(matches!(
+        magi::verdict::parse_verified_noop(evidence),
+        Some(Ok(_))
+    ));
 
     let queue = Queue::at(fx.tmp.path().join("queue"));
     let mut task = Task::new(

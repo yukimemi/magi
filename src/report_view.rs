@@ -1202,7 +1202,7 @@ pub fn build_with(
                 let is_winner = state.tally.as_ref().is_some_and(|t| t.winner == c.label);
                 let (st, detail) = match (&c.failed, c.empty, &c.verified_noop) {
                     (Some(e), _, _) => ("failed", Some(e.clone())),
-                    (None, true, Some(ev)) => ("verified_noop", Some(ev.clone())),
+                    (None, true, Some(_)) => ("verified_noop", c.verified_noop_display()),
                     (None, true, None) => (
                         "no_change",
                         Some(c.summary.clone()).filter(|s| !s.trim().is_empty()),

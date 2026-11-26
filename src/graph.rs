@@ -3378,12 +3378,12 @@ impl Runner {
                     )
                     .await
                     {
-                        NoopClaimVerdict::Accepted(evidence) => {
+                        NoopClaimVerdict::Accepted => {
                             if matches!(
                                 verdict::parse_verified_noop(&sanitized_summary),
                                 Some(Ok(_))
                             ) {
-                                Some(blind::sanitize_prose(&evidence, &blind_cfg))
+                                Some(sanitized_summary.clone())
                             } else {
                                 rejected_noops.push((
                                     label,
@@ -11058,7 +11058,7 @@ enum NoopClaimVerdict {
     /// Reply did not open with `NO CHANGE NEEDED:`.
     Absent,
     /// Structured evidence passed schema, CLI command, and repository checks.
-    Accepted(String),
+    Accepted,
     /// Reply opened with `NO CHANGE NEEDED:` but was disqualified with a
     /// concrete reason.
     Rejected(String),
@@ -11259,7 +11259,7 @@ async fn verified_noop_claim_in_worktree(
     if let Err(reason) = verify_noop_repo_evidence(&report, worktree, base_commit).await {
         return NoopClaimVerdict::Rejected(reason);
     }
-    NoopClaimVerdict::Accepted(report.summary_text())
+    NoopClaimVerdict::Accepted
 }
 
 /// Whether a `NO CHANGE NEEDED` marker in an implementer's reply should be
@@ -25474,7 +25474,7 @@ esac
         );
         assert!(matches!(
             verified_noop_claim_in_worktree(true, &[], &valid, &repo, &base).await,
-            NoopClaimVerdict::Accepted(_)
+            NoopClaimVerdict::Accepted
         ));
 
         // Non-existent commit SHA -> Rejected.
@@ -25507,10 +25507,7 @@ esac
             .enumerate()
             .map(|(i, &(empty, verified))| {
                 let (summary, verified_noop) = match verified {
-                    Some(raw) => (
-                        raw.to_owned(),
-                        verdict::verified_noop(raw).or_else(|| Some(raw.to_owned())),
-                    ),
+                    Some(raw) => (raw.to_owned(), Some(raw.to_owned())),
                     None => (String::new(), None),
                 };
                 Candidate {
