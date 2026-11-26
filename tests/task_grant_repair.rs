@@ -319,6 +319,30 @@ async fn a_later_hold_or_foreign_reopen_claim_keeps_the_hold_even_with_the_same_
 }
 
 common::e2e! {
+async fn legacy_reopen_without_hold_identity_cannot_authorize_release() {
+    let (_fx, task, _runner, mut request) = stopped(true).await;
+    reopened(&mut request, &task);
+    let queue = Queue::open();
+    let path = queue.path_of(&task.id);
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    record.as_object_mut().unwrap().remove("reopen_hold");
+    let reopened_at = queue.get(&task.id).unwrap().completion_history.last().unwrap().at;
+    record["held_at"] = serde_json::json!(reopened_at);
+    // A later same-reason hold preserves held_at but stamps a new decision.
+    record["operator_decided_at"] =
+        serde_json::json!(reopened_at + jiff::SignedDuration::from_secs(1));
+    std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+    refused(&request, "not the unchanged hold");
+    let held = queue.get(&task.id).unwrap();
+    assert_eq!(held.status, TaskStatus::Held);
+    assert!(held.repair_grants.is_empty());
+    assert!(held.resume_override.is_none());
+    assert!(RunState::load(&request.run).unwrap().repair_grants.is_empty());
+}
+}
+
+common::e2e! {
 async fn automatic_budget_hold_admits_only_an_explicit_same_run_repair() {
     let mut fx = fixture(home_lock().await, Judges::Unanimous, true);
     fx.config.graph.implementers = 1;

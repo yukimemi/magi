@@ -85,6 +85,9 @@ reason); and every ordinary check passes (budget exhausted, head and pass,
 no live driver, no open question or unapplied owner effect, no other grant).
 Abandoned questions are not waiting and do not block. Other manual holds are never
 ignored. A retry with the same request ID returns the original receipt.
+Legacy reopened tasks without a persisted reopen-hold identity are refused:
+matching reason and timestamps cannot prove that no later manual hold replaced
+the reopen hold. Do not release such a task merely to bypass this check.
 
 The task claim, run owner lock, driver execution lease and worktree output
 leases exclude concurrent drivers and surviving tools. Live or unknown driver

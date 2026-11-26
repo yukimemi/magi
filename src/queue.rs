@@ -1874,6 +1874,7 @@ impl Task {
     fn note_held(&mut self) {
         self.stamp_schema();
         self.recovery_budget_hold = None;
+        self.reopen_hold = None;
         let continuing = self.status == TaskStatus::Held
             || (self.status == TaskStatus::Blocked
                 && (self.blocked_from == Some(TaskStatus::Held)
@@ -2784,9 +2785,8 @@ impl Task {
     }
 
     /// Whether this task is still held by exactly the manual hold that reopen
-    /// `occurrence` created for `run`: no later hold, owner decision, dependency
-    /// or continuation has replaced it. Records written before the identity was
-    /// stored are matched on the audit event, reason and a 2 s timing window.
+    /// `occurrence` created for `run`. Legacy records without the hold identity
+    /// cannot distinguish a reopen from a subsequent manual hold.
     pub(crate) fn held_by_reopen(&self, occurrence: &str, run: &str) -> bool {
         let Some(event) = self.completion_history.last() else {
             return false;
@@ -2813,12 +2813,7 @@ impl Task {
                     && hold.held_at == held_at
                     && hold.decision == Some(decided)
             }
-            None => {
-                let window = jiff::SignedDuration::from_secs(2);
-                [held_at, decided]
-                    .iter()
-                    .all(|t| *t >= event.at && t.duration_since(event.at) <= window)
-            }
+            None => false,
         }
     }
 
