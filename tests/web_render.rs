@@ -581,7 +581,11 @@ async fn pages_render_with_visible_titles_and_no_console_errors() {
                 for st in &states {
                     let id = st["id"].as_str().unwrap_or("");
                     let label = st["label"].as_str().unwrap_or("");
-                    let want = if id == talk_ids[1] { "Needs owner" } else { "Idle" };
+                    let want = if id == talk_ids[1] {
+                        "Needs owner"
+                    } else {
+                        "Idle"
+                    };
                     if !label.starts_with(want) {
                         failures.push(format!("{tag}: {id} status {label:?}, expected {want}"));
                     }
