@@ -495,7 +495,9 @@ pub fn implement_in(
             \"continuing once it completes\" is never the final line of this \
             reply.\n\n\
          # Reply format\n\n\
-         End your reply with, exactly:\n\n\
+         End your reply with `## SUMMARY` following exactly one of these three \
+         cases:\n\n\
+         1. **Changes made**:\n\n\
          ## SUMMARY\n\
          TITLE: type(scope): one-line description of the change you made\n\
          - background: why the change is needed\n\
@@ -508,14 +510,30 @@ pub fn implement_in(
          pull request title, so describe the change itself in a conventional-\
          commit style (`fix(web): …`) and keep the `type(scope):` prefix in \
          English. Do not write it for a NO CHANGE NEEDED reply.\n\n\
-         If, after investigating, you conclude the task's request is already \
-         satisfied elsewhere and no change belongs in this worktree, write no \
-         bullets. Instead start SUMMARY with a line reading exactly \
-         `NO CHANGE NEEDED:` followed by the evidence you verified it with — \
-         the commit SHA(s) you checked, the existing test name(s) that already \
-         cover it, the exact command you ran and its output, or the path you \
-         read. An empty or unsupported claim reads as an ordinary candidate \
-         that wrote nothing, not a verified one.\n\n{}{}{}",
+         2. **Verified no change needed** — ONLY when you finished verifying \
+         every requirement, confirmed the task's request is already satisfied \
+         elsewhere with concrete positive evidence, left nothing unresolved, \
+         and no change belongs in this worktree. Write no `TITLE:` and no \
+         bullets. Start `## SUMMARY` with `NO CHANGE NEEDED:` followed by a \
+         single strict JSON object (inline or inside one ```json``` fence) with \
+         exact keys:\n\n\
+         ```json\n\
+         {{\"status\":\"already_satisfied\",\"requirements\":[{{\"requirement\":\"...\",\"satisfied\":true,\"evidence\":[\"c1\"]}}],\"checks\":[{{\"id\":\"c1\",\"kind\":\"commit\",\"target\":\"b32cfc4\",\"method\":\"git merge-base --is-ancestor b32cfc4 HEAD\",\"observed\":\"exit 0; commit is on base and contains the fix\",\"passed\":true}}],\"unresolved\":[]}}\n\
+         ```\n\n\
+         Schema requirements for `NO CHANGE NEEDED:`:\n\
+         - `status`: `\"already_satisfied\"` (only `\"already_satisfied\"` qualifies; `\"incomplete\"` or `\"failed\"` is rejected as an unfinished run).\n\
+         - `requirements`: non-empty list; every requirement must have `satisfied: true` and cite passing check id(s) in `evidence`.\n\
+         - `checks`: non-empty list with unique `id`, `kind` (`\"commit\"` | `\"test\"` | `\"command\"` | `\"path\"`), concrete `target`, `method`, `observed`, and `passed`; the final check must have `passed: true`. Commit targets must be 7-40 hex SHAs on base; path targets must be existing repository-relative paths.\n\
+         - `unresolved`: must be `[]`.\n\n\
+         3. **Incomplete or failed investigation** — if you hit a blocker, \
+         could not complete verification or reproduction checks, or anything \
+         remains unresolved, do NOT claim `NO CHANGE NEEDED:` as \
+         `already_satisfied`. Write an ordinary `## SUMMARY` stating what was \
+         checked and what remained unresolved (or emit `status: \"incomplete\"` \
+         / `\"failed\"` with the open items in `unresolved`). Any empty, \
+         prose-only, legacy, incomplete, contradictory, or unsupported \
+         no-change claim is treated as an ordinary unsuccessful implementation, \
+         never a verified no-op.\n\n{}{}{}",
         ask_the_owner(language),
         lang(language),
         github_rule(language, github_language)
@@ -3640,6 +3658,9 @@ mod tests {
         let p = implement("do it", "/tmp/wt", "en", None, &[]);
         assert!(p.contains("NO CHANGE NEEDED:"), "{p}");
         assert!(p.contains("already satisfied elsewhere"), "{p}");
+        assert!(p.contains("\"status\":\"already_satisfied\""), "{p}");
+        assert!(p.contains("\"unresolved\":[]"), "{p}");
+        assert!(p.contains("Incomplete or failed investigation"), "{p}");
     }
 
     #[test]

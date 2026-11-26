@@ -622,14 +622,18 @@ pub struct Candidate {
     /// Why this candidate is not in the running.
     #[serde(default)]
     pub failed: Option<String>,
-    /// The evidence this candidate gave for writing no change on purpose —
-    /// the `NO CHANGE NEEDED:` marker `prompt::implement`'s reply format
-    /// documents, verbatim. `Some` only when [`crate::graph`]'s adoption
-    /// guard accepted the claim: the CLI exited cleanly, the tree really is
-    /// empty, no command in the reply was left with an unconfirmed exit
-    /// status, and the evidence itself is non-empty. A candidate that wrote
-    /// nothing and said nothing about why — the ordinary empty loss — always
-    /// reads `None` here, same as one written before schema 10 ever existed.
+    /// The validated evidence summary this candidate gave for writing no change
+    /// on purpose — parsed from the strict structured JSON `NO CHANGE NEEDED:`
+    /// contract `prompt::implement` documents. `Some` only when
+    /// [`crate::graph`]'s adoption guard accepted the claim: the CLI exited
+    /// cleanly, the tree really is empty, no command in the reply was left with
+    /// an unconfirmed exit status, the structured report passed validation
+    /// (`already_satisfied`, all requirements satisfied by passing checks,
+    /// final check passed, empty `unresolved`), and verifiable command/commit/
+    /// path evidence matched. A candidate that wrote nothing without valid
+    /// structured evidence — including incomplete or failed investigations —
+    /// always reads `None` here, same as one written before schema 10 ever
+    /// existed.
     #[serde(default)]
     pub verified_noop: Option<String>,
     /// Wall-clock time for the implementation.
@@ -644,6 +648,25 @@ impl Candidate {
     /// Can this candidate be judged?
     pub fn viable(&self) -> bool {
         self.failed.is_none() && !self.empty
+    }
+
+    /// Whether this candidate carries a consistent, non-failed, empty-tree
+    /// verified no-op claim backed by a valid structured `NO CHANGE NEEDED:`
+    /// summary.
+    pub fn has_valid_verified_noop(&self) -> bool {
+        !self.folded
+            && self.empty
+            && self.commits == 0
+            && self.files == 0
+            && self.failed.is_none()
+            && self
+                .verified_noop
+                .as_deref()
+                .is_some_and(|evidence| !evidence.trim().is_empty())
+            && matches!(
+                crate::verdict::parse_verified_noop(&self.summary),
+                Some(Ok(_))
+            )
     }
 }
 
@@ -4044,7 +4067,8 @@ impl RunState {
         self.candidates.iter().filter(|c| c.viable()).collect()
     }
 
-    /// Did every candidate write nothing, and every one of them back it with
+    /// Did every candidate write nothing, have no failure or pending
+    /// preservation/interruption, and back its claim with valid structured
     /// evidence [`crate::graph`]'s adoption guard accepted?
     ///
     /// All-or-nothing on purpose: one candidate declaring `NO CHANGE NEEDED`
@@ -4055,10 +4079,12 @@ impl RunState {
     /// never reaches the caller that asks this.
     pub fn all_candidates_verified_noop(&self) -> bool {
         !self.candidates.is_empty()
+            && self.candidate_preservation.is_empty()
+            && self.interrupted_implementations.is_empty()
             && self
                 .candidates
                 .iter()
-                .all(|c| c.empty && c.verified_noop.is_some())
+                .all(Candidate::has_valid_verified_noop)
     }
 
     /// Findings still open when the review loop stopped trying: the last
