@@ -528,10 +528,45 @@ fn abandonment_confirmed(home: &Path, q: &Question, st: &WatchState) -> Result<b
         return Ok(false);
     }
     let Some(task) = &st.held_task else {
-        return Ok(true);
+        return Ok(recover_release_hold(home, st)?.is_none());
     };
     let task = crate::queue::Queue::at(home.join("queue")).get(task)?;
     Ok(task.decision_effects.get(&q.id) == Some(&format!("decision: {LEAVE_IT}")))
+}
+
+fn owns_release_hold(st: &WatchState, t: &crate::queue::Task) -> bool {
+    st.run.as_ref().is_some_and(|run| {
+        t.execution_runs().last() == Some(run)
+            && t.status == crate::queue::TaskStatus::Held
+            && t.hold_source == Some(crate::queue::HoldSource::Machine)
+            && t.hold_notice_cause.as_ref().is_some_and(|cause| {
+                cause.stage == "release-failed" && cause.run.as_ref() == Some(run)
+            })
+            && t.hold_reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with(HOLD_PREFIX))
+    })
+}
+
+fn recover_release_hold(home: &Path, st: &WatchState) -> Result<Option<String>> {
+    if st.run.is_none() {
+        return Ok(None);
+    }
+    let queue = crate::queue::Queue::at(home.join("queue"));
+    let mut matching = queue
+        .list()
+        .into_iter()
+        .filter(|t| owns_release_hold(st, t));
+    let id = matching.next().map(|t| t.id);
+    anyhow::ensure!(
+        matching.next().is_none(),
+        "ambiguous release hold ownership"
+    );
+    anyhow::ensure!(
+        id.is_some() || queue.unreadable().is_empty(),
+        "unreadable queue may contain the release hold"
+    );
+    Ok(id)
 }
 
 /// Resolve a release notification through its saved watch record, never its prose.
@@ -1368,15 +1403,15 @@ impl Watcher {
         if !st.applied.iter().any(|a| a == id) {
             st.applied.push(id.to_owned());
         }
+        if st.held_task.is_none() {
+            st.held_task = recover_release_hold(&self.home, st)?;
+        }
         anyhow::ensure!(self.save(pr, st), "could not persist abandonment intent");
         anyhow::ensure!(self.record_on_run(st), "could not record abandoned release");
         if let Some(task) = &st.held_task {
             let queue = crate::queue::Queue::at(self.home.join("queue"));
             let _claim = queue.claim(task)?;
-            let run = st
-                .run
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("missing release run"))?;
+            anyhow::ensure!(st.run.is_some(), "missing release run");
             let effect = format!("decision: {LEAVE_IT}");
             let mut confirmed = false;
             queue.modify(task, |t| {
@@ -1386,24 +1421,17 @@ impl Watcher {
                 }
                 if !matches!((t.repo.canonicalize(), Path::new(&st.repo).canonicalize()),
                     (Ok(a), Ok(b)) if a == b)
-                    || t.execution_runs().last() != Some(run)
-                    || t.status != crate::queue::TaskStatus::Held
-                    || t.hold_source != Some(crate::queue::HoldSource::Machine)
+                    || !owns_release_hold(st, t)
                     || !t.held_at.is_some_and(|at| at <= answered)
-                    || !t.hold_notice_cause.as_ref().is_some_and(|cause| {
-                        cause.stage == "release-failed" && cause.run.as_ref() == Some(run)
-                    })
-                    || !t.hold_reason.as_deref().is_some_and(|reason| {
-                        st.job.as_ref().is_some_and(|job| {
-                            job.failed.as_ref().is_some_and(|why| {
-                                reason
-                                    == format!("{HOLD_PREFIX}release {} failed: {why}", job.tag())
-                                    || reason
-                                        == format!(
-                                            "{HOLD_PREFIX}release {} is on hold: {why}",
-                                            job.tag()
-                                        )
-                            })
+                    || !st.job.as_ref().is_some_and(|job| {
+                        t.hold_reason.as_deref().is_some_and(|reason| {
+                            reason.starts_with(&format!(
+                                "{HOLD_PREFIX}release {} failed: ",
+                                job.tag()
+                            )) || reason.starts_with(&format!(
+                                "{HOLD_PREFIX}release {} is on hold: ",
+                                job.tag()
+                            ))
                         })
                     })
                 {
@@ -1611,9 +1639,20 @@ impl Watcher {
             return;
         };
         let q = crate::queue::Queue::at(self.home.join("queue"));
+        match recover_release_hold(&self.home, st) {
+            Ok(Some(id)) => {
+                st.held_task = Some(id);
+                return;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!("could not recover release hold for {run}: {e:#}");
+                return;
+            }
+        }
         for mut t in q.list() {
-            if t.runs.contains(&run) {
-                if t.status != crate::queue::TaskStatus::Held {
+            if t.execution_runs().last() == Some(&run) {
+                if t.status == crate::queue::TaskStatus::Done {
                     t.notice_cause("release-failed", Some(&run), None);
                     t.hold_machine(Some(format!("{HOLD_PREFIX}{reason}")));
                     match q.put(&mut t) {
@@ -2499,17 +2538,30 @@ mod tests {
             let talks = Talks::at(home.join("talks"));
             let chat = talk::begin(&talks, &config, repo.clone(), Some("test")).unwrap();
             let queue = Queue::at(home.join("queue"));
+            let mut run = RunState::new(
+                repo.clone(),
+                "main".into(),
+                "base".into(),
+                "release".into(),
+                config.clone(),
+            );
+            run.status = crate::run::RunStatus::Merged;
+            run.release_bump = Some(crate::run::ReleaseBump {
+                pr_url: Some(URL.into()),
+                ..Default::default()
+            });
+            run.save_under(home).unwrap();
             let mut task = Task::new(
                 "release".into(),
                 "release".into(),
                 repo.clone(),
                 Source::Human,
             );
-            task.runs.push("run1".into());
+            task.runs.push(run.id.clone());
             task.origin_chat = Some(chat.id.clone());
             task.status = crate::queue::TaskStatus::Done;
             queue.put(&mut task).unwrap();
-            register(home, &repo, URL, "run1");
+            register(home, &repo, URL, &run.id);
             *fake.local.lock().unwrap() = true;
             *fake.snap.lock().unwrap() = Some(snap(
                 if choice == HOLD {
@@ -2547,15 +2599,19 @@ mod tests {
             );
             w.watch(&repo, URL, 60, 2, &|| false).await;
             let st = w.load("o/r#7");
-            assert!(st.applied.contains(&q.id));
+            assert!(quiet_effect_applied(home, &questions.read_history(&q.id).unwrap()).unwrap());
             if choice == HOLD {
                 assert_eq!(st.held_head.as_deref(), Some("h1"));
             } else {
-                assert!(st.ignored);
+                assert!(!w.state_path("o/r#7").exists());
+                assert_eq!(
+                    queue.get(&task.id).unwrap().status,
+                    crate::queue::TaskStatus::Done
+                );
             }
             for now in [3, 4] {
                 let restarted = Watcher::new(Box::new(fake.clone()), home.into());
-                restarted.watch(&repo, URL, 60, now, &|| false).await;
+                restarted.lap(&[], 60, now, &|| false).await;
                 crate::task_chat::sweep(&Queue::at(home.join("queue")), &talks, &questions, home);
                 assert_eq!(
                     Outbox::at(home)
@@ -3317,7 +3373,13 @@ mod tests {
             local: true,
             ..Default::default()
         };
-        w.hold_task(&mut st, "release v1.0.0 failed: build exited 101");
+        // The retry failed differently, but the original machine hold is still ours.
+        w.hold_task(&mut st, "release v1.0.0 failed: original failure");
+        // Simulate interruption between the queue write and watch persistence.
+        st.held_task = None;
+        w.hold_task(&mut st, "release v1.0.0 is on hold: build exited 101");
+        assert_eq!(st.held_task.as_deref(), Some(task.id.as_str()));
+        st.held_task = None;
         w.file_job_question("o/r#7", &mut st, &job);
         let id = st.question.take().unwrap();
         answer(&w, &id, LEAVE_IT);
