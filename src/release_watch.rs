@@ -144,6 +144,24 @@ impl WatchState {
             || self.held_head.is_some()
             || self.job.is_some()
     }
+
+    fn legacy_abandonment_id<'a>(&'a self, questions: &Questions) -> Option<&'a str> {
+        if !self.ignored || self.job.is_none() {
+            return None;
+        }
+        self.job
+            .as_ref()
+            .and_then(|job| job.abandoned.as_deref())
+            .or_else(|| {
+                self.applied.iter().rev().find_map(|id| {
+                    let q = questions.read_history(id).ok()?;
+                    (q.node == crate::bump::NOTICE_NODE
+                        && q.seat == "release-watch"
+                        && q.resolution().as_deref() == Some(LEAVE_IT))
+                    .then_some(id.as_str())
+                })
+            })
+    }
 }
 
 pub(crate) fn is_failed(v: Verdict) -> bool {
@@ -495,11 +513,9 @@ fn abandonment_confirmed(home: &Path, q: &Question, st: &WatchState) -> Result<b
         return Ok(true);
     }
     let Some(run) = &st.run else {
-        return Ok(st.held_task.is_none()
-            && st
-                .job
-                .as_ref()
-                .is_some_and(|j| j.abandoned.as_deref() == Some(&q.id)));
+        // A standalone watch has no task or run effect to acknowledge.
+        // Legacy ignored receipts already prove the entire local effect.
+        return Ok(st.held_task.is_none() && st.ignored);
     };
     let state = RunState::load_under(run, home)?;
     if state
@@ -927,6 +943,9 @@ impl Watcher {
                     else {
                         continue;
                     };
+                    if st.legacy_abandonment_id(&self.questions()) != Some(id.as_str()) {
+                        continue;
+                    }
                     let Ok(_claim) =
                         crate::task_inquiry::Outbox::at(&self.home).execution_claim(&id)
                     else {
@@ -991,8 +1010,9 @@ impl Watcher {
         let mut st = self.load(&pr);
         let _execution = if let Some(id) = st
             .question
-            .as_ref()
-            .or_else(|| st.job.as_ref().and_then(|j| j.abandoned.as_ref()))
+            .as_deref()
+            .or_else(|| st.job.as_ref().and_then(|j| j.abandoned.as_deref()))
+            .or_else(|| st.legacy_abandonment_id(&self.questions()))
         {
             match crate::task_inquiry::Outbox::at(&self.home).execution_claim(id) {
                 Ok(claim) => Some(claim),
@@ -1281,23 +1301,23 @@ impl Watcher {
         if job.finished || (job.failed.is_none() && !job.interrupted()) {
             return false;
         }
-        let id = job.abandoned.clone().or_else(|| {
-            st.question
-                .iter()
-                .chain(st.applied.iter().rev())
-                .find_map(|id| {
-                    let q = if st.ignored && st.applied.contains(id) {
-                        self.questions().read_history(id).ok()?
-                    } else {
-                        self.questions().get_for_effects(id).ok()?
-                    };
-                    (q.node == crate::bump::NOTICE_NODE
-                        && q.seat == "release-watch"
-                        && q.resolution().as_deref() == Some(LEAVE_IT))
-                    .then(|| id.clone())
-                })
-        });
+        let id = st
+            .question
+            .as_deref()
+            .or(job.abandoned.as_deref())
+            .or_else(|| st.legacy_abandonment_id(&self.questions()));
         let Some(id) = id else { return st.ignored };
+        if !st.ignored
+            && job.abandoned.is_none()
+            && !self.questions().get_for_effects(id).is_ok_and(|q| {
+                q.node == crate::bump::NOTICE_NODE
+                    && q.seat == "release-watch"
+                    && q.resolution().as_deref() == Some(LEAVE_IT)
+            })
+        {
+            return false;
+        }
+        let id = id.to_owned();
         let result = self.apply_abandonment(pr, st, &id);
         if let Err(e) = result {
             tracing::warn!("release abandonment {id} remains pending: {e:#}");
@@ -3303,6 +3323,19 @@ mod tests {
         answer(&w, &id, LEAVE_IT);
         st.ignored = true;
         st.applied.push(id.clone());
+        // A legacy live watch must wait for the exact decision claim, even
+        // though its question was cleared by the previous watcher.
+        assert!(w.save("o/r#7", &st));
+        let claim = crate::task_inquiry::Outbox::at(d.path())
+            .execution_claim(&id)
+            .unwrap();
+        w.watch(&repo, URL, 60, 1, &(|| false)).await;
+        assert!(w.state_path("o/r#7").exists());
+        assert_eq!(
+            queue.get(&task.id).unwrap().status,
+            crate::queue::TaskStatus::Held
+        );
+        drop(claim);
         w.finish("o/r#7", &st);
         let question = w.questions().read_history(&id).unwrap();
         assert!(!quiet_effect_applied(d.path(), &question).unwrap());
@@ -3324,5 +3357,31 @@ mod tests {
             queue.get(&task.id).unwrap().completion_history,
             saved.completion_history
         );
+    }
+
+    #[tokio::test]
+    async fn retired_standalone_abandonment_receipt_is_terminal() {
+        let (d, _fake, w) = rig();
+        let mut job = Job::new("1.0.0", URL, "commit");
+        job.failed = Some("build exited 101".into());
+        let mut st = WatchState {
+            url: URL.into(),
+            job: Some(job.clone()),
+            local: true,
+            ..Default::default()
+        };
+        w.file_job_question("o/r#7", &mut st, &job);
+        let id = st.question.take().unwrap();
+        answer(&w, &id, LEAVE_IT);
+        st.ignored = true;
+        st.applied.push(id.clone());
+        w.finish("o/r#7", &st);
+        let q = w.questions().read_history(&id).unwrap();
+        assert!(quiet_effect_applied(d.path(), &q).unwrap());
+        for now in [1, 2] {
+            w.lap(&[], 60, now, &(|| false)).await;
+            assert!(!w.state_path("o/r#7").exists());
+            assert!(quiet_effect_applied(d.path(), &q).unwrap());
+        }
     }
 }
