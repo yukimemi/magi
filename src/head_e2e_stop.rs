@@ -194,17 +194,12 @@ pub fn conclusive(state: &RunState) -> Option<Stop> {
         return None;
     }
 
+    // Legacy records lack the verification base. Use the run's starting base,
+    // not the mutable synchronization tip, to keep their stop identity stable.
     let base = e2e
         .base_commit
         .as_deref()
         .filter(|s| !s.is_empty())
-        .or_else(|| {
-            state
-                .base_sync
-                .as_ref()
-                .map(|s| s.tip.as_str())
-                .filter(|s| !s.is_empty())
-        })
         .unwrap_or(&state.base_commit)
         .to_owned();
     let generation = e2e.generation.unwrap_or(state.verification_history.len());
@@ -861,6 +856,60 @@ mod tests {
         let mut diff_out = s1.clone();
         diff_out.head_e2e.as_mut().unwrap().outcomes[0].output_tail = "different failure".into();
         assert_ne!(conclusive(&diff_out).unwrap().id, stop1.id);
+    }
+
+    #[test]
+    fn legacy_stop_identity_survives_base_sync_without_new_verification() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (repo, wt, base, head) = init_repo_with_origin(tmp.path());
+        let mut state = sample_blocked_state(&repo, &wt, &base, &head);
+        let task = Task::new(
+            "t".into(),
+            "fix typography".into(),
+            repo.clone(),
+            Source::Human,
+        );
+        state.head_e2e.as_mut().unwrap().base_commit = None;
+        let before = conclusive(&state).unwrap();
+        git_sync(&repo, &["update-ref", "refs/remotes/origin/main", &head]);
+        assert!(matches!(
+            inspect_facts(&task, &state, &before),
+            FactCheck::Changed(_)
+        ));
+        state.base_sync = Some(crate::run::BaseSync {
+            tip: head.clone(),
+            behind: 0,
+            attempts: 1,
+            conflict: None,
+            already_in: None,
+        });
+        let after = conclusive(&state).unwrap();
+        assert_eq!(before.id, after.id);
+        assert_eq!(after.base, base);
+        assert_eq!(inspect_facts(&task, &state, &after), FactCheck::Unchanged);
+
+        state.head_e2e.as_mut().unwrap().base_commit = Some(String::new());
+        assert_eq!(conclusive(&state).unwrap().id, before.id);
+
+        let mut different_base = state.clone();
+        different_base.base_commit = head.clone();
+        assert_ne!(conclusive(&different_base).unwrap().id, before.id);
+
+        let mut different_head = state.clone();
+        different_head.head_e2e.as_mut().unwrap().head = base.clone();
+        assert_ne!(conclusive(&different_head).unwrap().id, before.id);
+
+        let mut different_failure = state.clone();
+        different_failure.head_e2e.as_mut().unwrap().outcomes[0].output_tail =
+            "another failure".into();
+        assert_ne!(conclusive(&different_failure).unwrap().id, before.id);
+
+        state.head_e2e.as_mut().unwrap().base_commit = Some(head);
+        let recorded = conclusive(&state).unwrap();
+        assert_ne!(recorded.id, before.id);
+        state.base_commit = "another initial base".into();
+        state.base_sync.as_mut().unwrap().tip = base;
+        assert_eq!(conclusive(&state).unwrap().id, recorded.id);
     }
 
     #[test]
