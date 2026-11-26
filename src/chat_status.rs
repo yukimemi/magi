@@ -260,14 +260,36 @@ impl Inventory {
             {
                 continue;
             }
-            let task = tasks
+            let Some(task) = tasks
                 .iter()
-                .find(|t| t.id == q.run || t.runs.iter().any(|r| *r == q.run));
-            let task = task.filter(|t| !t.stale_question(q));
-            let Some(chat) = task.and_then(chat_of) else {
+                .find(|t| t.execution_runs().last() == Some(&q.run))
+            else {
                 continue;
             };
-            let task_id = task.map(|t| t.id.clone()).unwrap_or_default();
+            if task.stale_question(q) {
+                continue;
+            }
+            let Some(chat) = chat_of(task) else {
+                continue;
+            };
+            match crate::run::RunState::load_under(&q.run, home) {
+                Ok(run)
+                    if task.assignment_accepts(&run)
+                        && run.status == crate::run::RunStatus::Landing
+                        && !run.released()
+                        && run.retired_to.is_none()
+                        && !run.merge_decision.as_ref().is_some_and(|d| d.closed)
+                        && run
+                            .land_approval
+                            .as_ref()
+                            .is_some_and(|a| a.question == q.id) => {}
+                Ok(_) => continue,
+                Err(_) => {
+                    inv.mark_unreadable();
+                    continue;
+                }
+            }
+            let task_id = task.id.clone();
             inv.evidence(chat).owner.push(Item {
                 reason: "merge approval".into(),
                 link: Some(Link {
@@ -321,10 +343,10 @@ impl Inventory {
                 TaskStatus::Held if task.operator_held() => ev.owner.push(reason("on hold")),
                 TaskStatus::Held
                     if task.has_disk_capacity_cause()
-                        || task.hold_reason.as_deref().is_some_and(|r| {
-                            r.starts_with(crate::cache::RESOURCE_HOLD)
-                                || r.starts_with("[release] ")
-                        }) =>
+                        || task
+                            .hold_reason
+                            .as_deref()
+                            .is_some_and(|r| r.starts_with(crate::cache::RESOURCE_HOLD)) =>
                 {
                     ev.waiting.push(reason("waiting for resources"))
                 }
@@ -595,6 +617,55 @@ mod tests {
             inv.status_of("running", true, Goals::default(), false).kind,
             Kind::NeedsAttention
         );
+    }
+
+    #[test]
+    fn failed_release_is_attention_not_automatic_wait() {
+        let home = tempfile::TempDir::new().unwrap();
+        let mut t = task("chat", "/repo", TaskStatus::Queued);
+        t.hold_machine(Some("[release] command failed".into()));
+        let inv = Inventory::collect(home.path(), &[t], &[]);
+        assert_eq!(
+            inv.status_of("chat", true, Goals::default(), false).kind,
+            Kind::NeedsAttention
+        );
+    }
+
+    #[test]
+    fn only_current_landing_approval_counts() {
+        let home = tempfile::TempDir::new().unwrap();
+        let mut t = task("chat", "/repo", TaskStatus::Parked);
+        let mut run = crate::run::RunState::new(
+            t.repo.clone(),
+            "main".into(),
+            "base".into(),
+            "task".into(),
+            crate::config::Config::default(),
+        );
+        run.status = crate::run::RunStatus::Landing;
+        t.runs.push(run.id.clone());
+        let question = |summary: &str| {
+            Question::new(
+                run.id.clone(),
+                crate::land::APPROVAL_NODE.into(),
+                "approval".into(),
+                summary.into(),
+                String::new(),
+                vec!["merge".into()],
+            )
+        };
+        let mut old = question("old");
+        old.id = "old".into();
+        let mut current = question("current");
+        current.id = "current".into();
+        run.land_approval = Some(crate::run::LandApproval {
+            question: current.id.clone(),
+            head: "head".into(),
+        });
+        run.save_under(home.path()).unwrap();
+        let inv = Inventory::collect(home.path(), &[t], &[old, current]);
+        let status = inv.status_of("chat", true, Goals::default(), false);
+        assert_eq!((status.kind, status.owner_count), (Kind::NeedsOwner, 1));
     }
 
     #[test]

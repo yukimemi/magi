@@ -439,6 +439,72 @@ fn file_identity(path: &FsPath) -> std::io::Result<FileIdentity> {
     })
 }
 
+// Legacy goal layouts place goals after the transcript. Cache their projection
+// using actual file identity and change time, not just size and write time.
+#[derive(Debug, PartialEq, Eq)]
+struct GoalIdentity {
+    file: FileIdentity,
+    #[cfg(windows)]
+    windows: (u64, [u8; 16], i64),
+}
+
+fn goal_identity(path: &FsPath) -> std::io::Result<GoalIdentity> {
+    #[cfg(windows)]
+    fn windows_identity(path: &FsPath) -> std::io::Result<(u64, [u8; 16], i64)> {
+        use std::os::windows::io::AsRawHandle;
+        #[repr(C)]
+        struct FileId {
+            volume: u64,
+            id: [u8; 16],
+        }
+        #[repr(C)]
+        struct Basic {
+            created: i64,
+            accessed: i64,
+            written: i64,
+            changed: i64,
+            attributes: u32,
+        }
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetFileInformationByHandleEx(
+                file: *mut std::ffi::c_void,
+                class: i32,
+                output: *mut std::ffi::c_void,
+                size: u32,
+            ) -> i32;
+        }
+        let file = std::fs::File::open(path)?;
+        let mut id = std::mem::MaybeUninit::<FileId>::uninit();
+        let mut basic = std::mem::MaybeUninit::<Basic>::uninit();
+        // Both buffers have the layout and size of the requested Win32 structures.
+        unsafe {
+            if GetFileInformationByHandleEx(
+                file.as_raw_handle(),
+                18,
+                id.as_mut_ptr().cast(),
+                std::mem::size_of::<FileId>() as u32,
+            ) == 0
+                || GetFileInformationByHandleEx(
+                    file.as_raw_handle(),
+                    0,
+                    basic.as_mut_ptr().cast(),
+                    std::mem::size_of::<Basic>() as u32,
+                ) == 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            let id = id.assume_init();
+            Ok((id.volume, id.id, basic.assume_init().changed))
+        }
+    }
+    Ok(GoalIdentity {
+        file: file_identity(path)?,
+        #[cfg(windows)]
+        windows: windows_identity(path)?,
+    })
+}
+
 type Revisions = (u64, u64, u64, u64, u64, u64);
 type MonitorSnapshot = Option<(Revisions, [Stamps; 3])>;
 
@@ -454,7 +520,7 @@ pub(crate) struct SharedMonitor {
     disk_cache: Mutex<DiskCache>,
     talk_index: Mutex<HashMap<String, (FileIdentity, TalkListView)>>,
     talk_status_index: Mutex<TalkStatusIndex>,
-    closed_goal_index: Mutex<HashMap<String, (FileIdentity, bool)>>,
+    closed_goal_index: Mutex<HashMap<String, (GoalIdentity, bool)>>,
     /// Conversation status evidence, rebuilt only when a source store moved.
     chat_inventory: Mutex<Option<(Revisions, Arc<crate::chat_status::Inventory>)>>,
     bulk_slots: Arc<tokio::sync::Semaphore>,
@@ -5432,23 +5498,22 @@ fn page_ids(ui: &Ui, talks: bool, q: PageQuery) -> ApiResult<(Vec<String>, Optio
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let present: HashSet<_> = ids.iter().collect();
-        goals.retain(|id, _| present.contains(id) && !open.contains(id));
+        goals.retain(|id, _| present.contains(id));
         for id in ids {
             if open.contains(id) {
                 continue;
             }
             let path = ui.talks.path_of(id);
-            let Ok(identity) = file_identity(&path) else {
-                continue;
-            };
-            let owner = if cfg!(unix)
-                && let Some((old, owner)) = goals.get(id)
-                && *old == identity
+            let identity = goal_identity(&path).ok();
+            let owner = if let Some((old, owner)) = goals.get(id)
+                && identity.as_ref() == Some(old)
             {
                 *owner
             } else {
                 let owner = std::fs::File::open(&path).ok().is_some_and(read_owner_goal);
-                if cfg!(unix) && file_identity(&path).is_ok_and(|after| after == identity) {
+                if let Some(identity) = identity
+                    && goal_identity(&path).is_ok_and(|after| after == identity)
+                {
                     goals.insert(id.clone(), (identity, owner));
                 }
                 owner
@@ -27231,6 +27296,27 @@ mod tests {
         let rows = talk_rows(&ui, ids, &header::HeaderMap::new());
         let row = rows.iter().find(|row| row.id == id).unwrap();
         assert_eq!(row.chat_status.kind, crate::chat_status::Kind::NeedsOwner);
+        {
+            let cache = ui.monitor.closed_goal_index.lock().unwrap();
+            assert!(cache.get(&id).is_some_and(|(_, owner)| *owner));
+            assert!(cache.len() > STORE_PAGE_SIZE);
+        }
+        // A second request must retain the projection even for promoted rows.
+        let (again, _) = page_ids(&ui, true, PageQuery::default()).unwrap();
+        assert!(again.contains(&id));
+        // A same-length rewrite preserving write time still changes identity.
+        let modified = path.metadata().unwrap().modified().unwrap();
+        raw["goals"][0]["state"] = serde_json::json!("paused");
+        raw["goals"][0]["step"] = serde_json::json!("waiting");
+        std::fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        let (changed, _) = page_ids(&ui, true, PageQuery::default()).unwrap();
+        assert!(!changed.contains(&id));
     }
 
     #[test]

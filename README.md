@@ -747,6 +747,11 @@ goals and current execution evidence, not the wording of the transcript.
 owner-waiting goals. Resource waits and queued replies are waiting, while
 unverified execution or incomplete records are surfaced as attention/unknown.
 The badges refresh on execution and store changes independently of new replies.
+Old closed conversations are scanned once per file version for goal state,
+without retaining transcript text; subsequent list refreshes reuse that
+projection on Windows and Unix. Only the current landing approval counts.
+Failed local releases are attention states unless an outstanding decision
+requires the owner.
 
 While a reply is running, Chat accepts the next message as one durable pending
 draft instead of starting a second CLI turn. The web composer shows that draft;
