@@ -51,6 +51,7 @@ async fn stopped(review: bool) -> (common::Fixture, Task, Runner, Request) {
     let request = Request {
         replace_request: None,
         evidence_digest: None,
+        reopen_occurrence: None,
         tip: None,
         instruction: None,
         task: task.id.clone(),
@@ -90,6 +91,9 @@ fn command(request: &Request) -> std::process::Command {
         "--reason",
         &request.reason,
     ]);
+    if let Some(occurrence) = &request.reopen_occurrence {
+        command.args(["--reopen-occurrence", occurrence]);
+    }
     command
 }
 
@@ -254,6 +258,66 @@ async fn accepted_grant_survives_restart_but_changed_head_or_decision_prevents_c
 }
 }
 
+/// Same shape as a mistaken bulk completion: review budget spent, task Done,
+/// reopened into a manual hold, then repaired in place by one explicit grant.
+fn reopened(request: &mut Request, task: &Task) -> String {
+    let queue = Queue::open();
+    let mut held = queue.get(&task.id).unwrap();
+    held.status = TaskStatus::Done;
+    let state = RunState::load(&request.run).unwrap();
+    held.reopen(magi::queue::CompletionContext::from_run(
+        magi::queue::CompletionActor::Cli,
+        Some("completion was mistaken".into()),
+        &held.clone(),
+        &state,
+    ))
+    .unwrap();
+    queue.put(&mut held).unwrap();
+    assert_eq!(held.status, TaskStatus::Held);
+    let occurrence = held.completion_history.last().unwrap().occurrence.clone();
+    request.reopen_occurrence = Some(occurrence.clone());
+    occurrence
+}
+
+common::e2e! {
+async fn reopen_hold_is_lifted_only_by_its_own_occurrence_and_repairs_the_same_run() {
+    let (_fx, task, runner, mut request) = stopped(true).await;
+    let occurrence = reopened(&mut request, &task);
+    let ordinary = Request { reopen_occurrence: None, ..request.clone() };
+    refused(&ordinary, "owner hold");
+    let wrong = Request { reopen_occurrence: Some("other".into()), ..request.clone() };
+    refused(&wrong, "not the unchanged hold");
+    let receipt = accepted(&request);
+    assert_eq!(accepted(&request), receipt, "a retry returns the receipt without a second grant");
+    let queued = Queue::open().get(&task.id).unwrap();
+    assert_eq!(queued.status, TaskStatus::Queued);
+    assert_eq!(queued.repair_grants.len(), 1);
+    assert_eq!(queued.runs, task.runs);
+    assert_eq!(queued.resume_override.as_ref().unwrap().pinned_run.as_ref(), Some(&request.run));
+    assert_eq!(queued.completion_history.last().unwrap().occurrence, occurrence);
+    let mut resumed = Runner::resume(&request.run).unwrap();
+    resumed.execute().await.unwrap();
+    assert_eq!(resumed.state.id, runner.state.id);
+    assert_eq!(resumed.state.repair_grants[0].spent, 1);
+    assert!(resumed.state.reviews.len() > runner.state.reviews.len());
+}
+}
+
+common::e2e! {
+async fn a_later_hold_or_foreign_reopen_claim_keeps_the_hold_even_with_the_same_reason() {
+    let (_fx, task, _runner, mut request) = stopped(true).await;
+    reopened(&mut request, &task);
+    let queue = Queue::open();
+    let mut again = queue.get(&task.id).unwrap();
+    let reason = again.hold_reason.clone();
+    again.hold_manual(reason);
+    queue.put(&mut again).unwrap();
+    refused(&request, "not the unchanged hold");
+    assert_eq!(RunState::load(&request.run).unwrap().repair_grants.len(), 0);
+    assert_eq!(Queue::open().get(&task.id).unwrap().status, TaskStatus::Held);
+}
+}
+
 common::e2e! {
 async fn automatic_budget_hold_admits_only_an_explicit_same_run_repair() {
     let mut fx = fixture(home_lock().await, Judges::Unanimous, true);
@@ -292,7 +356,7 @@ async fn automatic_budget_hold_admits_only_an_explicit_same_run_repair() {
         head: magi::git::rev_parse(&run.winner().unwrap().worktree, "HEAD").await.unwrap(),
         expect_pass: run.passes.last().unwrap().index, request: "budget-review-1".into(),
         reason: "Repair the retained review once".into(), tip: None, instruction: None,
-        replace_request: None, evidence_digest: None,
+        replace_request: None, evidence_digest: None, reopen_occurrence: None,
     };
     // Launch a fixture chat seat so the control bridge, not the CLI environment,
     // distinguishes an automatic report from the owner's current request.

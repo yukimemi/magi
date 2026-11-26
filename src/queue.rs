@@ -382,6 +382,14 @@ pub enum CompletionAction {
     Reopen,
 }
 
+/// The manual hold created by one reopen occurrence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ReopenHold {
+    occurrence: String,
+    held_at: Timestamp,
+    decision: Option<Timestamp>,
+}
+
 /// Run and publication evidence observed when a task decision was made.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CompletionRunSnapshot {
@@ -602,6 +610,10 @@ pub struct Task {
     pub hold_source: Option<HoldSource>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     recovery_budget_hold: Option<RecoveryBudgetHold>,
+    /// Identity of the manual hold a reopen produced; stale once any later hold or
+    /// owner decision changes `held_at` or `operator_decided_at`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reopen_hold: Option<ReopenHold>,
     /// Disk resource wait recorded by the admission gate; never owner consent.
     #[serde(default)]
     pub machine_hold_cause: Option<MachineHoldCause>,
@@ -1250,6 +1262,7 @@ impl Task {
             hold_reason: None,
             hold_source: None,
             recovery_budget_hold: None,
+            reopen_hold: None,
             machine_hold_cause: None,
             disk_resume_run: None,
             disk_checked_at: None,
@@ -1760,6 +1773,14 @@ impl Task {
         self.record_completion(CompletionAction::Reopen, context);
         self.hold_manual(reason);
         self.resume_override = None;
+        self.reopen_hold =
+            self.held_at
+                .zip(self.completion_history.last())
+                .map(|(held_at, event)| ReopenHold {
+                    occurrence: event.occurrence.clone(),
+                    held_at,
+                    decision: self.operator_decided_at,
+                });
         self.fresh_start = false;
         self.last_error = None;
         self.diagnostic = None;
@@ -2752,6 +2773,7 @@ impl Task {
         self.hold_reason = None;
         self.held_at = None;
         self.recovery_budget_hold = None;
+        self.reopen_hold = None;
         self.resume_override = Some(OperatorResume {
             question_id: String::new(),
             at: receipt.at,
@@ -2759,6 +2781,45 @@ impl Task {
             forced: true,
             pinned_run: Some(receipt.request.run.clone()),
         });
+    }
+
+    /// Whether this task is still held by exactly the manual hold that reopen
+    /// `occurrence` created for `run`: no later hold, owner decision, dependency
+    /// or continuation has replaced it. Records written before the identity was
+    /// stored are matched on the audit event, reason and a 2 s timing window.
+    pub(crate) fn held_by_reopen(&self, occurrence: &str, run: &str) -> bool {
+        let Some(event) = self.completion_history.last() else {
+            return false;
+        };
+        if self.status != TaskStatus::Held
+            || self.hold_source != Some(HoldSource::Manual)
+            || !self.blocked_by.is_empty()
+            || self.resume_override.is_some()
+            || self.fresh_start
+            || event.action != CompletionAction::Reopen
+            || event.occurrence != occurrence
+            || event.run.as_ref().map(|r| r.id.as_str()) != Some(run)
+            || event.reason.is_none()
+            || self.hold_reason != event.reason
+        {
+            return false;
+        }
+        let (Some(held_at), Some(decided)) = (self.held_at, self.operator_decided_at) else {
+            return false;
+        };
+        match &self.reopen_hold {
+            Some(hold) => {
+                hold.occurrence == occurrence
+                    && hold.held_at == held_at
+                    && hold.decision == Some(decided)
+            }
+            None => {
+                let window = jiff::SignedDuration::from_secs(2);
+                [held_at, decided]
+                    .iter()
+                    .all(|t| *t >= event.at && t.duration_since(event.at) <= window)
+            }
+        }
     }
 
     /// Put a held or finished task back in line, with its attempt count reset

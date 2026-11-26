@@ -801,6 +801,7 @@ mod tests {
                     instruction: None,
                     replace_request: None,
                     evidence_digest: None,
+                    reopen_occurrence: None,
                 },
                 at: Timestamp::now(),
                 decision: None,

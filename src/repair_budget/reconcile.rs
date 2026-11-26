@@ -403,6 +403,7 @@ mod tests {
                 instruction: None,
                 replace_request: None,
                 evidence_digest: None,
+                reopen_occurrence: None,
             },
             at: "2026-01-01T00:00:02Z".parse().unwrap(),
             decision: None,

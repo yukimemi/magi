@@ -70,6 +70,11 @@ pub struct Request {
     #[arg(long)]
     #[serde(default)]
     pub evidence_digest: Option<String>,
+    /// Reopen audit occurrence (see `task show`) whose manual hold this owner-approved
+    /// grant may lift for the same retained run. Review and gate grants only.
+    #[arg(long)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reopen_occurrence: Option<String>,
 }
 
 /// Accepted grant and the control state against which it was authorized.
@@ -500,7 +505,31 @@ pub(crate) async fn grant_with_claim(
         && matches!(request.kind, Kind::Review | Kind::Gate)
         && owner_requested_at.is_some_and(|at| task.held_at.is_some_and(|held| at >= held))
         && task.held_for_recovery_budget(&state);
-    controls(home, &task, &state, request.kind, explicit_budget_override)?;
+    let reopen_override = match request.reopen_occurrence.as_deref() {
+        None => false,
+        Some(occurrence) => {
+            ensure!(
+                matches!(request.kind, Kind::Review | Kind::Gate),
+                "repair grant refused: --reopen-occurrence applies to review and gate grants only"
+            );
+            ensure!(
+                owner_requested_at.is_some_and(|at| task.held_at.is_some_and(|held| at >= held)),
+                "repair grant refused: lifting a reopen hold requires a current owner request"
+            );
+            ensure!(
+                task.held_by_reopen(occurrence, &state.id),
+                "repair grant refused: the task hold is not the unchanged hold of reopen occurrence {occurrence} for this run"
+            );
+            true
+        }
+    };
+    controls(
+        home,
+        &task,
+        &state,
+        request.kind,
+        explicit_budget_override || reopen_override,
+    )?;
     owner_effects_settled(home, &task, &state)?;
     unique_owner(queue, &task, &state)?;
     ensure!(

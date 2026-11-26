@@ -63,6 +63,29 @@ A missing pin or a cleared hold does not prove execution. After an uncertain
 publication error, inspect the task or retry the identical request. The reason
 is retained in the receipt and run events.
 
+### Repairing a run after a mistaken completion (`--reopen-occurrence`)
+
+`task control reopen` turns a wrongly completed task into a manual hold, which a
+`review` or `gate` grant normally refuses (`unresolved owner hold or dependency`).
+Releasing it first would give up the exact-run pin and open a window for a fresh
+competition. Instead, add `--reopen-occurrence <id>` (the `occurrence` printed by
+`magi task show` / the reopen audit) to the same grant:
+
+```sh
+magi task grant-repair <task> --run <run> --kind review --rounds 1 --head <sha> \
+  --expect-pass <n> --reopen-occurrence <occurrence> --request <id> --reason <text>
+```
+
+The hold is lifted, the receipt recorded and the same run queued in one task
+write, only when all of these hold: the request comes from a current owner
+terminal or chat request (never a standing or goal-wake turn); the task is still
+held by exactly that reopen's manual hold for that run (any later hold, owner
+decision, dependency, release or continuation makes it stale, even with the same
+reason); and every ordinary check passes (budget exhausted, head and pass,
+no live driver, no open question or unapplied owner effect, no other grant).
+Abandoned questions are not waiting and do not block. Other manual holds are never
+ignored. A retry with the same request ID returns the original receipt.
+
 The task claim, run owner lock, driver execution lease and worktree output
 leases exclude concurrent drivers and surviving tools. Live or unknown driver
 ownership, a changed task/run/pass/branch/head, dirty worktree, moved or closed
