@@ -1364,7 +1364,17 @@ impl Runner {
     /// Authorize one bounded synchronization interval, under the caller's queue task
     /// claim and the same owner/execution locks used by run maintenance.
     pub async fn authorize_base_recovery(home: &Path, id: &str, task: &str) -> Result<()> {
-        Self::authorize_base_recovery_request(home, id, task, false, None).await
+        Self::authorize_base_recovery_request(home, id, task, false, None, None).await
+    }
+
+    /// Authorize a known preparation failure against the inspected evidence.
+    pub async fn authorize_base_preparation_recovery(
+        home: &Path,
+        id: &str,
+        task: &str,
+        digest: &str,
+    ) -> Result<()> {
+        Self::authorize_base_recovery_request(home, id, task, false, None, Some(digest)).await
     }
 
     /// Queue release uses its durable approval generation exactly once.
@@ -1373,7 +1383,7 @@ impl Runner {
         id: &str,
         task: &str,
     ) -> Result<()> {
-        Self::authorize_base_recovery_request(home, id, task, true, None).await
+        Self::authorize_base_recovery_request(home, id, task, true, None, None).await
     }
 
     pub(crate) async fn authorize_base_recovery_control(
@@ -1382,7 +1392,7 @@ impl Runner {
         control: &mut crate::base_recovery_control::Transaction,
     ) -> Result<()> {
         let id = control.request.run.clone();
-        Self::authorize_base_recovery_request(home, &id, task, false, Some(control)).await
+        Self::authorize_base_recovery_request(home, &id, task, false, Some(control), None).await
     }
 
     async fn authorize_base_recovery_request(
@@ -1391,6 +1401,7 @@ impl Runner {
         task: &str,
         resumption: bool,
         mut control: Option<&mut crate::base_recovery_control::Transaction>,
+        terminal_digest: Option<&str>,
     ) -> Result<()> {
         let _owner = crate::pr_head::owner_lock(home, id)?;
         let mut state = RunState::load_under(id, home)?;
@@ -1398,6 +1409,7 @@ impl Runner {
         let queued = crate::queue::Queue::at(home.join("queue")).get(task)?;
         anyhow::ensure!(
             queued.execution_runs().last().is_some_and(|run| run == id)
+                && queued.assignment_accepts(&state)
                 && queued.status != crate::queue::TaskStatus::Done
                 && !queued.fresh_start
                 && queued.review_branch.is_none(),
@@ -1464,13 +1476,15 @@ impl Runner {
         );
         state.ensure_base_episode();
         state.record_base_sync_stop(&head);
+        let preparation = state.unknown_preparation_stop(&head);
         anyhow::ensure!(
             state
                 .base_sync_recovery
                 .stop
                 .as_ref()
-                .is_some_and(|s| s.kind == crate::base_sync_recovery::StopKind::Exhausted),
-            "base recovery refused: missing eligible movement-exhaustion evidence; inspect with `magi task inspect-base-stop {task} --run {id}`. Textual stops require an evidence-bound base-conflict grant"
+                .is_some_and(|s| s.kind == crate::base_sync_recovery::StopKind::Exhausted)
+                || (preparation && !resumption),
+            "base recovery refused: missing eligible movement-exhaustion or preparation-stop evidence; inspect with `magi task inspect-base-stop {task} --run {id}`. Textual stops require an evidence-bound base-conflict grant"
         );
         let fetched =
             git::fetch(&state.repo, &state.config.merge.remote, &state.base_branch).await?;
@@ -1483,6 +1497,47 @@ impl Runner {
             &format!("{}/{}", state.config.merge.remote, state.base_branch),
         )
         .await?;
+        let preparation_digest = state.preparation_digest(&head);
+        anyhow::ensure!(
+            preparation
+                || (terminal_digest.is_none()
+                    && control
+                        .as_ref()
+                        .is_none_or(|c| c.request.evidence_digest.is_none())),
+            "preparation evidence digest does not name an eligible preparation stop"
+        );
+        if preparation {
+            anyhow::ensure!(
+                crate::daemon::compatible_run_instruction(&state, &queued),
+                "task instruction does not match the retained run"
+            );
+            if let Some(control) = control.as_ref() {
+                anyhow::ensure!(
+                    control.request.head == head
+                        && control.request.evidence_digest.is_some()
+                        && control.request.evidence_digest == preparation_digest
+                        && control.request.decision.is_none(),
+                    "preparation stop requires the full HEAD and current inspected evidence digest"
+                );
+            } else {
+                anyhow::ensure!(
+                    terminal_digest.is_some() && terminal_digest == preparation_digest.as_deref(),
+                    "preparation stop requires the current inspected evidence digest"
+                );
+            }
+            let stop = state.base_sync_recovery.stop.as_ref().unwrap();
+            anyhow::ensure!(
+                git::is_ancestor(&state.repo, &stop.tip, &approved_tip).await,
+                "current base does not descend from the stopped base"
+            );
+            git::probe_rebase_preparation(
+                &state,
+                &head,
+                &home.join("runs").join(id),
+                &repository_wait(&state, None),
+            )
+            .await?;
+        }
         if let Some(control) = control.as_deref_mut() {
             let queue = crate::queue::Queue::at(home.join("queue"));
             control.prepare(&queue, &state, &queued, &head, &approved_tip)?;
@@ -1526,6 +1581,7 @@ impl Runner {
             tip: approved_tip,
             instruction: queued.instruction.clone(),
             episode,
+            preparation_digest,
         });
         if let Some(control) = control.as_deref_mut() {
             let authorization = state.base_sync_recovery.authorizations.last_mut().unwrap();
@@ -1540,7 +1596,11 @@ impl Runner {
         }
         state.event(
             "base-recovery",
-            "owner authorized a bounded base synchronization interval; fresh verification required",
+            if preparation {
+                "owner authorized the proven preparation-stop recovery; remaining budget retained; fresh verification required"
+            } else {
+                "owner authorized a bounded base synchronization interval; fresh verification required"
+            },
         );
         state.save_under(home)?;
         if let Some(control) = control {
@@ -6002,6 +6062,7 @@ impl Runner {
                 crate::queue::Queue::at(crate::run::home().join("queue")).get(&authorization.task);
             let owner_valid = owner.as_ref().is_ok_and(|t| {
                 t.execution_runs().last() == Some(&self.state.id)
+                    && t.assignment_accepts(&self.state)
                     && t.status != crate::queue::TaskStatus::Done
                     && !t.fresh_start
                     && t.review_branch.is_none()
@@ -6029,6 +6090,13 @@ impl Runner {
                     .is_ok_and(|t| t.operator_decided_at == authorization.decision)
             {
                 Some("owner decision changed")
+            } else if authorization.stop.kind == crate::base_sync_recovery::StopKind::Unknown
+                && !authorization.scope.as_ref().is_some_and(|scope| {
+                    scope.preparation_digest.is_some()
+                        && scope.preparation_digest == self.state.preparation_digest(&head)
+                })
+            {
+                Some("scratch preparation stop evidence changed")
             } else if let Some(scope) = &authorization.scope {
                 if scope.tip != tip {
                     Some("fetched base changed")
@@ -6068,6 +6136,9 @@ impl Runner {
                 || !owner.is_ok_and(|t| t.execution_runs().last() == Some(&self.state.id))
             {
                 return Ok(());
+            }
+            if authorization.stop.kind == crate::base_sync_recovery::StopKind::Unknown {
+                git::check_rebase_preparation(&self.state, &head, &self.state.dir()).await?;
             }
         }
         let recovery = conflicted && self.state.consume_base_recovery(&head);
@@ -18335,6 +18406,7 @@ mod tests {
                         runner.state.base_sync_recovery.stop.clone().unwrap(),
                         runner.state.base_sync_recovery.episodes.last().unwrap().id,
                     )),
+                    evidence_digest: None,
                 },
             )
             .await
@@ -18698,6 +18770,110 @@ esac
                 head
             );
         }
+    }
+
+    #[tokio::test]
+    async fn base_recovery_preparation_stop_keeps_remaining_budget() {
+        let (_tmp, mut runner, head, task) = exhausted_base_fixture().await;
+        let state = &mut runner.state;
+        let tip = state.base_sync.as_ref().unwrap().tip.clone();
+        let branch = state.winner().unwrap().branch.clone();
+        state.base_sync_recovery = Default::default();
+        state.base_sync.as_mut().unwrap().attempts = 0;
+        state.reserve_base_operation(&head, &tip);
+        state.finish_base_operation(None);
+        let detail = format!(
+            "could not rebase {branch} onto origin/main: spawn git rev-parse --git-path magi-rebase-heads: Invalid directory (os error 267)"
+        );
+        state.base_sync.as_mut().unwrap().conflict = Some(detail.clone());
+        state.event("land", detail);
+        state.record_base_sync_stop_as(&head, Some(crate::base_sync_recovery::StopKind::Unknown));
+        assert!(state.unknown_preparation_stop(&head));
+        let digest = state.preparation_digest(&head).unwrap();
+        state
+            .base_sync_recovery
+            .operations
+            .last_mut()
+            .unwrap()
+            .validated_head = Some(head.clone());
+        assert!(!state.unknown_preparation_stop(&head));
+        state
+            .base_sync_recovery
+            .operations
+            .last_mut()
+            .unwrap()
+            .validated_head = None;
+        state.task_instruction = Some(crate::queue::Queue::open().get(&task).unwrap().instruction);
+        state.driver_exited = true;
+        state.save().unwrap();
+        let home = crate::run::home();
+        let queue = crate::queue::Queue::open();
+        let inspection = crate::repair_budget::legacy::inspect(&queue, &home, &task, &state.id)
+            .await
+            .unwrap();
+        assert_eq!(inspection["classification"], "recoverable-unknown-stop");
+        assert_eq!(inspection["evidence_digest"], digest);
+        let request = crate::base_recovery_control::Request {
+            run: state.id.clone(),
+            head: head.clone(),
+            actor: "test".into(),
+            request: "preparation".into(),
+            decision: None,
+            expected_stop: None,
+            evidence_digest: Some(digest),
+        };
+        let mut stale = request.clone();
+        stale.evidence_digest = Some("stale".into());
+        assert!(
+            crate::base_recovery_control::recover(&queue, &home, stale)
+                .await
+                .is_err()
+        );
+        let scratch = state.dir().join("base-sync");
+        std::fs::create_dir(&scratch).unwrap();
+        assert!(
+            crate::base_recovery_control::recover(&queue, &home, request.clone())
+                .await
+                .is_err()
+        );
+        std::fs::remove_dir(&scratch).unwrap();
+        git::git(&state.repo, &["checkout", "main"]).await.unwrap();
+        git::git(
+            &state.repo,
+            &[
+                "commit",
+                "--allow-empty",
+                "-m",
+                "base advanced after inspection",
+            ],
+        )
+        .await
+        .unwrap();
+        git::git(&state.repo, &["push", "origin", "main"])
+            .await
+            .unwrap();
+        git::git(&state.repo, &["checkout", "fix/retained"])
+            .await
+            .unwrap();
+        let outcome = crate::base_recovery_control::recover(&queue, &home, request.clone())
+            .await
+            .unwrap();
+        assert!(!outcome.repeated);
+        assert!(
+            crate::base_recovery_control::recover(&queue, &home, request)
+                .await
+                .unwrap()
+                .repeated
+        );
+        runner.state = RunState::load(&runner.state.id).unwrap();
+        assert!(runner.state.base_recovery_pending());
+        runner.sync_to_base().await.unwrap();
+        assert!(!runner.state.base_sync_blocked());
+        assert!(!runner.state.consume_base_recovery(&head));
+        assert_eq!(runner.state.base_episode_used(), 2);
+        assert_eq!(runner.state.base_sync.as_ref().unwrap().attempts, 2);
+        assert_eq!(runner.state.base_sync_recovery.episodes.len(), 1);
+        assert_eq!(runner.state.base_sync_recovery.stops.len(), 1);
     }
 
     #[cfg(unix)]

@@ -155,6 +155,8 @@ pub struct Scope {
     pub tip: String,
     pub instruction: String,
     pub episode: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preparation_digest: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -252,7 +254,8 @@ impl RunState {
             Some(StopKind::Divergence) => "Reconcile foreign remote branch commits before resuming; do not overwrite them".into(),
             Some(StopKind::Publication) => "Inspect the retained publication failure and remote lease before resuming".into(),
             Some(StopKind::ClosingIntegratedPr) => "Resume to retry closing the already integrated pull request".into(),
-            Some(StopKind::Unknown) => "Inspect the retained synchronization state before resuming; unknown evidence grants no new budget".into(),
+            Some(StopKind::Unknown) if self.base_recovery_pending() => "Preparation recovery approval recorded; resume the retained run using only its remaining synchronization budget".into(),
+            Some(StopKind::Unknown) => format!("Inspect the retained synchronization state with `magi task inspect-base-stop {} --run {}`. Only a recognized preparation failure with evidence and remaining budget permits recovery", self.origin.as_ref().and_then(|o| o.task.as_deref()).unwrap_or("<task>"), self.id),
             None => "Continue verification on the current synchronized HEAD".into(),
         }
     }
@@ -535,6 +538,83 @@ impl RunState {
             })
     }
 
+    /// Recognize only the historical Windows scratch preparation failure.
+    /// No sequencer was started by this diagnostic.
+    pub(crate) fn unknown_preparation_stop(&self, head: &str) -> bool {
+        let Some(stop) = &self.base_sync_recovery.stop else {
+            return false;
+        };
+        let Some(sync) = &self.base_sync else {
+            return false;
+        };
+        let Some(winner) = self.winner() else {
+            return false;
+        };
+        let prefix = format!(
+            "could not rebase {} onto {}/{}: spawn git rev-parse --git-path magi-rebase-heads: ",
+            winner.branch, self.config.merge.remote, self.base_branch
+        );
+        stop.kind == StopKind::Unknown
+            && stop.head == head
+            && stop.tip == sync.tip
+            && stop.attempts == sync.attempts
+            && stop.attempts > 0
+            && self.base_sync_recovery.stops.contains(stop)
+            && self
+                .base_sync_recovery
+                .operations
+                .iter()
+                .all(|op| op.finished)
+            && self
+                .base_sync_recovery
+                .episodes
+                .iter()
+                .try_fold(0usize, |sum, e| sum.checked_add(e.used))
+                == Some(stop.attempts)
+            && sync.conflict.as_ref() == Some(&stop.detail)
+            && stop.detail.strip_prefix(&prefix).is_some_and(|suffix| {
+                suffix.ends_with(" (os error 267)") && !suffix.contains(['\r', '\n'])
+            })
+            && self
+                .events
+                .iter()
+                .any(|e| e.node == "land" && e.message == stop.detail && e.at == stop.at)
+            && self.base_episode_used() < crate::graph::BASE_SYNC_ROUNDS
+            && self.base_sync_recovery.operations.last().is_some_and(|op| {
+                op.finished
+                    && op.id == self.base_sync_recovery.operations.len() - 1
+                    && op.validated_head.is_none()
+                    && op.head == head
+                    && op.tip == stop.tip
+                    && self
+                        .base_sync_recovery
+                        .episodes
+                        .last()
+                        .is_some_and(|e| e.id == op.episode)
+            })
+            && self.rebase_fixes.is_empty()
+    }
+
+    pub(crate) fn preparation_digest(&self, head: &str) -> Option<String> {
+        use sha2::{Digest, Sha256};
+        self.unknown_preparation_stop(head).then(|| {
+            let evidence = serde_json::json!({
+                "run": self.id,
+                "assignment": self.task_assignment,
+                "stop": self.base_sync_recovery.stop,
+                "sync": self.base_sync,
+                "episodes": self.base_sync_recovery.episodes,
+                "operations": self.base_sync_recovery.operations,
+                "task": self.origin.as_ref().and_then(|o| o.task.as_ref()),
+                "branch": self.winner().map(|w| &w.branch),
+            });
+            Sha256::digest(evidence.to_string())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect()
+        })
+    }
+
     pub(crate) fn authorize_base_sync(&mut self, task: &str) -> Result<()> {
         let stop = self
             .base_sync_recovery
@@ -542,8 +622,8 @@ impl RunState {
             .clone()
             .ok_or_else(|| anyhow::anyhow!("no recorded base-sync stop"))?;
         ensure!(
-            stop.kind == StopKind::Exhausted,
-            "only exhausted base movement permits recovery"
+            stop.kind == StopKind::Exhausted || self.unknown_preparation_stop(&stop.head),
+            "only exhausted base movement or a proven scratch preparation stop permits recovery"
         );
         ensure!(
             !self
@@ -607,14 +687,29 @@ impl RunState {
         Ok(())
     }
 
-    /// Open the approved bounded interval and detach old gate evidence atomically
-    /// with consumption. The caller must save before reserving Git work.
+    /// Consume the approved recovery and detach old verification evidence atomically.
+    /// Preparation recovery keeps the same interval. Save before reserving Git work.
     pub(crate) fn consume_base_recovery(&mut self, head: &str) -> bool {
         if !self.base_recovery_pending() {
             return false;
         }
+        let preparation_valid = self
+            .base_sync_recovery
+            .authorizations
+            .last()
+            .is_some_and(|a| {
+                a.stop.kind != StopKind::Unknown
+                    || a.scope.as_ref().is_some_and(|scope| {
+                        scope.preparation_digest.is_some()
+                            && scope.preparation_digest == self.preparation_digest(head)
+                    })
+            });
         let a = self.base_sync_recovery.authorizations.last_mut().unwrap();
         a.consumed = true;
+        if !preparation_valid {
+            a.refuse("preparation stop evidence changed; inspect and authorize again");
+            return false;
+        }
         if a.stop.head != head {
             a.refuse(format!(
                 "retained HEAD changed from {} to {head}; inspect it and authorize again with --recover-base",
@@ -628,12 +723,35 @@ impl RunState {
         a.gate_ran = std::mem::replace(&mut self.gate_ran, false);
         let interval = a.interval;
         self.base_sync.as_mut().unwrap().conflict = None;
-        self.open_base_episode("explicit exhausted-base recovery");
-        self.base_sync_recovery.stop = None;
-        if !interval {
-            self.base_sync_recovery.episodes.last_mut().unwrap().used =
-                crate::graph::BASE_SYNC_ROUNDS - 1;
+        if a.stop.kind == StopKind::Unknown {
+            for review in &mut self.reviews {
+                review.verified_head = None;
+            }
+            for e2e in [self.head_e2e.take(), self.gate_repair_e2e.take()]
+                .into_iter()
+                .flatten()
+            {
+                self.verification_history
+                    .push(crate::run::VerificationEvidence {
+                        superseded_by: None,
+                        archived_at: Some(Timestamp::now()),
+                        fixes_spent: Some(self.gate_fixes.len()),
+                        gate_head: None,
+                        gate_ran: false,
+                        gate: Vec::new(),
+                        e2e: Some(e2e),
+                    });
+            }
+            self.pre_gate.clear();
+            self.pre_gate_commit = None;
+        } else {
+            self.open_base_episode("explicit exhausted-base recovery");
+            if !interval {
+                self.base_sync_recovery.episodes.last_mut().unwrap().used =
+                    crate::graph::BASE_SYNC_ROUNDS - 1;
+            }
         }
+        self.base_sync_recovery.stop = None;
         true
     }
 }

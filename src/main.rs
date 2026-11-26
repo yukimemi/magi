@@ -279,6 +279,9 @@ enum Command {
         /// Authorize a new bounded base synchronization interval after movement exhaustion.
         #[arg(long, requires = "resume", conflicts_with = "dry_run")]
         recover_base: bool,
+        /// Evidence digest from inspect-base-stop for a preparation failure.
+        #[arg(long, requires = "recover_base")]
+        evidence_digest: Option<String>,
         /// Synchronize the retained winner to the fetched base, then hold without verification.
         #[arg(long, requires = "resume", conflicts_with_all = ["recover_base", "dry_run"])]
         sync_base_only: bool,
@@ -860,6 +863,9 @@ enum ControlCmd {
         /// Retained HEAD inspected for the owner's request (full SHA or 7+ hex digits).
         #[arg(long)]
         head: String,
+        /// Evidence digest from inspect-base-stop for a preparation failure.
+        #[arg(long)]
+        evidence_digest: Option<String>,
     },
     /// Queue a stopped, blocked or parked run (does not recover exhausted base movement).
     Resume {
@@ -1738,6 +1744,7 @@ async fn dispatch(command: Command) -> Result<()> {
             issue,
             resume,
             recover_base,
+            evidence_digest,
             sync_base_only,
             opts,
         } => {
@@ -1778,7 +1785,14 @@ async fn dispatch(command: Command) -> Result<()> {
                 );
             }
             if let Some(id) = resume {
-                return resume_run(&id, opts.dry_run, recover_base, sync_base_only).await;
+                return resume_run(
+                    &id,
+                    opts.dry_run,
+                    recover_base,
+                    evidence_digest.as_deref(),
+                    sync_base_only,
+                )
+                .await;
             }
             let queue = Queue::open();
             if let Some(task_id) = opts.task.as_deref() {
@@ -4348,9 +4362,17 @@ async fn task_cmd_inner(command: TaskCmd, q: Queue) -> Result<()> {
                         cc::Operation::Resume { run }
                     }
                 }
-                ControlCmd::RecoverBase { run, head, request } => {
-                    cc::Operation::RecoverBase { run, head, request }
-                }
+                ControlCmd::RecoverBase {
+                    run,
+                    head,
+                    request,
+                    evidence_digest,
+                } => cc::Operation::RecoverBase {
+                    run,
+                    head,
+                    request,
+                    evidence_digest,
+                },
                 ControlCmd::Hold { id, reason } => cc::Operation::Hold {
                     task: id,
                     reason: reason.join(" "),
@@ -5337,6 +5359,7 @@ async fn resume_run(
     id: &str,
     dry_run: bool,
     recover_base: bool,
+    evidence_digest: Option<&str>,
     sync_base_only: bool,
 ) -> Result<()> {
     let runner = Runner::resume(id)?;
@@ -5395,7 +5418,11 @@ async fn resume_run(
         "the task has a pending base-only pass"
     );
     if recover_base {
-        Runner::authorize_base_recovery(&home, &run_id, &task.id).await?;
+        if let Some(digest) = evidence_digest {
+            Runner::authorize_base_preparation_recovery(&home, &run_id, &task.id, digest).await?;
+        } else {
+            Runner::authorize_base_recovery(&home, &run_id, &task.id).await?;
+        }
     }
     // The loop picks `task.execution_runs().last()`, so it only resumes *this* run when it
     // is that one and nothing else steers the attempt elsewhere.

@@ -27,6 +27,8 @@ pub enum Class {
     SequencerInfrastructure,
     /// 通常のベース移動予算の枯渇。
     MovementExhausted,
+    /// Known pre-sequencer preparation failure, with remaining budget.
+    RecoverableUnknown,
     /// 停止を安全に証明する証拠が不足している。
     Insufficient,
 }
@@ -55,6 +57,9 @@ impl Assessment {
             Class::SequencerInfrastructure => anyhow::bail!(
                 "the rebase sequencer failed without a textual conflict; base-conflict repair is not applicable"
             ),
+            Class::RecoverableUnknown => anyhow::bail!(
+                "scratch preparation stop; use explicit terminal base recovery, not conflict repair"
+            ),
             Class::Insufficient => anyhow::bail!("{}", self.missing.unwrap_or_default()),
         }
     }
@@ -67,6 +72,7 @@ impl Assessment {
                 Class::LegacyTextual => "legacy-textual-conflict",
                 Class::SequencerInfrastructure => "sequencer-infrastructure",
                 Class::MovementExhausted => "movement-exhaustion",
+                Class::RecoverableUnknown => "recoverable-unknown-stop",
                 Class::Insufficient => "insufficient-evidence",
             },
             "stop": self.stop,
@@ -162,6 +168,14 @@ pub fn classify(state: &RunState, head: &str, tip: &str) -> Assessment {
     if current || legacy_sequencer_head(state) == Some(head) {
         return Assessment {
             class: Class::SequencerInfrastructure,
+            stop: state.base_sync_recovery.stop.clone(),
+            legacy: None,
+            missing: None,
+        };
+    }
+    if state.unknown_preparation_stop(head) {
+        return Assessment {
+            class: Class::RecoverableUnknown,
             stop: state.base_sync_recovery.stop.clone(),
             legacy: None,
             missing: None,
@@ -411,6 +425,48 @@ pub async fn inspect(
             "Restore the required resource and explicitly resume the retained run. No conflict repair is needed."
         };
         result["next_step"] = action.into();
+        return Ok(result);
+    }
+    if assessment.class == Class::Insufficient
+        && state
+            .base_sync_recovery
+            .stop
+            .as_ref()
+            .is_some_and(|s| s.kind == StopKind::Unknown)
+    {
+        result["next_step"] = "Compare the stop diagnostic and timestamp with the saved land event; inspect the finished operation, unchanged winner HEAD, stopped base tip and remaining episode budget. Only the exact Windows magi-rebase-heads spawn error (os error 267) is supported. Preserve the run and scratch; do not clear the stop or start a new competition.".into();
+    }
+    if assessment.class == Class::RecoverableUnknown {
+        let digest = state.preparation_digest(&head).unwrap();
+        result["evidence_digest"] = digest.clone().into();
+        let checks = async {
+            ensure!(task.assignment_accepts(&state), "task assignment changed");
+            ensure!(
+                task.status != crate::queue::TaskStatus::Running,
+                "task driver is running"
+            );
+            let claimed =
+                crate::daemon::is_working_on_other(home, &state.id, jiff::Timestamp::now())?;
+            ensure!(
+                state.liveness_under(home, claimed) == crate::run::Liveness::Dead,
+                "driver is live or unknown; wait for supported driver cleanup before recovery"
+            );
+            ensure!(
+                crate::git::is_ancestor(&state.repo, &assessment.stop.as_ref().unwrap().tip, &tip)
+                    .await,
+                "current base does not descend from stopped base"
+            );
+            crate::git::check_rebase_preparation(&state, &head, &home.join("runs").join(&state.id))
+                .await?;
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        if let Err(error) = checks {
+            result["admission_blocker"] = error.to_string().into();
+            result["next_step"] = "Resolve the reported blocker through supported controls, preserve the scratch and branch, and inspect again. Inspection grants no authorization.".into();
+        } else {
+            result["next_step"] = format!("Install the Windows scratch preparation fix; explicitly authorize with `magi task control recover-base {} --request <unique-id> --head {head} --evidence-digest {digest}` or `magi run --resume {} --recover-base --evidence-digest {digest}`. Authorization probes the current preparation path before allowing the remaining budget.", state.id, state.id).into();
+        }
         return Ok(result);
     }
     if assessment.class == Class::MovementExhausted {

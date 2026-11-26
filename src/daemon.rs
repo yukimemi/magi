@@ -1306,6 +1306,7 @@ async fn apply_maintenance_choices(queue: &Queue, questions: &Questions, home: &
                         request: q.id.clone(),
                         decision: Some((owner, q.answered_at.unwrap_or(q.asked_at))),
                         expected_stop: Some((stop.clone(), *episode)),
+                        evidence_digest: None,
                     },
                 )
                 .await;
@@ -13565,7 +13566,9 @@ mod tests {
             output_tail: "previous verification failed".into(),
             duration_ms: 0,
             resource_blocked: false,
-            ..Default::default()
+            artifact: None,
+            failure_evidence: None,
+            rerun_comparison: None,
         });
         state.reviews.push(unresolved);
         state.base_sync = Some(crate::run::BaseSync {
