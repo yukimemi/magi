@@ -1268,7 +1268,7 @@ async fn mechanical_pre_gate_review_grant_refuses_stale_missing_or_drifted_proof
 
     // Post-acceptance drift before import prevents receipt import and leaves run untouched.
     let mut drifted = baseline.clone();
-    drifted.pre_gate_commit = None;
+    drifted.reviews[0].e2e[0].output_tail.push_str(" changed");
     drifted.save().unwrap();
     let mut resumed = Runner::resume(&request.run).unwrap();
     assert!(resumed.execute().await.is_err());
@@ -1287,7 +1287,7 @@ async fn mechanical_pre_gate_review_grant_refuses_stale_missing_or_drifted_proof
         succeeded: false,
         conflict: None,
     });
-    imported_drifted.pre_gate_commit = None;
+    imported_drifted.pre_gate[0].output_tail.push_str(" changed");
     imported_drifted.save().unwrap();
     let mut resumed = Runner::resume(&request.run).unwrap();
     assert!(resumed.execute().await.is_err());
@@ -1322,7 +1322,7 @@ async fn mechanical_pre_gate_review_grant_refuses_stale_missing_or_drifted_proof
         reason: "reconcile mechanical pre-gate review grant".into(),
     };
     let mut tampered = baseline.clone();
-    tampered.pre_gate_commit = None;
+    tampered.reviews[0].e2e[0].duration_ms += 1;
     tampered.save().unwrap();
     assert!(
         magi::repair_budget::reconcile::apply(&queue, &magi::run::home(), recovery.clone())

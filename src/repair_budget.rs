@@ -4,6 +4,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 pub mod legacy;
 pub mod reconcile;
@@ -84,6 +85,9 @@ pub struct ReviewTransition {
     pub verified_head: String,
     /// Timestamp recorded when E2E ran against `verified_head` (`ReviewRound::verified_at`).
     pub verified_at: jiff::Timestamp,
+    /// Digest of the exact review, verification configuration, outcomes and commit events.
+    #[serde(default)]
+    pub evidence_digest: String,
 }
 
 /// Accepted grant and the control state against which it was authorized.
@@ -410,12 +414,15 @@ pub(crate) async fn prove_mechanical_pre_gate_commit(
         "repair grant refused: recorded pre-gate outcomes are missing, resource-blocked, or inconsistent with configuration"
     );
     let commit_event = crate::graph::pre_gate_commit_event(head);
+    let events: Vec<_> = state
+        .events
+        .iter()
+        .filter(|ev| ev.node == crate::graph::PRE_GATE_EVENT_NODE)
+        .collect();
     ensure!(
-        state.events.iter().any(|ev| {
-            ev.node == crate::graph::PRE_GATE_EVENT_NODE
-                && ev.message == commit_event
-                && ev.at <= verified_at
-        }),
+        events
+            .iter()
+            .any(|ev| ev.message == commit_event && ev.at <= verified_at),
         "repair grant refused: missing pre-verification mechanical pre-gate commit event"
     );
     let winner = state
@@ -440,6 +447,17 @@ pub(crate) async fn prove_mechanical_pre_gate_commit(
         reviewed_head: round.head.clone(),
         verified_head: head.to_owned(),
         verified_at,
+        evidence_digest: Sha256::digest(serde_json::to_vec(&(
+            round,
+            &state.config.verify.e2e,
+            &state.config.verify.pre_gate,
+            &state.pre_gate,
+            events,
+            head,
+        ))?)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect(),
     })
 }
 
@@ -499,24 +517,7 @@ pub(crate) async fn verify_initial_review_grant(state: &RunState, grant: &Applie
             ),
         "repair grant refused: review budget is not exhausted"
     );
-    let winner = state
-        .winner()
-        .context("repair grant refused: no retained winner")?;
-    ensure!(
-        git::is_clean(&winner.worktree).await?,
-        "repair grant refused: uncommitted work retained; commit it before requesting repair"
-    );
-    ensure!(
-        git::current_branch(&winner.worktree).await?.as_deref() == Some(winner.branch.as_str()),
-        "repair grant refused: retained worktree branch changed"
-    );
-    ensure!(
-        git::rev_parse(&winner.worktree, "HEAD").await? == grant.receipt.request.head
-            && git::rev_parse(&state.repo, &format!("refs/heads/{}", winner.branch)).await?
-                == grant.receipt.request.head,
-        "repair grant refused: winner branch/head changed"
-    );
-    Ok(())
+    head_and_public(state, &grant.receipt.request.head).await
 }
 
 async fn evidence(state: &RunState, request: &Request) -> Result<Option<ReviewTransition>> {
@@ -879,8 +880,7 @@ pub(crate) async fn apply(home: &Path, state: &mut RunState, disk: &RunState) ->
             && active.receipt.request.kind == Kind::Review
         {
             verify_initial_review_grant(disk, active).await?;
-        }
-        if active.phase != Phase::Fixing {
+        } else if active.phase != Phase::Fixing {
             head_and_public(disk, &active.head).await?;
         } else {
             let winner = disk.winner().context("repair winner missing")?;
@@ -1340,6 +1340,7 @@ mod tests {
             reviewed_head: "b".repeat(40),
             verified_head: "a".repeat(40),
             verified_at: "2026-06-01T00:00:02Z".parse().unwrap(),
+            evidence_digest: "c".repeat(64),
         });
         let with = serde_json::to_value(&receipt).unwrap();
         assert_eq!(with["review_transition"]["review_round"], 1);
@@ -1367,12 +1368,11 @@ mod tests {
         let mut passed_with_blocking = state.clone();
         passed_with_blocking.reviews[0].e2e[0].code = Some(0);
         passed_with_blocking.reviews[0].blocking = 1;
-        assert_eq!(
-            prove_review_target(&passed_with_blocking, &verified)
-                .await
-                .unwrap(),
-            Some(transition.clone())
-        );
+        let changed = prove_review_target(&passed_with_blocking, &verified)
+            .await
+            .unwrap()
+            .expect("proven transition");
+        assert_ne!(changed.evidence_digest, transition.evidence_digest);
 
         // Conflict lineage exhaustion check matches the reviewed head behind the proven transition.
         let conflict_grant = Applied {
