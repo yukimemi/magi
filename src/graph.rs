@@ -10108,11 +10108,9 @@ impl Runner {
                         format!("--force-with-lease=refs/heads/{public}:{}", lease.expected);
                     let refspec = format!("{delivery_head}:refs/heads/{public}");
                     git::git_raw(&winner.worktree, &["push", &option, &remote, &refspec]).await?
-                } else if self.state.foreign_checkout.is_some() {
+                } else {
                     let refspec = format!("{delivery_head}:refs/heads/{public}");
                     git::git_raw(&winner.worktree, &["push", &remote, &refspec]).await?
-                } else {
-                    git::push(&winner.worktree, &remote, &winner.branch).await?
                 };
                 if !pushed.ok() {
                     MergeOutcome {
