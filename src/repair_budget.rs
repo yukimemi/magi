@@ -75,6 +75,11 @@ pub struct Request {
     #[arg(long)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reopen_occurrence: Option<String>,
+    /// Explicit approval of the current ambiguous legacy hold, as
+    /// <held_at>/<operator_decided_at> from `task show --json`.
+    #[arg(long, requires = "reopen_occurrence")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirm_legacy_reopen_hold: Option<String>,
 }
 
 /// Accepted grant and the control state against which it was authorized.
@@ -445,6 +450,10 @@ pub(crate) async fn grant_with_claim(
         "only base-conflict grants support --replace-request"
     );
     ensure!(
+        request.confirm_legacy_reopen_hold.is_none() || request.reopen_occurrence.is_some(),
+        "legacy reopen hold confirmation requires --reopen-occurrence"
+    );
+    ensure!(
         !request.reason.trim().is_empty() && request.reason.len() <= 4096,
         "reason must contain 1..=4096 bytes"
     );
@@ -513,11 +522,20 @@ pub(crate) async fn grant_with_claim(
                 "repair grant refused: --reopen-occurrence applies to review and gate grants only"
             );
             ensure!(
-                owner_requested_at.is_some_and(|at| task.held_at.is_some_and(|held| at >= held)),
+                owner_requested_at.is_some_and(|at| {
+                    task.held_at.is_some_and(|held| at >= held)
+                        && task
+                            .operator_decided_at
+                            .is_some_and(|decision| at >= decision)
+                }),
                 "repair grant refused: lifting a reopen hold requires a current owner request"
             );
             ensure!(
-                task.held_by_reopen(occurrence, &state.id),
+                task.held_by_reopen(
+                    occurrence,
+                    &state.id,
+                    request.confirm_legacy_reopen_hold.as_deref()
+                ),
                 "repair grant refused: the task hold is not the unchanged hold of reopen occurrence {occurrence} for this run"
             );
             true

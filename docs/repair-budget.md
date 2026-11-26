@@ -85,9 +85,19 @@ reason); and every ordinary check passes (budget exhausted, head and pass,
 no live driver, no open question or unapplied owner effect, no other grant).
 Abandoned questions are not waiting and do not block. Other manual holds are never
 ignored. A retry with the same request ID returns the original receipt.
-Legacy reopened tasks without a persisted reopen-hold identity are refused:
-matching reason and timestamps cannot prove that no later manual hold replaced
-the reopen hold. Do not release such a task merely to bypass this check.
+Legacy reopened tasks may lack a persisted reopen-hold identity. Matching
+reason and timestamps cannot prove that no later manual hold replaced it.
+Inspect `magi task show <task> --json`: confirm the latest completion history
+entry is the intended reopen for the retained run, inspect `hold_reason`,
+`held_at` and `operator_decided_at`, and obtain a fresh owner decision explicitly
+lifting that **current** hold. Add
+`--confirm-legacy-reopen-hold '<held_at>/<operator_decided_at>'` to the command
+above, using the exact timestamp strings. This is an attestation of the
+current ambiguous hold, not proof of its origin. Both timestamps, the reopen
+occurrence and the ordinary run/head/pass guards must match; a later hold
+recorded by this build invalidates the snapshot. The confirmation is retained
+in the grant receipt and cannot be used for an unrelated manual hold.
+Do not release the task first.
 
 The task claim, run owner lock, driver execution lease and worktree output
 leases exclude concurrent drivers and surviving tools. Live or unknown driver

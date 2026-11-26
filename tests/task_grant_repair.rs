@@ -52,6 +52,7 @@ async fn stopped(review: bool) -> (common::Fixture, Task, Runner, Request) {
         replace_request: None,
         evidence_digest: None,
         reopen_occurrence: None,
+        confirm_legacy_reopen_hold: None,
         tip: None,
         instruction: None,
         task: task.id.clone(),
@@ -93,6 +94,9 @@ fn command(request: &Request) -> std::process::Command {
     ]);
     if let Some(occurrence) = &request.reopen_occurrence {
         command.args(["--reopen-occurrence", occurrence]);
+    }
+    if let Some(confirmation) = &request.confirm_legacy_reopen_hold {
+        command.args(["--confirm-legacy-reopen-hold", confirmation]);
     }
     command
 }
@@ -309,9 +313,19 @@ async fn a_later_hold_or_foreign_reopen_claim_keeps_the_hold_even_with_the_same_
     reopened(&mut request, &task);
     let queue = Queue::open();
     let mut again = queue.get(&task.id).unwrap();
+    let mut stale = again.clone();
     let reason = again.hold_reason.clone();
     again.hold_manual(reason);
     queue.put(&mut again).unwrap();
+    queue.put(&mut stale).unwrap();
+    let confirmed = Request {
+        confirm_legacy_reopen_hold: Some(format!(
+            "{}/{}",
+            again.held_at.unwrap(), again.operator_decided_at.unwrap()
+        )),
+        ..request.clone()
+    };
+    refused(&confirmed, "not the unchanged hold");
     refused(&request, "not the unchanged hold");
     assert_eq!(RunState::load(&request.run).unwrap().repair_grants.len(), 0);
     assert_eq!(Queue::open().get(&task.id).unwrap().status, TaskStatus::Held);
@@ -319,26 +333,45 @@ async fn a_later_hold_or_foreign_reopen_claim_keeps_the_hold_even_with_the_same_
 }
 
 common::e2e! {
-async fn legacy_reopen_without_hold_identity_cannot_authorize_release() {
-    let (_fx, task, _runner, mut request) = stopped(true).await;
+async fn legacy_reopen_requires_explicit_current_hold_confirmation() {
+    let (_fx, task, runner, mut request) = stopped(true).await;
     reopened(&mut request, &task);
     let queue = Queue::open();
     let path = queue.path_of(&task.id);
     let mut record: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     record.as_object_mut().unwrap().remove("reopen_hold");
-    let reopened_at = queue.get(&task.id).unwrap().completion_history.last().unwrap().at;
+    record["schema"] = serde_json::json!(26);
+    let reopened_at = jiff::Timestamp::now() - jiff::SignedDuration::from_secs(5);
+    record["completion_history"].as_array_mut().unwrap().last_mut().unwrap()["at"] =
+        serde_json::json!(reopened_at);
     record["held_at"] = serde_json::json!(reopened_at);
     // A later same-reason hold preserves held_at but stamps a new decision.
-    record["operator_decided_at"] =
-        serde_json::json!(reopened_at + jiff::SignedDuration::from_secs(1));
+    let decided = reopened_at + jiff::SignedDuration::from_secs(1);
+    record["operator_decided_at"] = serde_json::json!(decided);
     std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
     refused(&request, "not the unchanged hold");
-    let held = queue.get(&task.id).unwrap();
+    let mut held = queue.get(&task.id).unwrap();
     assert_eq!(held.status, TaskStatus::Held);
     assert!(held.repair_grants.is_empty());
     assert!(held.resume_override.is_none());
     assert!(RunState::load(&request.run).unwrap().repair_grants.is_empty());
+    // A routine save must preserve the ambiguous provenance across upgrades.
+    queue.put(&mut held).unwrap();
+    request.confirm_legacy_reopen_hold = Some(format!("{reopened_at}/{reopened_at}"));
+    refused(&request, "not the unchanged hold");
+    request.confirm_legacy_reopen_hold = Some(format!("{reopened_at}/{decided}"));
+    let receipt = accepted(&request);
+    assert_eq!(accepted(&request), receipt);
+    let queued = queue.get(&task.id).unwrap();
+    assert_eq!(queued.status, TaskStatus::Queued);
+    assert_eq!(queued.runs, task.runs);
+    assert_eq!(queued.resume_override.as_ref().unwrap().pinned_run.as_ref(), Some(&request.run));
+    let mut resumed = Runner::resume(&request.run).unwrap();
+    resumed.execute().await.unwrap();
+    assert_eq!(resumed.state.id, runner.state.id);
+    assert_eq!(resumed.state.repair_grants[0].spent, 1);
+    assert!(resumed.state.reviews.len() > runner.state.reviews.len());
 }
 }
 
@@ -381,6 +414,7 @@ async fn automatic_budget_hold_admits_only_an_explicit_same_run_repair() {
         expect_pass: run.passes.last().unwrap().index, request: "budget-review-1".into(),
         reason: "Repair the retained review once".into(), tip: None, instruction: None,
         replace_request: None, evidence_digest: None, reopen_occurrence: None,
+        confirm_legacy_reopen_hold: None,
     };
     // Launch a fixture chat seat so the control bridge, not the CLI environment,
     // distinguishes an automatic report from the owner's current request.

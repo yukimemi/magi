@@ -123,6 +123,7 @@ async fn stopped() -> (common::Fixture, Task, Runner, Request) {
         replace_request: None,
         evidence_digest: None,
         reopen_occurrence: None,
+        confirm_legacy_reopen_hold: None,
         task: task.id.clone(),
         run: runner.state.id.clone(),
         kind: Kind::BaseConflict,

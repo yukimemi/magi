@@ -404,6 +404,7 @@ mod tests {
                 replace_request: None,
                 evidence_digest: None,
                 reopen_occurrence: None,
+                confirm_legacy_reopen_hold: None,
             },
             at: "2026-01-01T00:00:02Z".parse().unwrap(),
             decision: None,

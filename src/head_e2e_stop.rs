@@ -802,6 +802,7 @@ mod tests {
                     replace_request: None,
                     evidence_digest: None,
                     reopen_occurrence: None,
+                    confirm_legacy_reopen_hold: None,
                 },
                 at: Timestamp::now(),
                 decision: None,

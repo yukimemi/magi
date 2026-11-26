@@ -149,9 +149,11 @@ use crate::id_reserve::{IdSource, path_exists};
 /// 25: append-only completion/reopen audit and occurrence-bound completion notices.
 ///
 /// 26: typed conclusive `head_e2e` machine hold cause.
-pub const SCHEMA: u32 = 26;
+/// 27: distinguish a recorded reopen hold from an ambiguous legacy snapshot.
+pub const SCHEMA: u32 = 27;
 
 const RECOVERY_HOLD_SCHEMA: u32 = 24;
+const REOPEN_HOLD_SCHEMA: u32 = 27;
 
 /// Candidate order only: all claims, lanes and eligibility gates still apply.
 /// Upgrade-parked runs retain their pass-start order ahead of ordinary work,
@@ -388,6 +390,8 @@ struct ReopenHold {
     occurrence: String,
     held_at: Timestamp,
     decision: Option<Timestamp>,
+    #[serde(default)]
+    legacy: bool,
 }
 
 /// Run and publication evidence observed when a task decision was made.
@@ -1780,6 +1784,7 @@ impl Task {
                     occurrence: event.occurrence.clone(),
                     held_at,
                     decision: self.operator_decided_at,
+                    legacy: false,
                 });
         self.fresh_start = false;
         self.last_error = None;
@@ -1866,6 +1871,7 @@ impl Task {
         if self.schema < RECOVERY_HOLD_SCHEMA && self.recovery_budget_hold.is_none() {
             self.recovery_budget_hold = self.legacy_recovery_budget_hold();
         }
+        self.snapshot_legacy_reopen_hold();
         self.schema = self.schema.max(SCHEMA);
     }
 
@@ -2784,10 +2790,41 @@ impl Task {
         });
     }
 
-    /// Whether this task is still held by exactly the manual hold that reopen
-    /// `occurrence` created for `run`. Legacy records without the hold identity
-    /// cannot distinguish a reopen from a subsequent manual hold.
-    pub(crate) fn held_by_reopen(&self, occurrence: &str, run: &str) -> bool {
+    /// A legacy record can identify the current hold, but cannot prove that
+    /// it was never replaced. Preserve that distinction across schema upgrades.
+    fn snapshot_legacy_reopen_hold(&mut self) {
+        if self.schema >= REOPEN_HOLD_SCHEMA || self.reopen_hold.is_some() {
+            return;
+        }
+        let Some(event) = self.completion_history.last() else {
+            return;
+        };
+        if event.action == CompletionAction::Reopen
+            && self.status == TaskStatus::Held
+            && self.hold_source == Some(HoldSource::Manual)
+            && event.reason.is_some()
+            && self.hold_reason == event.reason
+            && let (Some(held_at), Some(decision)) = (self.held_at, self.operator_decided_at)
+            && held_at >= event.at
+            && decision >= event.at
+        {
+            self.reopen_hold = Some(ReopenHold {
+                occurrence: event.occurrence.clone(),
+                held_at,
+                decision: Some(decision),
+                legacy: true,
+            });
+        }
+    }
+
+    /// A legacy snapshot additionally requires explicit approval of the
+    /// current hold timestamps, not an inference from temporal proximity.
+    pub(crate) fn held_by_reopen(
+        &self,
+        occurrence: &str,
+        run: &str,
+        legacy_confirmation: Option<&str>,
+    ) -> bool {
         let Some(event) = self.completion_history.last() else {
             return false;
         };
@@ -2804,17 +2841,19 @@ impl Task {
         {
             return false;
         }
-        let (Some(held_at), Some(decided)) = (self.held_at, self.operator_decided_at) else {
+        let (Some(held_at), Some(decided), Some(hold)) =
+            (self.held_at, self.operator_decided_at, &self.reopen_hold)
+        else {
             return false;
         };
-        match &self.reopen_hold {
-            Some(hold) => {
-                hold.occurrence == occurrence
-                    && hold.held_at == held_at
-                    && hold.decision == Some(decided)
+        hold.occurrence == occurrence
+            && hold.held_at == held_at
+            && hold.decision == Some(decided)
+            && if hold.legacy {
+                legacy_confirmation == Some(format!("{held_at}/{decided}").as_str())
+            } else {
+                legacy_confirmation.is_none()
             }
-            None => false,
-        }
     }
 
     /// Put a held or finished task back in line, with its attempt count reset
@@ -3583,6 +3622,7 @@ impl Queue {
             if task.updated_at < stored.updated_at
                 && (task.sync_only != stored.sync_only
                     || stored.sync_only.is_some()
+                    || (task.reopen_hold.is_some() && task.reopen_hold != stored.reopen_hold)
                     || stored
                         .recovery_budget_hold
                         .as_ref()
@@ -4445,6 +4485,7 @@ fn read_path(path: &Path) -> Result<Task> {
         );
     }
     task.preserve_legacy_build_cache();
+    task.snapshot_legacy_reopen_hold();
     if task.schema < 22
         && task.status == TaskStatus::Held
         && task.hold_source == Some(HoldSource::Machine)
