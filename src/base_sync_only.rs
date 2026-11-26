@@ -159,7 +159,7 @@ pub(crate) fn validate_run(state: &RunState, home: &Path) -> Result<()> {
 
 /// Queue under the owning task's claim, including explicit recovery of a dead worker.
 pub fn queue(task: &mut Task, home: &Path, run: &str) -> Result<()> {
-    let state = crate::resume::validate(home, run)?;
+    let state = crate::resume::validate_sync_only(home, run)?;
     crate::pr_head::ensure_owner_record(&state, None)?;
     validate_run(&state, home)?;
     let orphan = task

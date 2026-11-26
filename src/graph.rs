@@ -10013,10 +10013,12 @@ impl Runner {
         let message = pr.commit_message();
 
         let delivery_head = git::rev_parse(&winner.worktree, "HEAD").await?;
-        if self.state.deferred_rebase_push.is_some() && delivery_head != head {
+        if delivery_head != head {
             self.state.status = RunStatus::Blocked;
-            self.state
-                .event("gate", "winner changed before deferred rebase publication");
+            self.state.event(
+                "gate",
+                "winner changed after gate; fresh verification required",
+            );
             self.state.save()?;
             return Ok(());
         }
@@ -12623,7 +12625,11 @@ async fn run_e2e_with_retry(
             state, "verify", "e2e", 1, shell, commands, worktree, timeout,
         )
         .await;
-        e2e = retried.0;
+        if state.gate_repair_retry_pass.is_some() && verify_inconclusive(&retried.0) {
+            e2e.extend(retried.0);
+        } else {
+            e2e = retried.0;
+        }
         // Both attempts' timeouts matter, not just the last one: the first
         // attempt's descendants may still be alive alongside the retry's.
         timed_out_pids.extend(retried.1);
@@ -12681,6 +12687,10 @@ async fn run_e2e_with_retry(
             let Some(again) = second.get(slot) else {
                 break;
             };
+            if state.gate_repair_retry_pass.is_some() && again.resource_blocked {
+                e2e.push(again.clone());
+                continue;
+            }
             let first = std::mem::replace(&mut e2e[i], again.clone());
             if again.ok() {
                 let signature = crate::flake::signature(&first.output_tail, first.code);

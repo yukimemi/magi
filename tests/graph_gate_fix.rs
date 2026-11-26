@@ -134,6 +134,7 @@ async fn owner_resume_rechecks_the_retained_gate_repair_before_publication() {
     let fixed = fx.tmp.path().join("e2e-ready");
     let gate_closed = fx.tmp.path().join("gate-closed");
     let deny_second = fx.tmp.path().join("deny-second");
+    let first_rerun = fx.tmp.path().join("first-rerun");
     fx.config.verify.e2e = vec![format!(
         "echo \"e2e $(git rev-parse HEAD)\" >> {}; test ! -f gatefix.txt || test -f {}",
         quote(&log), quote(&fixed),
@@ -145,10 +146,11 @@ async fn owner_resume_rechecks_the_retained_gate_repair_before_publication() {
     let queue = Queue::open();
     let opts = magi::daemon::Opts { repo: fx.repo.clone(), ..Default::default() };
 
-    for scenario in ["success", "timeout", "mixed-outcomes", "moved-head-mixed", "repeated-failure", "moved-head", "moved-head-fails", "changed-checkpoint", "attempt-limit", "final-gate", "base-moved"] {
+    for scenario in ["success", "timeout", "mixed-outcomes", "moved-head-mixed", "rerun-denied", "repeated-failure", "moved-head", "moved-head-fails", "unreviewed-changes", "changed-checkpoint", "attempt-limit", "final-gate", "base-moved"] {
         let mixed = matches!(scenario, "mixed-outcomes" | "moved-head-mixed");
         let moved_head = matches!(scenario, "moved-head" | "moved-head-fails" | "moved-head-mixed");
         let _ = std::fs::remove_file(&deny_second);
+        let _ = std::fs::remove_file(&first_rerun);
         let _ = std::fs::remove_file(&fixed);
         let mut task = Task::new("create note.txt".into(), "create note.txt".into(), fx.repo.clone(), Source::Human);
         let claim = queue.file_claimed(&mut task).unwrap();
@@ -165,6 +167,14 @@ async fn owner_resume_rechecks_the_retained_gate_repair_before_publication() {
                 "test ! -f {} || {{ echo 'incremental cache admission blocked'; exit 1; }}",
                 quote(&deny_second),
             ));
+        }
+        if scenario == "rerun-denied" {
+            config.graph.rerun_failed_e2e = true;
+            config.verify.e2e[0] = format!(
+                "if test -f {} && test -f {}; then echo 'incremental cache admission blocked'; exit 1; fi; if test -f {}; then touch {}; fi; {}",
+                quote(&deny_second), quote(&first_rerun), quote(&deny_second),
+                quote(&first_rerun), config.verify.e2e[0]
+            );
         }
         let mut runner = Runner::start(&fx.repo, task.instruction.clone(), config, Origin::queue(&task.id))
             .await.unwrap();
@@ -241,14 +251,18 @@ async fn owner_resume_rechecks_the_retained_gate_repair_before_publication() {
         task = magi::chat_control::resume(&queue, &magi::run::home(), &run).unwrap();
         let claim = queue.claim(&task.id).unwrap();
         assert_eq!(task.attempts, 1, "a resume pin does not refill attempts");
-        if mixed {
+        if mixed || scenario == "rerun-denied" {
             std::fs::write(&deny_second, "").unwrap();
         }
-        if !mixed && !matches!(scenario, "repeated-failure" | "moved-head-fails") {
+        if !mixed && !matches!(scenario, "repeated-failure" | "moved-head-fails" | "rerun-denied") {
             std::fs::write(&fixed, "").unwrap();
         }
         if moved_head {
             git(&winner, &["commit", "--allow-empty", "-m", "External head movement"]).await.unwrap();
+        } else if scenario == "unreviewed-changes" {
+            std::fs::write(winner.join("unreviewed.txt"), "new content\n").unwrap();
+            git(&winner, &["add", "unreviewed.txt"]).await.unwrap();
+            git(&winner, &["commit", "-m", "Add unreviewed change"]).await.unwrap();
         } else if scenario == "changed-checkpoint" {
             stopped.gate_repair_e2e.as_mut().unwrap().outcomes[0].output_tail = "different failure".into();
             stopped.save().unwrap();
@@ -313,14 +327,14 @@ async fn owner_resume_rechecks_the_retained_gate_repair_before_publication() {
             continue;
         }
         let expected = match scenario {
-            "mixed-outcomes" | "repeated-failure" => format!("e2e {repaired}\n"),
+            "mixed-outcomes" | "repeated-failure" | "rerun-denied" => format!("e2e {repaired}\n"),
             "final-gate" => format!("e2e {repaired}\ngate {repaired}\n"),
             _ => String::new(),
         };
         assert_eq!(observed, expected, "{scenario}");
         assert!(saved.merge.is_none() && saved.pr.is_none(), "{scenario}");
         assert_eq!(task.status, TaskStatus::Held, "{scenario}");
-        if scenario == "mixed-outcomes" {
+        if matches!(scenario, "mixed-outcomes" | "rerun-denied") {
             let outcomes = &saved.gate_repair_e2e.as_ref().unwrap().outcomes;
             assert_eq!(outcomes.len(), 2);
             assert_eq!(outcomes[0].code, Some(1));

@@ -106,6 +106,13 @@ impl GateRepairRetry {
             head == self.head || crate::git::is_ancestor(&path, &self.head, &head).await,
             "the retained winner no longer descends from the authorized post-repair head"
         );
+        ensure!(
+            head == self.head
+                || crate::git::git_raw(&path, &["diff", "--quiet", &self.head, &head, "--"])
+                    .await?
+                    .ok(),
+            "the retained winner contains unreviewed changes; request an explicit successor review"
+        );
         Ok(head)
     }
 }
@@ -133,13 +140,20 @@ pub fn validate(home: &Path, id: &str) -> Result<RunState> {
     ensure!(crate::run::is_run_id(id), "invalid run id");
     crate::task_reassign::ensure_current(&crate::queue::Queue::at(home.join("queue")), id)?;
     let _owner = crate::pr_head::owner_lock(home, id)?;
-    validate_locked(home, id)
+    validate_locked(home, id, false)
 }
 
-fn validate_locked(home: &Path, id: &str) -> Result<RunState> {
+pub(crate) fn validate_sync_only(home: &Path, id: &str) -> Result<RunState> {
+    ensure!(crate::run::is_run_id(id), "invalid run id");
+    crate::task_reassign::ensure_current(&crate::queue::Queue::at(home.join("queue")), id)?;
+    let _owner = crate::pr_head::owner_lock(home, id)?;
+    validate_locked(home, id, true)
+}
+
+fn validate_locked(home: &Path, id: &str, sync_only: bool) -> Result<RunState> {
     let state = crate::run::RunState::load_under(id, home)?;
     ensure!(
-        state.pending_sync_only().is_none(),
+        sync_only || state.pending_sync_only().is_none(),
         "base-only synchronization has not succeeded; resume with --sync-base-only before verifying"
     );
     if let Some(reason) = owner_refusal(&state, home) {
@@ -268,7 +282,7 @@ pub(crate) fn pin_queued(
         .context("queue has no home")
         .map_err(BeforeQueueWrite)?;
     let _owner = crate::pr_head::owner_lock(home, run).map_err(BeforeQueueWrite)?;
-    let state = validate_locked(home, run).map_err(BeforeQueueWrite)?;
+    let state = validate_locked(home, run, false).map_err(BeforeQueueWrite)?;
     let post_repair = crate::handover::failed_gate_repair_e2e(&state).is_some();
     if applied.is_none()
         && task.status == TaskStatus::Queued
@@ -307,7 +321,7 @@ pub fn publish_owner_pin<T>(
     let home = queue.root().parent().context("queue has no home")?;
     crate::task_reassign::ensure_current(queue, run)?;
     let _owner = crate::pr_head::owner_lock(home, run)?;
-    let state = validate_locked(home, run)?;
+    let state = validate_locked(home, run, false)?;
     prepare_pin(&state, task, queue, source, None)?;
     let result = configure(task);
     queue.put(task)?;

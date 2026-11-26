@@ -338,6 +338,10 @@ pub(crate) async fn publish(
     let remote = state.config.merge.remote.clone();
     let remote_head = git::remote_head(&winner.worktree, &remote, &head).await?;
     let local_tip = git::rev_parse(&winner.worktree, &winner.branch).await?;
+    anyhow::ensure!(
+        state.gate_head.as_deref() == Some(local_tip.as_str()),
+        "winner changed after gate; fresh verification required"
+    );
     state.check_delivery_evidence(&local_tip)?;
     let expected = if let Some(selected) = &state.pr_recovery {
         selected_lease(
@@ -401,11 +405,14 @@ pub(crate) async fn publish(
         }
     }
     let tip = git::rev_parse(&winner.worktree, &format!("refs/heads/{}", winner.branch)).await?;
+    anyhow::ensure!(tip == local_tip, "winner changed during publication");
     anyhow::ensure!(
         crate::foreign_checkout::write_back(state, &tip).await?,
         "foreign checkout delivery is blocked; see the run events"
     );
-    let push = git::push_as(&winner.worktree, &remote, &winner.branch, &head, &expected).await?;
+    let lease = format!("--force-with-lease=refs/heads/{head}:{expected}");
+    let refspec = format!("{tip}:refs/heads/{head}");
+    let push = git::git_raw(&winner.worktree, &["push", &lease, &remote, &refspec]).await?;
     if !push.ok() {
         bail!("public head push refused: {}", push.stderr);
     }
