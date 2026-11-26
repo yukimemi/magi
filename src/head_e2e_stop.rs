@@ -802,6 +802,7 @@ mod tests {
                 contract: String::new(),
                 stop: None,
                 legacy: None,
+                review_transition: None,
             },
             spent: 0,
             phase: crate::repair_budget::Phase::Pending,

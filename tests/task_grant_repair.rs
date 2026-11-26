@@ -1080,3 +1080,339 @@ async fn superseded_dependency_question_does_not_deadlock_triage_after_repair_fa
     assert_eq!(questions.get(&generic.id).unwrap().answer, None);
 }
 }
+
+async fn stopped_with_pre_gate(
+    pre_gate: Vec<String>,
+    e2e: Vec<String>,
+) -> (common::Fixture, Task, Runner, Request) {
+    let mut fx = fixture(home_lock().await, Judges::Unanimous, true);
+    fx.config.graph.implementers = 1;
+    fx.config.graph.reviewers = 1;
+    fx.config.graph.review_rounds = 1;
+    fx.config.graph.gate_fix_rounds = 0;
+    fx.config.disk.min_free_bytes = 0;
+    fx.config.disk.auto_fold = false;
+    fx.config.verify.pre_gate = pre_gate;
+    fx.config.verify.e2e = e2e;
+    let mut task = Task::new(
+        "mechanical pre-gate repair fixture".into(),
+        "create note.txt".into(),
+        fx.repo.clone(),
+        Source::Human,
+    );
+    Queue::open().put(&mut task).unwrap();
+    let mut runner = Runner::start(
+        &fx.repo,
+        task.instruction.clone(),
+        fx.config.clone(),
+        Origin::queue(&task.id),
+    )
+    .await
+    .unwrap();
+    runner.execute().await.unwrap();
+    let head = magi::git::rev_parse(&runner.state.winner().unwrap().worktree, "HEAD")
+        .await
+        .unwrap();
+    task.start(runner.state.id.clone());
+    task.status = TaskStatus::Failed;
+    Queue::open().put(&mut task).unwrap();
+    let request = Request {
+        replace_request: None,
+        evidence_digest: None,
+        tip: None,
+        instruction: None,
+        task: task.id.clone(),
+        run: runner.state.id.clone(),
+        kind: Kind::Review,
+        rounds: 1,
+        head,
+        expect_pass: runner.state.passes.last().unwrap().index,
+        request: "pre-gate-review-1".into(),
+        reason: "repair retained review after mechanical pre-gate commit".into(),
+    };
+    (fx, task, runner, request)
+}
+
+common::e2e! {
+async fn exhausted_review_grant_admits_proven_mechanical_pre_gate_head_repairs_and_requires_fresh_review() {
+    let (_fx, task, runner, request) = stopped_with_pre_gate(
+        vec!["echo formatted > fmt.txt".into()],
+        vec!["test -f fixed.txt || { echo 'fixed.txt is missing'; exit 1; }".into()],
+    )
+    .await;
+    assert_eq!(runner.state.status, RunStatus::Blocked);
+    assert_eq!(runner.state.reviews.len(), 1);
+    let review = &runner.state.reviews[0];
+    assert_ne!(review.head, request.head, "pre_gate must advance HEAD past review.head");
+    assert_eq!(review.verified_head.as_deref(), Some(request.head.as_str()));
+    assert!(review.verified_at.is_some());
+    assert_eq!(runner.state.pre_gate_commit.as_deref(), Some(request.head.as_str()));
+
+    // Requesting the pre-pre_gate reviewed head must still be refused because HEAD moved.
+    let mut stale = request.clone();
+    stale.head = review.head.clone();
+    stale.request = "stale-reviewed-head".into();
+    refused(&stale, "branch/head changed");
+
+    // Accepting at the verified mechanical pre_gate head pins ReviewTransition and is idempotent.
+    let receipt = accepted(&request);
+    assert_eq!(accepted(&request), receipt);
+    assert_eq!(receipt["review_transition"]["review_round"], 1);
+    assert_eq!(receipt["review_transition"]["reviewed_head"], review.head);
+    assert_eq!(receipt["review_transition"]["verified_head"], request.head);
+    let mut conflict = request.clone();
+    conflict.rounds = 2;
+    refused(&conflict, "different arguments");
+    assert!(RunState::load(&request.run).unwrap().repair_grants.is_empty());
+    assert_eq!(Queue::open().get(&task.id).unwrap().repair_grants.len(), 1);
+
+    // Execution repairs the retained tree (preserving fmt.txt), then requires fresh review, E2E and gate.
+    let mut resumed = Runner::resume(&request.run).unwrap();
+    resumed.execute().await.unwrap();
+    assert_eq!(resumed.state.repair_grants.len(), 1);
+    assert_eq!(resumed.state.repair_grants[0].spent, 1);
+    assert_eq!(resumed.state.repair_grants[0].phase, Phase::Complete);
+    assert!(resumed.state.repair_grants[0].succeeded);
+    assert!(resumed.state.reviews[0].fix.is_some());
+    assert_eq!(resumed.state.reviews.len(), 2);
+    let wt = &resumed.state.winner().unwrap().worktree;
+    assert!(wt.join("fmt.txt").is_file(), "mechanical pre-gate file must be preserved");
+    assert!(wt.join("fixed.txt").is_file(), "fixer change must be applied");
+    let final_head = magi::git::rev_parse(wt, "HEAD").await.unwrap();
+    assert_ne!(final_head, request.head);
+    assert_eq!(resumed.state.reviews[1].head, final_head);
+    assert_eq!(resumed.state.reviews[1].verified_head.as_deref(), Some(final_head.as_str()));
+    assert!(resumed.state.reviews[1].clean);
+    assert!(resumed.state.gate_allows_progress());
+    assert!(
+        magi::land::approval_reasons(&resumed.state)
+            .contains(&magi::land::ApprovalReason::AfterRepair),
+        "owner approval after repair must never be bypassed"
+    );
+}
+}
+
+common::e2e! {
+async fn mechanical_pre_gate_review_grant_refuses_stale_missing_or_drifted_proof_and_reconciles() {
+    let (fx, task, runner, request) = stopped_with_pre_gate(
+        vec!["echo formatted > fmt.txt".into()],
+        vec!["test -f fixed.txt || { echo 'fixed.txt is missing'; exit 1; }".into()],
+    )
+    .await;
+    let mut baseline = runner.state.clone();
+    let wt = baseline.winner().unwrap().worktree.clone();
+    let reviewed = baseline.reviews[0].head.clone();
+    let verified = request.head.clone();
+
+    // Missing pre_gate_commit refuses without mutating task.
+    let mut tampered = baseline.clone();
+    tampered.pre_gate_commit = None;
+    tampered.save().unwrap();
+    refused(&request, "proven mechanical pre-gate commit");
+
+    // Missing verified_at refuses.
+    let mut tampered = baseline.clone();
+    tampered.reviews[0].verified_at = None;
+    tampered.save().unwrap();
+    refused(&request, "verification timestamp");
+
+    // Post-verification pre_gate commit event refuses.
+    let mut tampered = baseline.clone();
+    for ev in &mut tampered.events {
+        if ev.node == "pre_gate" {
+            ev.at = tampered.reviews[0]
+                .verified_at
+                .unwrap()
+                .checked_add(jiff::Span::new().seconds(5))
+                .unwrap();
+        }
+    }
+    tampered.save().unwrap();
+    refused(&request, "pre-verification mechanical pre-gate commit event");
+
+    // Resource-blocked pre_gate outcome refuses.
+    let mut tampered = baseline.clone();
+    tampered.pre_gate[0].resource_blocked = true;
+    tampered.save().unwrap();
+    refused(&request, "resource-blocked");
+
+    // Arbitrary second descendant (two commits past review.head) refuses even with matching state fields.
+    std::fs::write(wt.join("second.txt"), "extra\n").unwrap();
+    assert!(
+        magi::git::commit_all(&wt, magi::graph::PRE_GATE_COMMIT_MESSAGE)
+            .await
+            .unwrap()
+    );
+    let second = magi::git::rev_parse(&wt, "HEAD").await.unwrap();
+    let mut tampered = baseline.clone();
+    tampered.pre_gate_commit = Some(second.clone());
+    tampered.reviews[0].verified_head = Some(second.clone());
+    tampered.events.push(magi::run::Event {
+        at: tampered.reviews[0].verified_at.unwrap(),
+        node: "pre_gate".into(),
+        message: format!("committed mechanical fixes ({second})"),
+    });
+    tampered.save().unwrap();
+    let mut second_req = request.clone();
+    second_req.head = second;
+    refused(&second_req, "single-commit mechanical pre-gate transition");
+
+    // Restore exact verified commit and verify acceptance.
+    let reset = magi::git::git_raw(&wt, &["reset", "--hard", &verified])
+        .await
+        .unwrap();
+    assert!(reset.ok(), "{}", reset.stderr);
+    baseline.save().unwrap();
+    let receipt = accepted(&request);
+    assert_eq!(receipt["review_transition"]["reviewed_head"], reviewed);
+
+    // Post-acceptance drift before import prevents receipt import and leaves run untouched.
+    let mut drifted = baseline.clone();
+    drifted.pre_gate_commit = None;
+    drifted.save().unwrap();
+    let mut resumed = Runner::resume(&request.run).unwrap();
+    assert!(resumed.execute().await.is_err());
+    assert!(RunState::load(&request.run).unwrap().repair_grants.is_empty());
+
+    // Already-imported Pending grant (spent == 0) whose proof drifts before execution
+    // must refuse WITHOUT consuming budget or entering Phase::Fixing.
+    let saved_receipt = Queue::open().get(&task.id).unwrap().repair_grants[0].clone();
+    let mut imported_drifted = baseline.clone();
+    imported_drifted.repair_grants.push(magi::repair_budget::Applied {
+        receipt: saved_receipt.clone(),
+        spent: 0,
+        phase: Phase::Pending,
+        review_start: imported_drifted.reviews.len(),
+        head: request.head.clone(),
+        succeeded: false,
+        conflict: None,
+    });
+    imported_drifted.pre_gate_commit = None;
+    imported_drifted.save().unwrap();
+    let mut resumed = Runner::resume(&request.run).unwrap();
+    assert!(resumed.execute().await.is_err());
+    let persisted = RunState::load(&request.run).unwrap();
+    assert_eq!(persisted.repair_grants.len(), 1);
+    assert_eq!(persisted.repair_grants[0].spent, 0);
+    assert_eq!(persisted.repair_grants[0].phase, Phase::Pending);
+
+    // Restore unimported baseline and exercise the reconciliation path with mechanical proof.
+    baseline.save().unwrap();
+    let queue = Queue::open();
+    let mut historical = queue.get(&task.id).unwrap();
+    let q = dependency_question(&historical);
+    let _talk = decide_dependency(&fx, &q);
+    let q = magi::ask::Questions::open().get(&q.id).unwrap();
+    historical.repair_grants[0].at = jiff::Timestamp::now();
+    queue.put(&mut historical).unwrap();
+    assert_eq!(
+        magi::triage::apply_answers(&queue, &magi::ask::Questions::open()),
+        std::slice::from_ref(&task.id)
+    );
+    settle_worker_projection();
+    let recovery = magi::repair_budget::reconcile::Request {
+        task: task.id.clone(),
+        run: request.run.clone(),
+        head: request.head.clone(),
+        expect_pass: request.expect_pass,
+        receipt: request.request.clone(),
+        question: q.id.clone(),
+        answer_at: q.answered_at.unwrap(),
+        request: "recover-pre-gate-review".into(),
+        reason: "reconcile mechanical pre-gate review grant".into(),
+    };
+    let mut tampered = baseline.clone();
+    tampered.pre_gate_commit = None;
+    tampered.save().unwrap();
+    assert!(
+        magi::repair_budget::reconcile::apply(&queue, &magi::run::home(), recovery.clone())
+            .await
+            .is_err()
+    );
+    baseline.save().unwrap();
+    let reconciled = magi::repair_budget::reconcile::apply(&queue, &magi::run::home(), recovery)
+        .await
+        .unwrap();
+    assert_eq!(reconciled.grant.review_transition, saved_receipt.review_transition);
+    let mut resumed = Runner::resume(&request.run).unwrap();
+    resumed.execute().await.unwrap();
+    assert_eq!(resumed.state.repair_grants[0].spent, 1);
+    assert!(resumed.state.repair_grants[0].succeeded);
+}
+}
+
+common::e2e! {
+async fn confirmation_review_pre_gate_head_change_requires_fresh_review_and_resumes_without_initial_head() {
+    let (_fx, _task, runner, request) = stopped_with_pre_gate(
+        vec![
+            "if [ ! -f fmt-note.txt ]; then echo formatted > fmt-note.txt; fi; if [ -f fixed.txt ] && [ ! -f fmt-fixed.txt ]; then echo formatted > fmt-fixed.txt; fi".into(),
+        ],
+        vec!["test -f fixed.txt || { echo 'fixed.txt is missing'; exit 1; }".into()],
+    )
+    .await;
+    assert_ne!(runner.state.reviews[0].head, request.head);
+    accepted(&request);
+
+    // First execution fixes the retained tree (H1 -> H2), then confirmation review's pre_gate
+    // formats fixed.txt (H2 -> H3). It must NOT publish H3 without a fresh review of H3.
+    let mut first = Runner::resume(&request.run).unwrap();
+    first.execute().await.unwrap();
+    let wt = first.state.winner().unwrap().worktree.clone();
+    let after_confirm_pre_gate = magi::git::rev_parse(&wt, "HEAD").await.unwrap();
+    assert_eq!(first.state.status, RunStatus::Blocked);
+    assert_eq!(first.state.repair_grants[0].spent, 1);
+    assert_eq!(first.state.repair_grants[0].phase, Phase::Reviewing);
+    assert!(!first.state.repair_grants[0].succeeded);
+    assert_eq!(first.state.repair_grants[0].head, after_confirm_pre_gate);
+    assert_ne!(after_confirm_pre_gate, request.head);
+    assert_eq!(first.state.reviews.len(), 2);
+    assert_ne!(first.state.reviews[1].head, after_confirm_pre_gate);
+    assert_eq!(
+        first.state.reviews[1].verified_head.as_deref(),
+        Some(after_confirm_pre_gate.as_str())
+    );
+    assert!(wt.join("fmt-note.txt").is_file());
+    assert!(wt.join("fixed.txt").is_file());
+    assert!(wt.join("fmt-fixed.txt").is_file());
+
+    // Resuming an already-started repair must not demand the initial acceptance HEAD (H1).
+    // Fresh review and E2E now certify H3 cleanly without spending another fix attempt.
+    let mut second = Runner::resume(&request.run).unwrap();
+    second.execute().await.unwrap();
+    assert_eq!(second.state.repair_grants[0].spent, 1);
+    assert_eq!(second.state.repair_grants[0].phase, Phase::Complete);
+    assert!(second.state.repair_grants[0].succeeded);
+    assert_eq!(second.state.reviews.len(), 3);
+    assert_eq!(second.state.reviews[2].head, after_confirm_pre_gate);
+    assert_eq!(
+        second.state.reviews[2].verified_head.as_deref(),
+        Some(after_confirm_pre_gate.as_str())
+    );
+    assert!(second.state.reviews[2].clean);
+    assert!(second.state.gate_allows_progress());
+}
+}
+
+common::e2e! {
+async fn multi_round_mechanical_review_grant_continues_second_round_without_requiring_initial_head() {
+    let (_fx, _task, runner, mut request) = stopped_with_pre_gate(
+        vec!["echo formatted > fmt.txt".into()],
+        vec!["test \"$(wc -l < fixed.txt 2>/dev/null || echo 0)\" -ge 2 || { echo 'need two fix lines'; exit 1; }".into()],
+    )
+    .await;
+    assert_ne!(runner.state.reviews[0].head, request.head);
+    request.rounds = 2;
+    accepted(&request);
+
+    let mut resumed = Runner::resume(&request.run).unwrap();
+    resumed.execute().await.unwrap();
+    assert_eq!(resumed.state.repair_grants[0].spent, 2);
+    assert_eq!(resumed.state.repair_grants[0].phase, Phase::Complete);
+    assert!(resumed.state.repair_grants[0].succeeded);
+    assert_eq!(resumed.state.reviews.len(), 3);
+    assert!(resumed.state.reviews[0].fix.is_some());
+    assert!(resumed.state.reviews[1].fix.is_some());
+    assert!(resumed.state.reviews[2].clean);
+    assert!(resumed.state.gate_allows_progress());
+}
+}
