@@ -2142,6 +2142,9 @@ Each linked checkout generation in isolated mode gets a separate target under
 `MAGI_HOME/isolated-builds`. Editing seats and managed verification in that
 checkout reuse it; reviewers do not get the path. Git's absolute and relative
 linked-worktree registrations are supported.
+Concurrent magi workers serialize worktree creation and shared worktree-extension
+writes within each Git common directory, including the first relative-worktree
+format upgrade. Builds and agent execution remain independent.
 No outputs go in the source tree. Inspect the run's build mode with `magi show`.
 Use `magi cache list` for the actual target paths, owners, and leases. The
 usual cache maintenance locks and `[disk] cache_limit_bytes` apply to the isolated

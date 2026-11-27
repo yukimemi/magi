@@ -39,6 +39,54 @@ pub(crate) async fn git_raw_command(
     args: &[&str],
     kill_on_drop: bool,
 ) -> Result<GitOut> {
+    // Creating a relative worktree can upgrade the shared repository format
+    // and write extensions.relativeWorktrees. Serialize it with our other
+    // shared extension writes, including calls from detached worker processes.
+    let _config_lock = if args.starts_with(&["worktree", "add"])
+        || args == ["config", "extensions.worktreeConfig", "true"]
+        || args == ["config", "--unset", "extensions.worktreeConfig"]
+    {
+        Some(lock_worktree_config(cwd).await?)
+    } else {
+        None
+    };
+    git_raw_unlocked(cwd, args, kill_on_drop).await
+}
+
+async fn lock_worktree_config(repo: &Path) -> Result<std::fs::File> {
+    let common = git_raw_unlocked(
+        repo,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        false,
+    )
+    .await?;
+    ensure!(common.ok(), "resolve shared Git directory: {}", common.stderr);
+    let common = std::fs::canonicalize(&common.stdout)?;
+    let path = common.join("magi-worktree-config.lock");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)?;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        match crate::pr_head::try_lock_file(&file) {
+            Ok(()) => return Ok(file),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.raw_os_error() == Some(33) => {
+                ensure!(
+                    tokio::time::Instant::now() < deadline,
+                    "waiting for shared Git config lock: {}",
+                    path.display()
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            Err(e) => return Err(e).context("acquire shared Git config lock"),
+        }
+    }
+}
+
+async fn git_raw_unlocked(cwd: &Path, args: &[&str], kill_on_drop: bool) -> Result<GitOut> {
     #[cfg(test)]
     crate::web::request_cost::git();
     let out = Command::new("git")
