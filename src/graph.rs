@@ -58,6 +58,17 @@ use crate::verdict::{
     self, FinalVote, Finding, FixReport, Position, Proposal, Ranking, Review, ReviewRevote,
     ReviewVote, Severity,
 };
+
+/// Fixed commit message for graph-owned mechanical `verify.pre_gate` commits.
+pub const PRE_GATE_COMMIT_MESSAGE: &str = "magi: pre_gate (mechanical fixes)";
+
+/// Event node recorded by [`Runner::run_pre_gate`].
+pub(crate) const PRE_GATE_EVENT_NODE: &str = "pre_gate";
+
+/// Durable event text logged when [`Runner::run_pre_gate`] commits mechanical changes.
+pub(crate) fn pre_gate_commit_event(head: &str) -> String {
+    format!("committed mechanical fixes ({head})")
+}
 use crate::worktree_setup;
 
 /// Bytes of a failing command's output kept in an event, so the reason a run
@@ -1972,6 +1983,10 @@ impl Runner {
                         self.state.save()?;
                         return Ok(());
                     }
+                    if grant.spent == 0 && grant.receipt.request.kind == Kind::Review {
+                        crate::repair_budget::verify_initial_review_grant(&self.state, &grant)
+                            .await?;
+                    }
                     // Reserve before dispatch. A crash can consume an attempt,
                     // but can never duplicate it or reset saved fixer history.
                     self.state.repair_grants[index].spent += 1;
@@ -2076,26 +2091,74 @@ impl Runner {
                         return Ok(());
                     }
                     let head = git::rev_parse(&winner.worktree, "HEAD").await?;
-                    let clean = self.state.reviews.len() > grant.review_start
-                        && self.state.reviews.last().is_some_and(|r| {
-                            r.head == head
-                                && r.clean
-                                && r.expected > 0
-                                && r.answered == r.expected
-                                && matches!(
-                                    r.e2e_status(),
-                                    E2eStatus::Passed | E2eStatus::NotConfigured
-                                )
-                        });
+                    let reviewed = (self.state.reviews.len() > grant.review_start)
+                        .then(|| self.state.reviews.last())
+                        .flatten();
+                    let review_passed = reviewed.is_some_and(|r| {
+                        r.clean
+                            && r.expected > 0
+                            && r.answered == r.expected
+                            && matches!(
+                                r.e2e_status(),
+                                E2eStatus::Passed | E2eStatus::NotConfigured
+                            )
+                            && ((r.e2e_status() == E2eStatus::NotConfigured
+                                && self.state.config.verify.e2e.is_empty())
+                                || r.verified_head.as_deref() == Some(head.as_str()))
+                    });
+                    let clean = review_passed && reviewed.is_some_and(|r| r.head == head);
                     if !clean {
-                        // A confirmation review carries no additional fix budget.
-                        self.state.repair_grants[index].phase = if grant.receipt.request.kind
-                            == Kind::Review
+                        let next = if review_passed
+                            && let Some(r) = reviewed
+                            && r.head != head
+                        {
+                            crate::repair_budget::prove_mechanical_pre_gate_commit(
+                                &self.state,
+                                r,
+                                &head,
+                            )
+                            .await
+                            .map(|_| Some(Phase::Reviewing))
+                        } else if grant.receipt.request.kind == Kind::Review
                             && grant.spent < grant.receipt.request.rounds
-                            && self.state.reviews.last().is_some_and(|r| {
-                                r.fix.is_none()
-                                    && (r.blocking > 0 || r.e2e_status() == E2eStatus::Failed)
-                            }) {
+                        {
+                            crate::repair_budget::prove_review_target(&self.state, &head)
+                                .await
+                                .map(|_| Some(Phase::Pending))
+                        } else {
+                            Ok(None)
+                        };
+                        let next = match next {
+                            Ok(next) => next,
+                            Err(error) => {
+                                if self.state.repair_grants[index]
+                                    .checkpoint_provenance_retry(&head, &error)
+                                {
+                                    self.state.status = RunStatus::Blocked;
+                                    self.state.event("repair-grant", format!(
+                                        "pre-gate provenance unavailable; resume confirmation without spending repair budget: {error:#}"
+                                    ));
+                                    self.state.save()?;
+                                    return Ok(());
+                                }
+                                None
+                            }
+                        };
+                        if next == Some(Phase::Reviewing) {
+                            self.state.repair_grants[index].review_start = self.state.reviews.len();
+                            self.state.repair_grants[index].head = head;
+                            self.state.repair_grants[index].phase = Phase::Reviewing;
+                            self.state.status = RunStatus::Blocked;
+                            self.state.event(
+                                "repair-grant",
+                                "pre-gate changed the reviewed head; resume for fresh review before publication",
+                            );
+                            self.state.save()?;
+                            return Ok(());
+                        }
+                        // A confirmation review carries no additional fix budget.
+                        self.state.repair_grants[index].phase = if next == Some(Phase::Pending) {
+                            self.state.repair_grants[index].head = head;
                             Phase::Pending
                         } else {
                             Phase::Complete
@@ -9015,10 +9078,10 @@ impl Runner {
             );
         }
         state.pre_gate = outcomes;
-        match git::commit_all(&winner.worktree, "magi: pre_gate (mechanical fixes)").await {
+        match git::commit_all(&winner.worktree, PRE_GATE_COMMIT_MESSAGE).await {
             Ok(true) => match git::rev_parse(&winner.worktree, "HEAD").await {
                 Ok(head) => {
-                    state.event("pre_gate", format!("committed mechanical fixes ({head})"));
+                    state.event(PRE_GATE_EVENT_NODE, pre_gate_commit_event(&head));
                     state.pre_gate_commit = Some(head);
                 }
                 Err(e) => tracing::warn!("pre_gate committed but HEAD unreadable: {e:#}"),

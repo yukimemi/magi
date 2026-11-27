@@ -296,7 +296,11 @@ async fn apply_inner(queue: &Queue, home: &Path, mut request: Request) -> Result
         !state.repair_grants.iter().any(|r| r.receipt == grant),
         "receipt was already imported; recovery requires an unimported, unspent receipt"
     );
-    evidence(&state, &grant.request)?;
+    let transition = evidence(&state, &grant.request).await?;
+    ensure!(
+        transition == grant.review_transition,
+        "repair grant reconciliation refused: review transition evidence changed after acceptance"
+    );
     head_and_public(&state, &request.head).await?;
     task.status = TaskStatus::Queued;
     task.hold_source = None;
@@ -409,6 +413,7 @@ mod tests {
             contract: contract(&task, Kind::Review).unwrap(),
             stop: None,
             legacy: None,
+            review_transition: None,
         };
         // The old worker committed the response and release together, without
         // the modern full-source receipt. This is durable application evidence,

@@ -690,6 +690,74 @@ pub async fn commits_ahead(worktree: &Path, base: &str, head: &str) -> Result<us
     Ok(out.trim().parse().unwrap_or(0))
 }
 
+/// Neutral git author/committer name used for magi-owned mechanical and rescue commits.
+pub const NEUTRAL_IDENTITY_NAME: &str = "magi candidate";
+
+/// Neutral git author/committer email used for magi-owned mechanical and rescue commits.
+pub const NEUTRAL_IDENTITY_EMAIL: &str = "magi@localhost";
+
+/// Commit header and message metadata read directly from a git commit object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitProvenance {
+    /// Full 40-hex commit SHA (`%H`).
+    pub commit: String,
+    /// Parent commit SHAs in order (`%P`).
+    pub parents: Vec<String>,
+    /// Raw author name (`%an`, ignoring `.mailmap`).
+    pub author_name: String,
+    /// Raw author email (`%ae`, ignoring `.mailmap`).
+    pub author_email: String,
+    /// Raw committer name (`%cn`, ignoring `.mailmap`).
+    pub committer_name: String,
+    /// Raw committer email (`%ce`, ignoring `.mailmap`).
+    pub committer_email: String,
+    /// Full commit message (`%B`), with at most one trailing line ending removed.
+    pub message: String,
+}
+
+/// Inspect exact parent, identity, and message metadata for commit `rev`.
+pub async fn commit_provenance(repo: &Path, rev: &str) -> Result<CommitProvenance> {
+    let spec = format!("{rev}^{{commit}}");
+    let out = git_raw(
+        repo,
+        &[
+            "-c",
+            "log.showSignature=false",
+            "show",
+            "-s",
+            "--format=%H%x00%P%x00%an%x00%ae%x00%cn%x00%ce%x00%B%x00end",
+            &spec,
+            "--",
+        ],
+    )
+    .await?;
+    ensure!(
+        out.ok(),
+        "git show commit provenance for {rev} failed: {}",
+        out.stderr
+    );
+    let parts: Vec<&str> = out.stdout.split('\0').collect();
+    ensure!(
+        parts.len() == 8 && parts[7] == "end",
+        "unexpected git commit provenance output for {rev}"
+    );
+    let parents = parts[1].split_whitespace().map(str::to_owned).collect();
+    let message = parts[6]
+        .strip_suffix("\r\n")
+        .or_else(|| parts[6].strip_suffix('\n'))
+        .unwrap_or(parts[6])
+        .to_owned();
+    Ok(CommitProvenance {
+        commit: parts[0].to_owned(),
+        parents,
+        author_name: parts[2].to_owned(),
+        author_email: parts[3].to_owned(),
+        committer_name: parts[4].to_owned(),
+        committer_email: parts[5].to_owned(),
+        message,
+    })
+}
+
 /// Stage everything and commit under a neutral identity.
 ///
 /// Used to rescue an agent that edited files but never committed: without this
@@ -714,13 +782,15 @@ pub async fn commit_all(worktree: &Path, message: &str) -> Result<bool> {
             return Ok(false);
         }
     }
+    let user_name = format!("user.name={NEUTRAL_IDENTITY_NAME}");
+    let user_email = format!("user.email={NEUTRAL_IDENTITY_EMAIL}");
     let out = git_raw(
         worktree,
         &[
             "-c",
-            "user.name=magi candidate",
+            &user_name,
             "-c",
-            "user.email=magi@localhost",
+            &user_email,
             "commit",
             "--no-verify",
             "-m",
@@ -2703,10 +2773,83 @@ done
             .unwrap();
         assert_eq!(author, "magi candidate <magi@localhost>");
 
+        let head = rev_parse(&wt, "HEAD").await.unwrap();
+        let prov = commit_provenance(&wt, &head).await.unwrap();
+        assert_eq!(prov.commit, head);
+        assert_eq!(prov.parents, vec![base.clone()]);
+        assert_eq!(prov.author_name, NEUTRAL_IDENTITY_NAME);
+        assert_eq!(prov.author_email, NEUTRAL_IDENTITY_EMAIL);
+        assert_eq!(prov.committer_name, NEUTRAL_IDENTITY_NAME);
+        assert_eq!(prov.committer_email, NEUTRAL_IDENTITY_EMAIL);
+        assert_eq!(prov.message, "candidate work");
+
         assert!(worktree_remove(&repo, &wt).await.unwrap());
         assert!(branch_exists(&repo, "magi/test/a").await.unwrap());
         assert!(branch_delete(&repo, "magi/test/a").await.unwrap());
         assert!(!branch_exists(&repo, "magi/test/a").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn commit_provenance_distinguishes_merge_commits_body_and_identities() {
+        let (_guard, repo) = scratch().await;
+        let base = rev_parse(&repo, "HEAD").await.unwrap();
+
+        // Non-neutral author with neutral committer and extra body line.
+        tokio::fs::write(repo.join("body.txt"), "one\n")
+            .await
+            .unwrap();
+        git(&repo, &["add", "body.txt"]).await.unwrap();
+        let out = tokio::process::Command::new("git")
+            .current_dir(&repo)
+            .env("GIT_AUTHOR_NAME", "Alice")
+            .env("GIT_AUTHOR_EMAIL", "alice@example.com")
+            .env("GIT_COMMITTER_NAME", NEUTRAL_IDENTITY_NAME)
+            .env("GIT_COMMITTER_EMAIL", NEUTRAL_IDENTITY_EMAIL)
+            .args(["commit", "--no-verify", "-m", "subject\n\nextra body"])
+            .output()
+            .await
+            .unwrap();
+        assert!(out.status.success());
+        let extra = rev_parse(&repo, "HEAD").await.unwrap();
+        let prov = commit_provenance(&repo, &extra).await.unwrap();
+        assert_eq!(prov.parents, vec![base.clone()]);
+        assert_eq!(prov.author_name, "Alice");
+        assert_eq!(prov.author_email, "alice@example.com");
+        assert_eq!(prov.committer_name, NEUTRAL_IDENTITY_NAME);
+        assert_eq!(prov.committer_email, NEUTRAL_IDENTITY_EMAIL);
+        assert_eq!(prov.message, "subject\n\nextra body");
+
+        // Merge commit reports two parents.
+        git(&repo, &["checkout", "-b", "side", &base])
+            .await
+            .unwrap();
+        tokio::fs::write(repo.join("side.txt"), "two\n")
+            .await
+            .unwrap();
+        assert!(commit_all(&repo, "side change").await.unwrap());
+        let side = rev_parse(&repo, "HEAD").await.unwrap();
+        git(&repo, &["checkout", "-"]).await.unwrap();
+        let merge_out = git_raw(
+            &repo,
+            &[
+                "-c",
+                &format!("user.name={NEUTRAL_IDENTITY_NAME}"),
+                "-c",
+                &format!("user.email={NEUTRAL_IDENTITY_EMAIL}"),
+                "merge",
+                "--no-ff",
+                "-m",
+                "merge side",
+                &side,
+            ],
+        )
+        .await
+        .unwrap();
+        assert!(merge_out.ok(), "{}", merge_out.stderr);
+        let merged = rev_parse(&repo, "HEAD").await.unwrap();
+        let merged_prov = commit_provenance(&repo, &merged).await.unwrap();
+        assert_eq!(merged_prov.parents, vec![extra, side]);
+        assert_eq!(merged_prov.message, "merge side");
     }
 
     #[tokio::test]

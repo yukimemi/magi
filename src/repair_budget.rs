@@ -4,6 +4,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 pub mod legacy;
 pub mod reconcile;
@@ -72,6 +73,23 @@ pub struct Request {
     pub evidence_digest: Option<String>,
 }
 
+/// Durably proven single-commit mechanical `verify.pre_gate` transition from
+/// the reviewed commit to the verified retained head.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewTransition {
+    /// 1-based review round index whose findings or failed E2E are being repaired.
+    pub review_round: usize,
+    /// Commit SHA reviewed by the panel (`ReviewRound::head`).
+    pub reviewed_head: String,
+    /// Retained commit SHA created by `verify.pre_gate` and verified by E2E (`ReviewRound::verified_head`).
+    pub verified_head: String,
+    /// Timestamp recorded when E2E ran against `verified_head` (`ReviewRound::verified_at`).
+    pub verified_at: jiff::Timestamp,
+    /// Digest of the exact review, verification configuration, outcomes and commit events.
+    #[serde(default)]
+    pub evidence_digest: String,
+}
+
 /// Accepted grant and the control state against which it was authorized.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Receipt {
@@ -89,6 +107,9 @@ pub struct Receipt {
     /// Diagnostic-only provenance; never a fabricated sequencer checkpoint.
     #[serde(default)]
     pub legacy: Option<legacy::Evidence>,
+    /// Proven mechanical `pre_gate` transition pinned at review-grant acceptance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_transition: Option<ReviewTransition>,
 }
 
 /// Durable execution checkpoint; consumed attempts never reset historical counters.
@@ -110,6 +131,22 @@ pub struct Applied {
     /// Write-ahead merge checkpoint, retained across interrupted delivery.
     #[serde(default)]
     pub conflict: Option<crate::base_conflict::Operation>,
+}
+
+impl Applied {
+    /// Pin the observed E2E head for exact resume admission without accepting
+    /// the transition. Keep the completed round available for re-proving it.
+    pub(crate) fn checkpoint_provenance_retry(
+        &mut self,
+        head: &str,
+        error: &anyhow::Error,
+    ) -> bool {
+        if !error.is::<ProvenanceUnavailable>() {
+            return false;
+        }
+        self.head = head.to_owned();
+        true
+    }
 }
 
 /// Checkpoint saved before each potentially interrupted operation.
@@ -345,7 +382,165 @@ async fn public_lease(state: &RunState) -> Result<()> {
     Ok(())
 }
 
-fn evidence(state: &RunState, request: &Request) -> Result<()> {
+#[derive(Debug, thiserror::Error)]
+#[error("repair grant refused: cannot inspect mechanical pre-gate commit provenance")]
+pub(crate) struct ProvenanceUnavailable;
+
+/// Prove that `head` is a single-commit mechanical `verify.pre_gate` transition
+/// from `round.head` verified by completed E2E on `head`.
+pub(crate) async fn prove_mechanical_pre_gate_commit(
+    state: &RunState,
+    round: &crate::run::ReviewRound,
+    head: &str,
+) -> Result<ReviewTransition> {
+    ensure!(
+        round.head != head
+            && round.verified_head.as_deref() == Some(head)
+            && state.pre_gate_commit.as_deref() == Some(head),
+        "repair grant refused: no unfixed review failure or proven mechanical pre-gate commit at the expected head"
+    );
+    ensure!(
+        matches!(
+            round.e2e_status(),
+            crate::run::E2eStatus::Passed | crate::run::E2eStatus::Failed
+        ),
+        "repair grant refused: mechanical pre-gate review target requires completed E2E verification"
+    );
+    let verified_at = round.verified_at.context(
+        "repair grant refused: mechanical pre-gate review target is missing verification timestamp",
+    )?;
+    ensure!(
+        !state.config.verify.e2e.is_empty()
+            && round.e2e.len() == state.config.verify.e2e.len()
+            && round
+                .e2e
+                .iter()
+                .zip(&state.config.verify.e2e)
+                .all(|(outcome, configured)| {
+                    !outcome.resource_blocked && outcome.command == *configured
+                }),
+        "repair grant refused: recorded E2E verification is inconsistent with configured commands"
+    );
+    ensure!(
+        !state.config.verify.pre_gate.is_empty()
+            && state.pre_gate.len() == state.config.verify.pre_gate.len()
+            && state
+                .pre_gate
+                .iter()
+                .zip(&state.config.verify.pre_gate)
+                .all(|(outcome, configured)| {
+                    !outcome.resource_blocked && outcome.command == *configured
+                }),
+        "repair grant refused: recorded pre-gate outcomes are missing, resource-blocked, or inconsistent with configuration"
+    );
+    let commit_event = crate::graph::pre_gate_commit_event(head);
+    let events: Vec<_> = state
+        .events
+        .iter()
+        .filter(|ev| ev.node == crate::graph::PRE_GATE_EVENT_NODE)
+        .collect();
+    ensure!(
+        events
+            .iter()
+            .any(|ev| ev.message == commit_event && ev.at <= verified_at),
+        "repair grant refused: missing pre-verification mechanical pre-gate commit event"
+    );
+    let winner = state
+        .winner()
+        .context("repair grant refused: no retained winner")?;
+    let provenance = git::commit_provenance(&winner.worktree, head)
+        .await
+        .context(ProvenanceUnavailable)?;
+    ensure!(
+        provenance.commit == head
+            && provenance.parents.len() == 1
+            && provenance.parents[0] == round.head
+            && provenance.message == crate::graph::PRE_GATE_COMMIT_MESSAGE
+            && provenance.author_name == git::NEUTRAL_IDENTITY_NAME
+            && provenance.author_email == git::NEUTRAL_IDENTITY_EMAIL
+            && provenance.committer_name == git::NEUTRAL_IDENTITY_NAME
+            && provenance.committer_email == git::NEUTRAL_IDENTITY_EMAIL,
+        "repair grant refused: retained head is not a single-commit mechanical pre-gate transition from the reviewed head"
+    );
+    Ok(ReviewTransition {
+        review_round: round.round,
+        reviewed_head: round.head.clone(),
+        verified_head: head.to_owned(),
+        verified_at,
+        evidence_digest: Sha256::digest(serde_json::to_vec(&(
+            round,
+            &state.config.verify.e2e,
+            &state.config.verify.pre_gate,
+            &state.pre_gate,
+            events,
+            head,
+        ))?)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect(),
+    })
+}
+
+/// Prove that `head` is either the exact head of the last unfixed review failure
+/// or the durably proven single-commit mechanical `verify.pre_gate` descendant
+/// that mandatory E2E verified for that review round.
+///
+/// Returns `Ok(None)` when `review.head == head` and `Ok(Some(ReviewTransition))`
+/// only when every durable state, event, and Git provenance requirement holds.
+pub async fn prove_review_target(state: &RunState, head: &str) -> Result<Option<ReviewTransition>> {
+    let last = state
+        .reviews
+        .last()
+        .context("repair grant refused: no unfixed review failure at the expected head")?;
+    ensure!(
+        !last.clean
+            && last.fix.is_none()
+            && (last.blocking > 0 || last.e2e_status() == crate::run::E2eStatus::Failed),
+        "repair grant refused: no unfixed review failure at the expected head"
+    );
+    if last.head == head {
+        return Ok(None);
+    }
+    prove_mechanical_pre_gate_commit(state, last, head)
+        .await
+        .map(Some)
+}
+
+/// Revalidate an initial unspent review grant immediately before reserving budget
+/// or entering `Phase::Fixing`.
+pub(crate) async fn verify_initial_review_grant(state: &RunState, grant: &Applied) -> Result<()> {
+    ensure!(
+        grant.receipt.request.kind == Kind::Review
+            && grant.phase == Phase::Pending
+            && grant.spent == 0,
+        "repair grant refused: unexpected initial review grant state"
+    );
+    ensure!(
+        grant.head == grant.receipt.request.head,
+        "repair grant refused: review grant head checkpoint changed"
+    );
+    let prior_grants = match state.repair_grants.split_last() {
+        Some((last, prior)) if last.receipt == grant.receipt => prior,
+        _ => &state.repair_grants,
+    };
+    let transition = prove_review_target(state, &grant.receipt.request.head).await?;
+    ensure!(
+        transition == grant.receipt.review_transition,
+        "repair grant refused: review transition evidence changed after acceptance"
+    );
+    ensure!(
+        state.reviews.len() >= state.config.graph.review_rounds
+            || failed_conflict_repair_at(
+                prior_grants,
+                &grant.receipt.request.head,
+                transition.as_ref(),
+            ),
+        "repair grant refused: review budget is not exhausted"
+    );
+    head_and_public(state, &grant.receipt.request.head).await
+}
+
+async fn evidence(state: &RunState, request: &Request) -> Result<Option<ReviewTransition>> {
     let pass = state.passes.last().context("repair grant refused: missing stopped pass checkpoint; inspect retained run provenance before recovery")?;
     ensure!(
         pass.index == request.expect_pass,
@@ -389,7 +584,7 @@ fn evidence(state: &RunState, request: &Request) -> Result<()> {
         Kind::Gate => {
             ensure!(
                 state.gate_fixes.len() >= state.config.graph.gate_fix_rounds
-                    || failed_conflict_repair_at(state, &request.head),
+                    || failed_conflict_repair_at(&state.repair_grants, &request.head, None),
                 "repair grant refused: gate repair budget is not exhausted"
             );
             ensure!(
@@ -401,20 +596,23 @@ fn evidence(state: &RunState, request: &Request) -> Result<()> {
         }
         Kind::Review => {
             ensure!(
-                state.reviews.len() >= state.config.graph.review_rounds
-                    || failed_conflict_repair_at(state, &request.head),
+                state.reviews.len() >= state.config.graph.review_rounds || conflict_lineage(state),
                 "repair grant refused: review budget is not exhausted"
             );
+            let transition = prove_review_target(state, &request.head).await?;
             ensure!(
-                state.reviews.last().is_some_and(|r| r.head == request.head
-                    && !r.clean
-                    && r.fix.is_none()
-                    && (r.blocking > 0 || r.e2e_status() == crate::run::E2eStatus::Failed)),
-                "repair grant refused: no unfixed review failure at the expected head"
+                state.reviews.len() >= state.config.graph.review_rounds
+                    || failed_conflict_repair_at(
+                        &state.repair_grants,
+                        &request.head,
+                        transition.as_ref(),
+                    ),
+                "repair grant refused: review budget is not exhausted"
             );
+            return Ok(transition);
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -582,7 +780,7 @@ pub(crate) async fn grant_with_claim(
             "repair grant refused: another grant is queued; a stale unimported base-conflict approval requires explicit --replace-request <old-request-id>"
         );
     }
-    evidence(&state, &request)?;
+    let review_transition = evidence(&state, &request).await?;
     head_and_public(&state, &request.head).await?;
     conflict_target(&state, &request, None).await?;
     if request.kind == Kind::BaseConflict {
@@ -606,6 +804,7 @@ pub(crate) async fn grant_with_claim(
     let receipt = Receipt {
         stop,
         legacy,
+        review_transition,
         request,
         at: jiff::Timestamp::now(),
         decision: task.operator_decided_at,
@@ -696,7 +895,12 @@ pub(crate) async fn apply(home: &Path, state: &mut RunState, disk: &RunState) ->
         if matches!(active.phase, Phase::Pending | Phase::Fixing) {
             conflict_target(disk, &active.receipt.request, active.receipt.stop.as_ref()).await?;
         }
-        if active.phase != Phase::Fixing {
+        if active.phase == Phase::Pending
+            && active.spent == 0
+            && active.receipt.request.kind == Kind::Review
+        {
+            verify_initial_review_grant(disk, active).await?;
+        } else if active.phase != Phase::Fixing {
             head_and_public(disk, &active.head).await?;
         } else {
             let winner = disk.winner().context("repair winner missing")?;
@@ -721,7 +925,11 @@ pub(crate) async fn apply(home: &Path, state: &mut RunState, disk: &RunState) ->
                 && contract(&task, receipt.request.kind)? == receipt.contract,
             "repair grant held: owner decision changed after acceptance"
         );
-        evidence(disk, &receipt.request)?;
+        let transition = evidence(disk, &receipt.request).await?;
+        ensure!(
+            transition == receipt.review_transition,
+            "repair grant held: review transition evidence changed after acceptance"
+        );
         if receipt.request.kind == Kind::BaseConflict {
             ensure!(
                 legacy::textual_stop(
@@ -967,11 +1175,25 @@ fn conflict_lineage(state: &RunState) -> bool {
     })
 }
 
-fn failed_conflict_repair_at(state: &RunState, head: &str) -> bool {
-    conflict_lineage(state)
-        && state.repair_grants.last().is_some_and(|grant| {
-            grant.phase == Phase::Complete && !grant.succeeded && grant.head == head
-        })
+fn failed_conflict_repair_at(
+    grants: &[Applied],
+    head: &str,
+    transition: Option<&ReviewTransition>,
+) -> bool {
+    grants.iter().any(|grant| {
+        grant.receipt.request.kind == Kind::BaseConflict
+            && grant.phase == Phase::Complete
+            && grant
+                .conflict
+                .as_ref()
+                .is_some_and(|operation| operation.result.is_some())
+    }) && grants.last().is_some_and(|grant| {
+        grant.phase == Phase::Complete
+            && !grant.succeeded
+            && (grant.head == head
+                || transition
+                    .is_some_and(|t| t.verified_head == head && grant.head == t.reviewed_head))
+    })
 }
 
 /// A replacement is an append-only task receipt; the old approval is never
@@ -981,4 +1203,439 @@ fn superseded(task: &Task, receipt: &Receipt) -> bool {
         newer.request.run == receipt.request.run
             && newer.request.replace_request.as_ref() == Some(&receipt.request.request)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::run::{Candidate, CommandOutcome, ReviewRound};
+
+    async fn git_ok(dir: &Path, args: &[&str]) {
+        let out = git::git_raw(dir, args).await.unwrap();
+        assert!(out.ok(), "git {:?} failed: {}", args, out.stderr);
+    }
+
+    async fn mechanical_fixture() -> (tempfile::TempDir, RunState, String, String) {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git_ok(&repo, &["init", "-b", "main"]).await;
+        git_ok(&repo, &["config", "user.name", "Test User"]).await;
+        git_ok(&repo, &["config", "user.email", "test@example.com"]).await;
+        git_ok(&repo, &["config", "commit.gpgsign", "false"]).await;
+        std::fs::write(repo.join("note.txt"), "initial\n").unwrap();
+        git_ok(&repo, &["add", "-A"]).await;
+        git_ok(&repo, &["commit", "-m", "initial"]).await;
+        let reviewed = git::rev_parse(&repo, "HEAD").await.unwrap();
+
+        std::fs::write(repo.join("fmt.txt"), "formatted\n").unwrap();
+        assert!(
+            git::commit_all(&repo, crate::graph::PRE_GATE_COMMIT_MESSAGE)
+                .await
+                .unwrap()
+        );
+        let verified = git::rev_parse(&repo, "HEAD").await.unwrap();
+
+        let mut config = crate::config::Config::default();
+        config.verify.pre_gate = vec!["echo formatted > fmt.txt".into()];
+        config.verify.e2e = vec!["test -f fixed.txt".into()];
+        config.graph.review_rounds = 1;
+
+        let mut state = RunState::new(
+            repo.clone(),
+            "main".into(),
+            reviewed.clone(),
+            "create note.txt".into(),
+            config,
+        );
+        state.candidates.push(Candidate {
+            index: 0,
+            label: 'A',
+            agent: "mock".into(),
+            branch: "main".into(),
+            worktree: repo,
+            summary: String::new(),
+            stat: String::new(),
+            files: 1,
+            commits: 1,
+            empty: false,
+            failed: None,
+            verified_noop: None,
+            duration_ms: 0,
+            folded: false,
+        });
+        state.tally = Some(crate::run::Tally {
+            first_choice: std::collections::BTreeMap::new(),
+            borda: std::collections::BTreeMap::new(),
+            winner: 'A',
+            rankings: 1,
+            unanimous_initial: true,
+            deliberated: false,
+            changed_votes: 0,
+            unanimous_final: true,
+            tie_break: None,
+            judges: 1,
+            present: 1,
+            quorum: 1,
+            met_quorum: true,
+            uncontested: None,
+        });
+        state.pre_gate = vec![CommandOutcome {
+            command: "echo formatted > fmt.txt".into(),
+            code: Some(0),
+            output_tail: String::new(),
+            duration_ms: 1,
+            resource_blocked: false,
+            ..Default::default()
+        }];
+        state.pre_gate_commit = Some(verified.clone());
+        let pre_gate_at: jiff::Timestamp = "2026-06-01T00:00:01Z".parse().unwrap();
+        let verified_at: jiff::Timestamp = "2026-06-01T00:00:02Z".parse().unwrap();
+        state.events.push(crate::run::Event {
+            at: pre_gate_at,
+            node: crate::graph::PRE_GATE_EVENT_NODE.into(),
+            message: crate::graph::pre_gate_commit_event(&verified),
+        });
+        state.reviews.push(ReviewRound {
+            round: 1,
+            head: reviewed.clone(),
+            verified_head: Some(verified.clone()),
+            verified_at: Some(verified_at),
+            reviews: Vec::new(),
+            e2e: vec![CommandOutcome {
+                command: "test -f fixed.txt".into(),
+                code: Some(1),
+                output_tail: "missing fixed.txt".into(),
+                duration_ms: 1,
+                resource_blocked: false,
+                ..Default::default()
+            }],
+            verify_retried: false,
+            e2e_deferred: false,
+            e2e_defer_reason: None,
+            fix: None,
+            blocking: 0,
+            answered: 1,
+            expected: 1,
+            clean: false,
+            progressed: false,
+            vote_split: false,
+            reconsideration: Vec::new(),
+            verdict: None,
+        });
+        (tmp, state, reviewed, verified)
+    }
+
+    #[test]
+    fn receipt_review_transition_is_optional_and_backwards_compatible() {
+        let mut receipt = Receipt {
+            request: Request {
+                task: "t1".into(),
+                run: "20260601-000000-abcd".into(),
+                kind: Kind::Review,
+                rounds: 1,
+                head: "a".repeat(40),
+                expect_pass: 0,
+                request: "req-1".into(),
+                reason: "repair".into(),
+                tip: None,
+                instruction: None,
+                replace_request: None,
+                evidence_digest: None,
+            },
+            at: "2026-06-01T00:00:03Z".parse().unwrap(),
+            decision: None,
+            contract: "[]".into(),
+            stop: None,
+            legacy: None,
+            review_transition: None,
+        };
+        let without = serde_json::to_value(&receipt).unwrap();
+        assert!(without.get("review_transition").is_none());
+        let decoded: Receipt = serde_json::from_value(without).unwrap();
+        assert_eq!(decoded, receipt);
+
+        receipt.review_transition = Some(ReviewTransition {
+            review_round: 1,
+            reviewed_head: "b".repeat(40),
+            verified_head: "a".repeat(40),
+            verified_at: "2026-06-01T00:00:02Z".parse().unwrap(),
+            evidence_digest: "c".repeat(64),
+        });
+        let with = serde_json::to_value(&receipt).unwrap();
+        assert_eq!(with["review_transition"]["review_round"], 1);
+        let decoded: Receipt = serde_json::from_value(with).unwrap();
+        assert_eq!(decoded, receipt);
+    }
+
+    #[tokio::test]
+    async fn confirmation_provenance_retry_pins_exact_resume_head() {
+        let (_tmp, mut state, reviewed, verified) = mechanical_fixture().await;
+        state.reviews[0].clean = true;
+        state.reviews[0].e2e[0].code = Some(0);
+        let mut grant = Applied {
+            receipt: Receipt {
+                request: Request {
+                    task: "t1".into(),
+                    run: state.id.clone(),
+                    kind: Kind::Review,
+                    rounds: 2,
+                    head: reviewed.clone(),
+                    expect_pass: 0,
+                    request: "req-1".into(),
+                    reason: "repair".into(),
+                    tip: None,
+                    instruction: None,
+                    replace_request: None,
+                    evidence_digest: None,
+                },
+                at: "2026-06-01T00:00:00Z".parse().unwrap(),
+                decision: None,
+                contract: "[]".into(),
+                stop: None,
+                legacy: None,
+                review_transition: None,
+            },
+            spent: 1,
+            phase: Phase::Reviewing,
+            review_start: 0,
+            head: reviewed.clone(),
+            succeeded: false,
+            conflict: None,
+        };
+        let git_dir = state.repo.join(".git");
+        let hidden = state.repo.join("hidden-git");
+        std::fs::rename(&git_dir, &hidden).unwrap();
+        let error = prove_mechanical_pre_gate_commit(&state, &state.reviews[0], &verified)
+            .await
+            .unwrap_err();
+        assert!(error.is::<ProvenanceUnavailable>());
+        assert!(grant.checkpoint_provenance_retry(&verified, &error));
+        let mut grant: Applied =
+            serde_json::from_slice(&serde_json::to_vec(&grant).unwrap()).unwrap();
+        std::fs::rename(&hidden, &git_dir).unwrap();
+        // Resume admission must still check the actual branch and exact HEAD.
+        head_and_public(&state, &grant.head).await.unwrap();
+        assert_eq!(grant.phase, Phase::Reviewing);
+        assert_eq!(grant.review_start, 0);
+        assert_eq!(grant.spent, 1);
+        assert!(!grant.succeeded);
+        assert_eq!(grant.receipt.request.head, reviewed);
+
+        let transition = prove_mechanical_pre_gate_commit(&state, &state.reviews[0], &verified)
+            .await
+            .unwrap();
+        assert_eq!(transition.reviewed_head, reviewed);
+        state.reviews[0].head = verified.clone();
+        let error = prove_mechanical_pre_gate_commit(&state, &state.reviews[0], &verified)
+            .await
+            .unwrap_err();
+        assert!(!error.is::<ProvenanceUnavailable>());
+        assert!(!grant.checkpoint_provenance_retry(&reviewed, &error));
+        assert_eq!(grant.head, verified);
+        git_ok(&state.repo, &["reset", "--hard", &reviewed]).await;
+        assert!(head_and_public(&state, &grant.head).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn prove_review_target_accepts_exact_and_proven_mechanical_and_refuses_invalid() {
+        let (_tmp, state, reviewed, verified) = mechanical_fixture().await;
+
+        // Exact head match preserves existing behavior without transition metadata.
+        assert_eq!(prove_review_target(&state, &reviewed).await.unwrap(), None);
+
+        // Proven single-commit mechanical pre_gate transition succeeds.
+        let transition = prove_review_target(&state, &verified)
+            .await
+            .unwrap()
+            .expect("proven transition");
+        assert_eq!(transition.review_round, 1);
+        assert_eq!(transition.reviewed_head, reviewed);
+        assert_eq!(transition.verified_head, verified);
+
+        // Passed E2E with blocking findings is also valid.
+        let mut passed_with_blocking = state.clone();
+        passed_with_blocking.reviews[0].e2e[0].code = Some(0);
+        passed_with_blocking.reviews[0].blocking = 1;
+        let changed = prove_review_target(&passed_with_blocking, &verified)
+            .await
+            .unwrap()
+            .expect("proven transition");
+        assert_ne!(changed.evidence_digest, transition.evidence_digest);
+
+        // Conflict lineage exhaustion check matches the reviewed head behind the proven transition.
+        let conflict_grant = Applied {
+            receipt: Receipt {
+                request: Request {
+                    task: "t1".into(),
+                    run: state.id.clone(),
+                    kind: Kind::BaseConflict,
+                    rounds: 1,
+                    head: reviewed.clone(),
+                    expect_pass: 0,
+                    request: "conflict-1".into(),
+                    reason: "resolve conflict".into(),
+                    tip: Some(reviewed.clone()),
+                    instruction: Some("keep both".into()),
+                    replace_request: None,
+                    evidence_digest: None,
+                },
+                at: "2026-06-01T00:00:00Z".parse().unwrap(),
+                decision: None,
+                contract: "[]".into(),
+                stop: None,
+                legacy: None,
+                review_transition: None,
+            },
+            spent: 1,
+            phase: Phase::Complete,
+            review_start: 0,
+            head: reviewed.clone(),
+            succeeded: false,
+            conflict: Some(crate::base_conflict::Operation {
+                paths: vec!["note.txt".into()],
+                outside: String::new(),
+                tree: None,
+                result: Some(reviewed.clone()),
+            }),
+        };
+        assert!(failed_conflict_repair_at(
+            std::slice::from_ref(&conflict_grant),
+            &verified,
+            Some(&transition),
+        ));
+        assert!(!failed_conflict_repair_at(
+            std::slice::from_ref(&conflict_grant),
+            &verified,
+            None,
+        ));
+
+        // Missing or mismatched verified_head / pre_gate_commit.
+        let mut bad = state.clone();
+        bad.reviews[0].verified_head = None;
+        assert!(prove_review_target(&bad, &verified).await.is_err());
+
+        let mut bad = state.clone();
+        bad.pre_gate_commit = None;
+        assert!(prove_review_target(&bad, &verified).await.is_err());
+
+        // Incomplete E2E states and missing verified_at.
+        let mut bad = state.clone();
+        bad.reviews[0].e2e.clear();
+        bad.reviews[0].e2e_deferred = true;
+        bad.reviews[0].blocking = 1;
+        assert!(prove_review_target(&bad, &verified).await.is_err());
+
+        let mut bad = state.clone();
+        bad.reviews[0].e2e[0].resource_blocked = true;
+        bad.reviews[0].blocking = 1;
+        assert!(prove_review_target(&bad, &verified).await.is_err());
+
+        let mut bad = state.clone();
+        bad.reviews[0].verified_at = None;
+        assert!(prove_review_target(&bad, &verified).await.is_err());
+
+        // Pre-gate config / outcomes mismatch or resource-blocked.
+        let mut bad = state.clone();
+        bad.config.verify.pre_gate.clear();
+        assert!(prove_review_target(&bad, &verified).await.is_err());
+
+        let mut bad = state.clone();
+        bad.pre_gate[0].resource_blocked = true;
+        assert!(prove_review_target(&bad, &verified).await.is_err());
+
+        let mut bad = state.clone();
+        bad.pre_gate[0].command = "different command".into();
+        assert!(prove_review_target(&bad, &verified).await.is_err());
+
+        // Missing or post-verification mechanical commit event.
+        let mut bad = state.clone();
+        bad.events.clear();
+        assert!(prove_review_target(&bad, &verified).await.is_err());
+
+        let mut bad = state.clone();
+        bad.events[0].at = "2026-06-01T00:00:03Z".parse().unwrap();
+        assert!(prove_review_target(&bad, &verified).await.is_err());
+
+        // Arbitrary second descendant (even with identical mechanical commit message).
+        std::fs::write(state.repo.join("fmt2.txt"), "second\n").unwrap();
+        assert!(
+            git::commit_all(&state.repo, crate::graph::PRE_GATE_COMMIT_MESSAGE)
+                .await
+                .unwrap()
+        );
+        let second = git::rev_parse(&state.repo, "HEAD").await.unwrap();
+        let mut bad = state.clone();
+        bad.pre_gate_commit = Some(second.clone());
+        bad.reviews[0].verified_head = Some(second.clone());
+        bad.events[0].message = crate::graph::pre_gate_commit_event(&second);
+        assert!(prove_review_target(&bad, &second).await.is_err());
+
+        // Wrong commit message directly on reviewed head.
+        git_ok(&state.repo, &["reset", "--hard", &reviewed]).await;
+        std::fs::write(state.repo.join("manual.txt"), "manual\n").unwrap();
+        assert!(git::commit_all(&state.repo, "manual fix").await.unwrap());
+        let manual = git::rev_parse(&state.repo, "HEAD").await.unwrap();
+        let mut bad = state.clone();
+        bad.pre_gate_commit = Some(manual.clone());
+        bad.reviews[0].verified_head = Some(manual.clone());
+        bad.events[0].message = crate::graph::pre_gate_commit_event(&manual);
+        assert!(prove_review_target(&bad, &manual).await.is_err());
+
+        // Non-neutral author directly on reviewed head with matching message.
+        git_ok(&state.repo, &["reset", "--hard", &reviewed]).await;
+        std::fs::write(state.repo.join("human.txt"), "human\n").unwrap();
+        git_ok(&state.repo, &["add", "-A"]).await;
+        let out = tokio::process::Command::new("git")
+            .current_dir(&state.repo)
+            .env("GIT_AUTHOR_NAME", "Human")
+            .env("GIT_AUTHOR_EMAIL", "human@example.com")
+            .env("GIT_COMMITTER_NAME", git::NEUTRAL_IDENTITY_NAME)
+            .env("GIT_COMMITTER_EMAIL", git::NEUTRAL_IDENTITY_EMAIL)
+            .args([
+                "commit",
+                "--no-verify",
+                "-m",
+                crate::graph::PRE_GATE_COMMIT_MESSAGE,
+            ])
+            .output()
+            .await
+            .unwrap();
+        assert!(out.status.success());
+        let non_neutral = git::rev_parse(&state.repo, "HEAD").await.unwrap();
+        let mut bad = state.clone();
+        bad.pre_gate_commit = Some(non_neutral.clone());
+        bad.reviews[0].verified_head = Some(non_neutral.clone());
+        bad.events[0].message = crate::graph::pre_gate_commit_event(&non_neutral);
+        assert!(prove_review_target(&bad, &non_neutral).await.is_err());
+
+        // Multi-parent merge commit with neutral identity and matching message.
+        git_ok(&state.repo, &["checkout", "-b", "side", &reviewed]).await;
+        std::fs::write(state.repo.join("side.txt"), "side\n").unwrap();
+        assert!(git::commit_all(&state.repo, "side commit").await.unwrap());
+        let side = git::rev_parse(&state.repo, "HEAD").await.unwrap();
+        git_ok(&state.repo, &["checkout", "main"]).await;
+        git_ok(&state.repo, &["reset", "--hard", &reviewed]).await;
+        git_ok(
+            &state.repo,
+            &[
+                "-c",
+                &format!("user.name={}", git::NEUTRAL_IDENTITY_NAME),
+                "-c",
+                &format!("user.email={}", git::NEUTRAL_IDENTITY_EMAIL),
+                "merge",
+                "--no-ff",
+                "-m",
+                crate::graph::PRE_GATE_COMMIT_MESSAGE,
+                &side,
+            ],
+        )
+        .await;
+        let merged = git::rev_parse(&state.repo, "HEAD").await.unwrap();
+        let mut bad = state.clone();
+        bad.pre_gate_commit = Some(merged.clone());
+        bad.reviews[0].verified_head = Some(merged.clone());
+        bad.events[0].message = crate::graph::pre_gate_commit_event(&merged);
+        assert!(prove_review_target(&bad, &merged).await.is_err());
+    }
 }
