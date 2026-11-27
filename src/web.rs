@@ -523,6 +523,7 @@ pub(crate) struct SharedMonitor {
     closed_goal_index: Mutex<HashMap<String, (GoalIdentity, bool)>>,
     /// Conversation status evidence, rebuilt only when a source store moved.
     chat_inventory: Mutex<Option<(Revisions, Arc<crate::chat_status::Inventory>)>>,
+    chat_sources_unreadable: std::sync::atomic::AtomicBool,
     bulk_slots: Arc<tokio::sync::Semaphore>,
     talk_core_slots: Arc<tokio::sync::Semaphore>,
     #[cfg(test)]
@@ -683,6 +684,7 @@ struct DiskCache {
 /// Keep a failed store's last observation without suppressing healthy stores.
 fn monitor_scan(ui: &Ui, previous: MonitorSnapshot) -> (Revisions, [Stamps; 3]) {
     let (mut rev, mut stamps) = previous.unwrap_or_default();
+    let mut failed = 0u8;
     for (index, root, runs) in [
         (0, ui.queue.root(), false),
         (1, ui.runs.as_path(), true),
@@ -696,13 +698,19 @@ fn monitor_scan(ui: &Ui, previous: MonitorSnapshot) -> (Revisions, [Stamps; 3]) 
                 _ => rev.3 = value,
             }
             stamps[index] = next;
+        } else {
+            failed |= 1 << index;
         }
     }
     if let Ok(next) = try_stamps(ui.questions.root(), false, true) {
         rev.2 = stamps_revision(&next);
+    } else {
+        failed |= 1 << 3;
     }
     if let Ok(next) = notice_and_decision_stamps(ui) {
         rev.4 = stamps_revision(&next);
+    } else {
+        failed |= 1 << 4;
     }
     rev.5 = ui.lock_loop().rev;
     // Live worker ownership can change without any transcript write.
@@ -710,7 +718,8 @@ fn monitor_scan(ui: &Ui, previous: MonitorSnapshot) -> (Revisions, [Stamps; 3]) 
     let mut activity = std::collections::hash_map::DefaultHasher::new();
     rev.3 = stamps_revision(&stamps[2]);
     rev.3.hash(&mut activity);
-    let mut changed = false;
+    let mut changed = failed != 0;
+    failed.hash(&mut activity);
     match crate::worker::observe_active(&ui.home) {
         Ok(jobs) => {
             let mut ids: Vec<_> = jobs
@@ -735,6 +744,9 @@ fn monitor_scan(ui: &Ui, previous: MonitorSnapshot) -> (Revisions, [Stamps; 3]) 
     if changed {
         rev.3 = activity.finish();
     }
+    ui.monitor
+        .chat_sources_unreadable
+        .store(failed != 0, std::sync::atomic::Ordering::Release);
     (rev, stamps)
 }
 
@@ -754,6 +766,7 @@ impl SharedMonitor {
             talk_status_index: Mutex::default(),
             closed_goal_index: Mutex::default(),
             chat_inventory: Mutex::default(),
+            chat_sources_unreadable: std::sync::atomic::AtomicBool::new(false),
             bulk_slots: Arc::new(tokio::sync::Semaphore::new(2)),
             talk_core_slots: Arc::new(tokio::sync::Semaphore::new(2)),
             #[cfg(test)]
@@ -5673,6 +5686,10 @@ struct TalkListTurn {
 /// loop revisions so a list read never re-parses the stores unless one moved;
 /// without a published revision (before the first scan) it is built per call.
 fn chat_inventory(ui: &Ui) -> Arc<crate::chat_status::Inventory> {
+    let unreadable = ui
+        .monitor
+        .chat_sources_unreadable
+        .load(std::sync::atomic::Ordering::Acquire);
     let key = ui
         .monitor
         .latest
@@ -5680,7 +5697,8 @@ fn chat_inventory(ui: &Ui) -> Arc<crate::chat_status::Inventory> {
         .unwrap_or_else(PoisonError::into_inner)
         .as_ref()
         .map(|(revisions, _)| *revisions);
-    if let Some(key) = key
+    if !unreadable
+        && let Some(key) = key
         && let Some((cached, inventory)) = ui
             .monitor
             .chat_inventory
@@ -5694,14 +5712,16 @@ fn chat_inventory(ui: &Ui) -> Arc<crate::chat_status::Inventory> {
     let tasks = ui.queue.list();
     let questions = ui.questions.list();
     let mut inventory = crate::chat_status::Inventory::collect(&ui.home, &tasks, &questions);
-    if crate::queue::record_ids(ui.queue.root(), "json").map_or(true, |ids| ids.len() > tasks.len())
+    if unreadable
+        || crate::queue::record_ids(ui.queue.root(), "json")
+            .map_or(true, |ids| ids.len() > tasks.len())
         || crate::queue::record_ids(ui.questions.root(), "json")
             .map_or(true, |ids| ids.len() > questions.len())
     {
         inventory.mark_unreadable();
     }
     let inventory = Arc::new(inventory);
-    if let Some(key) = key {
+    if !unreadable && let Some(key) = key {
         *ui.monitor
             .chat_inventory
             .lock()
@@ -11743,6 +11763,13 @@ mod tests {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     use super::*;
+
+    // Embedded assets preserve checkout line endings. Source assertions use
+    // logical lines, independent of the platform's checkout conversion.
+    static APP_JS: std::sync::LazyLock<String> =
+        std::sync::LazyLock::new(|| super::APP_JS.replace("\r\n", "\n"));
+    static APP_CSS: std::sync::LazyLock<String> =
+        std::sync::LazyLock::new(|| super::APP_CSS.replace("\r\n", "\n"));
     use crate::config::Config;
     use crate::queue::Source;
 
@@ -23137,7 +23164,34 @@ mod tests {
         assert_eq!(after.0.3, stamps_revision(&after.1[2]));
         // A failed first scan also permits healthy stores to publish.
         std::fs::write(ui.questions.root(), "not a directory").unwrap();
-        assert_eq!(monitor_scan(&ui, None).0.3, after.0.3);
+        assert_ne!(monitor_scan(&ui, None).0.3, after.0.3);
+    }
+
+    #[test]
+    fn chat_status_cached_inventory_invalidates_on_store_failure_and_recovery() {
+        let home = TempDir::new().unwrap();
+        let ui = delta_test_ui(home.path());
+        let root = ui.queue.root();
+        std::fs::create_dir_all(root).unwrap();
+        let before = monitor_scan(&ui, None);
+        *ui.monitor.latest.lock().unwrap() = Some(before.clone());
+        let status = || {
+            chat_inventory(&ui)
+                .status_of("chat", true, crate::chat_status::Goals::default(), false)
+                .kind
+        };
+        assert_eq!(status(), crate::chat_status::Kind::Idle);
+        std::fs::remove_dir(root).unwrap();
+        std::fs::write(root, "not a directory").unwrap();
+        let failed = monitor_scan(&ui, Some(before.clone()));
+        assert_ne!(failed.0.3, before.0.3);
+        *ui.monitor.latest.lock().unwrap() = Some(failed.clone());
+        assert_eq!(status(), crate::chat_status::Kind::Unknown);
+        std::fs::remove_file(root).unwrap();
+        std::fs::create_dir(root).unwrap();
+        let recovered = monitor_scan(&ui, Some(failed));
+        *ui.monitor.latest.lock().unwrap() = Some(recovered);
+        assert_eq!(status(), crate::chat_status::Kind::Idle);
     }
 
     #[tokio::test]
