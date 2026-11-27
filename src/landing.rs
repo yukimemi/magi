@@ -1335,6 +1335,10 @@ mod tests {
             .edit("edited".into(), "different work".into())
             .unwrap();
         edited.edit("edited".into(), "work".into()).unwrap();
+        assert!(load_run(&f.home, &edited, &run2.id).is_err());
+        run2.task_instruction_rev = None;
+        run2.save_under(&f.home).unwrap();
+        assert!(load_run(&f.home, &edited, &run2.id).is_err());
         queue.put(&mut edited).unwrap();
 
         let summary = audit_pass(&f.home, Limits::default(), MAX_PER_PASS).await;

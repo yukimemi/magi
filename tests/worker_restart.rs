@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use common::{Judges, SeatBlock, fixture, home_lock, magi_cli};
 use magi::git;
-use magi::queue::{Queue, RunOverrides, Source, Task, TaskStatus};
+use magi::queue::{Queue, RunOverrides, Source, Task};
 use magi::run::RunState;
 
 struct Process(Child);
@@ -167,8 +167,8 @@ async fn scheduler_restart_keeps_the_same_worker_and_occupied_slot() {
         j.kind == "task" && j.pid == Some(worker_pid) && j.generation == generation));
 
     block.release();
-    wait_for(|| queue.get(&first.id).unwrap().status == TaskStatus::Done
-        && queue.get(&second.id).unwrap().status == TaskStatus::Done,
+    wait_for(|| queue.get(&first.id).unwrap().awaiting_landing_run().is_some()
+        && queue.get(&second.id).unwrap().awaiting_landing_run().is_some(),
         "both independent executions to finish").await;
     let finished = queue.get(&first.id).unwrap();
     assert_eq!(finished.attempts, 1);
@@ -202,7 +202,7 @@ async fn standalone_execution_finishes_after_its_following_cli_exits() {
     caller.stop();
     assert!(queue.claim(&task.id).is_err());
     block.release();
-    wait_for(|| queue.get(&task.id).unwrap().status == TaskStatus::Done,
+    wait_for(|| queue.get(&task.id).unwrap().awaiting_landing_run().is_some(),
         "worker completion without a scheduler or following CLI").await;
     let finished = queue.get(&task.id).unwrap();
     assert_eq!(finished.attempts, 1);

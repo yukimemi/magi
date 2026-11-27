@@ -330,26 +330,9 @@ pub async fn admit_close(
                 assessment.describe()
             )
         })?;
-        let landed = if crate::landing::recorded_landing(state) {
-            Ok(())
-        } else if !state.repo.join(".git").exists()
-            && !state.merge.as_ref().is_some_and(|m| m.empty)
-            && !state.winner().is_some_and(|w| w.empty)
-            && state.pr.as_ref().is_some_and(|pr| pr.state == "merged")
-        {
-            // Forge lifecycle was just confirmed live in `guard_runs` when no
-            // local checkout is present to probe further.
-            Ok(())
-        } else {
-            let (verdict, why) =
-                crate::landing::verdict(state, crate::landing::Limits::default()).await;
-            if verdict == crate::landing::State::Landed {
-                Ok(())
-            } else {
-                Err(why)
-            }
-        };
-        if let Err(why) = landed {
+        let (verdict, why) =
+            crate::landing::verdict(state, crate::landing::Limits::default()).await;
+        if verdict != crate::landing::State::Landed {
             anyhow::bail!(
                 "{}; landing not confirmed ({why}); use --discard to explicitly abandon unfinished work",
                 assessment.describe()
@@ -740,9 +723,8 @@ mod tests {
         });
         run.save_under(dir.path()).unwrap();
         queue.put(&mut task).unwrap();
-        // A stale blocked record is not an unfinished PR once the forge proves
-        // its merge. Closing it must not require claiming that work was discarded.
-        let done = close(
+        // Lifecycle alone cannot establish the target base or exact head.
+        let error = close(
             &queue,
             dir.path(),
             &task.id,
@@ -751,21 +733,16 @@ mod tests {
             false,
         )
         .await
-        .unwrap();
-        assert!(!done.completion_history[0].discard);
-        assert_eq!(
-            done.completion_history[0]
-                .run
-                .as_ref()
-                .unwrap()
-                .pr_state
-                .as_deref(),
-            Some("merged")
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("landing not confirmed"),
+            "{error:#}"
         );
-        assert_eq!(
-            done.completion_history[0].run.as_ref().unwrap().status,
-            Some(RunStatus::Blocked)
-        );
+        assert_eq!(queue.get(&task.id).unwrap().status, task.status);
+        // Seed a historical Done record to exercise the independent reopen guard.
+        task.status = TaskStatus::Done;
+        queue.put(&mut task).unwrap();
+        let done = queue.get(&task.id).unwrap();
         let error = reopen(&queue, dir.path(), &task.id, CompletionActor::Cli, "retry")
             .await
             .unwrap_err();

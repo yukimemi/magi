@@ -6939,9 +6939,7 @@ fn may_resume_run(run: &RunState, task: &Task) -> bool {
 
 /// Review scaffolding is execution context, not evidence of an operator edit.
 pub(crate) fn compatible_run_instruction(run: &RunState, task: &Task) -> bool {
-    if let Some(rev) = run.task_instruction_rev
-        && rev != task.instruction_rev
-    {
+    if run.task_instruction_rev.unwrap_or(0) != task.instruction_rev {
         return false;
     }
     if let Some(authored) = &run.task_instruction {
@@ -7966,6 +7964,7 @@ mod tests {
         t.review_of = None;
         t.instruction = "Fix Clippy on approved head".into();
         run.task_instruction = None;
+        run.task_instruction_rev = Some(t.instruction_rev);
         run.instruction = format!(
             "{}\n\n# Work already on branch `approved-head` (commit subjects)\n\nCommit log",
             t.instruction
