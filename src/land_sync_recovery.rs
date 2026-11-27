@@ -233,6 +233,13 @@ impl RunState {
             .graph
             .land_rounds
             .saturating_add(self.land_sync_recovery.extra_attempts)
+            .saturating_sub(
+                self.land_sync_recovery
+                    .authorizations
+                    .iter()
+                    .filter(|a| a.invalidated.is_some() && a.archived_verification.is_some())
+                    .count(),
+            )
     }
 
     /// Remaining lifetime recovery grants available for this run.
@@ -300,7 +307,15 @@ impl RunState {
                     .is_some_and(|pr| pr.url == stop.pr_url && pr.number == stop.pr_number)
                 && self.land_sync_recovery.stops.contains(stop)
         } else {
-            legacy_exhausted_diagnostic(self)
+            self.land_sync_recovery
+                .authorizations
+                .last()
+                .is_some_and(|a| {
+                    a.invalidated.is_some()
+                        && a.archived_verification.is_some()
+                        && a.stop.attempts == self.land_sync_attempts
+                })
+                || legacy_exhausted_diagnostic(self)
         }
     }
 
@@ -330,7 +345,7 @@ impl RunState {
     }
 
     /// A grant was saved but its synchronization attempt has not been charged.
-    /// Retain this binding even when a subsequent validation refuses it.
+    /// A refused grant no longer contributes to the effective attempt budget.
     pub(crate) fn land_sync_unstarted_grant(&self) -> bool {
         self.status.resumable()
             && self
@@ -339,6 +354,7 @@ impl RunState {
                 .last()
                 .is_some_and(|a| {
                     a.consumed
+                        && a.invalidated.is_none()
                         && a.archived_verification.is_some()
                         && self.land_sync_attempts == a.stop.attempts
                         && self.land_sync_recovery.extra_attempts
@@ -365,11 +381,17 @@ impl RunState {
             .and_then(|a| a.invalidated.as_ref())
             && !self.land_sync_recovery_pending()
         {
+            if self.land_sync_grants_remaining() == 0 {
+                return format!(
+                    "Landing base-sync recovery approval invalidated: {reason}; lifetime grant limit reached ({grants}/{MAX_GRANTS})"
+                );
+            }
             return format!(
-                "Landing base-sync recovery approval invalidated: {reason} ({attempts}/{limit} landing sync attempts, {grants}/{MAX_GRANTS} recovery grants used)"
+                "Landing base-sync recovery approval invalidated: {reason}. Authorize a new bounded attempt with `magi task control recover-land-sync {} --request <unique-id> --head {head}` ({attempts}/{limit} attempts, {grants}/{MAX_GRANTS} grants used)",
+                self.id
             );
         }
-        if self.land_sync_recovery_pending() {
+        if self.land_sync_recovery_pending() || self.land_sync_unstarted_grant() {
             return format!(
                 "Landing base-sync recovery approval recorded; resume the retained run to spend {GRANT_ATTEMPTS} approved synchronization attempt ({attempts}/{limit} attempts, {grants}/{MAX_GRANTS} recovery grants used)"
             );
@@ -534,6 +556,40 @@ impl RunState {
     }
 }
 
+/// Retry an observation failure without changing the accepted owner generation.
+pub(crate) fn queue_existing_authorization(queue: &Queue, task: &mut Task, run: &str) -> bool {
+    let Some(state) = latest_exhausted_run(queue, task) else {
+        return false;
+    };
+    if state.id != run || !(state.land_sync_recovery_pending() || state.land_sync_unstarted_grant())
+    {
+        return false;
+    }
+    let Some(auth) = state.land_sync_recovery.authorizations.last() else {
+        return false;
+    };
+    if task.id != auth.task
+        || !task.assignment_accepts(&state)
+        || task.instruction != auth.scope.instruction
+        || task.operator_decided_at != auth.decision
+        || auth
+            .generation
+            .is_some_and(|g| task.resumption.as_ref().map(|r| r.generation) != Some(g))
+        || !task.land_sync_recovery_requests.contains(&auth.request)
+        || task.fresh_start
+        || task.review_branch.is_some()
+        || task.pr_recovery.is_some()
+        || matches!(task.status, TaskStatus::Running | TaskStatus::Done)
+    {
+        return false;
+    }
+    task.status = TaskStatus::Queued;
+    task.hold_source = None;
+    task.hold_reason = None;
+    task.held_at = None;
+    true
+}
+
 /// Whether `task`'s latest run is held by landing base-sync exhaustion without
 /// an active pending recovery authorization.
 pub(crate) fn held_task(queue: &Queue, task: &Task) -> bool {
@@ -566,19 +622,49 @@ pub(crate) fn latest_exhausted_run(queue: &Queue, task: &Task) -> Option<RunStat
 /// Used both at daemon dispatch time (`task_override = Some(task)`) and after
 /// acquiring the execution lease inside `land_with` (`task_override = None`,
 /// `observed_override = Some(&observed_pr)`).
+#[derive(Debug)]
+pub(crate) struct ValidationFailure {
+    pub reason: String,
+    pub observation_failed: bool,
+}
+
+impl ValidationFailure {
+    fn observation(reason: String) -> Self {
+        Self {
+            reason,
+            observation_failed: true,
+        }
+    }
+}
+
+impl From<String> for ValidationFailure {
+    fn from(reason: String) -> Self {
+        Self {
+            reason,
+            observation_failed: false,
+        }
+    }
+}
+
+impl From<&str> for ValidationFailure {
+    fn from(reason: &str) -> Self {
+        reason.to_owned().into()
+    }
+}
+
 pub(crate) async fn validate_pending_authorization<O: PrObserver>(
     home: &Path,
     state: &RunState,
     task_override: Option<&Task>,
     observed_override: Option<&ObservedPr>,
     observer: &O,
-) -> std::result::Result<(String, String), String> {
+) -> std::result::Result<(String, String), ValidationFailure> {
     let unstarted = state.land_sync_unstarted_grant();
     if !state.land_sync_recovery_pending() && !unstarted {
         return Err("landing base-sync stop or pending authorization state changed".into());
     }
     if let Err(error) = crate::pr_head::ensure_owner(state) {
-        return Err(format!("run ownership check failed: {error:#}"));
+        return Err(format!("run ownership check failed: {error:#}").into());
     }
     let auth = state
         .land_sync_recovery
@@ -594,7 +680,8 @@ pub(crate) async fn validate_pending_authorization<O: PrObserver>(
         return Err(format!(
             "lifetime landing base-sync recovery limit reached ({}/{MAX_GRANTS})",
             state.land_sync_recovery.extra_attempts
-        ));
+        )
+        .into());
     }
 
     if !auth.task.is_empty() {
@@ -602,9 +689,12 @@ pub(crate) async fn validate_pending_authorization<O: PrObserver>(
         let task = match task_override {
             Some(task) => task,
             None => {
-                loaded_task = Queue::at(home.join("queue"))
-                    .get(&auth.task)
-                    .map_err(|e| format!("owning task {} unreadable: {e:#}", auth.task))?;
+                loaded_task = Queue::at(home.join("queue")).get(&auth.task).map_err(|e| {
+                    ValidationFailure::observation(format!(
+                        "owning task {} unreadable: {e:#}",
+                        auth.task
+                    ))
+                })?;
                 &loaded_task
             }
         };
@@ -650,8 +740,7 @@ pub(crate) async fn validate_pending_authorization<O: PrObserver>(
                 .resume_override
                 .as_ref()
                 .is_some_and(|pin| pin.pinned_run.as_deref() == Some(state.id.as_str()))
-            && !(unstarted
-                && task.resume_override.is_none()
+            && !(task.resume_override.is_none()
                 && task.land_sync_recovery_requests.contains(&auth.request))
         {
             return Err("task exact-run pin is missing or targets another run".into());
@@ -661,25 +750,33 @@ pub(crate) async fn validate_pending_authorization<O: PrObserver>(
     let winner = state
         .winner()
         .ok_or_else(|| "run has no retained winner".to_owned())?;
-    let clean = git::is_clean(&winner.worktree)
-        .await
-        .map_err(|e| format!("could not inspect retained worktree cleanliness: {e:#}"))?;
+    let clean = git::is_clean(&winner.worktree).await.map_err(|e| {
+        ValidationFailure::observation(format!(
+            "could not inspect retained worktree cleanliness: {e:#}"
+        ))
+    })?;
     if !clean {
         return Err("retained worktree has uncommitted changes".into());
     }
     let scratch = home.join("runs").join(&state.id).join("rebase");
     let rebase_in_progress = git::checked_rebase_in_progress(&scratch)
         .await
-        .map_err(|e| format!("could not inspect scratch rebase state: {e:#}"))?;
+        .map_err(|e| {
+            ValidationFailure::observation(format!("could not inspect scratch rebase state: {e:#}"))
+        })?;
     if rebase_in_progress {
         return Err("landing rebase is already in progress in scratch worktree".into());
     }
     let local_head = git::rev_parse(&winner.worktree, "HEAD")
         .await
-        .map_err(|e| format!("could not read retained worktree HEAD: {e:#}"))?;
+        .map_err(|e| {
+            ValidationFailure::observation(format!("could not read retained worktree HEAD: {e:#}"))
+        })?;
     let branch_head = git::rev_parse(&state.repo, &format!("refs/heads/{}", winner.branch))
         .await
-        .map_err(|e| format!("could not read winner branch ref: {e:#}"))?;
+        .map_err(|e| {
+            ValidationFailure::observation(format!("could not read winner branch ref: {e:#}"))
+        })?;
     if local_head != branch_head {
         return Err("retained worktree HEAD does not match the winner branch ref".into());
     }
@@ -687,7 +784,8 @@ pub(crate) async fn validate_pending_authorization<O: PrObserver>(
         return Err(format!(
             "retained HEAD changed from {} to {local_head}",
             auth.stop.head
-        ));
+        )
+        .into());
     }
     if !state
         .pr_pushed_head
@@ -714,7 +812,11 @@ pub(crate) async fn validate_pending_authorization<O: PrObserver>(
             fetched_pr = observer
                 .observe_pr(&state.repo, &auth.scope.pr_url)
                 .await
-                .map_err(|e| format!("could not verify open pull request state: {e:#}"))?;
+                .map_err(|e| {
+                    ValidationFailure::observation(format!(
+                        "could not verify open pull request state: {e:#}"
+                    ))
+                })?;
             &fetched_pr
         }
     };
@@ -725,13 +827,16 @@ pub(crate) async fn validate_pending_authorization<O: PrObserver>(
         return Err("observed pull request does not match authorized pull request".into());
     }
     if observed.head.len() != 40 || !observed.head.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err("observed pull request head is unreadable".into());
+        return Err(ValidationFailure::observation(
+            "observed pull request head is unreadable".into(),
+        ));
     }
     if !observed.head.eq_ignore_ascii_case(&local_head) {
         return Err(format!(
             "published PR head changed from {} to {}",
             auth.scope.pr_head, observed.head
-        ));
+        )
+        .into());
     }
     if observed
         .base_branch
@@ -743,34 +848,48 @@ pub(crate) async fn validate_pending_authorization<O: PrObserver>(
 
     let fetched = git::fetch(&state.repo, &state.config.merge.remote, &state.base_branch)
         .await
-        .map_err(|e| format!("could not fetch base branch for revalidation: {e:#}"))?;
+        .map_err(|e| {
+            ValidationFailure::observation(format!(
+                "could not fetch base branch for revalidation: {e:#}"
+            ))
+        })?;
     if !fetched.ok() {
-        return Err(format!(
+        return Err(ValidationFailure::observation(format!(
             "could not fetch base branch for revalidation: {}",
             fetched.stderr
-        ));
+        )));
     }
     let onto = format!("{}/{}", state.config.merge.remote, state.base_branch);
-    let current_tip = git::rev_parse(&state.repo, &onto)
-        .await
-        .map_err(|e| format!("could not resolve fetched base tip: {e:#}"))?;
+    let current_tip = git::rev_parse(&state.repo, &onto).await.map_err(|e| {
+        ValidationFailure::observation(format!("could not resolve fetched base tip: {e:#}"))
+    })?;
     let descends_scope = git::ancestry(&state.repo, &auth.scope.tip, &current_tip)
         .await
-        .map_err(|e| format!("could not verify base tip lineage against authorized tip: {e:#}"))?;
+        .map_err(|e| {
+            ValidationFailure::observation(format!(
+                "could not verify base tip lineage against authorized tip: {e:#}"
+            ))
+        })?;
     if !descends_scope {
         return Err(format!(
             "fetched base tip {current_tip} does not fast-forward from authorized tip {}",
             auth.scope.tip
-        ));
+        )
+        .into());
     }
     let descends_stop = git::ancestry(&state.repo, &auth.stop.tip, &current_tip)
         .await
-        .map_err(|e| format!("could not verify base tip lineage against stopped tip: {e:#}"))?;
+        .map_err(|e| {
+            ValidationFailure::observation(format!(
+                "could not verify base tip lineage against stopped tip: {e:#}"
+            ))
+        })?;
     if !descends_stop {
         return Err(format!(
             "fetched base tip {current_tip} does not fast-forward from stopped tip {}",
             auth.stop.tip
-        ));
+        )
+        .into());
     }
 
     Ok((local_head, observed.head.clone()))
@@ -827,9 +946,11 @@ pub(crate) async fn dispatch_check_with<O: PrObserver>(
     }
     match validate_pending_authorization(home, &state, Some(task), None, observer).await {
         Ok(_) => DispatchDecision::Proceed,
-        Err(reason) => {
+        Err(failure) => {
+            let reason = failure.reason;
             let mut updated = state;
-            if let Ok(_owner) = crate::pr_head::owner_lock(home, &updated.id)
+            if !failure.observation_failed
+                && let Ok(_owner) = crate::pr_head::owner_lock(home, &updated.id)
                 && let Ok(mut reloaded) = RunState::load_under(&updated.id, home)
                 && let Ok(claimed) =
                     crate::daemon::is_working_on_other(home, &reloaded.id, Timestamp::now())

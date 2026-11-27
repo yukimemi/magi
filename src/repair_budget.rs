@@ -999,6 +999,9 @@ pub(crate) fn pending(task: &Task, state: &RunState) -> bool {
 /// Ordinary resume must not turn a pending grant into a new owner decision.
 /// Retain its exact authorization generation, and never release a newer hold.
 pub fn queue_resumption(queue: &Queue, task: &mut Task, run: &str) -> Result<bool> {
+    if crate::land_sync_recovery::queue_existing_authorization(queue, task, run) {
+        return Ok(true);
+    }
     if task.repair_grants.is_empty() {
         return Ok(false);
     }

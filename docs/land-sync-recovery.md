@@ -47,8 +47,10 @@ magi task control recover-land-sync <saved-run> --request <unique-id> --head <fu
 
 - `land_sync_attempts` is **never** reset; it keeps full cumulative attempt history.
 - Each consumed authorization adds `GRANT_ATTEMPTS = 1` to
-  `land_sync_recovery.extra_attempts`, raising the effective budget to
-  `config.graph.land_rounds + land_sync_recovery.extra_attempts`.
+  `land_sync_recovery.extra_attempts`. The effective budget is
+  `config.graph.land_rounds + land_sync_recovery.extra_attempts` minus grants
+  invalidated before their attempt starts. Invalidated consumed grants still
+  count against the lifetime limit; actual synchronization attempts never change.
 - Lifetime recovery grants are strictly capped at `MAX_GRANTS = 4` per run. Once
   reached, further `recover-land-sync` requests are refused.
 - Legacy runs saved before `land_sync_recovery` existed are recognized centrally
@@ -99,6 +101,12 @@ inside `land.rs` after acquiring the execution lease, before changing `status` t
   HEAD, open PR state/head, or non-fast-forward base branch history invalidates
   the authorization durably (`consumed = true`, `invalidated = Some(...)`) and
   holds the task without touching Git.
+  An unavailable observation (including fetch failure) instead holds the task
+  without invalidating the authorization. Resume the exact run to retry the
+  observation under the same owner generation.
+  A confirmed invalidation after consumption returns the run to exhaustion;
+  a new request can authorize another attempt within the remaining lifetime
+  limit, after the usual exact-head and base-lineage admission checks.
 - Normal fast-forward movement of the base branch is permitted.
 - On valid execution, the authorization is marked `consumed = true` and
   `extra_attempts` is incremented and saved to `run.json` **before** any Git

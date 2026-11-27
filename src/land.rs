@@ -4293,7 +4293,7 @@ async fn prepare_land_sync_recovery<F: Forge>(
     };
     let home = crate::run::home();
     let validation = if owner_requested_stop(state)? {
-        Err("owner requested stop before landing base-sync recovery".to_owned())
+        Err("owner requested stop before landing base-sync recovery".into())
     } else {
         crate::land_sync_recovery::validate_pending_authorization(
             &home,
@@ -4329,16 +4329,18 @@ async fn prepare_land_sync_recovery<F: Forge>(
             state.save()?;
             Ok(LandSyncPrep::Continue(Some(seen)))
         }
-        Err(reason) => {
-            if let Some(auth) = state
-                .land_sync_recovery
-                .authorizations
-                .iter_mut()
-                .rev()
-                .find(|a| {
-                    a.invalidated.is_none()
-                        && (!a.consumed || unstarted && a.archived_verification.is_some())
-                })
+        Err(failure) => {
+            let reason = failure.reason;
+            if !failure.observation_failed
+                && let Some(auth) = state
+                    .land_sync_recovery
+                    .authorizations
+                    .iter_mut()
+                    .rev()
+                    .find(|a| {
+                        a.invalidated.is_none()
+                            && (!a.consumed || unstarted && a.archived_verification.is_some())
+                    })
             {
                 auth.refuse(&reason);
             }
@@ -12858,6 +12860,44 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
                 "{:?}",
                 auth.invalidated
             );
+            assert!(run.land_sync_exhausted());
+            assert_eq!(run.land_sync_budget(), 4);
+            let mut held = queue
+                .list()
+                .into_iter()
+                .find(|t| t.execution_runs().last() == Some(&run.id))
+                .unwrap();
+            held.hold_machine(Some("recovery scope changed".into()));
+            queue.put(&mut held).unwrap();
+            crate::land_sync_recovery_control::recover_with(
+                &queue,
+                home,
+                crate::land_sync_recovery_control::Request {
+                    run: run.id.clone(),
+                    head: old.clone(),
+                    actor: "cli".into(),
+                    request: "req-rewritten-base-new-approval".into(),
+                },
+                &observer,
+            )
+            .await
+            .unwrap();
+            let mut resumed = RunState::load_under(&run.id, home).unwrap();
+            let forge = Scripted::new(vec![seen(&old, Checks::Green, "BEHIND", false)], vec![]);
+            assert!(matches!(
+                prepare_land_sync_recovery(&mut resumed, &pr_url, &forge)
+                    .await
+                    .unwrap(),
+                LandSyncPrep::Continue(Some(_))
+            ));
+            assert_eq!(resumed.land_sync_recovery.extra_attempts, 2);
+            assert_eq!(resumed.land_sync_budget(), 5);
+            assert_eq!(resumed.land_sync_attempts, 4);
+            assert!(
+                resumed.land_sync_recovery.authorizations[0]
+                    .invalidated
+                    .is_some()
+            );
         }
     }
 
@@ -12898,6 +12938,47 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         assert_eq!(crashed.land_sync_recovery.extra_attempts, 1);
         assert_eq!(crashed.land_sync_attempts, 4);
         assert!(crashed.land_sync_recovery.authorizations[0].consumed);
+
+        // An unreadable base is not proof that the authorized lineage changed.
+        let remote = git::git(&state.repo, &["remote", "get-url", "origin"])
+            .await
+            .unwrap();
+        git::git(
+            &state.repo,
+            &["remote", "set-url", "origin", "missing-local-origin"],
+        )
+        .await
+        .unwrap();
+        let mut interrupted = RunState::load_under(&state.id, home).unwrap();
+        let forge = Scripted::new(vec![seen(&old, Checks::Green, "BEHIND", false)], vec![]);
+        assert!(matches!(
+            prepare_land_sync_recovery(&mut interrupted, &pr_url, &forge)
+                .await
+                .unwrap(),
+            LandSyncPrep::Stop(_)
+        ));
+        assert!(
+            interrupted.land_sync_recovery.authorizations[0]
+                .invalidated
+                .is_none()
+        );
+        assert_eq!(interrupted.land_sync_attempts, 4);
+        git::git(&state.repo, &["remote", "set-url", "origin", remote.trim()])
+            .await
+            .unwrap();
+        let mut held = queue
+            .list()
+            .into_iter()
+            .find(|t| t.execution_runs().last() == Some(&state.id))
+            .unwrap();
+        held.hold_machine(Some("base observation failed".into()));
+        queue.put(&mut held).unwrap();
+        assert!(crate::resume::pin_queued(&queue, &state.id, None, None).unwrap());
+        let queued = queue.get(&held.id).unwrap();
+        assert!(matches!(
+            crate::land_sync_recovery::dispatch_check_with(&queue, home, &queued, &observer).await,
+            crate::land_sync_recovery::DispatchDecision::Proceed
+        ));
 
         // Reload after restart and run land_with: uses the 1 already-granted attempt, never double-grants.
         let mut restarted = RunState::load_under(&state.id, home).unwrap();
