@@ -2108,7 +2108,7 @@ impl Runner {
                     });
                     let clean = review_passed && reviewed.is_some_and(|r| r.head == head);
                     if !clean {
-                        let mechanical_pre_gate = if review_passed
+                        let next = if review_passed
                             && let Some(r) = reviewed
                             && r.head != head
                         {
@@ -2118,11 +2118,31 @@ impl Runner {
                                 &head,
                             )
                             .await
-                            .is_ok()
+                            .map(|_| Some(Phase::Reviewing))
+                        } else if grant.receipt.request.kind == Kind::Review
+                            && grant.spent < grant.receipt.request.rounds
+                        {
+                            crate::repair_budget::prove_review_target(&self.state, &head)
+                                .await
+                                .map(|_| Some(Phase::Pending))
                         } else {
-                            false
+                            Ok(None)
                         };
-                        if mechanical_pre_gate {
+                        let next = match next {
+                            Ok(next) => next,
+                            Err(error) => {
+                                if error.is::<crate::repair_budget::ProvenanceUnavailable>() {
+                                    self.state.status = RunStatus::Blocked;
+                                    self.state.event("repair-grant", format!(
+                                        "pre-gate provenance unavailable; resume confirmation without spending repair budget: {error:#}"
+                                    ));
+                                    self.state.save()?;
+                                    return Ok(());
+                                }
+                                None
+                            }
+                        };
+                        if next == Some(Phase::Reviewing) {
                             self.state.repair_grants[index].review_start = self.state.reviews.len();
                             self.state.repair_grants[index].head = head;
                             self.state.repair_grants[index].phase = Phase::Reviewing;
@@ -2135,12 +2155,7 @@ impl Runner {
                             return Ok(());
                         }
                         // A confirmation review carries no additional fix budget.
-                        let retry_next_round = grant.receipt.request.kind == Kind::Review
-                            && grant.spent < grant.receipt.request.rounds
-                            && crate::repair_budget::prove_review_target(&self.state, &head)
-                                .await
-                                .is_ok();
-                        self.state.repair_grants[index].phase = if retry_next_round {
+                        self.state.repair_grants[index].phase = if next == Some(Phase::Pending) {
                             self.state.repair_grants[index].head = head;
                             Phase::Pending
                         } else {

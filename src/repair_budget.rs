@@ -366,6 +366,10 @@ async fn public_lease(state: &RunState) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("repair grant refused: cannot inspect mechanical pre-gate commit provenance")]
+pub(crate) struct ProvenanceUnavailable;
+
 /// Prove that `head` is a single-commit mechanical `verify.pre_gate` transition
 /// from `round.head` verified by completed E2E on `head`.
 pub(crate) async fn prove_mechanical_pre_gate_commit(
@@ -430,7 +434,7 @@ pub(crate) async fn prove_mechanical_pre_gate_commit(
         .context("repair grant refused: no retained winner")?;
     let provenance = git::commit_provenance(&winner.worktree, head)
         .await
-        .context("repair grant refused: cannot inspect mechanical pre-gate commit provenance")?;
+        .context(ProvenanceUnavailable)?;
     ensure!(
         provenance.commit == head
             && provenance.parents.len() == 1
@@ -1346,6 +1350,31 @@ mod tests {
         assert_eq!(with["review_transition"]["review_round"], 1);
         let decoded: Receipt = serde_json::from_value(with).unwrap();
         assert_eq!(decoded, receipt);
+    }
+
+    #[tokio::test]
+    async fn confirmation_provenance_distinguishes_unavailable_from_inconsistent() {
+        let (_tmp, mut state, reviewed, verified) = mechanical_fixture().await;
+        state.reviews[0].clean = true;
+        state.reviews[0].e2e[0].code = Some(0);
+        let git_dir = state.repo.join(".git");
+        let hidden = state.repo.join("hidden-git");
+        std::fs::rename(&git_dir, &hidden).unwrap();
+        let error = prove_mechanical_pre_gate_commit(&state, &state.reviews[0], &verified)
+            .await
+            .unwrap_err();
+        assert!(error.is::<ProvenanceUnavailable>());
+        std::fs::rename(&hidden, &git_dir).unwrap();
+
+        let transition = prove_mechanical_pre_gate_commit(&state, &state.reviews[0], &verified)
+            .await
+            .unwrap();
+        assert_eq!(transition.reviewed_head, reviewed);
+        state.reviews[0].head = verified.clone();
+        let error = prove_mechanical_pre_gate_commit(&state, &state.reviews[0], &verified)
+            .await
+            .unwrap_err();
+        assert!(!error.is::<ProvenanceUnavailable>());
     }
 
     #[tokio::test]
