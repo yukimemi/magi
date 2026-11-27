@@ -254,7 +254,10 @@ fn converting_done_to_investigation_requires_current_findings() {
     ));
     let done = queue.get(&task.id).unwrap();
     assert_eq!(done.status, TaskStatus::Done);
-    assert_eq!(done.current_investigation_result(), Some("Observed behavior"));
+    assert_eq!(
+        done.current_investigation_result(),
+        Some("Observed behavior")
+    );
 
     // Previously saved Done investigations may already lack findings.
     queue
@@ -274,8 +277,14 @@ fn converting_done_to_investigation_requires_current_findings() {
         &["task", "done", &task.id, "--result", "Recovered findings"],
     ));
     let repaired = queue.get(&task.id).unwrap();
-    assert_eq!(repaired.current_investigation_result(), Some("Recovered findings"));
-    assert_eq!(repaired.completion_history.len(), done.completion_history.len());
+    assert_eq!(
+        repaired.current_investigation_result(),
+        Some("Recovered findings")
+    );
+    assert_eq!(
+        repaired.completion_history.len(),
+        done.completion_history.len()
+    );
 }
 
 #[tokio::test]
