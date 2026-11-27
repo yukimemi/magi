@@ -104,7 +104,7 @@ impl<'a> Head<'a> {
 
 enum Branch {
     Empty,
-    InBase,
+    InBase(String),
     /// Not in the base at the exact tracking-ref commit SHA that was tested.
     OutsideBase(String),
 }
@@ -255,7 +255,7 @@ async fn local_branch(run: &RunState, head: Head<'_>) -> Result<Branch, String> 
         return Ok(Branch::Empty);
     }
     if ancestor(repo, head.sha, tested_base).await? {
-        return Ok(Branch::InBase);
+        return Ok(Branch::InBase(tested_base.to_owned()));
     }
     let shallow = probe("git", &["rev-parse", "--is-shallow-repository"], repo).await?;
     if !shallow.status.success() || stdout(&shallow)? != "false" {
@@ -500,7 +500,15 @@ async fn gather_facts(run: &RunState, limits: Limits) -> Facts {
     }
     match tokio::time::timeout(limits.git, local_branch(run, head)).await {
         Ok(Ok(Branch::Empty)) => Facts::Empty,
-        Ok(Ok(Branch::InBase)) => Facts::InBase,
+        Ok(Ok(Branch::InBase(tested))) => {
+            match base_is_stale(run, &tested, limits).await {
+                None => Facts::InBase,
+                Some(git_error) => Facts::Compared {
+                    git_error: Some(git_error),
+                    forge: Ok(None),
+                },
+            }
+        }
         Ok(Ok(Branch::OutsideBase(tested))) => {
             // Query remote freshness and forge in parallel so `ls-remote` does
             // not extend worst-case audit latency beyond the forge timeout.
@@ -659,12 +667,18 @@ fn try_promote_awaiting_landing(
     let Ok(_lease) = crate::driver::maintenance(home, run_id) else {
         return false;
     };
+    // The asynchronous observation predates these locks. Refuse any changed
+    // run snapshot, including head, base, pass and merge evidence.
+    match (serde_json::to_value(run_state), serde_json::to_value(&reloaded)) {
+        (Ok(observed), Ok(current)) if observed == current => {}
+        _ => return false,
+    }
     let expected = current.clone();
     current.succeed(CompletionContext::from_run(
         CompletionActor::DaemonSettle,
         Some(format!("Landing confirmed: {reason}")),
         &current,
-        run_state,
+        &reloaded,
     ));
     if let Err(e) = queue.commit_completion(&mut current, &expected) {
         tracing::warn!("landing audit: promote {}: {e:#}", observed.id);
@@ -964,6 +978,24 @@ mod tests {
             sha
         }
 
+        fn publish_base(&self, sha: &str) {
+            let remote = self._temp.path().join("origin.git");
+            if !remote.exists() {
+                git(
+                    self._temp.path(),
+                    &["init", "--bare", "-b", "main", "origin.git"],
+                );
+                git(
+                    &self.repo,
+                    &["remote", "add", "origin", remote.to_str().unwrap()],
+                );
+            }
+            git(
+                &self.repo,
+                &["push", "origin", &format!("+{sha}:refs/heads/main")],
+            );
+        }
+
         fn run(&self, head: &str) -> RunState {
             let mut run = RunState::new(
                 self.repo.clone(),
@@ -1016,9 +1048,18 @@ mod tests {
         let f = Fixture::new();
         let sha = f.head(false);
         let mut run = f.run(&sha);
-        git(&f.repo, &["update-ref", "refs/remotes/origin/main", &sha]);
+        f.publish_base(&sha);
         git(&f.repo, &["branch", "-f", BRANCH, &f.base]);
         assert_eq!(verdict(&run, Limits::default()).await.0, State::Landed);
+
+        // A remote rewrite can invalidate positive ancestry while the tracking
+        // ref still contains the candidate.
+        let remote = f._temp.path().join("origin.git");
+        git(&remote, &["update-ref", "refs/heads/main", &f.base]);
+        let (state, why) = verdict(&run, Limits::default()).await;
+        assert_eq!(state, State::Unknown);
+        assert!(why.contains("stale"), "{why}");
+        f.publish_base(&sha);
 
         git(&f.repo, &["branch", "-f", BRANCH, &sha]);
         run.pr_pushed_head = None;
@@ -1309,7 +1350,20 @@ mod tests {
         queue.put(&mut task).unwrap();
 
         // Landing on origin/main promotes the held awaiting-landing task to Done.
-        git(&f.repo, &["update-ref", "refs/remotes/origin/main", &sha]);
+        f.publish_base(&sha);
+        let mut changed = run.clone();
+        changed.pr_pushed_head = Some(f.base.clone());
+        changed.save_under(&f.home).unwrap();
+        assert!(!try_promote_awaiting_landing(
+            &f.home,
+            &queue,
+            &task,
+            &run.id,
+            &run,
+            "old head landed",
+        ));
+        assert_eq!(queue.get(&task.id).unwrap().status, TaskStatus::Held);
+        run.save_under(&f.home).unwrap();
         let summary = audit_pass(&f.home, Limits::default(), MAX_PER_PASS).await;
         assert_eq!(summary.promoted, 1);
         let promoted = queue.get(&task.id).unwrap();

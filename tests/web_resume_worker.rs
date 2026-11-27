@@ -300,7 +300,7 @@ async fn manual_web_resume_after_web_replacement(orphaned_running: bool) {
 
     block.release();
     wait_for(
-        || queue.get(&task.id).unwrap().status == TaskStatus::Done,
+        || queue.get(&task.id).unwrap().has_awaiting_landing_cause(),
         "the same resumed worker to finish",
     )
     .await;

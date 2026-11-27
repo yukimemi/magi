@@ -575,7 +575,7 @@ async fn selected_review_with_no_verification_finishes_locally_without_public_de
     assert!(runner.state.events.iter().any(|e| e.message.contains("not tested")));
     assert_eq!(git::remote_head(&fx.repo, "origin", &selected.branch).await.unwrap().as_deref(), Some(selected.head.as_str()));
     magi::daemon::finish_attempt(3, &queue, &mut task, &runner.state, &[], result);
-    assert_eq!(task.status, magi::queue::TaskStatus::Done);
+    assert!(task.has_awaiting_landing_cause());
 }
 }
 

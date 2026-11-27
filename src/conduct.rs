@@ -2841,13 +2841,8 @@ printf '%s\n' "$MOCK_REPLY"
     }
 
     #[test]
-    fn done_recovery_closes_a_held_task_whose_goal_is_already_met() {
+    fn done_recovery_requires_evidence_even_after_an_operator_claims_landing() {
         crate::run::pin_test_home();
-        // Reproduces the other half of the reported bug (task 6081): once
-        // the operator's answer says the work already happened outside the
-        // loop - PR merged, worktree cleaned up - the conductor needs an
-        // actual terminal state to put the task in, not just a hold it will
-        // keep being re-asked about.
         let dir = tempdir().unwrap();
         let queue = Queue::at(dir.path().join("queue"));
         let questions = Questions::at(dir.path().join("questions"));
@@ -2874,16 +2869,10 @@ printf '%s\n' "$MOCK_REPLY"
         .unwrap();
 
         let after = queue.get(&t.id).unwrap();
-        assert_eq!(after.status, TaskStatus::Done);
-        assert!(after.hold_reason.is_none());
+        assert_eq!(after.status, TaskStatus::Held);
+        assert_eq!(after.hold_reason, t.hold_reason);
         assert_eq!(after.answers.len(), 1, "the record of why is kept");
-        let completion = after.completion_history.last().unwrap();
-        assert_eq!(completion.actor, CompletionActor::Conductor);
-        assert_eq!(completion.prior_status, TaskStatus::Held);
-        assert_eq!(
-            completion.reason.as_deref(),
-            Some("operator confirmed this already landed")
-        );
+        assert!(after.completion_history.is_empty());
     }
 
     #[test]
