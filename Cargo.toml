@@ -61,7 +61,7 @@ ansi-to-tui = "8.0.1"
 jiff = { version = "0.2.46", features = ["serde"] }
 dirs = "7.0.0"
 kaishin = "0.7.5"
-teravars = { version = "0.2.2", features = ["merge"] }
+teravars = { version = "0.3.0", features = ["merge"] }
 # Web UI. `axum` for the API and its built-in SSE, `tokio-stream` to turn the
 # change-notification channel into the stream SSE wants. No `tower-http` and no
 # JS toolchain: the front end is three files embedded with `include_str!`, so
