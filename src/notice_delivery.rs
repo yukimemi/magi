@@ -130,8 +130,31 @@ fn reconcile(n: &Notice, queue: &Queue, talks: &Talks, home: &Path, repo: &Path)
         return acknowledge(&store, n, None);
     }
     let tasks = queue.list();
-    let task = task_of(n, &tasks)?;
-    if matches!(&n.link, Some(Link::Task { .. })) {
+    // Landing audits report a repository-wide set, not a task's own stop.
+    // Keep the navigation link and subjects without assigning chat ownership.
+    let landing_repo = n.key.strip_prefix("landing:");
+    let task = if let Some(repo) = landing_repo {
+        let current = tasks
+            .iter()
+            .filter(|t| {
+                t.repo.to_string_lossy().replace('\\', "/") == repo
+                    && n.subjects.contains(&t.id)
+                    && crate::landing::current_note(t)
+                        .is_some_and(|note| note.state == crate::landing::State::NotLanded)
+            })
+            .count();
+        if current == 0 {
+            return acknowledge(&store, n, None);
+        }
+        anyhow::ensure!(
+            current == n.subjects.len(),
+            "landing audit membership changed; waiting for the next audit"
+        );
+        None
+    } else {
+        task_of(n, &tasks)?
+    };
+    if landing_repo.is_none() && matches!(&n.link, Some(Link::Task { .. })) {
         anyhow::ensure!(task.is_some(), "notice task is unavailable");
     }
     if cleared(n, task, None) {
@@ -162,7 +185,9 @@ fn reconcile(n: &Notice, queue: &Queue, talks: &Talks, home: &Path, repo: &Path)
     if let Some(q) = question {
         return acknowledge(&store, n, Some(q.id));
     }
-    let mut chat = if let Some(task) = task {
+    let mut chat = if let Some(repo) = landing_repo {
+        crate::task_chat::destination_in(talks, Path::new(repo), &format!("notice-{}", n.id))?
+    } else if let Some(task) = task {
         crate::task_chat::destination(queue, talks, &task.id)?.1
     } else if let Some(id) = run_of(n) {
         let repo = run

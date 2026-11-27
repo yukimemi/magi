@@ -516,7 +516,9 @@ invalidates earlier findings even if later reverted (title-only edits preserve
 them). Housekeeping also runs a bounded, timeout-guarded landing audit over
 completed change tasks (caching `landed` / `not_landed` / `unknown` without
 changing task state, alerting only on confirmed non-landings) and promotes
-awaiting-landing holds once landing is confirmed. Web **Mark done**
+awaiting-landing holds once landing is confirmed. Aggregated audit alerts
+are delivered to a dedicated conversation per repository, without changing
+any member task's chat association. Web **Mark done**
 opens that explicit confirmation when the server refuses unmerged work, showing
 the retained run, status, branches and PR. Every completion
 path records its evidence, including automatic settlement and structured done.

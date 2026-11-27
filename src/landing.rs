@@ -1359,6 +1359,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repository_landing_notice_delivers_all_task_ids_to_one_chat() {
+        let f = Fixture::new();
+        let sha = f.head(true);
+        let queue = Queue::at(f.home.join("queue"));
+        let a = f.done_task(&queue, f.run(&sha), false);
+        let b = f.done_task(&queue, f.run(&sha), false);
+        audit_pass(&f.home, Limits::default(), MAX_PER_PASS).await;
+        let notices = Notices::at(f.home.join("notifications"));
+        let notice = notices.list().pop().unwrap();
+        assert_eq!(notice.subjects.len(), 2);
+        let talks = crate::talk::Talks::at(f.home.join("talks"));
+        let id = format!("notice-{}", notice.id);
+        let mut chat = crate::talk::seeded_for_test(&id, f.repo.clone());
+        talks.put(&mut chat).unwrap();
+
+        crate::notice_delivery::sweep(&queue, &talks, &f.home, &f.repo);
+        let saved = notices.get(&notice.id).unwrap();
+        assert_eq!(saved.delivered, saved.generation);
+        assert!(!saved.unread());
+        let pending = talks.get(&id).unwrap().pending;
+        assert!(pending.contains(&a.id));
+        assert!(pending.contains(&b.id));
+        assert!(queue.get(&a.id).unwrap().chat.is_none());
+        assert!(queue.get(&b.id).unwrap().chat.is_none());
+        crate::notice_delivery::sweep(&queue, &talks, &f.home, &f.repo);
+        assert_eq!(talks.list().len(), 1);
+        assert_eq!(talks.get(&id).unwrap().pending, pending);
+    }
+
+    #[tokio::test]
     async fn audit_promotes_held_awaiting_landing_only_when_snapshot_is_unchanged() {
         let f = Fixture::new();
         let sha = f.head(false);
