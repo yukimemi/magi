@@ -2131,7 +2131,9 @@ impl Runner {
                         let next = match next {
                             Ok(next) => next,
                             Err(error) => {
-                                if error.is::<crate::repair_budget::ProvenanceUnavailable>() {
+                                if self.state.repair_grants[index]
+                                    .checkpoint_provenance_retry(&head, &error)
+                                {
                                     self.state.status = RunStatus::Blocked;
                                     self.state.event("repair-grant", format!(
                                         "pre-gate provenance unavailable; resume confirmation without spending repair budget: {error:#}"

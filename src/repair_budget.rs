@@ -133,6 +133,22 @@ pub struct Applied {
     pub conflict: Option<crate::base_conflict::Operation>,
 }
 
+impl Applied {
+    /// Pin the observed E2E head for exact resume admission without accepting
+    /// the transition. Keep the completed round available for re-proving it.
+    pub(crate) fn checkpoint_provenance_retry(
+        &mut self,
+        head: &str,
+        error: &anyhow::Error,
+    ) -> bool {
+        if !error.is::<ProvenanceUnavailable>() {
+            return false;
+        }
+        self.head = head.to_owned();
+        true
+    }
+}
+
 /// Checkpoint saved before each potentially interrupted operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Phase {
@@ -1353,10 +1369,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn confirmation_provenance_distinguishes_unavailable_from_inconsistent() {
+    async fn confirmation_provenance_retry_pins_exact_resume_head() {
         let (_tmp, mut state, reviewed, verified) = mechanical_fixture().await;
         state.reviews[0].clean = true;
         state.reviews[0].e2e[0].code = Some(0);
+        let mut grant = Applied {
+            receipt: Receipt {
+                request: Request {
+                    task: "t1".into(),
+                    run: state.id.clone(),
+                    kind: Kind::Review,
+                    rounds: 2,
+                    head: reviewed.clone(),
+                    expect_pass: 0,
+                    request: "req-1".into(),
+                    reason: "repair".into(),
+                    tip: None,
+                    instruction: None,
+                    replace_request: None,
+                    evidence_digest: None,
+                },
+                at: "2026-06-01T00:00:00Z".parse().unwrap(),
+                decision: None,
+                contract: "[]".into(),
+                stop: None,
+                legacy: None,
+                review_transition: None,
+            },
+            spent: 1,
+            phase: Phase::Reviewing,
+            review_start: 0,
+            head: reviewed.clone(),
+            succeeded: false,
+            conflict: None,
+        };
         let git_dir = state.repo.join(".git");
         let hidden = state.repo.join("hidden-git");
         std::fs::rename(&git_dir, &hidden).unwrap();
@@ -1364,7 +1410,17 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.is::<ProvenanceUnavailable>());
+        assert!(grant.checkpoint_provenance_retry(&verified, &error));
+        let mut grant: Applied =
+            serde_json::from_slice(&serde_json::to_vec(&grant).unwrap()).unwrap();
         std::fs::rename(&hidden, &git_dir).unwrap();
+        // Resume admission must still check the actual branch and exact HEAD.
+        head_and_public(&state, &grant.head).await.unwrap();
+        assert_eq!(grant.phase, Phase::Reviewing);
+        assert_eq!(grant.review_start, 0);
+        assert_eq!(grant.spent, 1);
+        assert!(!grant.succeeded);
+        assert_eq!(grant.receipt.request.head, reviewed);
 
         let transition = prove_mechanical_pre_gate_commit(&state, &state.reviews[0], &verified)
             .await
@@ -1375,6 +1431,10 @@ mod tests {
             .await
             .unwrap_err();
         assert!(!error.is::<ProvenanceUnavailable>());
+        assert!(!grant.checkpoint_provenance_retry(&reviewed, &error));
+        assert_eq!(grant.head, verified);
+        git_ok(&state.repo, &["reset", "--hard", &reviewed]).await;
+        assert!(head_and_public(&state, &grant.head).await.is_err());
     }
 
     #[tokio::test]
