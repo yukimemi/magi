@@ -11,7 +11,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::run::{Liveness, RunState};
+use crate::run::{Liveness, LivenessAssessment, LivenessEvidence, RunState};
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct Identity {
@@ -50,15 +50,51 @@ impl Drop for ExecutionLease {
     }
 }
 
+fn lease_path(home: &Path, id: &str) -> PathBuf {
+    home.join("runs").join(id).join("driver.lock")
+}
+
 fn lease(home: &Path, id: &str) -> Result<ExecutionLease> {
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(home.join("runs").join(id).join("driver.lock"))?;
+        .open(lease_path(home, id))?;
     crate::pr_head::try_lock_file(&file).context("run execution lease unavailable")?;
     Ok(ExecutionLease { _file: file })
+}
+
+enum LeaseProbe {
+    Free(PathBuf),
+    Held(PathBuf),
+    Error(PathBuf, String),
+}
+
+/// Non-blocking, read-only probe of an existing execution lease file.
+/// Never creates `driver.lock` or mutates the run directory.
+fn observe_lease(home: &Path, id: &str) -> LeaseProbe {
+    let path = lease_path(home, id);
+    let file = match File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return LeaseProbe::Free(path);
+        }
+        Err(error) => return LeaseProbe::Error(path, error.to_string()),
+    };
+    match crate::pr_head::try_lock_file(&file) {
+        Ok(()) => {
+            drop(ExecutionLease { _file: file });
+            LeaseProbe::Free(path)
+        }
+        Err(error)
+            if error.kind() == std::io::ErrorKind::WouldBlock
+                || (cfg!(windows) && error.raw_os_error() == Some(33)) =>
+        {
+            LeaseProbe::Held(path)
+        }
+        Err(error) => LeaseProbe::Error(path, error.to_string()),
+    }
 }
 
 pub(crate) fn maintenance(home: &Path, id: &str) -> Result<ExecutionLease> {
@@ -68,21 +104,37 @@ pub(crate) fn maintenance(home: &Path, id: &str) -> Result<ExecutionLease> {
 /// A held lease is evidence of an execution, including within a long-lived
 /// daemon. A free lease proves death when its metadata names this pass, or
 /// a durable marker proves execution never claimed the record. Missing legacy
-/// metadata is not such a marker. The caller supplies the process judge.
-pub(crate) fn judge(state: &RunState, home: &Path, fallback: Liveness) -> Liveness {
+/// metadata is not such a marker. The caller supplies the process assessment.
+pub(crate) fn assess(
+    state: &RunState,
+    home: &Path,
+    fallback: LivenessAssessment,
+) -> LivenessAssessment {
     if state.driver_exited {
         // A daemon claim always wins, even in the gap after graph completion.
         return fallback;
     }
     let dir = home.join("runs").join(&state.id);
-    match std::fs::read(dir.join("driver.json")) {
+    let metadata_path = dir.join("driver.json");
+    let never_claimed = match std::fs::read(&metadata_path) {
         Ok(body) => {
-            let Ok(recorded) = serde_json::from_slice::<Identity>(&body) else {
-                return Liveness::Unknown;
+            let recorded = match serde_json::from_slice::<Identity>(&body) {
+                Ok(recorded) => recorded,
+                Err(error) => {
+                    return LivenessAssessment::new(
+                        Liveness::Unknown,
+                        LivenessEvidence::DriverMetadataUnreadable {
+                            path: metadata_path,
+                            error: error.to_string(),
+                        },
+                        fallback.observed_at,
+                    );
+                }
             };
             if recorded != Identity::of(state) || recorded.pass.is_none() {
                 return fallback;
             }
+            false
         }
         Err(error)
             if error.kind() == std::io::ErrorKind::NotFound
@@ -90,23 +142,34 @@ pub(crate) fn judge(state: &RunState, home: &Path, fallback: Liveness) -> Livene
                 && state.driver_pid.is_none()
                 && state.driver_started_at.is_none()
                 && state.passes.is_empty()
-                && state.active.is_empty() => {}
+                && state.active.is_empty() =>
+        {
+            true
+        }
         Err(_) => return fallback,
-    }
+    };
     // Both a matching prior pass and a durable never-claimed record can be
     // admitted only with a free lease. The latter also reaches every queue
     // preflight, so a public owner can recover before its first driver claim.
-    match lease(home, &state.id) {
-        Ok(_) => Liveness::Dead,
-        Err(e)
-            if e.downcast_ref::<std::io::Error>().is_some_and(|e| {
-                e.kind() == std::io::ErrorKind::WouldBlock
-                    || (cfg!(windows) && e.raw_os_error() == Some(33))
-            }) =>
-        {
-            Liveness::Live
-        }
-        Err(_) => Liveness::Unknown,
+    match observe_lease(home, &state.id) {
+        LeaseProbe::Free(path) => LivenessAssessment::new(
+            Liveness::Dead,
+            LivenessEvidence::ExecutionLeaseFree {
+                path,
+                never_claimed,
+            },
+            fallback.observed_at,
+        ),
+        LeaseProbe::Held(path) => LivenessAssessment::new(
+            Liveness::Live,
+            LivenessEvidence::ExecutionLeaseHeld { path },
+            fallback.observed_at,
+        ),
+        LeaseProbe::Error(path, error) => LivenessAssessment::new(
+            Liveness::Unknown,
+            LivenessEvidence::ExecutionLeaseUnreadable { path, error },
+            fallback.observed_at,
+        ),
     }
 }
 
@@ -608,5 +671,76 @@ mod tests {
         let disk = RunState::load_under(&s.id, home.path()).unwrap();
         assert!(!disk.driver_exited);
         assert_ne!(disk.liveness_under(home.path(), false), Liveness::Dead);
+    }
+
+    #[test]
+    fn read_only_liveness_assessment_never_creates_driver_lock_and_reports_lease_evidence() {
+        let home = tempfile::tempdir().unwrap();
+        let mut fresh = RunState::new(
+            PathBuf::from("repo"),
+            "main".into(),
+            "base".into(),
+            "task".into(),
+            Config::default(),
+        );
+        fresh.driver_claimed = Some(false);
+        fresh.save_under(home.path()).unwrap();
+        let lock_path = lease_path(home.path(), &fresh.id);
+        assert!(!lock_path.exists());
+
+        let now = jiff::Timestamp::now();
+        let assessment = fresh.assess_liveness_under(home.path(), None, now);
+        assert_eq!(assessment.verdict, Liveness::Dead);
+        assert_eq!(
+            assessment.evidence,
+            LivenessEvidence::ExecutionLeaseFree {
+                path: lock_path.clone(),
+                never_claimed: true,
+            }
+        );
+        assert!(
+            !lock_path.exists(),
+            "read-only liveness observation must not create driver.lock"
+        );
+
+        // Now hold the execution lease and verify Live evidence names driver.lock.
+        let mut claimed = state(home.path());
+        claimed.save_under(home.path()).unwrap();
+        let guard = claim(home.path(), &claimed);
+        let claimed_lock = lease_path(home.path(), &claimed.id);
+        let live = claimed.assess_liveness_under(home.path(), None, now);
+        assert_eq!(live.verdict, Liveness::Live);
+        assert_eq!(
+            live.evidence,
+            LivenessEvidence::ExecutionLeaseHeld {
+                path: claimed_lock.clone(),
+            }
+        );
+        let refusal = live.live_driver_refusal();
+        assert!(
+            refusal.starts_with("run already has a live driver: "),
+            "{refusal}"
+        );
+        assert!(
+            refusal.contains(&claimed_lock.display().to_string()),
+            "{refusal}"
+        );
+        drop(guard);
+
+        // Corrupt driver.json yields Unknown with metadata path evidence.
+        let mut corrupt = state(home.path());
+        corrupt.save_under(home.path()).unwrap();
+        let meta = home
+            .path()
+            .join("runs")
+            .join(&corrupt.id)
+            .join("driver.json");
+        std::fs::write(&meta, b"{corrupt").unwrap();
+        let unknown = corrupt.assess_liveness_under(home.path(), None, now);
+        assert_eq!(unknown.verdict, Liveness::Unknown);
+        assert!(matches!(
+            unknown.evidence,
+            LivenessEvidence::DriverMetadataUnreadable { ref path, .. } if path == &meta
+        ));
     }
 }

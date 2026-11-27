@@ -467,6 +467,139 @@ pub fn read_status(home: &Path) -> Option<Reading> {
     serde_json::from_str(&body).ok()
 }
 
+struct ClaimObservation {
+    current: Current,
+    evidence: crate::run::LivenessEvidence,
+}
+
+fn observe_current_work(home: &Path, now: Timestamp) -> Vec<ClaimObservation> {
+    let mut observed: Vec<ClaimObservation> = Vec::new();
+    let reading = read_status(home).filter(|reading| reading.running(now));
+    let daemon_pid = reading.as_ref().and_then(|r| r.pid);
+    let heartbeat_age_secs = reading.as_ref().and_then(|r| r.age_secs(now));
+    if let Some(reading) = reading {
+        for claim in reading.current {
+            let task = (!claim.task.is_empty()).then(|| claim.task.clone());
+            let (worker_pid, worker_status, worker_lookup_error) = match claim.worker.as_deref() {
+                Some(worker_id) => match crate::worker::get(home, worker_id) {
+                    Ok(job)
+                        if matches!(
+                            job.status,
+                            crate::worker::Status::Finished | crate::worker::Status::Failed
+                        ) =>
+                    {
+                        // The worker positively reached a terminal status, so
+                        // this heartbeat snapshot is stale until the next poll.
+                        continue;
+                    }
+                    Ok(job) => (job.pid, Some(job.status), None),
+                    Err(error) => (None, None, Some(format!("{error:#}"))),
+                },
+                None => (None, None, None),
+            };
+            let evidence = crate::run::LivenessEvidence::DaemonHeartbeat {
+                daemon_pid,
+                heartbeat_age_secs,
+                worker_id: claim.worker.clone(),
+                worker_pid,
+                worker_status,
+                worker_lookup_error,
+                task,
+            };
+            observed.push(ClaimObservation {
+                current: claim,
+                evidence,
+            });
+        }
+    }
+    let workers = crate::worker::observe_active_detailed(home).and_then(|jobs| {
+        jobs.into_iter()
+            .filter(|entry| entry.job.kind == "task")
+            .map(|entry| {
+                let job = entry.job;
+                let request: TaskWorker = serde_json::from_value(job.payload).map_err(|_| {
+                    anyhow::anyhow!("invalid task worker payload metadata for worker {}", job.id)
+                })?;
+                let run = Queue::at(request.queue)
+                    .get(&request.task)
+                    .ok()
+                    .and_then(|task| task.execution_runs().last().cloned())
+                    .unwrap_or_default();
+                let task_label = (!request.task.is_empty()).then(|| request.task.clone());
+                let current = Current {
+                    worker: Some(job.id.clone()),
+                    task: request.task,
+                    run,
+                };
+                let evidence = crate::run::LivenessEvidence::WorkerClaim {
+                    worker_id: job.id,
+                    pid: job.pid,
+                    status: job.status,
+                    reason: entry.reason,
+                    task: task_label,
+                    daemon_pid: None,
+                };
+                Ok(ClaimObservation { current, evidence })
+            })
+            .collect::<Result<Vec<_>>>()
+    });
+    match workers {
+        Ok(workers) => {
+            for mut worker in workers {
+                if let Some(existing) = observed.iter_mut().find(|claim| {
+                    claim.current.task == worker.current.task
+                        && claim.current.run == worker.current.run
+                        && claim.current.worker == worker.current.worker
+                }) {
+                    if let crate::run::LivenessEvidence::WorkerClaim {
+                        daemon_pid: ref mut target_daemon_pid,
+                        ..
+                    } = worker.evidence
+                    {
+                        *target_daemon_pid = daemon_pid;
+                    }
+                    existing.evidence = worker.evidence;
+                } else {
+                    observed.push(worker);
+                }
+            }
+        }
+        Err(error) => {
+            // This API gates destructive cleanup. Unknown worker ownership
+            // protects every known task/run instead of pretending it is idle.
+            let detail = format!("{error:#}");
+            tracing::error!("cannot determine active workers: {detail}");
+            let evidence = crate::run::LivenessEvidence::WorkerStoreUnreadable { error: detail };
+            observed.extend(
+                Queue::at(home.join("queue"))
+                    .list()
+                    .into_iter()
+                    .map(|task| ClaimObservation {
+                        current: Current {
+                            worker: None,
+                            task: task.id.clone(),
+                            run: task.execution_runs().last().cloned().unwrap_or_default(),
+                        },
+                        evidence: evidence.clone(),
+                    }),
+            );
+            observed.extend(
+                crate::run::list_ids_in(&home.join("runs"))
+                    .into_iter()
+                    .map(|run| ClaimObservation {
+                        current: Current {
+                            worker: None,
+                            task: String::new(),
+                            run,
+                        },
+                        evidence: evidence.clone(),
+                    }),
+            );
+        }
+    }
+    observed
+}
+
 /// Read-only evidence of runs owned by a live daemon or independent worker.
 ///
 /// CLI, sandboxed conversation controls and Web cleanup share this observation.
@@ -477,72 +610,29 @@ pub fn read_status(home: &Path) -> Option<Reading> {
 /// [`is_working_on_task`].
 #[must_use]
 pub fn current_work(home: &Path, now: Timestamp) -> Vec<Current> {
-    let mut current = read_status(home)
-        .filter(|reading| reading.running(now))
-        .map(|reading| reading.current)
-        .unwrap_or_default();
-    let workers = crate::worker::observe_active(home).and_then(|jobs| {
-        jobs.into_iter()
-            .filter(|job| job.kind == "task")
-            .map(|job| {
-                let request: TaskWorker = serde_json::from_value(job.payload)?;
-                let run = Queue::at(request.queue)
-                    .get(&request.task)
-                    .ok()
-                    .and_then(|task| task.execution_runs().last().cloned())
-                    .unwrap_or_default();
-                Ok(Current {
-                    worker: Some(job.id),
-                    task: request.task,
-                    run,
-                })
-            })
-            .collect::<Result<Vec<_>>>()
-    });
-    match workers {
-        Ok(workers) => {
-            for worker in workers {
-                if !current.iter().any(|claim| {
-                    claim.task == worker.task
-                        && claim.run == worker.run
-                        && claim.worker == worker.worker
-                }) {
-                    current.push(worker);
-                }
-            }
-        }
-        Err(error) => {
-            // This API gates destructive cleanup. Unknown worker ownership
-            // protects every known task/run instead of pretending it is idle.
-            tracing::error!("cannot determine active workers: {error:#}");
-            current.extend(
-                Queue::at(home.join("queue"))
-                    .list()
-                    .into_iter()
-                    .map(|task| Current {
-                        worker: None,
-                        task: task.id.clone(),
-                        run: task.execution_runs().last().cloned().unwrap_or_default(),
-                    }),
-            );
-            current.extend(
-                crate::run::list_ids_in(&home.join("runs"))
-                    .into_iter()
-                    .map(|run| Current {
-                        worker: None,
-                        task: String::new(),
-                        run,
-                    }),
-            );
-        }
-    }
-    current
+    observe_current_work(home, now)
+        .into_iter()
+        .map(|entry| entry.current)
+        .collect()
+}
+
+/// Structured evidence for a live daemon or worker claim on `run`, if any.
+#[must_use]
+pub fn claim_for_run(
+    home: &Path,
+    run: &str,
+    now: Timestamp,
+) -> Option<crate::run::LivenessEvidence> {
+    observe_current_work(home, now)
+        .into_iter()
+        .find(|entry| entry.current.run == run)
+        .map(|entry| entry.evidence)
 }
 
 /// Whether a live daemon is working on this run at this moment.
 #[must_use]
 pub fn is_working_on(home: &Path, run: &str, now: Timestamp) -> bool {
-    current_work(home, now).iter().any(|c| c.run == run)
+    claim_for_run(home, run, now).is_some()
 }
 
 /// Admission may ignore only this process's confirmed worker reservation.
@@ -550,6 +640,16 @@ pub fn is_working_on(home: &Path, run: &str, now: Timestamp) -> bool {
 /// same task. The run's execution lease and process identity are checked by
 /// the caller under the owner lock as well.
 pub(crate) fn is_working_on_other(home: &Path, run: &str, now: Timestamp) -> Result<bool> {
+    Ok(other_claim_for_run(home, run, now)?.is_some())
+}
+
+/// Same exclusion rule as [`is_working_on_other`], returning the concrete claim
+/// evidence when another owner (or conservative protection) claims `run`.
+pub(crate) fn other_claim_for_run(
+    home: &Path,
+    run: &str,
+    now: Timestamp,
+) -> Result<Option<crate::run::LivenessEvidence>> {
     // A helper or test may inherit an identity from a different run store.
     // That identity grants no exception here; retain all ownership evidence.
     let same_home = std::env::var_os("MAGI_WORKER_HOME")
@@ -564,13 +664,17 @@ pub(crate) fn is_working_on_other(home: &Path, run: &str, now: Timestamp) -> Res
             && job.status == crate::worker::Status::Running
             && job.pid == Some(std::process::id())
     });
-    Ok(other_claims_run(
-        &current_work(home, now),
-        run,
-        caller.as_ref().map(|job| job.id.as_str()),
-    ))
+    let caller_id = caller.as_ref().map(|job| job.id.as_str());
+    Ok(observe_current_work(home, now)
+        .into_iter()
+        .find(|entry| {
+            entry.current.run == run
+                && !(caller_id.is_some() && entry.current.worker.as_deref() == caller_id)
+        })
+        .map(|entry| entry.evidence))
 }
 
+#[cfg(test)]
 fn other_claims_run(claims: &[Current], run: &str, caller: Option<&str>) -> bool {
     claims
         .iter()
@@ -1053,17 +1157,21 @@ where
                         ActionDecision::Resume(run.clone())
                     }
                 }
-                Ok(s) if s.liveness_under(home, false) == Liveness::Live => {
-                    ActionDecision::Refuse("run already has a live driver".into())
+                Ok(s) => {
+                    let assessment = s.assess_liveness_under(home, None, Timestamp::now());
+                    if assessment.verdict == Liveness::Live {
+                        ActionDecision::Refuse(assessment.live_driver_refusal())
+                    } else {
+                        match crate::handover::resume_refusal_under(&s, Some(home)) {
+                            None => ActionDecision::Resume(run.clone()),
+                            Some(reason) => ActionDecision::Refuse((p.resume_cannot_progress)(
+                                q.short(),
+                                ask::short_id(run),
+                                &reason.diagnostic(&s),
+                            )),
+                        }
+                    }
                 }
-                Ok(s) => match crate::handover::resume_refusal_under(&s, Some(home)) {
-                    None => ActionDecision::Resume(run.clone()),
-                    Some(reason) => ActionDecision::Refuse((p.resume_cannot_progress)(
-                        q.short(),
-                        ask::short_id(run),
-                        &reason.diagnostic(&s),
-                    )),
-                },
                 Err(e) => ActionDecision::Refuse((p.resume_unreadable)(
                     q.short(),
                     ask::short_id(run),
@@ -14058,10 +14166,20 @@ mod tests {
         };
         let lease = crate::driver::maintenance(home.path(), &state.id).unwrap();
         assert_eq!(state.liveness_under(home.path(), false), Liveness::Live);
-        assert_eq!(
-            decide(),
-            ActionDecision::Refuse("run already has a live driver".into())
-        );
+        let expected_lock = home.path().join("runs").join(&state.id).join("driver.lock");
+        match decide() {
+            ActionDecision::Refuse(detail) => {
+                assert!(
+                    detail.starts_with("run already has a live driver: "),
+                    "{detail}"
+                );
+                assert!(
+                    detail.contains(&expected_lock.display().to_string()),
+                    "{detail}"
+                );
+            }
+            other => panic!("expected live driver refusal, got {other:?}"),
+        }
         drop(lease);
         assert_eq!(decide(), ActionDecision::Resume(state.id.clone()));
     }
@@ -15186,5 +15304,285 @@ mod tests {
         queue.put(&mut again).unwrap();
         apply_task_choice_actions(&queue, &questions, &home);
         assert_eq!(queue.get(&t.id).unwrap().status, TaskStatus::Held);
+    }
+
+    #[test]
+    fn stale_heartbeat_pointing_to_terminal_worker_does_not_block_resume_while_unproven_claims_stay_protected()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let queue = Queue::at(home.join("queue"));
+        let mut state = run_state(RunStatus::Blocked);
+        state.id = "20261125-084544-669a".to_owned();
+        state.driver_exited = true;
+        state.driver_pid = None;
+        state.driver_started_at = None;
+        state.save_under(home).unwrap();
+
+        let mut t = held_task_with(&state.id);
+        queue.put(&mut t).unwrap();
+
+        // Simulate a task worker that finished and was archived to results/,
+        // while daemon.json still has a fresh heartbeat referencing that worker.
+        let worker_id = "fc769e65-0000-4000-8000-000000000001";
+        let retained_dir = home.join("workers").join("results").join(worker_id);
+        std::fs::create_dir_all(&retained_dir).unwrap();
+        let finished_job = crate::worker::Job {
+            id: worker_id.to_owned(),
+            sequence: 1,
+            kind: "task".to_owned(),
+            key: format!("task:{}", t.id),
+            payload: serde_json::json!({
+                "queue": home.join("queue"),
+                "task": t.id,
+                "opts": Opts::default(),
+                "standalone": false,
+            }),
+            generation: "a".repeat(64),
+            version: Some("0.260.0".to_owned()),
+            status: crate::worker::Status::Finished,
+            result: Some("completed".to_owned()),
+            pid: Some(37456),
+            created_at: 1,
+            finished_at: Some(2),
+        };
+        std::fs::write(
+            retained_dir.join("job.json"),
+            serde_json::to_vec(&finished_job).unwrap(),
+        )
+        .unwrap();
+
+        let now = Timestamp::now();
+        let mut status = Status::new();
+        status.updated_at = now;
+        status.current = vec![Current {
+            worker: Some(worker_id.to_owned()),
+            task: t.id.clone(),
+            run: state.id.clone(),
+        }];
+        write_status_to(&home.join("daemon.json"), &status).unwrap();
+
+        assert!(
+            claim_for_run(home, &state.id, now).is_none(),
+            "a fresh heartbeat pointing to a confirmed terminal worker must not claim the run"
+        );
+        assert!(crate::resume::validate(home, &state.id).is_ok());
+
+        // Legacy heartbeat without worker id remains protected.
+        status.current = vec![Current {
+            worker: None,
+            task: t.id.clone(),
+            run: state.id.clone(),
+        }];
+        write_status_to(&home.join("daemon.json"), &status).unwrap();
+        let legacy_err = crate::resume::validate(home, &state.id)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            legacy_err.starts_with("run already has a live driver: daemon heartbeat claim"),
+            "{legacy_err}"
+        );
+        assert!(legacy_err.contains("worker=none"), "{legacy_err}");
+
+        // Heartbeat naming a missing/unreadable worker record remains protected.
+        let missing_id = "fc769e65-0000-4000-8000-000000000002";
+        status.current = vec![Current {
+            worker: Some(missing_id.to_owned()),
+            task: t.id.clone(),
+            run: state.id.clone(),
+        }];
+        write_status_to(&home.join("daemon.json"), &status).unwrap();
+        let missing_err = crate::resume::validate(home, &state.id)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            missing_err.starts_with("run already has a live driver: daemon heartbeat claim"),
+            "{missing_err}"
+        );
+        assert!(missing_err.contains(missing_id), "{missing_err}");
+        assert!(missing_err.contains("status=unknown"), "{missing_err}");
+
+        // Heartbeat naming a Running (non-terminal) worker whose lease is not held
+        // still remains protected conservatively until fenced to a terminal status.
+        let running_id = "fc769e65-0000-4000-8000-000000000003";
+        let running_dir = home.join("workers").join("jobs").join(running_id);
+        std::fs::create_dir_all(&running_dir).unwrap();
+        let running_job = crate::worker::Job {
+            id: running_id.to_owned(),
+            status: crate::worker::Status::Running,
+            pid: Some(42424),
+            finished_at: None,
+            result: None,
+            ..finished_job
+        };
+        std::fs::write(
+            running_dir.join("job.json"),
+            serde_json::to_vec(&running_job).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(running_dir.join("live.lock"), b"").unwrap();
+        status.current = vec![Current {
+            worker: Some(running_id.to_owned()),
+            task: t.id.clone(),
+            run: state.id.clone(),
+        }];
+        write_status_to(&home.join("daemon.json"), &status).unwrap();
+        let running_err = crate::resume::validate(home, &state.id)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            running_err.starts_with("run already has a live driver: daemon heartbeat claim"),
+            "{running_err}"
+        );
+        assert!(running_err.contains(running_id), "{running_err}");
+        assert!(running_err.contains("pid=42424"), "{running_err}");
+        assert!(running_err.contains("status=running"), "{running_err}");
+    }
+
+    #[test]
+    fn resume_validate_refusals_include_concrete_evidence_for_every_live_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let queue = Queue::at(home.join("queue"));
+        let mut state = run_state(RunStatus::Blocked);
+        state.id = "20261125-090000-evid".to_owned();
+        state.driver_exited = true;
+        state.save_under(home).unwrap();
+        let mut t = held_task_with(&state.id);
+        queue.put(&mut t).unwrap();
+
+        // 1. Live task worker holding live.lock.
+        let payload = serde_json::json!({
+            "queue": home.join("queue"),
+            "task": t.id,
+            "opts": Opts::default(),
+            "standalone": false,
+        });
+        let (job, lease) =
+            crate::worker::running_fixture(home, &format!("task:{}", t.id), payload).unwrap();
+        let worker_err = crate::resume::validate(home, &state.id)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            worker_err.starts_with("run already has a live driver: worker claim"),
+            "{worker_err}"
+        );
+        assert!(worker_err.contains(&job.id), "{worker_err}");
+        assert!(
+            worker_err.contains(&format!("pid={}", std::process::id())),
+            "{worker_err}"
+        );
+        assert!(worker_err.contains("status=running"), "{worker_err}");
+        assert!(worker_err.contains("live.lock held"), "{worker_err}");
+        drop(lease);
+        std::fs::remove_dir_all(home.join("workers").join("jobs").join(&job.id)).unwrap();
+
+        // 2. Unfenced Starting worker reservation.
+        let starting_id = "fc769e65-0000-4000-8000-000000000010";
+        let starting_dir = home.join("workers").join("jobs").join(starting_id);
+        std::fs::create_dir_all(&starting_dir).unwrap();
+        let starting_job = crate::worker::Job {
+            id: starting_id.to_owned(),
+            sequence: 2,
+            kind: "task".to_owned(),
+            key: format!("task:{}", t.id),
+            payload: serde_json::json!({
+                "queue": home.join("queue"),
+                "task": t.id,
+                "opts": Opts::default(),
+                "standalone": false,
+            }),
+            generation: "a".repeat(64),
+            version: None,
+            status: crate::worker::Status::Starting,
+            result: None,
+            pid: None,
+            created_at: 1,
+            finished_at: None,
+        };
+        std::fs::write(
+            starting_dir.join("job.json"),
+            serde_json::to_vec(&starting_job).unwrap(),
+        )
+        .unwrap();
+        let starting_err = crate::resume::validate(home, &state.id)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            starting_err.starts_with("run already has a live driver: worker claim"),
+            "{starting_err}"
+        );
+        assert!(starting_err.contains(starting_id), "{starting_err}");
+        assert!(starting_err.contains("status=starting"), "{starting_err}");
+        assert!(
+            starting_err.contains("unfenced starting reservation"),
+            "{starting_err}"
+        );
+        std::fs::remove_dir_all(&starting_dir).unwrap();
+
+        // 3. Unrelated corrupt worker triggers conservative protection with distinct wording.
+        let corrupt_id = "bad00000-0000-4000-8000-000000000099";
+        let corrupt_dir = home.join("workers").join("jobs").join(corrupt_id);
+        std::fs::create_dir_all(&corrupt_dir).unwrap();
+        std::fs::write(corrupt_dir.join("job.json"), b"{not valid json").unwrap();
+        let store_err = crate::resume::validate(home, &state.id)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            store_err.starts_with(
+                "run already has a live driver: worker store observation failed (conservative protection):"
+            ),
+            "{store_err}"
+        );
+        assert!(store_err.contains(corrupt_id), "{store_err}");
+        std::fs::remove_dir_all(&corrupt_dir).unwrap();
+
+        // 4. Held execution lease (driver.lock path).
+        state.driver_exited = false;
+        state.driver_claimed = Some(false);
+        state.driver_pid = None;
+        state.driver_started_at = None;
+        state.save_under(home).unwrap();
+        let exec_lease = crate::driver::maintenance(home, &state.id).unwrap();
+        let lease_err = crate::resume::validate(home, &state.id)
+            .unwrap_err()
+            .to_string();
+        let lock_path = home.join("runs").join(&state.id).join("driver.lock");
+        assert!(
+            lease_err.starts_with("run already has a live driver: execution lease held"),
+            "{lease_err}"
+        );
+        assert!(
+            lease_err.contains(&lock_path.display().to_string()),
+            "{lease_err}"
+        );
+        drop(exec_lease);
+
+        // 5. Live process identity (pid + identity).
+        let pid = std::process::id();
+        let identity = crate::proc::process_started_at(pid).expect("current process identity");
+        state.driver_claimed = None;
+        state.driver_pid = Some(pid);
+        state.driver_started_at = Some(identity.clone());
+        state.save_under(home).unwrap();
+        let pid_err = crate::resume::validate(home, &state.id)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            pid_err.starts_with("run already has a live driver: live driver process"),
+            "{pid_err}"
+        );
+        assert!(pid_err.contains(&format!("pid={pid}")), "{pid_err}");
+        assert!(
+            pid_err.contains(&format!("identity={identity}")),
+            "{pid_err}"
+        );
+
+        // decide_action uses the exact same refusal format for process identity too.
+        let question = action_question(&state.id, resume_action(&state.id));
+        let decision = decide_action(home, &t, &question, &PHRASES_EN, |id| {
+            RunState::load_under(id, home)
+        });
+        assert_eq!(decision, ActionDecision::Refuse(pid_err));
     }
 }

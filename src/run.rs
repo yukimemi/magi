@@ -2136,6 +2136,354 @@ pub enum Liveness {
     Unknown,
 }
 
+impl Liveness {
+    /// Lowercase verdict name used in diagnostics and reports.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Live => "live",
+            Self::Dead => "dead",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl std::fmt::Display for Liveness {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Concrete observation that decided a [`Liveness`] verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LivenessEvidence {
+    /// An active detached task worker reservation claims this run.
+    WorkerClaim {
+        /// Worker reservation id.
+        worker_id: String,
+        /// Worker process id, when acknowledged.
+        pid: Option<u32>,
+        /// Worker job status.
+        status: crate::worker::Status,
+        /// Why the worker was judged active.
+        reason: crate::worker::ActiveReason,
+        /// Owning queue task id, when known.
+        task: Option<String>,
+        /// Daemon process id if a fresh daemon heartbeat also named this claim.
+        daemon_pid: Option<u32>,
+    },
+    /// A fresh `daemon.json` heartbeat claims this run.
+    DaemonHeartbeat {
+        /// Daemon process id from `daemon.json`, when present.
+        daemon_pid: Option<u32>,
+        /// Age of the daemon heartbeat in seconds, when known.
+        heartbeat_age_secs: Option<i64>,
+        /// Worker reservation id from `daemon.json`, absent on legacy drivers.
+        worker_id: Option<String>,
+        /// Worker process id, when the worker record could be read.
+        worker_pid: Option<u32>,
+        /// Worker job status, when the worker record could be read.
+        worker_status: Option<crate::worker::Status>,
+        /// Error reading the worker record, when a `worker_id` was present but unreadable.
+        worker_lookup_error: Option<String>,
+        /// Owning queue task id, when known.
+        task: Option<String>,
+    },
+    /// Observing the worker store failed; all known runs are conservatively protected.
+    WorkerStoreUnreadable {
+        /// Concrete observation error.
+        error: String,
+    },
+    /// Caller supplied a boolean daemon claim without structured claim metadata.
+    DaemonClaimed,
+    /// The run's execution lease (`driver.lock`) is currently held by another process.
+    ExecutionLeaseHeld {
+        /// Path to `driver.lock`.
+        path: PathBuf,
+    },
+    /// The recorded `driver_pid` is alive and its process identity matches `driver_started_at`.
+    ProcessIdentity {
+        /// Live driver process id.
+        pid: u32,
+        /// Matched process start identity marker.
+        identity: String,
+    },
+    /// `run.json` records `driver_exited = true` and no active daemon or worker claim exists.
+    DriverExited,
+    /// The run's execution lease (`driver.lock`) is unlocked for a matching pass or never-claimed record.
+    ExecutionLeaseFree {
+        /// Path to `driver.lock`.
+        path: PathBuf,
+        /// Whether this run had a durable `driver_claimed = false` marker with no prior pass.
+        never_claimed: bool,
+    },
+    /// The recorded `driver_pid` is no longer running.
+    ProcessExited {
+        /// Exited driver process id.
+        pid: u32,
+    },
+    /// The recorded `driver_pid` now belongs to a different process.
+    ProcessIdentityMismatch {
+        /// Reused process id.
+        pid: u32,
+        /// Identity marker originally recorded on the run.
+        recorded: String,
+        /// Identity marker observed for the current process.
+        observed: String,
+    },
+    /// No `driver_pid` is recorded in `run.json` and no exit or lease proof applies.
+    NoDriverPid,
+    /// The OS could not report whether `driver_pid` is alive.
+    ProcessStatusUnavailable {
+        /// Unqueryable process id.
+        pid: u32,
+    },
+    /// `driver_pid` is alive, but no `driver_started_at` identity was recorded.
+    MissingDriverIdentity {
+        /// Live process id without a recorded identity.
+        pid: u32,
+    },
+    /// `driver_pid` is alive, but the recorded `driver_started_at` is in a legacy non-comparable format.
+    UncomparableRecordedIdentity {
+        /// Live process id.
+        pid: u32,
+        /// Recorded non-comparable identity string.
+        recorded: String,
+    },
+    /// `driver_pid` is alive, but the current process identity could not be read or compared.
+    ObservedIdentityUnavailable {
+        /// Live process id.
+        pid: u32,
+        /// Identity marker recorded on the run.
+        recorded: String,
+        /// Non-comparable identity returned by the OS, if any.
+        observed: Option<String>,
+    },
+    /// `driver.json` exists but could not be parsed.
+    DriverMetadataUnreadable {
+        /// Path to `driver.json`.
+        path: PathBuf,
+        /// Parse error.
+        error: String,
+    },
+    /// `driver.lock` could not be opened or probed due to an unexpected I/O error.
+    ExecutionLeaseUnreadable {
+        /// Path to `driver.lock`.
+        path: PathBuf,
+        /// I/O error.
+        error: String,
+    },
+}
+
+impl std::fmt::Display for LivenessEvidence {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WorkerClaim {
+                worker_id,
+                pid,
+                status,
+                reason,
+                task,
+                daemon_pid,
+            } => {
+                write!(formatter, "worker claim (worker={worker_id}, pid=")?;
+                match pid {
+                    Some(pid) => write!(formatter, "{pid}")?,
+                    None => write!(formatter, "none")?,
+                }
+                write!(formatter, ", status={status}, reason={reason}")?;
+                if let Some(task) = task {
+                    write!(formatter, ", task={task}")?;
+                }
+                if let Some(daemon_pid) = daemon_pid {
+                    write!(formatter, ", daemon_pid={daemon_pid}")?;
+                }
+                write!(formatter, ")")
+            }
+            Self::DaemonHeartbeat {
+                daemon_pid,
+                heartbeat_age_secs,
+                worker_id,
+                worker_pid,
+                worker_status,
+                worker_lookup_error,
+                task,
+            } => {
+                write!(formatter, "daemon heartbeat claim (")?;
+                match daemon_pid {
+                    Some(pid) => write!(formatter, "daemon_pid={pid}, ")?,
+                    None => write!(formatter, "daemon_pid=none, ")?,
+                }
+                match worker_id {
+                    Some(id) => write!(formatter, "worker={id}, ")?,
+                    None => write!(formatter, "worker=none, ")?,
+                }
+                match worker_pid {
+                    Some(pid) => write!(formatter, "pid={pid}, ")?,
+                    None => write!(formatter, "pid=none, ")?,
+                }
+                match worker_status {
+                    Some(status) => write!(formatter, "status={status}")?,
+                    None => write!(formatter, "status=unknown")?,
+                }
+                if let Some(age) = heartbeat_age_secs {
+                    write!(formatter, ", age={age}s")?;
+                }
+                if let Some(task) = task {
+                    write!(formatter, ", task={task}")?;
+                }
+                if let Some(error) = worker_lookup_error {
+                    write!(formatter, ", worker_record={error}")?;
+                }
+                write!(formatter, ")")
+            }
+            Self::WorkerStoreUnreadable { error } => {
+                write!(
+                    formatter,
+                    "worker store observation failed (conservative protection): {error}"
+                )
+            }
+            Self::DaemonClaimed => write!(formatter, "daemon claim"),
+            Self::ExecutionLeaseHeld { path } => {
+                write!(formatter, "execution lease held ({})", path.display())
+            }
+            Self::ProcessIdentity { pid, identity } => {
+                write!(
+                    formatter,
+                    "live driver process (pid={pid}, identity={identity})"
+                )
+            }
+            Self::DriverExited => {
+                write!(
+                    formatter,
+                    "driver_exited=true in run.json and no active daemon/worker claim"
+                )
+            }
+            Self::ExecutionLeaseFree {
+                path,
+                never_claimed: true,
+            } => {
+                write!(
+                    formatter,
+                    "run was never claimed and execution lease is free ({})",
+                    path.display()
+                )
+            }
+            Self::ExecutionLeaseFree {
+                path,
+                never_claimed: false,
+            } => {
+                write!(
+                    formatter,
+                    "matching execution lease is free ({})",
+                    path.display()
+                )
+            }
+            Self::ProcessExited { pid } => {
+                write!(formatter, "driver process exited (pid={pid})")
+            }
+            Self::ProcessIdentityMismatch {
+                pid,
+                recorded,
+                observed,
+            } => {
+                write!(
+                    formatter,
+                    "driver pid reused by another process (pid={pid}, recorded_identity={recorded}, observed_identity={observed})"
+                )
+            }
+            Self::NoDriverPid => write!(formatter, "no driver_pid recorded in run.json"),
+            Self::ProcessStatusUnavailable { pid } => {
+                write!(formatter, "could not query process status (pid={pid})")
+            }
+            Self::MissingDriverIdentity { pid } => {
+                write!(
+                    formatter,
+                    "driver process alive without recorded identity (pid={pid})"
+                )
+            }
+            Self::UncomparableRecordedIdentity { pid, recorded } => {
+                write!(
+                    formatter,
+                    "driver process alive with non-comparable recorded identity (pid={pid}, recorded_identity={recorded})"
+                )
+            }
+            Self::ObservedIdentityUnavailable {
+                pid,
+                recorded,
+                observed: None,
+            } => {
+                write!(
+                    formatter,
+                    "could not query process identity (pid={pid}, recorded_identity={recorded})"
+                )
+            }
+            Self::ObservedIdentityUnavailable {
+                pid,
+                recorded,
+                observed: Some(observed),
+            } => {
+                write!(
+                    formatter,
+                    "observed process identity is not comparable (pid={pid}, recorded_identity={recorded}, observed_identity={observed})"
+                )
+            }
+            Self::DriverMetadataUnreadable { path, error } => {
+                write!(
+                    formatter,
+                    "driver metadata unreadable ({}): {error}",
+                    path.display()
+                )
+            }
+            Self::ExecutionLeaseUnreadable { path, error } => {
+                write!(
+                    formatter,
+                    "could not probe execution lease ({}): {error}",
+                    path.display()
+                )
+            }
+        }
+    }
+}
+
+/// Verdict and supporting evidence from a single driver-liveness observation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LivenessAssessment {
+    /// Whether the driver is proven live, proven dead, or unknown.
+    pub verdict: Liveness,
+    /// Exact evidence from the observation that produced `verdict`.
+    pub evidence: LivenessEvidence,
+    /// Timestamp when this observation was made.
+    pub observed_at: Timestamp,
+}
+
+impl LivenessAssessment {
+    /// Construct an assessment pairing a verdict with its evidence and timestamp.
+    #[must_use]
+    pub fn new(verdict: Liveness, evidence: LivenessEvidence, observed_at: Timestamp) -> Self {
+        Self {
+            verdict,
+            evidence,
+            observed_at,
+        }
+    }
+
+    /// Standard refusal message when an operation rejects a run with a live driver.
+    #[must_use]
+    pub fn live_driver_refusal(&self) -> String {
+        format!("run already has a live driver: {}", self.evidence)
+    }
+
+    /// Local-time observation stamp for reports.
+    #[must_use]
+    pub fn observed_local(&self) -> String {
+        self.observed_at
+            .to_zoned(jiff::tz::TimeZone::system())
+            .strftime("%Y-%m-%d %H:%M:%S")
+            .to_string()
+    }
+}
+
 /// A timestamped note about a node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
@@ -3698,45 +4046,162 @@ impl RunState {
     /// without spawning a real process query — production code goes through
     /// [`Self::liveness`], which supplies [`crate::proc::pid_status`] and
     /// [`crate::proc::process_started_at`].
+    /// Assess process liveness with structured evidence, without consulting
+    /// daemon or execution-lease files on disk.
+    #[must_use]
+    pub fn assess_liveness_with<F, G>(
+        &self,
+        claim: Option<LivenessEvidence>,
+        query: F,
+        identity: G,
+        observed_at: Timestamp,
+    ) -> LivenessAssessment
+    where
+        F: FnOnce(u32) -> Option<bool>,
+        G: FnOnce(u32) -> Option<String>,
+    {
+        if let Some(evidence) = claim {
+            return LivenessAssessment::new(Liveness::Live, evidence, observed_at);
+        }
+        // The driver said itself that it stopped; its pid may well be alive
+        // (a daemon outlives the runs it drives), so it is not asked.
+        if self.driver_exited {
+            return LivenessAssessment::new(
+                Liveness::Dead,
+                LivenessEvidence::DriverExited,
+                observed_at,
+            );
+        }
+        let Some(pid) = self.driver_pid else {
+            return LivenessAssessment::new(
+                Liveness::Unknown,
+                LivenessEvidence::NoDriverPid,
+                observed_at,
+            );
+        };
+        match query(pid) {
+            Some(false) => LivenessAssessment::new(
+                Liveness::Dead,
+                LivenessEvidence::ProcessExited { pid },
+                observed_at,
+            ),
+            None => LivenessAssessment::new(
+                Liveness::Unknown,
+                LivenessEvidence::ProcessStatusUnavailable { pid },
+                observed_at,
+            ),
+            Some(true) => {
+                let Some(recorded) = &self.driver_started_at else {
+                    return LivenessAssessment::new(
+                        Liveness::Unknown,
+                        LivenessEvidence::MissingDriverIdentity { pid },
+                        observed_at,
+                    );
+                };
+                // A marker in the old locale-dependent format can never be
+                // compared reliably, so it proves nothing either way.
+                if !crate::proc::is_identity_marker(recorded) {
+                    return LivenessAssessment::new(
+                        Liveness::Unknown,
+                        LivenessEvidence::UncomparableRecordedIdentity {
+                            pid,
+                            recorded: recorded.clone(),
+                        },
+                        observed_at,
+                    );
+                }
+                match identity(pid) {
+                    Some(current) if !crate::proc::is_identity_marker(&current) => {
+                        LivenessAssessment::new(
+                            Liveness::Unknown,
+                            LivenessEvidence::ObservedIdentityUnavailable {
+                                pid,
+                                recorded: recorded.clone(),
+                                observed: Some(current),
+                            },
+                            observed_at,
+                        )
+                    }
+                    Some(current) if *recorded == current => LivenessAssessment::new(
+                        Liveness::Live,
+                        LivenessEvidence::ProcessIdentity {
+                            pid,
+                            identity: current,
+                        },
+                        observed_at,
+                    ),
+                    Some(current) => LivenessAssessment::new(
+                        Liveness::Dead,
+                        LivenessEvidence::ProcessIdentityMismatch {
+                            pid,
+                            recorded: recorded.clone(),
+                            observed: current,
+                        },
+                        observed_at,
+                    ),
+                    None => LivenessAssessment::new(
+                        Liveness::Unknown,
+                        LivenessEvidence::ObservedIdentityUnavailable {
+                            pid,
+                            recorded: recorded.clone(),
+                            observed: None,
+                        },
+                        observed_at,
+                    ),
+                }
+            }
+        }
+    }
+
+    /// Assess driver liveness under `home`, pairing the verdict with the exact
+    /// claim, execution lease, or process identity evidence that decided it.
+    #[must_use]
+    pub fn assess_liveness_under(
+        &self,
+        home: &Path,
+        claim: Option<LivenessEvidence>,
+        observed_at: Timestamp,
+    ) -> LivenessAssessment {
+        self.assess_liveness_under_with(
+            home,
+            claim,
+            crate::proc::pid_status,
+            crate::proc::process_started_at,
+            observed_at,
+        )
+    }
+
+    pub(crate) fn assess_liveness_under_with<F, G>(
+        &self,
+        home: &Path,
+        claim: Option<LivenessEvidence>,
+        query: F,
+        identity: G,
+        observed_at: Timestamp,
+    ) -> LivenessAssessment
+    where
+        F: FnOnce(u32) -> Option<bool>,
+        G: FnOnce(u32) -> Option<String>,
+    {
+        if let Some(evidence) = claim {
+            return LivenessAssessment::new(Liveness::Live, evidence, observed_at);
+        }
+        let process = self.assess_liveness_with(None, query, identity, observed_at);
+        crate::driver::assess(self, home, process)
+    }
+
+    /// Whether a process is actually still driving this run, given whether a
+    /// daemon's heartbeat claims it and process-liveness/identity queries for
+    /// [`Self::driver_pid`]. Thin wrapper over [`Self::assess_liveness_with`].
     #[must_use]
     pub fn liveness_with<F, G>(&self, daemon_claims: bool, query: F, identity: G) -> Liveness
     where
         F: FnOnce(u32) -> Option<bool>,
         G: FnOnce(u32) -> Option<String>,
     {
-        if daemon_claims {
-            return Liveness::Live;
-        }
-        // The driver said itself that it stopped; its pid may well be alive
-        // (a daemon outlives the runs it drives), so it is not asked.
-        if self.driver_exited {
-            return Liveness::Dead;
-        }
-        let Some(pid) = self.driver_pid else {
-            return Liveness::Unknown;
-        };
-        match query(pid) {
-            Some(false) => Liveness::Dead,
-            None => Liveness::Unknown,
-            Some(true) => {
-                let Some(recorded) = &self.driver_started_at else {
-                    return Liveness::Unknown;
-                };
-                // A marker in the old locale-dependent format can never be
-                // compared reliably, so it proves nothing either way.
-                if !crate::proc::is_identity_marker(recorded) {
-                    return Liveness::Unknown;
-                }
-                match identity(pid) {
-                    Some(current) if !crate::proc::is_identity_marker(&current) => {
-                        Liveness::Unknown
-                    }
-                    Some(current) if *recorded == current => Liveness::Live,
-                    Some(_) => Liveness::Dead,
-                    None => Liveness::Unknown,
-                }
-            }
-        }
+        let claim = daemon_claims.then_some(LivenessEvidence::DaemonClaimed);
+        self.assess_liveness_with(claim, query, identity, Timestamp::now())
+            .verdict
     }
 
     /// [`Self::liveness_with`], backed by the real process-liveness and
@@ -3768,11 +4233,9 @@ impl RunState {
         F: FnOnce(u32) -> Option<bool>,
         G: FnOnce(u32) -> Option<String>,
     {
-        if daemon_claims {
-            return Liveness::Live;
-        }
-        let process = self.liveness_with(false, query, identity);
-        crate::driver::judge(self, home, process)
+        let claim = daemon_claims.then_some(LivenessEvidence::DaemonClaimed);
+        self.assess_liveness_under_with(home, claim, query, identity, Timestamp::now())
+            .verdict
     }
 
     /// Clear every seat this run still lists as active and fail it, unless it

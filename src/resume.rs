@@ -12,10 +12,13 @@ pub(crate) fn validate(home: &Path, id: &str) -> Result<crate::run::RunState> {
     if let Some(reason) = crate::handover::resume_refusal_under(&state, Some(home)) {
         anyhow::bail!(reason.diagnostic(&state));
     }
-    let claims = crate::daemon::is_working_on(home, id, jiff::Timestamp::now());
+    let now = jiff::Timestamp::now();
+    let claim = crate::daemon::claim_for_run(home, id, now);
+    let assessment = state.assess_liveness_under(home, claim, now);
     ensure!(
-        state.liveness_under(home, claims) != crate::run::Liveness::Live,
-        "run already has a live driver"
+        assessment.verdict != crate::run::Liveness::Live,
+        "{}",
+        assessment.live_driver_refusal()
     );
     Ok(state)
 }
