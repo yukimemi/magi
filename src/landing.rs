@@ -233,6 +233,20 @@ async fn local_branch(run: &RunState, head: Head<'_>) -> Result<Branch, String> 
     if !full_oid(tested_base) || !full_oid(start) {
         return Err("the recorded comparison base or remote base is not a full commit ID".into());
     }
+    // The public PR name can differ from the retained local winner branch.
+    let branch = run
+        .winner()
+        .map_or(head.branch, |winner| winner.branch.as_str());
+    let branch_ref = format!("refs/heads/{branch}");
+    let retained = probe(
+        "git",
+        &["show-ref", "--verify", "--hash", "--", &branch_ref],
+        repo,
+    )
+    .await?;
+    if !retained.status.success() {
+        return Err(git_failure("show-ref (retained branch)", &retained));
+    }
     if !ancestor(repo, start, head.sha).await? {
         return Err("the recorded head does not descend from its recorded comparison base".into());
     }
@@ -1070,6 +1084,21 @@ mod tests {
         let (state, why) = verdict(&run, Limits::default()).await;
         assert_eq!(state, State::Unknown);
         assert!(why.contains("git merge-base failed"), "{why}");
+    }
+
+    #[tokio::test]
+    async fn deleted_branch_with_retained_commit_is_unknown() {
+        for empty in [true, false] {
+            let f = Fixture::new();
+            let sha = f.head(empty);
+            f.publish_base(&f.base);
+            let run = f.run(&sha);
+            git(&f.repo, &["branch", "-D", BRANCH]);
+            assert_eq!(git(&f.repo, &["rev-parse", &sha]), sha);
+            let (state, why) = verdict(&run, Limits::default()).await;
+            assert_eq!(state, State::Unknown, "{why}");
+            assert!(why.contains("retained branch"), "{why}");
+        }
     }
 
     #[tokio::test]

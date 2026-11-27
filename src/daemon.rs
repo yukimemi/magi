@@ -11972,6 +11972,16 @@ mod tests {
         let mut task = task();
         task.repo = opts.repo.clone();
         task.chat = Some("decision-chat".into());
+        let mut state = run_state(RunStatus::Merged);
+        state.repo = task.repo.clone();
+        state.merge = Some(crate::run::MergeOutcome {
+            mode: MergeMode::Pr,
+            ok: true,
+            detail: "confirmed merge".into(),
+            empty: false,
+        });
+        task.link_run(&state.id);
+        state.save_under(&home).unwrap();
         task.hold_machine(Some("waiting for a decision".into()));
         queue.put(&mut task).unwrap();
         let questions = Questions::at(home.join("questions"));
@@ -15373,7 +15383,13 @@ mod tests {
         let questions = Questions::at(dir.path().join("questions"));
         let home = dir.path().join("home");
         // Execution finished before task settlement; Done is not a discard.
-        let mut state = run_state(RunStatus::Ready);
+        let mut state = run_state(RunStatus::Merged);
+        state.merge = Some(crate::run::MergeOutcome {
+            mode: MergeMode::Pr,
+            ok: true,
+            detail: "confirmed merge".into(),
+            empty: false,
+        });
         state.id = "20260101-000000-act4".to_owned();
         state.save_under(&home).unwrap();
         let mut t = held_task_with(&state.id);
