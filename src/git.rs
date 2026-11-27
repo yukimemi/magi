@@ -39,17 +39,69 @@ pub(crate) async fn git_raw_command(
     args: &[&str],
     kill_on_drop: bool,
 ) -> Result<GitOut> {
-    // Creating a relative worktree can upgrade the shared repository format
-    // and write extensions.relativeWorktrees. Serialize it with our other
-    // shared extension writes, including calls from detached worker processes.
-    let _config_lock = if args.starts_with(&["worktree", "add"])
-        || args == ["config", "extensions.worktreeConfig", "true"]
+    if args.starts_with(&["worktree", "add"]) {
+        return worktree_add_raw(cwd, args, kill_on_drop).await;
+    }
+    let _config_lock = if args == ["config", "extensions.worktreeConfig", "true"]
         || args == ["config", "--unset", "extensions.worktreeConfig"]
     {
         Some(lock_worktree_config(cwd).await?)
     } else {
         None
     };
+    git_raw_unlocked(cwd, args, kill_on_drop).await
+}
+
+async fn config_bool(repo: &Path, local: bool, key: &str) -> Result<bool> {
+    let scope = if local { "--local" } else { "--includes" };
+    let out = git_raw_unlocked(repo, &["config", scope, "--bool", "--get", key], false).await?;
+    match (out.code, out.stdout.as_str()) {
+        (Some(0), "true") => Ok(true),
+        (Some(0), "false") => Ok(false),
+        (Some(1), "") if out.stderr.is_empty() => Ok(false),
+        _ => bail!("read Git config {key}: {}", out.stderr),
+    }
+}
+
+async fn worktree_add_raw(cwd: &Path, args: &[&str], kill_on_drop: bool) -> Result<GitOut> {
+    let lock = lock_worktree_config(cwd).await?;
+    let relative = match args
+        .iter()
+        .rev()
+        .find(|arg| matches!(**arg, "--relative-paths" | "--no-relative-paths"))
+    {
+        Some(arg) => *arg == "--relative-paths",
+        None => config_bool(cwd, false, "worktree.useRelativePaths").await?,
+    };
+    if relative && !config_bool(cwd, true, "extensions.relativeWorktrees").await? {
+        // Older Git ignores worktree.useRelativePaths. Only a Git that
+        // implements relative worktrees can migrate the common config.
+        let help = git_raw_unlocked(cwd, &["worktree", "add", "-h"], false).await?;
+        if help.stdout.contains("relative-paths") || help.stderr.contains("relative-paths") {
+            // Git upgrades the repository format and sets the extension
+            // before writing the linking files, checking out any files, or
+            // running hooks. Once that monotonic extension is visible,
+            // subsequent adds won't write shared config. Let Git perform
+            // its own migration (including repository-format validation).
+            let add = git_raw_unlocked(cwd, args, kill_on_drop);
+            tokio::pin!(add);
+            loop {
+                tokio::select! {
+                    result = &mut add => return result,
+                    migrated = async {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        config_bool(cwd, true, "extensions.relativeWorktrees").await
+                    } => {
+                        if matches!(migrated, Ok(true)) {
+                            drop(lock);
+                            return add.await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    drop(lock);
     git_raw_unlocked(cwd, args, kill_on_drop).await
 }
 
