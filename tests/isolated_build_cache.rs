@@ -56,6 +56,12 @@ fn build_child() {
     }
     git(&fx.repo, &["checkout", "main"]);
     git(&fx.repo, &["config", "worktree.useRelativePaths", "true"]);
+    // The reviews contend for build caches, not Git's one-time repository
+    // format migration. Initialize both shared config extensions before
+    // independent workers start creating worktrees concurrently.
+    git(&fx.repo, &["config", "core.repositoryformatversion", "1"]);
+    git(&fx.repo, &["config", "extensions.relativeWorktrees", "true"]);
+    git(&fx.repo, &["config", "extensions.worktreeConfig", "true"]);
 
     let reader = fx.tmp.path().join("reader.sh");
     fs::write(&reader, "[ -z \"${CARGO_TARGET_DIR+x}\" ] || exit 42\nexec sh \"$@\"\n").unwrap();

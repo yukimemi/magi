@@ -3915,21 +3915,17 @@ const PUT_RETRIES: u32 = 5;
 /// Write `body` to `tmp` and rename it onto `path`, retrying the whole thing
 /// a handful of times with a short sleep in between.
 ///
-/// The only failure this is meant to absorb is a passing one - most
-/// concretely, a reader elsewhere in this process (or another `magi`
-/// process) with `path` briefly open for `read_to_string` at the exact
-/// moment this call tries to rename over it. That clears in milliseconds
-/// once the reader lets go; a caller still failing after several short
-/// sleeps has something more durable wrong (a full disk, a permissions
-/// change) that a longer sleep would not fix either, and is left to report
-/// it.
+/// This absorbs short-lived filesystem contention. On Windows, a handle that
+/// denies delete sharing can prevent replacement even when reads and writes
+/// succeed. Ordinary Rust readers allow delete sharing; their presence alone
+/// does not establish the cause of a rename failure.
 fn write_atomic(tmp: &Path, path: &Path, body: &str) -> Result<()> {
     let mut last_err = None;
     for attempt in 0..PUT_RETRIES {
         if attempt > 0 {
             std::thread::sleep(Duration::from_millis(20 * u64::from(attempt)));
         }
-        match try_write_atomic(tmp, path, body) {
+        match try_write_atomic(tmp, path, body, attempt + 1 == PUT_RETRIES) {
             Ok(()) => return Ok(()),
             Err(e) => last_err = Some(e),
         }
@@ -3937,14 +3933,98 @@ fn write_atomic(tmp: &Path, path: &Path, body: &str) -> Result<()> {
     Err(last_err.expect("the loop above always runs at least once"))
 }
 
-fn try_write_atomic(tmp: &Path, path: &Path, body: &str) -> Result<()> {
+fn try_write_atomic(tmp: &Path, path: &Path, body: &str, final_attempt: bool) -> Result<()> {
     #[cfg(test)]
     if failpoint::take_forced_put_failure() {
         bail!("simulated write failure (test)");
     }
     std::fs::write(tmp, body).with_context(|| format!("write {}", tmp.display()))?;
-    std::fs::rename(tmp, path).with_context(|| format!("replace {}", path.display()))?;
+    std::fs::rename(tmp, path).with_context(|| {
+        #[cfg(windows)]
+        if final_attempt {
+            return format!(
+                "replace {}; post-failure source: {}; destination: {}",
+                path.display(),
+                replacement_probe(tmp),
+                replacement_probe(path),
+            );
+        }
+        let _ = final_attempt;
+        format!("replace {}", path.display())
+    })?;
     Ok(())
+}
+
+#[cfg(windows)]
+fn replacement_probe(path: &Path) -> String {
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+    let metadata = match std::fs::metadata(path) {
+        Ok(m) => format!(
+            "attributes={:#x}, bytes={}",
+            m.file_attributes(),
+            m.file_size()
+        ),
+        Err(e) => format!("metadata OS error={:?}", e.raw_os_error()),
+    };
+    // A successful DELETE open does not establish that replacement is possible.
+    // These observations occur after the failed rename, not during it.
+    let delete = match std::fs::OpenOptions::new()
+        .access_mode(0x0001_0000) // DELETE
+        .share_mode(7) // READ | WRITE | DELETE
+        .open(path)
+    {
+        Ok(_) => "ok".to_owned(),
+        Err(e) => format!("OS error={:?}", e.raw_os_error()),
+    };
+    format!("{metadata}, DELETE open={delete}")
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn replacement_reports_denied_source_and_destination_without_losing_record() {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    for linked in [false, true] {
+        for deny_source in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("record.json");
+            let tmp = dir.path().join("record.json.tmp");
+            if linked {
+                assert!(publish_exclusive(&path, &dir.path().join("new"), "old").unwrap());
+            } else {
+                std::fs::write(&path, "old").unwrap();
+            }
+            std::fs::write(&tmp, "new").unwrap();
+            let reader = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(3) // READ | WRITE, no DELETE
+                .open(if deny_source { &tmp } else { &path })
+                .unwrap();
+            let error = write_atomic(&tmp, &path, "new").unwrap_err();
+            assert!(matches!(
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .unwrap()
+                    .raw_os_error(),
+                Some(5 | 32)
+            ));
+            let detail = error.to_string();
+            let (source, destination) = detail.split_once("; destination: ").unwrap();
+            let source = source.split_once("; post-failure source: ").unwrap().1;
+            let (denied, available) = if deny_source {
+                (source, destination)
+            } else {
+                (destination, source)
+            };
+            assert!(denied.contains("DELETE open=OS error=Some(32)"), "{detail}");
+            assert!(available.contains("DELETE open=ok"), "{detail}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "old");
+            drop(reader);
+            write_atomic(&tmp, &path, "new").unwrap();
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        }
+    }
 }
 
 /// Last resort when `turn`'s own `store.put` fails even after
