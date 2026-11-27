@@ -632,7 +632,8 @@ async fn queue_successful_review_links_one_execution_run() {
         repo: fx.repo.clone(), config: Some(config_path), ..Default::default()
     }, &queue, &mut task).await;
     let saved = queue.get(&task.id).unwrap();
-    assert_eq!(saved.status, magi::queue::TaskStatus::Done, "{:?}", saved.last_error);
+    assert_eq!(saved.status, magi::queue::TaskStatus::Held, "{:?}", saved.last_error);
+    assert_eq!(saved.awaiting_landing_run(), saved.runs.first().map(String::as_str));
     assert_eq!(saved.runs.len(), 1);
     assert_eq!(saved.attempts, 1);
     assert!(saved.startup_failures.is_empty());

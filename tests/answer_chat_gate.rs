@@ -893,7 +893,7 @@ fn consulted_chat_operates_a_task_it_did_not_file_and_keeps_queue_claims() {
         vec!["task", "hold", &task.id, "Wait for replacement"],
         vec!["task", "release", &task.id],
         vec!["task", "priority", &task.id, "5"],
-        vec!["task", "done", &task.id],
+        vec!["task", "done", &task.id, "--discard", "--reason", "No longer needed"],
     ] {
         // A running daemon's claim still wins over the chat's request.
         let claim = queue.claim(&task.id).unwrap();
@@ -960,7 +960,7 @@ fn ordinary_chat_task_add_does_not_require_an_existing_talk_record() {
     assert_eq!(tasks[0].instruction, "Independent work");
     for args in [
         vec!["task", "priority", &tasks[0].id, "9"],
-        vec!["task", "done", &tasks[0].id],
+        vec!["task", "done", &tasks[0].id, "--discard", "--reason", "No longer needed"],
     ] {
         let out = common::magi_cli(f.tmp.path())
             .args(args)

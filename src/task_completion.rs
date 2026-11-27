@@ -382,7 +382,11 @@ pub(crate) async fn close_claimed(
     result: Option<String>,
     discard: bool,
 ) -> Result<Task> {
-    if task.status == TaskStatus::Done {
+    if task.status == TaskStatus::Done
+        && (!task.investigation
+            || discard
+            || (result.is_none() && task.current_investigation_result().is_some()))
+    {
         return Ok(task);
     }
     let expected = task.clone();
@@ -393,7 +397,7 @@ pub(crate) async fn close_claimed(
     }
     task.succeed(context);
     queue.commit_completion(&mut task, &expected)?;
-    if !discard {
+    if !discard && expected.status != TaskStatus::Done {
         crate::daemon::supersede_prior_runs(&task, home);
     }
     Ok(task)

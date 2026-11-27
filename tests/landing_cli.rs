@@ -222,6 +222,62 @@ fn investigation_requires_findings_and_invalidates_after_instruction_edit_includ
     assert_eq!(finished["completion_result"]["instruction_rev"], 2);
 }
 
+#[test]
+fn converting_done_to_investigation_requires_current_findings() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let (repo, _) = init_repo_with_origin(root);
+    let queue = Queue::at(root.join("state").join("queue"));
+    let mut task = Task::new(
+        "research".into(),
+        "research".into(),
+        repo.clone(),
+        Source::Human,
+    );
+    task.status = TaskStatus::Done;
+    queue.put(&mut task).unwrap();
+
+    successful(cli(root, &repo, &["task", "investigation", &task.id]));
+    let held = queue.get(&task.id).unwrap();
+    assert!(held.investigation);
+    assert!(held.operator_held());
+    assert!(held.current_investigation_result().is_none());
+    assert!(
+        !cli(root, &repo, &["task", "done", &task.id])
+            .status
+            .success()
+    );
+    successful(cli(
+        root,
+        &repo,
+        &["task", "done", &task.id, "--result", "Observed behavior"],
+    ));
+    let done = queue.get(&task.id).unwrap();
+    assert_eq!(done.status, TaskStatus::Done);
+    assert_eq!(done.current_investigation_result(), Some("Observed behavior"));
+
+    // Previously saved Done investigations may already lack findings.
+    queue
+        .modify(&task.id, |t| {
+            t.completion_result = None;
+            true
+        })
+        .unwrap();
+    assert!(
+        !cli(root, &repo, &["task", "done", &task.id])
+            .status
+            .success()
+    );
+    successful(cli(
+        root,
+        &repo,
+        &["task", "done", &task.id, "--result", "Recovered findings"],
+    ));
+    let repaired = queue.get(&task.id).unwrap();
+    assert_eq!(repaired.current_investigation_result(), Some("Recovered findings"));
+    assert_eq!(repaired.completion_history.len(), done.completion_history.len());
+}
+
 #[tokio::test]
 async fn regression_seventeen_shapes_empty_missing_branch_multi_retry_wrong_base_and_forge_error() {
     let temp = tempfile::tempdir().unwrap();

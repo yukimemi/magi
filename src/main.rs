@@ -4569,6 +4569,18 @@ async fn task_cmd_inner(command: TaskCmd, q: Queue) -> Result<()> {
             q.modify(&resolved, |t| {
                 t.investigation = !clear;
                 t.landing = None;
+                if t.investigation
+                    && t.status == queue::TaskStatus::Done
+                    && t.current_investigation_result().is_none()
+                {
+                    let context = queue::CompletionContext::new(
+                        queue::CompletionActor::Cli,
+                        Some("Investigation requires findings for the current instruction".into()),
+                        &magi::run::home(),
+                        t,
+                    );
+                    t.reopen(context).expect("done task with a nonblank reason");
+                }
                 if t.investigation && t.has_awaiting_landing_cause() {
                     t.hold_manual(t.hold_reason.clone());
                 }
