@@ -14,6 +14,9 @@ an open PR against a moving base, magi stops the run (`RunStatus::Blocked`) with
 Ordinary `resume`, `release`, `triage`, standing automatic recovery, automatic goal
 turns, and daemon restarts never refill this budget or start a replacement
 competition.
+An explicit exact-run resume can still reconcile an externally merged or
+closed PR without granting or spending a synchronization attempt. An open PR
+at exhaustion still requires the recovery command below.
 
 ## Supported CLI and Chat Command
 
@@ -80,6 +83,8 @@ After an interruption, repeat the **exact same** `--request` ID and arguments:
   re-queueing.
 - An interrupted `prepared` or `authorized` request reconciles safely without
   creating a duplicate authorization when the binding still matches.
+  The original receipt binds the approved base and stop; normal fast-forward
+  movement does not change that binding.
 - A corrupt/unreadable receipt, mismatched request arguments, or an `authorized`
   receipt with no matching authorization in `run.json` is refused as uncertain;
   inspect the receipt file before taking action rather than minting a new ID.
@@ -98,6 +103,10 @@ inside `land.rs` after acquiring the execution lease, before changing `status` t
 - On valid execution, the authorization is marked `consumed = true` and
   `extra_attempts` is incremented and saved to `run.json` **before** any Git
   operation.
+  A restart before the authorized synchronization starts revalidates the same
+  binding without consuming another grant. A rewritten base is refused.
+  If the retained head already contains the base, successful fresh
+  verification and publication still spend the authorized attempt.
 - Prior gate, pre-gate, `head_e2e`, `gate_repair_e2e`, and review `verified_head`
   markers are archived into `land_sync_recovery.authorizations[*].archived_verification`
   and `verification_history` and cleared so **fresh head-bound E2E and gate**

@@ -485,7 +485,12 @@ pub async fn recover_with<O: PrObserver>(
                 )));
             }
         }
-        state.record_land_sync_exhausted_stop(&local_head, &observed_pr.head, &approved_tip);
+        let stopped_tip = prior_receipt
+            .as_ref()
+            .map_or(approved_tip.as_str(), |prior| {
+                prior.binding.stop.tip.as_str()
+            });
+        state.record_land_sync_exhausted_stop(&local_head, &observed_pr.head, stopped_tip);
     }
 
     let stop = state
@@ -519,31 +524,18 @@ pub async fn recover_with<O: PrObserver>(
                 auth.stop == prior.binding.stop && auth.scope == prior.binding.scope,
                 "interrupted landing sync recovery authorization does not match receipt binding"
             );
-            ensure!(
-                prior.binding.task == binding.task,
-                "interrupted landing sync recovery request is stale: owning task changed"
-            );
-            // Allow base tip fast-forward between interrupted authorization and queue completion,
-            // while refusing rewritten history or changed stop/HEAD/PR/instruction/assignment.
-            let descends =
-                git::ancestry(&state.repo, &prior.binding.scope.tip, &binding.scope.tip).await?;
-            ensure!(
-                descends
-                    && prior.binding.stop == binding.stop
-                    && prior.binding.scope.instruction == binding.scope.instruction
-                    && prior.binding.scope.assignment == binding.scope.assignment
-                    && prior.binding.scope.pr_head == binding.scope.pr_head
-                    && prior.binding.scope.pr_url == binding.scope.pr_url
-                    && prior.binding.scope.pr_number == binding.scope.pr_number
-                    && prior.binding.scope.grant_index == binding.scope.grant_index,
-                "interrupted landing sync recovery request is stale: stop, HEAD, PR, instruction, or base lineage changed"
-            );
-        } else {
-            ensure!(
-                prior.binding == binding,
-                "interrupted landing sync recovery request is stale: task, stop, HEAD, PR, or fetched base changed"
-            );
         }
+        let descends =
+            git::ancestry(&state.repo, &prior.binding.scope.tip, &binding.scope.tip).await?;
+        let mut original_scope = binding.scope.clone();
+        original_scope.tip.clone_from(&prior.binding.scope.tip);
+        ensure!(
+            descends
+                && prior.binding.task == binding.task
+                && prior.binding.stop == binding.stop
+                && prior.binding.scope == original_scope,
+            "interrupted landing sync recovery request is stale: task, stop, HEAD, PR, instruction, or base lineage changed"
+        );
         prior
     } else {
         let mut queued = task.clone();
@@ -578,8 +570,8 @@ pub async fn recover_with<O: PrObserver>(
             request: key.clone(),
             task: task.id.clone(),
             run: state.id.clone(),
-            stop,
-            scope,
+            stop: receipt.binding.stop.clone(),
+            scope: receipt.binding.scope.clone(),
             decision: receipt.queued.operator_decided_at,
             generation: receipt.queued.resumption.as_ref().map(|r| r.generation),
             granted_attempts: GRANT_ATTEMPTS,

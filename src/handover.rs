@@ -445,7 +445,6 @@ pub(crate) enum ResumeRefusal {
     ReviewDisabled,
     CleanReviewGateRan,
     BaseSyncStop,
-    LandSyncExhausted,
 }
 
 impl ResumeRefusal {
@@ -460,7 +459,6 @@ impl ResumeRefusal {
     pub(crate) fn diagnostic(&self, state: &RunState) -> String {
         let reason = match self {
             Self::BaseSyncStop => "base synchronization is stopped; inspect the retained work. For movement exhaustion only, use `magi run --resume <run> --recover-base` (standing chat: `magi task control recover-base <run> --request <id> --head <retained-sha>`, full SHA or 7+ hex digits) to authorize a new bounded synchronization interval and fresh verification".into(),
-            Self::LandSyncExhausted => "landing base synchronization budget is exhausted; inspect the retained work and open PR head, then explicitly authorize 1 bounded recovery attempt with `magi task control recover-land-sync <run> --request <id> --head <full-head-sha>` (ordinary resume or release grants no additional landing sync budget)".into(),
             Self::Status(status) => format!("status `{}` is final; there is nothing left to resume", status.as_str()),
             Self::Released(_) => "execution was released".into(),
             Self::Retired(_) => "execution was retired".into(),
@@ -501,9 +499,6 @@ impl ResumeRefusal {
         ));
         if matches!(self, Self::BaseSyncStop) {
             detail.push_str(&format!(" {}", state.base_sync_next_action()));
-        }
-        if matches!(self, Self::LandSyncExhausted) {
-            detail.push_str(&format!(" {}", state.land_sync_next_action()));
         }
         if matches!(self, Self::ReviewBudget { .. } | Self::ReviewDisabled) {
             detail.push_str(" To continue the retained implementation, first confirm its saved candidate branch and owning task with `magi task show <task-id>`. When the task is eligible and no driver is live, explicitly use `magi review <saved-branch> --task <task-id> --merge none --review-rounds <positive-rounds>`. This creates a review-only successor with a new review budget; it does not resume this run or start a new implementation competition. Existing ownership and checkpoint checks still apply.");
@@ -552,13 +547,6 @@ pub(crate) fn resume_refusal_under(state: &RunState, home: Option<&Path>) -> Opt
             None
         } else {
             Some(ResumeRefusal::BaseSyncStop)
-        };
-    }
-    if state.land_sync_exhausted() {
-        return if state.land_sync_recovery_pending() {
-            None
-        } else {
-            Some(ResumeRefusal::LandSyncExhausted)
         };
     }
     let review = crate::graph::review_conclusion(&state.reviews, state.config.graph.review_rounds);

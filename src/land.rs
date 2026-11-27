@@ -3954,6 +3954,11 @@ async fn publish_landing_head<F: Forge>(
         pushed.stderr
     );
     state.pr_pushed_head = Some(checked.clone());
+    // An already-current base still completes the authorized synchronization.
+    // Do not leave its allowance available for a later, unrelated base move.
+    if state.land_sync_unstarted_grant() {
+        state.land_sync_attempts += 1;
+    }
     state.land_sync_pending = false;
     state.save()?;
     Ok(checked)
@@ -4165,6 +4170,19 @@ async fn resume_landing_head<F: Forge>(
     );
     let onto = format!("{remote}/{base}");
     let tip = git::rev_parse(&state.repo, &onto).await?;
+    if state.land_sync_unstarted_grant() {
+        let auth = state
+            .land_sync_recovery
+            .authorizations
+            .last()
+            .context("missing recovery grant")?;
+        anyhow::ensure!(
+            auth.invalidated.is_none()
+                && git::ancestry(&state.repo, &auth.scope.tip, &tip).await?
+                && git::ancestry(&state.repo, &auth.stop.tip, &tip).await?,
+            "fetched landing base is outside the authorized recovery lineage"
+        );
+    }
     let contains_base = git::ancestry(&state.repo, &tip, &local)
         .await
         .context("could not determine whether the landing head contains the fetched base")?;
@@ -4173,7 +4191,7 @@ async fn resume_landing_head<F: Forge>(
         "BEHIND reported but the fetched base is already included; synchronization made no progress"
     );
     if !contains_base || reason == Some(Blocking::Conflict) {
-        match rebase_landing_worktree(state, &onto).await? {
+        match rebase_landing_worktree(state, &tip).await? {
             crate::rebase::Rebased::Applied => {}
             crate::rebase::Rebased::Stopped(why) => bail!("landing rebase stopped: {why}"),
         }
@@ -4243,18 +4261,29 @@ async fn prepare_land_sync_recovery<F: Forge>(
     forge: &F,
 ) -> Result<LandSyncPrep> {
     let has_unconsumed = state.has_unconsumed_land_sync_authorization();
+    let unstarted = state.land_sync_unstarted_grant();
     let exhausted = state.land_sync_exhausted();
-    if !has_unconsumed && !exhausted {
+    if !has_unconsumed && !exhausted && !unstarted {
         return Ok(LandSyncPrep::Continue(None));
     }
-    if !has_unconsumed {
+    let repo = state.repo.clone();
+    let seen = forge.view(&repo, pr_url).await?;
+    if seen.pr.state != PrLifecycle::Open {
+        anyhow::ensure!(
+            state
+                .pr
+                .as_ref()
+                .is_some_and(|pr| pr.url == seen.pr.url && pr.number == seen.pr.number),
+            "terminal pull request does not match the retained run"
+        );
+        return Ok(LandSyncPrep::Continue(Some(seen)));
+    }
+    if !has_unconsumed && !unstarted {
         bail!(
             "{}; explicit recover-land-sync authorization required",
             crate::land_sync_recovery::EXHAUSTED_DETAIL
         );
     }
-    let repo = state.repo.clone();
-    let seen = forge.view(&repo, pr_url).await?;
     let observed = crate::land_sync_recovery::ObservedPr {
         url: seen.pr.url.clone(),
         number: seen.pr.number,
@@ -4277,6 +4306,9 @@ async fn prepare_land_sync_recovery<F: Forge>(
     };
     match validation {
         Ok((local_head, pr_head)) => {
+            if unstarted {
+                return Ok(LandSyncPrep::Continue(Some(seen)));
+            }
             if let Err(reason) = state.consume_land_sync_recovery(&local_head, &pr_head) {
                 state.status = RunStatus::Blocked;
                 state.event("land-sync-recovery", format!("refused: {reason}"));
@@ -4303,7 +4335,10 @@ async fn prepare_land_sync_recovery<F: Forge>(
                 .authorizations
                 .iter_mut()
                 .rev()
-                .find(|a| !a.consumed && a.invalidated.is_none())
+                .find(|a| {
+                    a.invalidated.is_none()
+                        && (!a.consumed || unstarted && a.archived_verification.is_some())
+                })
             {
                 auth.refuse(&reason);
             }
@@ -12327,10 +12362,7 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             base_err.to_string().contains("run has no base-sync stop"),
             "{base_err:#}"
         );
-        assert_eq!(
-            crate::handover::resume_refusal_under(&state, Some(home)),
-            Some(crate::handover::ResumeRefusal::LandSyncExhausted)
-        );
+        assert!(crate::handover::resume_refusal_under(&state, Some(home)).is_none());
         assert!(crate::base_sync_recovery::ensure_generic_release(&queue, &task).is_err());
 
         // Ordinary land_with without authorization refuses without refilling budget.
@@ -12468,6 +12500,44 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         let new_approval = run.land_approval.as_ref().unwrap();
         assert_ne!(new_approval.question, old_q.id);
         assert_eq!(new_approval.head, new_head);
+    }
+
+    #[tokio::test]
+    async fn land_sync_recovery_observes_external_merge_without_grant() {
+        let (_tmp, home, queue, mut task, mut state, old) =
+            legacy_exhausted_landing_fixture().await;
+        let pr_url = format!(
+            "https://github.com/example/landing-merge-{}/pull/42",
+            state.id
+        );
+        state.pr.as_mut().unwrap().url.clone_from(&pr_url);
+        state.save_under(&home).unwrap();
+        task.resume_override = Some(crate::queue::OperatorResume {
+            question_id: String::new(),
+            at: jiff::Timestamp::now(),
+            conductor_rehold: None,
+            forced: true,
+            pinned_run: Some(state.id.clone()),
+        });
+        let observer = StaticPrObserver(crate::land_sync_recovery::ObservedPr {
+            url: pr_url.clone(),
+            number: 42,
+            open: false,
+            head: old.clone(),
+            base_branch: Some("main".into()),
+        });
+        assert!(matches!(
+            crate::land_sync_recovery::dispatch_check_with(&queue, &home, &task, &observer).await,
+            crate::land_sync_recovery::DispatchDecision::Proceed
+        ));
+        let mut merged = merged_view(&old);
+        merged.pr.url = pr_url.clone();
+        let forge = Scripted::new(vec![merged], vec![]);
+        land_with(&mut state, &pr_url, &forge).await.unwrap();
+        assert_eq!(state.status, RunStatus::Merged);
+        assert_eq!(state.land_sync_attempts, 4);
+        assert_eq!(state.land_sync_recovery.extra_attempts, 0);
+        assert_eq!(forge.calls(), ["view"]);
     }
 
     #[tokio::test]
@@ -12746,6 +12816,18 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             .await
             .unwrap();
 
+            // Persist consumption before the rewrite, as if the driver crashed
+            // between granting the attempt and starting the rebase.
+            let mut consumed = RunState::load_under(&state.id, home).unwrap();
+            let forge = Scripted::new(vec![seen(&old, Checks::Green, "BEHIND", false)], vec![]);
+            assert!(matches!(
+                prepare_land_sync_recovery(&mut consumed, &pr_url, &forge)
+                    .await
+                    .unwrap(),
+                LandSyncPrep::Continue(Some(_))
+            ));
+            assert_eq!(consumed.land_sync_attempts, 4);
+
             // Rewrite origin/main by amending the latest base commit and force-pushing.
             git::git(&state.repo, &["checkout", "main"]).await.unwrap();
             std::fs::write(state.repo.join("advance"), "rewritten").unwrap();
@@ -12764,7 +12846,9 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             let forge = Scripted::new(vec![seen(&old, Checks::Green, "BEHIND", false)], vec![]);
             land_with(&mut run, &pr_url, &forge).await.unwrap();
             assert_eq!(run.status, RunStatus::Blocked);
-            assert_eq!(run.land_sync_recovery.extra_attempts, 0);
+            assert_eq!(run.land_sync_recovery.extra_attempts, 1);
+            assert_eq!(run.land_sync_attempts, 4);
+            assert_eq!(git::rev_parse(&state.repo, "HEAD").await.unwrap(), old);
             let auth = run.land_sync_recovery.authorizations.last().unwrap();
             assert!(auth.consumed);
             assert!(

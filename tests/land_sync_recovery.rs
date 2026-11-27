@@ -506,6 +506,15 @@ async fn interrupted_acceptance_reconciles_across_all_phases_without_replay() {
             serde_json::to_vec_pretty(&interrupted).unwrap(),
         )
         .unwrap();
+        // Restore the actual legacy shape: neither the stop nor authorization
+        // was persisted when the Prepared receipt was written.
+        let mut run = fx.state();
+        run.land_sync_recovery = Default::default();
+        run.save_under(home).unwrap();
+        git(&fx.repo, &["checkout", "main"]);
+        git(&fx.repo, &["commit", "--allow-empty", "-m", "advance base"]);
+        git(&fx.repo, &["push", "origin", "main"]);
+        git(&fx.repo, &["checkout", "winner"]);
 
         let retry = land_sync_recovery_control::recover_with(
             &fx.queue,
@@ -523,6 +532,11 @@ async fn interrupted_acceptance_reconciles_across_all_phases_without_replay() {
         assert!(!retry.repeated);
         assert!(retry.reconciled);
         assert_eq!(fx.state().land_sync_recovery.authorizations.len(), 1);
+        let run = fx.state();
+        assert_eq!(
+            serde_json::to_value(&run.land_sync_recovery.authorizations[0].scope).unwrap(),
+            full_receipt["binding"]["scope"]
+        );
     }
 }
 

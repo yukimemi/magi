@@ -134,7 +134,9 @@ impl Authorization {
     pub(crate) fn refuse(&mut self, reason: impl Into<String>) {
         self.invalidated = Some(reason.into());
         self.consumed = true;
-        self.consumed_at = Some(Timestamp::now());
+        if self.consumed_at.is_none() {
+            self.consumed_at = Some(Timestamp::now());
+        }
     }
 }
 
@@ -324,6 +326,23 @@ impl RunState {
                         && a.granted_attempts == GRANT_ATTEMPTS
                         && a.scope.grant_index == self.land_sync_recovery.extra_attempts
                         && self.land_sync_recovery.stop.as_ref() == Some(&a.stop)
+                })
+    }
+
+    /// A grant was saved but its synchronization attempt has not been charged.
+    /// Retain this binding even when a subsequent validation refuses it.
+    pub(crate) fn land_sync_unstarted_grant(&self) -> bool {
+        self.status.resumable()
+            && self
+                .land_sync_recovery
+                .authorizations
+                .last()
+                .is_some_and(|a| {
+                    a.consumed
+                        && a.archived_verification.is_some()
+                        && self.land_sync_attempts == a.stop.attempts
+                        && self.land_sync_recovery.extra_attempts
+                            == a.scope.grant_index.saturating_add(GRANT_ATTEMPTS)
                 })
     }
 
@@ -535,7 +554,9 @@ pub(crate) fn latest_exhausted_run(queue: &Queue, task: &Task) -> Option<RunStat
         .last()
         .and_then(|id| RunState::load_under(id, home).ok())
         .filter(|state| {
-            state.land_sync_exhausted() || state.has_unconsumed_land_sync_authorization()
+            state.land_sync_exhausted()
+                || state.has_unconsumed_land_sync_authorization()
+                || state.land_sync_unstarted_grant()
         })
 }
 
@@ -552,7 +573,8 @@ pub(crate) async fn validate_pending_authorization<O: PrObserver>(
     observed_override: Option<&ObservedPr>,
     observer: &O,
 ) -> std::result::Result<(String, String), String> {
-    if !state.land_sync_recovery_pending() {
+    let unstarted = state.land_sync_unstarted_grant();
+    if !state.land_sync_recovery_pending() && !unstarted {
         return Err("landing base-sync stop or pending authorization state changed".into());
     }
     if let Err(error) = crate::pr_head::ensure_owner(state) {
@@ -563,8 +585,11 @@ pub(crate) async fn validate_pending_authorization<O: PrObserver>(
         .authorizations
         .last()
         .ok_or_else(|| "missing pending landing base-sync authorization".to_owned())?;
+    if auth.invalidated.is_some() {
+        return Err("landing base-sync recovery authorization was invalidated".into());
+    }
     if auth.granted_attempts != GRANT_ATTEMPTS
-        || state.land_sync_grants_remaining() < auth.granted_attempts
+        || (!unstarted && state.land_sync_grants_remaining() < auth.granted_attempts)
     {
         return Err(format!(
             "lifetime landing base-sync recovery limit reached ({}/{MAX_GRANTS})",
@@ -625,6 +650,9 @@ pub(crate) async fn validate_pending_authorization<O: PrObserver>(
                 .resume_override
                 .as_ref()
                 .is_some_and(|pin| pin.pinned_run.as_deref() == Some(state.id.as_str()))
+            && !(unstarted
+                && task.resume_override.is_none()
+                && task.land_sync_recovery_requests.contains(&auth.request))
         {
             return Err("task exact-run pin is missing or targets another run".into());
         }
@@ -774,7 +802,21 @@ pub(crate) async fn dispatch_check_with<O: PrObserver>(
     let Some(state) = latest_exhausted_run(queue, task) else {
         return DispatchDecision::Proceed;
     };
-    if !state.has_unconsumed_land_sync_authorization() {
+    // Explicit exact-run resume may observe an externally closed PR without
+    // authorizing any branch synchronization.
+    if task
+        .resume_override
+        .as_ref()
+        .is_some_and(|pin| pin.pinned_run.as_deref() == Some(state.id.as_str()))
+        && let Some(pr) = &state.pr
+        && let Ok(observed) = observer.observe_pr(&state.repo, &pr.url).await
+        && !observed.open
+        && observed.url == pr.url
+        && observed.number == pr.number
+    {
+        return DispatchDecision::Proceed;
+    }
+    if !state.has_unconsumed_land_sync_authorization() && !state.land_sync_unstarted_grant() {
         return DispatchDecision::Hold {
             reason: format!(
                 "Landing base synchronization remains stopped. {} Ordinary resume or release grants no additional synchronization budget and starts no replacement competition.",
@@ -793,12 +835,14 @@ pub(crate) async fn dispatch_check_with<O: PrObserver>(
                     crate::daemon::is_working_on_other(home, &reloaded.id, Timestamp::now())
                 && reloaded.liveness_under(home, claimed) == crate::run::Liveness::Dead
                 && let Ok(_exec) = crate::driver::maintenance(home, &reloaded.id)
-                && let Some(auth) = reloaded
+                && (reloaded.land_sync_recovery_pending() || reloaded.land_sync_unstarted_grant())
+                && let Some(auth) = reloaded.land_sync_recovery.authorizations.last_mut()
+                && auth.invalidated.is_none()
+                && updated
                     .land_sync_recovery
                     .authorizations
-                    .iter_mut()
-                    .rev()
-                    .find(|a| !a.consumed && a.invalidated.is_none())
+                    .last()
+                    .is_some_and(|prior| prior.request == auth.request)
             {
                 auth.refuse(&reason);
                 reloaded.event(
