@@ -40,6 +40,24 @@ configuration and its provenance stay unchanged; this command cannot change
 timeouts or recover conversations. The separate `base-conflict` kind below
 authorizes only an inspected textual merge repair.
 
+`verify` re-runs mandatory E2E on a retained, unchanged head when a run
+stopped on `STAGNANT_LIMIT` consecutive no-change fix rounds **before**
+`review_rounds` was exhausted, the last round was complete with no blocking
+findings, its E2E failed, and its fix recorded no commit. It requires
+`--rounds 1` and the exact head, pass and a clean retained worktree. No fixer
+runs. The grant spends one confirmation review within the remaining budget;
+earlier E2E and gate results are archived in `verification_history`, never
+erased. Only a clean fresh review and E2E on that head continue to the fresh
+gate and the normal publication/approval path; a new failure or finding ends
+the grant `Blocked` and consumed. Standing chats cannot grant it, and it is
+distinct from `review` (exhausted budget) and post-gate-repair E2E recovery.
+The mechanical `verify.pre_gate` commands are not run during this grant,
+including its final gate, because they may commit changes to the authorized
+head. Mandatory E2E and `verify.gate` still run.
+The authorized HEAD and clean worktree are checked again after E2E and gate.
+If either changes, the grant ends blocked even when the commands exit zero;
+command evidence and the changed worktree are retained for inspection.
+
 The terminal command prints a JSON receipt. Authorized standing chats use
 `magi task control grant-repair` with the same arguments and the existing
 control bridge. Implementation and reviewer seats cannot grant themselves

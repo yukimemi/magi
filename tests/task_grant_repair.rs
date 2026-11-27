@@ -74,10 +74,10 @@ fn command(request: &Request) -> std::process::Command {
         "--run",
         &request.run,
         "--kind",
-        if request.kind == Kind::Gate {
-            "gate"
-        } else {
-            "review"
+        match request.kind {
+            Kind::Gate => "gate",
+            Kind::Verify => "verify",
+            _ => "review",
         },
         "--rounds",
         &request.rounds.to_string(),
@@ -1078,5 +1078,166 @@ async fn superseded_dependency_question_does_not_deadlock_triage_after_repair_fa
     assert_eq!(after.repair_grants.len(), 1);
     assert_eq!(RunState::load(&request.run).unwrap().repair_grants[0].spent, 1);
     assert_eq!(questions.get(&generic.id).unwrap().answer, None);
+}
+}
+
+/// Two of three review rounds, each a complete panel with no blocking finding,
+/// failed E2E and a recorded no-change fix: the stagnation stop that left the
+/// retained head unverified once the machine was repaired.
+async fn stagnant_stop() -> (common::Fixture, Request) {
+    let (fx, _task, mut runner, mut request) = stopped(true).await;
+    request.kind = Kind::Verify;
+    runner.state.config.graph.review_rounds = 3;
+    let mut first = runner.state.reviews[0].clone();
+    first.blocking = 0;
+    first.answered = first.expected;
+    first.progressed = false;
+    first.fix = Some(magi::run::FixRecord {
+        agent: "impl-A".into(),
+        addressed: Vec::new(),
+        rejected: Vec::new(),
+        notes: "no change".into(),
+        committed: false,
+        failed: None,
+        duration_ms: 0,
+        continuation: None,
+    });
+    let mut second = first.clone();
+    second.round = 2;
+    runner.state.reviews = vec![first, second];
+    runner.state.status = RunStatus::Blocked;
+    runner.state.save().unwrap();
+    (fx, request)
+}
+
+common::e2e! {
+async fn early_unchanged_tree_stop_is_not_reverified_by_resume_or_review_grant() {
+    let (_fx, request) = stagnant_stop().await;
+    let mut review = request.clone();
+    review.kind = Kind::Review;
+    refused(&review, "review budget is not exhausted");
+    let mut resumed = Runner::resume(&request.run).unwrap();
+    resumed.execute().await.unwrap();
+    assert_eq!(resumed.state.reviews.len(), 2, "ordinary resume runs no new verification");
+}
+}
+
+common::e2e! {
+async fn verify_grant_runs_fresh_e2e_and_gate_on_the_unchanged_head() {
+    let (_fx, request) = stagnant_stop().await;
+    let receipt = accepted(&request);
+    assert_eq!(accepted(&request), receipt, "idempotent by request id");
+    let mut runner = Runner::resume(&request.run).unwrap();
+    let before = runner.state.reviews.clone();
+    runner.state.config.verify.e2e = vec!["true".into()];
+    runner.state.config.verify.gate = vec!["true".into()];
+    runner.state.config.verify.pre_gate = vec!["echo mechanical rewrite >> note.txt".into()];
+    for agent in &mut runner.state.config.agents {
+        agent.env.remove("MOCK_FINDING");
+    }
+    runner.state.save().unwrap();
+    let mut runner = Runner::resume(&request.run).unwrap();
+    runner.execute().await.unwrap();
+    let grant = &runner.state.repair_grants[0];
+    assert_eq!(grant.spent, 1);
+    assert!(grant.succeeded);
+    assert_eq!(runner.state.reviews.len(), 3);
+    for (old, kept) in before.iter().zip(&runner.state.reviews) {
+        assert_eq!(serde_json::to_value(old).unwrap(), serde_json::to_value(kept).unwrap());
+    }
+    let last = runner.state.reviews.last().unwrap();
+    assert!(last.clean && last.fix.is_none(), "no fixer is dispatched");
+    assert_eq!(last.head, request.head);
+    assert_eq!(last.e2e_status(), magi::run::E2eStatus::Passed);
+    assert_eq!(runner.state.gate_head.as_deref(), Some(request.head.as_str()));
+    assert!(runner.state.gate_allows_progress());
+    let worktree = &runner.state.winner().unwrap().worktree;
+    assert_eq!(
+        magi::git::rev_parse(worktree, "HEAD").await.unwrap(),
+        request.head
+    );
+    assert!(magi::git::is_clean(worktree).await.unwrap());
+    let mut again = Runner::resume(&request.run).unwrap();
+    again.execute().await.unwrap();
+    assert_eq!(again.state.repair_grants[0].spent, 1);
+    assert_eq!(again.state.reviews.len(), 3);
+}
+}
+
+common::e2e! {
+async fn verify_grant_stops_safely_when_the_fresh_e2e_fails_again() {
+    let (_fx, request) = stagnant_stop().await;
+    accepted(&request);
+    let mut runner = Runner::resume(&request.run).unwrap();
+    runner.execute().await.unwrap();
+    let grant = &runner.state.repair_grants[0];
+    assert_eq!(grant.spent, 1);
+    assert_eq!(grant.phase, Phase::Complete);
+    assert!(!grant.succeeded);
+    assert_eq!(runner.state.status, RunStatus::Blocked);
+    assert_eq!(runner.state.reviews.len(), 3);
+    assert_eq!(runner.state.reviews[2].e2e_status(), magi::run::E2eStatus::Failed);
+    assert!(runner.state.reviews[2].fix.is_none());
+    assert!(runner.state.merge.is_none() && !runner.state.gate_ran);
+    let mut again = Runner::resume(&request.run).unwrap();
+    again.execute().await.unwrap();
+    assert_eq!(again.state.reviews.len(), 3, "a spent verify grant never retries");
+    assert_eq!(again.state.repair_grants[0].spent, 1);
+}
+}
+
+async fn dirty_verify_grant(e2e_writes: bool) {
+    let (_fx, request) = stagnant_stop().await;
+    accepted(&request);
+    let mut runner = Runner::resume(&request.run).unwrap();
+    let edit = "echo unexpected change >> note.txt";
+    runner.state.config.verify.e2e = vec![if e2e_writes { edit } else { "true" }.into()];
+    runner.state.config.verify.gate = vec![if e2e_writes { "exit 99" } else { edit }.into()];
+    for agent in &mut runner.state.config.agents {
+        agent.env.remove("MOCK_FINDING");
+    }
+    runner.state.save().unwrap();
+    let mut runner = Runner::resume(&request.run).unwrap();
+    runner.execute().await.unwrap();
+    let grant = &runner.state.repair_grants[0];
+    assert_eq!(grant.phase, Phase::Complete);
+    assert_eq!(grant.spent, 1);
+    assert!(!grant.succeeded);
+    assert_eq!(runner.state.status, RunStatus::Blocked);
+    assert!(!runner.state.pr_publication_pending && runner.state.merge.is_none());
+    assert!(!runner.state.gate_ran);
+    let worktree = &runner.state.winner().unwrap().worktree;
+    assert_eq!(
+        magi::git::rev_parse(worktree, "HEAD").await.unwrap(),
+        request.head
+    );
+    assert!(!magi::git::is_clean(worktree).await.unwrap());
+    if e2e_writes {
+        assert!(!runner.state.reviews.last().unwrap().clean);
+        assert!(!runner.state.verification_history.iter().any(|e| e.gate_ran));
+    } else {
+        assert!(
+            runner
+                .state
+                .verification_history
+                .iter()
+                .any(|e| { e.gate_ran && e.gate.iter().any(|o| o.command == edit && o.ok()) })
+        );
+    }
+    let mut again = Runner::resume(&request.run).unwrap();
+    again.execute().await.unwrap();
+    assert_eq!(again.state.status, RunStatus::Blocked);
+    assert_eq!(again.state.repair_grants[0].spent, 1);
+}
+
+common::e2e! {
+async fn verify_grant_refuses_dirty_e2e_success() {
+    dirty_verify_grant(true).await;
+}
+}
+
+common::e2e! {
+async fn verify_grant_refuses_dirty_gate_success() {
+    dirty_verify_grant(false).await;
 }
 }
