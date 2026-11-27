@@ -359,7 +359,14 @@ async fn a_follow_up_review_claims_and_settles_the_task_that_owns_the_run() {
     let after = q.get(&id).unwrap();
     assert_eq!(after.runs.last(), Some(&follow_up), "{after:?}");
     assert_ne!(after.status, TaskStatus::Running, "settled, not left running");
-    assert_eq!(after.status, TaskStatus::Done, "{after:?}");
+    assert!(after.has_awaiting_landing_cause(), "{after:?}");
+    assert_eq!(after.awaiting_landing_run(), Some(follow_up.as_str()));
+    let reviewed = RunState::load(&follow_up).expect("saved follow-up");
+    assert_eq!(
+        reviewed.task_instruction.as_deref(),
+        Some(task.instruction.as_str())
+    );
+    assert_eq!(reviewed.task_instruction_rev, Some(task.instruction_rev));
     assert_eq!(
         after.runs.iter().filter(|r| **r == follow_up).count(),
         1,

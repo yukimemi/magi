@@ -7221,6 +7221,23 @@ impl Runner {
                                 .join(", "),
                         ),
                     );
+                    // A follow-up reviews the predecessor's work, not a new
+                    // task instruction. Preserve its authored generation even
+                    // if the queue instruction has since been edited.
+                    if let Some(id) = self.state.origin.as_ref().and_then(|o| o.task.as_deref()) {
+                        let authored = crate::queue::Queue::open()
+                            .get(id)
+                            .ok()
+                            .filter(|task| {
+                                crate::daemon::compatible_run_instruction(&self.state, task)
+                            })
+                            .map(|task| task.instruction);
+                        follow_up.state.task_instruction = authored
+                            .or_else(|| self.state.task_instruction.clone())
+                            .or_else(|| Some(self.state.instruction.clone()));
+                        follow_up.state.task_instruction_rev =
+                            Some(self.state.task_instruction_rev.unwrap_or(0));
+                    }
                     follow_up.state.save()?;
                     let follow_up_id = follow_up.state.id.clone();
                     // The follow-up is a run like any other: it belongs to the
