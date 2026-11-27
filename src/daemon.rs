@@ -2406,6 +2406,9 @@ fn settle_and_diagnose(
         // No automatic retry may turn a retained sync stop into a new competition.
         task.hold_machine(Some(detail.to_owned()));
         task.last_error = Some(detail.to_owned());
+    } else if state.land_sync_exhausted() {
+        task.hold_machine(Some(format!("{detail} {}", state.land_sync_next_action())));
+        task.last_error = Some(detail.to_owned());
     } else if !verdict.parked
         && task
             .pr_recovery
@@ -2490,6 +2493,8 @@ fn settle_and_diagnose(
     if task.status == TaskStatus::Held {
         if state.base_sync_blocked() {
             task.base_sync_notice(state);
+        } else if state.land_sync_exhausted() {
+            task.land_sync_notice(state);
         } else if let Some(stop) = &head_e2e_stop {
             task.head_e2e_notice(stop);
         } else if state.prep_failure.is_none() {
@@ -4933,6 +4938,18 @@ async fn attempt(
             task.hold_machine(Some(format!("Base synchronization remains stopped. {} A release without a new owner approval grants no additional synchronization budget and starts no replacement competition.", held.base_sync_next_action())));
             // Retain the existing stop identity when an old release reached the queue.
             task.base_sync_notice(&held);
+            task.resume_override = None;
+            record(queue, task);
+            return Vec::new();
+        }
+    }
+    if !task.fresh_start && task.pr_recovery.is_none() {
+        let home = queue.root().parent().expect("queue has a home");
+        if let crate::land_sync_recovery::DispatchDecision::Hold { reason, state } =
+            crate::land_sync_recovery::dispatch_check(queue, home, task).await
+        {
+            task.hold_machine(Some(reason));
+            task.land_sync_notice(state.as_ref());
             task.resume_override = None;
             record(queue, task);
             return Vec::new();

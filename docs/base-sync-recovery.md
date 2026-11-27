@@ -95,7 +95,9 @@ reuse an ID with changed arguments. Receipts live in `base-recovery-controls/`.
 Authorization takes the existing owner lock and execution maintenance lease and
 rejects live/unknown drivers (including descendants), transferred ownership,
 non-latest runs, dirty trees and branch/worktree mismatches. Publication and
-landing checkpoints retain their own workflow. Conflicts and foreign branch
+landing checkpoints retain their own workflow (for exhausted landing base
+synchronization on an existing open PR, see `docs/land-sync-recovery.md` and
+`magi task control recover-land-sync`). Conflicts and foreign branch
 commits cannot be bypassed with `--recover-base`.
 
 Approval is pinned to run, task, immutable stop HEAD, fetched base SHA, task

@@ -3072,6 +3072,9 @@ pub struct RunState {
     /// Stable stop identity and single-use owner authorizations, with prior evidence.
     #[serde(default)]
     pub base_sync_recovery: crate::base_sync_recovery::Recovery,
+    /// Explicit, bounded same-run recovery for exhausted landing base synchronization.
+    #[serde(default)]
+    pub land_sync_recovery: crate::land_sync_recovery::Recovery,
     /// Single-use explicit owner approvals consumed against conclusive `head_e2e` stops.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub head_e2e_resumptions: Vec<crate::head_e2e_stop::Resumption>,
@@ -3393,6 +3396,7 @@ impl RunState {
             bump_decision_attempts: Vec::new(),
             base_sync: None,
             base_sync_recovery: Default::default(),
+            land_sync_recovery: Default::default(),
             head_e2e_resumptions: Vec::new(),
             entry_resumption_generation: None,
             sync_only_passes: Vec::new(),

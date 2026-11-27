@@ -822,5 +822,11 @@ pub fn ensure_generic_release(
             state.base_sync_next_action()
         );
     }
+    if let Some(state) = crate::land_sync_recovery::held_run(queue, task) {
+        anyhow::bail!(
+            "generic release cannot authorize exhausted landing base synchronization. {}",
+            state.land_sync_next_action()
+        );
+    }
     Ok(())
 }

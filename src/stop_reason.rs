@@ -29,7 +29,15 @@ pub(crate) fn of(state: &RunState, latest: Option<(&str, RunStatus)>) -> Option<
             .is_some_and(|r| r.e2e_status() == crate::run::E2eStatus::Failed))
     .then(|| state.verification_blocking_cause())
     .flatten();
-    let reason = if let Some(reason) = current {
+    let reason = if state.land_sync_exhausted() {
+        Some(format!(
+            "Landing base synchronization budget exhausted ({}/{} attempts, {}/{} recovery grants used).",
+            state.land_sync_attempts,
+            state.land_sync_budget(),
+            state.land_sync_recovery.extra_attempts,
+            crate::land_sync_recovery::MAX_GRANTS
+        ))
+    } else if let Some(reason) = current {
         Some(reason)
     } else if state.gate_status() == GateStatus::Failed {
         state

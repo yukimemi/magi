@@ -698,6 +698,9 @@ pub struct Task {
     /// Durable base-recovery request keys saved atomically with the exact-run pin.
     #[serde(default)]
     pub base_recovery_requests: Vec<String>,
+    /// Durable land-sync-recovery request keys saved atomically with the exact-run pin.
+    #[serde(default)]
+    pub land_sync_recovery_requests: Vec<String>,
     /// The operator's "resume" answer to a triage question, kept until the
     /// task actually runs (or is done) so `crate::conduct` cannot silently
     /// undo it and `crate::triage` can tell that a hold it sees now came
@@ -1265,6 +1268,7 @@ impl Task {
             superseded_resumes: Default::default(),
             dispatched_resumes: Default::default(),
             base_recovery_requests: Vec::new(),
+            land_sync_recovery_requests: Vec::new(),
             resume_override: None,
             sync_only: None,
             repair_grants: Vec::new(),
@@ -3371,6 +3375,20 @@ impl Queue {
         self.put_unlocked(task)
     }
 
+    /// Save an exact-run landing base-sync recovery pin only if its admitted owner snapshot is current.
+    pub(crate) fn commit_land_sync_recovery(
+        &self,
+        task: &mut Task,
+        expected: &serde_json::Value,
+    ) -> Result<()> {
+        let _lock = self.lock_task(&task.id)?;
+        anyhow::ensure!(
+            serde_json::to_value(self.get(&task.id)?)? == *expected,
+            "task changed during landing base-sync recovery; inspect the pending authorization"
+        );
+        self.put_unlocked(task)
+    }
+
     pub(crate) fn commit_repair_grant(
         &self,
         task: &mut Task,
@@ -3473,6 +3491,10 @@ impl Queue {
                     &mut task.base_recovery_requests,
                     stale.base_recovery_requests,
                 );
+                append_missing(
+                    &mut task.land_sync_recovery_requests,
+                    stale.land_sync_recovery_requests,
+                );
                 // The tail is the current grant. Older receipts must not replace
                 // it or bring back their queued status or exact-run pins.
                 prepend_missing_by(&mut task.repair_grants, stale.repair_grants, |a, b| {
@@ -3559,6 +3581,10 @@ impl Queue {
             append_missing(
                 &mut task.base_recovery_requests,
                 stored.base_recovery_requests,
+            );
+            append_missing(
+                &mut task.land_sync_recovery_requests,
+                stored.land_sync_recovery_requests,
             );
             append_missing(&mut task.actions_applied, stored.actions_applied);
             append_missing(&mut task.triage_applied, stored.triage_applied);

@@ -2414,6 +2414,11 @@ impl Runner {
         if self.state.status == RunStatus::Landing
             || crate::handover::landing_checkpoint(&self.state)
         {
+            anyhow::ensure!(
+                !self.state.land_sync_exhausted() || self.state.land_sync_recovery_pending(),
+                "{}; explicit recover-land-sync authorization required",
+                crate::land_sync_recovery::EXHAUSTED_DETAIL
+            );
             self.state.land_sync_pending = true;
             self.state.save()?;
             self.run_land().await?;

@@ -1760,6 +1760,13 @@ async fn approval_gate(
                         .repair_grants
                         .last()
                         .is_none_or(|g| q.asked_at > g.receipt.at)
+                    && state
+                        .land_sync_recovery
+                        .authorizations
+                        .iter()
+                        .rev()
+                        .find(|auth| auth.consumed && auth.invalidated.is_none())
+                        .is_none_or(|auth| q.asked_at > auth.consumed_at.unwrap_or(auth.at))
                     && (a.head.eq_ignore_ascii_case(head)
                         || q.resolution()
                             .as_deref()
@@ -4067,10 +4074,17 @@ async fn rebase_landing_worktree(
             crate::rebase::rebase_target(&scratch).await?
         }
         None => {
-            anyhow::ensure!(
-                state.land_sync_attempts < state.config.graph.land_rounds,
-                "landing base synchronization budget exhausted"
-            );
+            if state.land_sync_attempts >= state.land_sync_budget() {
+                let head = git::rev_parse(&winner.worktree, "HEAD")
+                    .await
+                    .unwrap_or_default();
+                let tip = git::rev_parse(&state.repo, onto).await.unwrap_or_default();
+                let pr_head = state.pr_pushed_head.clone().unwrap_or_else(|| head.clone());
+                state.land_sync_pending = true;
+                state.record_land_sync_exhausted_stop(&head, &pr_head, &tip);
+                let _ = state.save();
+                bail!("{}", crate::land_sync_recovery::EXHAUSTED_DETAIL);
+            }
             let target = git::rev_parse(&state.repo, onto).await?;
             crate::rebase::prepare(state, &scratch, &winner.branch).await?;
             state.land_sync_attempts += 1;
@@ -4215,8 +4229,98 @@ async fn synchronize_landing<F: Forge>(
     }
 }
 
+enum LandSyncPrep {
+    Continue(Option<Seen>),
+    Stop(PrState),
+}
+
+/// Revalidate and durably consume a pending landing base-sync recovery
+/// authorization under the live execution lease before mutating landing status
+/// or adopting any observed PR head.
+async fn prepare_land_sync_recovery<F: Forge>(
+    state: &mut RunState,
+    pr_url: &str,
+    forge: &F,
+) -> Result<LandSyncPrep> {
+    let has_unconsumed = state.has_unconsumed_land_sync_authorization();
+    let exhausted = state.land_sync_exhausted();
+    if !has_unconsumed && !exhausted {
+        return Ok(LandSyncPrep::Continue(None));
+    }
+    if !has_unconsumed {
+        bail!(
+            "{}; explicit recover-land-sync authorization required",
+            crate::land_sync_recovery::EXHAUSTED_DETAIL
+        );
+    }
+    let repo = state.repo.clone();
+    let seen = forge.view(&repo, pr_url).await?;
+    let observed = crate::land_sync_recovery::ObservedPr {
+        url: seen.pr.url.clone(),
+        number: seen.pr.number,
+        open: seen.pr.state == PrLifecycle::Open,
+        head: seen.head.clone(),
+        base_branch: (!seen.base.is_empty()).then(|| seen.base.clone()),
+    };
+    let home = crate::run::home();
+    let validation = if owner_requested_stop(state)? {
+        Err("owner requested stop before landing base-sync recovery".to_owned())
+    } else {
+        crate::land_sync_recovery::validate_pending_authorization(
+            &home,
+            state,
+            None,
+            Some(&observed),
+            &crate::land_sync_recovery::GhPrObserver,
+        )
+        .await
+    };
+    match validation {
+        Ok((local_head, pr_head)) => {
+            if let Err(reason) = state.consume_land_sync_recovery(&local_head, &pr_head) {
+                state.status = RunStatus::Blocked;
+                state.event("land-sync-recovery", format!("refused: {reason}"));
+                state.save()?;
+                return Ok(LandSyncPrep::Stop(seen.pr));
+            }
+            state.event(
+                "land-sync-recovery",
+                format!(
+                    "consumed recovery grant {}/{}: authorized {} landing sync attempt ({}/{}); prior verification archived, fresh E2E and gate required",
+                    state.land_sync_recovery.extra_attempts,
+                    crate::land_sync_recovery::MAX_GRANTS,
+                    crate::land_sync_recovery::GRANT_ATTEMPTS,
+                    state.land_sync_attempts,
+                    state.land_sync_budget()
+                ),
+            );
+            state.save()?;
+            Ok(LandSyncPrep::Continue(Some(seen)))
+        }
+        Err(reason) => {
+            if let Some(auth) = state
+                .land_sync_recovery
+                .authorizations
+                .iter_mut()
+                .rev()
+                .find(|a| !a.consumed && a.invalidated.is_none())
+            {
+                auth.refuse(&reason);
+            }
+            state.status = RunStatus::Blocked;
+            state.event("land-sync-recovery", format!("refused: {reason}"));
+            state.save()?;
+            Ok(LandSyncPrep::Stop(seen.pr))
+        }
+    }
+}
+
 async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> Result<PrState> {
     crate::pr_head::ensure_owner(state)?;
+    let mut initial_seen = match prepare_land_sync_recovery(state, pr_url, forge).await? {
+        LandSyncPrep::Continue(seen) => seen,
+        LandSyncPrep::Stop(pr) => return Ok(pr),
+    };
     state.land_unrelated = None;
     let reopening_hold = crate::merge_decision::resumable_hold(state);
     let repo = state.repo.clone();
@@ -4257,7 +4361,10 @@ async fn land_with<F: Forge>(state: &mut RunState, pr_url: &str, forge: &F) -> R
     let mut resumed_armed = state.land_armed_head.is_some();
 
     'landing: loop {
-        let seen = forge.view(&repo, pr_url).await?;
+        let seen = match initial_seen.take() {
+            Some(seen) => seen,
+            None => forge.view(&repo, pr_url).await?,
+        };
         let mut pr = seen.pr.clone();
         pr.review_comments.retain(|c| !shown.contains(&c.body));
         state.pr = Some(crate::run::PrRecord {
@@ -5480,6 +5587,49 @@ fn rerun_step(
     } else {
         RerunStep::Fix
     }
+}
+
+/// Read minimal live PR metadata (`url`, `number`, `state`, `headRefOid`,
+/// `baseRefName`) for landing base-sync recovery admission and dispatch checks.
+pub(crate) async fn observe_pr_summary(
+    repo: &Path,
+    pr_url: &str,
+) -> Result<crate::land_sync_recovery::ObservedPr> {
+    #[derive(serde::Deserialize)]
+    struct Summary {
+        #[serde(default)]
+        url: String,
+        #[serde(default)]
+        number: u64,
+        #[serde(default)]
+        state: String,
+        #[serde(default, rename = "headRefOid")]
+        head_ref_oid: String,
+        #[serde(default, rename = "baseRefName")]
+        base_ref_name: String,
+    }
+    let view = gh(
+        repo,
+        &[
+            "pr".to_owned(),
+            "view".to_owned(),
+            pr_url.to_owned(),
+            "--json".to_owned(),
+            "url,number,state,headRefOid,baseRefName".to_owned(),
+        ],
+    )
+    .await?;
+    if !view.ok {
+        bail!("gh pr view {pr_url}: {}", view.combined());
+    }
+    let parsed: Summary = serde_json::from_str(&view.stdout).context("parse pull request json")?;
+    Ok(crate::land_sync_recovery::ObservedPr {
+        url: parsed.url,
+        number: parsed.number,
+        open: parsed.state.eq_ignore_ascii_case("OPEN"),
+        head: parsed.head_ref_oid,
+        base_branch: (!parsed.base_ref_name.is_empty()).then_some(parsed.base_ref_name),
+    })
 }
 
 /// Read the pull request: `gh pr view` for the top-level thread and merge
@@ -12056,5 +12206,690 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             .unwrap_err()
             .to_string();
         assert!(list_err.contains("HTTP 404 Not Found"), "{list_err}");
+    }
+
+    struct StaticPrObserver(crate::land_sync_recovery::ObservedPr);
+
+    impl crate::land_sync_recovery::PrObserver for StaticPrObserver {
+        async fn observe_pr(
+            &self,
+            _repo: &Path,
+            _pr_url: &str,
+        ) -> Result<crate::land_sync_recovery::ObservedPr> {
+            Ok(self.0.clone())
+        }
+    }
+
+    /// Build a real-shaped legacy landing base-sync exhaustion fixture backed by
+    /// an isolated temp Git repo, bare origin, queue task, and open PR metadata.
+    async fn legacy_exhausted_landing_fixture() -> (
+        tempfile::TempDir,
+        PathBuf,
+        crate::queue::Queue,
+        crate::queue::Task,
+        RunState,
+        String,
+    ) {
+        let (tmp, mut state, old) = landing_git_fixture().await;
+        crate::run::pin_test_home();
+        let home = crate::run::home();
+        // Move run state under this isolated home so load_under/save_under match.
+        state.config.graph.land_rounds = 4;
+        state.config.graph.land_approval = true;
+        state.config.verify.gate = vec!["git rev-parse HEAD".into()];
+        state.config.verify.e2e = vec!["git rev-parse HEAD".into()];
+        state.status = RunStatus::Blocked;
+        state.driver_exited = true;
+        state.pr = Some(crate::run::PrRecord {
+            url: green_pr().url,
+            number: 42,
+            state: "open".to_owned(),
+            checks: "green".to_owned(),
+            round: 0,
+            rounds: 4,
+            red_at_merge: Vec::new(),
+        });
+        state.merge = Some(MergeOutcome {
+            mode: MergeMode::Pr,
+            ok: false,
+            detail:
+                "could not synchronize landing base: landing base synchronization budget exhausted"
+                    .to_owned(),
+            empty: false,
+        });
+        state.reviews = vec![serde_json::from_value(serde_json::json!({
+            "round": 1,
+            "head": old,
+            "expected": 2,
+            "answered": 2,
+            "reviews": [],
+            "clean": true,
+            "e2e": [{"command": "git rev-parse HEAD", "code": 0, "output_tail": old, "duration_ms": 10}],
+            "verified_head": old,
+            "verified_at": jiff::Timestamp::now(),
+            "e2e_deferred": false
+        }))
+        .unwrap()];
+        let pass_cmd: crate::run::CommandOutcome = serde_json::from_value(serde_json::json!({
+            "command": "git rev-parse HEAD",
+            "code": 0,
+            "output_tail": old,
+            "duration_ms": 10
+        }))
+        .unwrap();
+        state.head_e2e = Some(crate::run::GateRepairE2e::new(
+            old.clone(),
+            true,
+            vec![pass_cmd.clone()],
+        ));
+        state.gate = vec![pass_cmd];
+        state.gate_ran = true;
+        state.gate_head = Some(old.clone());
+        state.land_sync_attempts = 4;
+        state.land_sync_target = None;
+        state.land_sync_pending = true;
+        state.event(
+            "land",
+            "stopped: could not synchronize landing base: landing base synchronization budget exhausted",
+        );
+
+        let queue = crate::queue::Queue::at(home.join("queue"));
+        let mut task = crate::queue::Task::new(
+            "landing sync".into(),
+            state.instruction.clone(),
+            state.repo.clone(),
+            crate::queue::Source::Human,
+        );
+        task.link_run(&state.id);
+        task.hold_machine(Some("landing base synchronization budget exhausted".into()));
+        queue.put(&mut task).unwrap();
+        state.origin = Some(crate::run::Origin::queue(&task.id));
+        state.save_under(&home).unwrap();
+        (tmp, home, queue, task, state, old)
+    }
+
+    #[tokio::test]
+    async fn land_sync_recovery_continues_legacy_real_shaped_stop_on_existing_pr() {
+        let (_tmp, home, queue, task, mut state, old) = legacy_exhausted_landing_fixture().await;
+        let home = home.as_path();
+
+        // Advance origin/main once so landing rebase has real work to replay.
+        advance_landing_base(&state).await;
+
+        // Pre-recovery: legacy shape recognized, recover-base refused, ordinary resume/release refused.
+        assert!(state.land_sync_exhausted());
+        assert!(!state.base_sync_blocked());
+        assert!(crate::land_sync_recovery::held_task(&queue, &task));
+        let base_err = crate::graph::Runner::authorize_base_recovery(home, &state.id, &task.id)
+            .await
+            .unwrap_err();
+        assert!(
+            base_err.to_string().contains("run has no base-sync stop"),
+            "{base_err:#}"
+        );
+        assert_eq!(
+            crate::handover::resume_refusal_under(&state, Some(home)),
+            Some(crate::handover::ResumeRefusal::LandSyncExhausted)
+        );
+        assert!(crate::base_sync_recovery::ensure_generic_release(&queue, &task).is_err());
+
+        // Ordinary land_with without authorization refuses without refilling budget.
+        let pr_url = green_pr().url;
+        let blocked_forge = Scripted::new(vec![seen(&old, Checks::Green, "BEHIND", false)], vec![]);
+        let err = land_with(&mut state, &pr_url, &blocked_forge)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("budget exhausted"), "{err:#}");
+        assert_eq!(state.land_sync_attempts, 4);
+        assert_eq!(state.land_sync_recovery.extra_attempts, 0);
+
+        // Attach a prior head-bound approval on `old` to prove fresh approval is required after recovery.
+        let questions = ask::Questions::at(home.join("questions"));
+        let mut old_q = ask::Question::new(
+            state.id.clone(),
+            APPROVAL_NODE.into(),
+            "owner".into(),
+            "old head approval".into(),
+            String::new(),
+            vec![APPROVE.into()],
+        );
+        old_q
+            .answer(ask::Answer::Choice(APPROVE.to_owned()))
+            .unwrap();
+        questions.put(&mut old_q).unwrap();
+        state.land_approval = Some(LandApproval {
+            question: old_q.id.clone(),
+            head: old.clone(),
+        });
+        state.save_under(home).unwrap();
+
+        // Admit explicit recover-land-sync via two-phase control.
+        let observer = StaticPrObserver(crate::land_sync_recovery::ObservedPr {
+            url: pr_url.clone(),
+            number: 42,
+            open: true,
+            head: old.clone(),
+            base_branch: Some("main".to_owned()),
+        });
+        let outcome = crate::land_sync_recovery_control::recover_with(
+            &queue,
+            home,
+            crate::land_sync_recovery_control::Request {
+                run: state.id.clone(),
+                head: old.clone(),
+                actor: "cli".into(),
+                request: "req-legacy-1".into(),
+            },
+            &observer,
+        )
+        .await
+        .unwrap();
+        assert!(!outcome.repeated);
+        assert_eq!(
+            outcome
+                .task
+                .resume_override
+                .as_ref()
+                .and_then(|pin| pin.pinned_run.as_deref()),
+            Some(state.id.as_str())
+        );
+
+        // Ordinary fast-forward of origin/main between admission and dispatch is allowed.
+        git::git(&state.repo, &["checkout", "main"]).await.unwrap();
+        std::fs::write(state.repo.join("advance2"), "advance2").unwrap();
+        git::git(&state.repo, &["add", "."]).await.unwrap();
+        git::git(&state.repo, &["commit", "-m", "advance base again"])
+            .await
+            .unwrap();
+        git::git(&state.repo, &["push", "origin", "main"])
+            .await
+            .unwrap();
+        git::git(&state.repo, &["checkout", "winner"])
+            .await
+            .unwrap();
+
+        let reloaded_task = queue.get(&task.id).unwrap();
+        assert!(matches!(
+            crate::land_sync_recovery::dispatch_check_with(&queue, home, &reloaded_task, &observer)
+                .await,
+            crate::land_sync_recovery::DispatchDecision::Proceed
+        ));
+
+        // Execute continuation on the existing PR using real rebase + fresh gate + fresh E2E.
+        let mut run = RunState::load_under(&state.id, home).unwrap();
+        assert!(run.land_sync_recovery_pending());
+        let mut forge = Scripted::new(
+            vec![
+                seen(&old, Checks::Green, "BEHIND", false),
+                seen(&old, Checks::Green, "BEHIND", false),
+                seen("@published", Checks::Green, "CLEAN", false),
+            ],
+            vec![],
+        );
+        forge.public_repo = Some(run.repo.clone());
+        let pr = land_with(&mut run, &pr_url, &forge).await.unwrap();
+        assert_eq!(pr.state, PrLifecycle::Open);
+        assert!(run.parked, "must park awaiting fresh head-bound approval");
+
+        // Verify attempts preserved (4 -> 5), 1 grant consumed, fresh head published,
+        // prior verification archived, fresh gate + E2E ran on new head, fresh approval asked.
+        let new_head = git::rev_parse(&run.repo, "HEAD").await.unwrap();
+        assert_ne!(new_head, old);
+        assert_eq!(run.land_sync_attempts, 5);
+        assert_eq!(run.land_sync_recovery.extra_attempts, 1);
+        assert_eq!(run.land_sync_budget(), 5);
+        assert!(!run.land_sync_pending);
+        assert_eq!(run.pr_pushed_head.as_deref(), Some(new_head.as_str()));
+        assert_eq!(
+            git::remote_head(&run.repo, "origin", "task-head")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(new_head.as_str())
+        );
+        assert!(run.gate_ran);
+        assert_eq!(run.gate_head.as_deref(), Some(new_head.as_str()));
+        assert!(
+            run.head_e2e
+                .as_ref()
+                .is_some_and(|e| e.head == new_head && e.passed)
+        );
+        assert_eq!(run.reviews.len(), 1);
+        assert!(run.reviews[0].clean);
+        assert_eq!(run.reviews[0].answered, 2);
+        assert!(run.reviews[0].verified_head.is_none());
+        assert!(!run.verification_history.is_empty());
+        assert_eq!(run.land_sync_recovery.stops.len(), 1);
+        assert_eq!(run.land_sync_recovery.authorizations.len(), 1);
+        let auth = &run.land_sync_recovery.authorizations[0];
+        assert!(auth.consumed);
+        assert!(auth.invalidated.is_none());
+        assert!(auth.archived_verification.is_some());
+        let new_approval = run.land_approval.as_ref().unwrap();
+        assert_ne!(new_approval.question, old_q.id);
+        assert_eq!(new_approval.head, new_head);
+    }
+
+    #[tokio::test]
+    async fn land_sync_recovery_forces_fresh_e2e_and_gate_even_when_head_unchanged() {
+        let (tmp, home, queue, _task, mut state, old) = legacy_exhausted_landing_fixture().await;
+        let home = home.as_path();
+
+        // Create marker-writing commands for gate and e2e so we prove both execute freshly
+        // even when HEAD does not change (origin/main is already an ancestor of winner).
+        let gate_marker = tmp.path().join("fresh-gate-ran");
+        let e2e_marker = tmp.path().join("fresh-e2e-ran");
+        state.config.verify.gate = vec![format!(
+            "git rev-parse HEAD > \"{}\"",
+            gate_marker.display().to_string().replace('\\', "/")
+        )];
+        state.config.verify.e2e = vec![format!(
+            "git rev-parse HEAD > \"{}\"",
+            e2e_marker.display().to_string().replace('\\', "/")
+        )];
+        let questions = ask::Questions::at(home.join("questions"));
+        let mut old_q = ask::Question::new(
+            state.id.clone(),
+            APPROVAL_NODE.into(),
+            "owner".into(),
+            "prior approval on same head".into(),
+            String::new(),
+            vec![APPROVE.into()],
+        );
+        old_q
+            .answer(ask::Answer::Choice(APPROVE.to_owned()))
+            .unwrap();
+        questions.put(&mut old_q).unwrap();
+        state.land_approval = Some(LandApproval {
+            question: old_q.id.clone(),
+            head: old.clone(),
+        });
+        state.save_under(home).unwrap();
+
+        let pr_url = green_pr().url;
+        let observer = StaticPrObserver(crate::land_sync_recovery::ObservedPr {
+            url: pr_url.clone(),
+            number: 42,
+            open: true,
+            head: old.clone(),
+            base_branch: Some("main".to_owned()),
+        });
+        crate::land_sync_recovery_control::recover_with(
+            &queue,
+            home,
+            crate::land_sync_recovery_control::Request {
+                run: state.id.clone(),
+                head: old.clone(),
+                actor: "cli".into(),
+                request: "req-same-head".into(),
+            },
+            &observer,
+        )
+        .await
+        .unwrap();
+
+        let mut run = RunState::load_under(&state.id, home).unwrap();
+        let mut forge = Scripted::new(
+            vec![
+                seen(&old, Checks::Green, "CLEAN", false),
+                seen(&old, Checks::Green, "CLEAN", false),
+                seen(&old, Checks::Green, "CLEAN", false),
+            ],
+            vec![],
+        );
+        forge.public_repo = Some(run.repo.clone());
+        land_with(&mut run, &pr_url, &forge).await.unwrap();
+
+        assert!(
+            gate_marker.exists(),
+            "fresh gate must run even on unchanged HEAD"
+        );
+        assert!(
+            e2e_marker.exists(),
+            "fresh E2E must run even on unchanged HEAD"
+        );
+        assert!(
+            run.parked,
+            "old approval before recovery must not be reused"
+        );
+        assert_ne!(run.land_approval.as_ref().unwrap().question, old_q.id);
+    }
+
+    #[tokio::test]
+    async fn land_sync_recovery_repeated_exhaustion_is_bounded_by_lifetime_cap() {
+        let (_tmp, home, queue, task, mut state, mut head) =
+            legacy_exhausted_landing_fixture().await;
+        let home = home.as_path();
+        state.config.graph.land_approval = false;
+        state.save_under(home).unwrap();
+
+        let pr_url = green_pr().url;
+        let mut base_step = 0usize;
+        let advance_step = |repo: PathBuf, step: usize| async move {
+            git::git(&repo, &["checkout", "main"]).await.unwrap();
+            std::fs::write(repo.join(format!("advance-{step}")), format!("step-{step}")).unwrap();
+            git::git(&repo, &["add", "."]).await.unwrap();
+            git::git(&repo, &["commit", "-m", &format!("advance base {step}")])
+                .await
+                .unwrap();
+            git::git(&repo, &["push", "origin", "main"]).await.unwrap();
+            git::git(&repo, &["checkout", "winner"]).await.unwrap();
+        };
+        for grant_num in 1..=crate::land_sync_recovery::MAX_GRANTS {
+            base_step += 1;
+            advance_step(state.repo.clone(), base_step).await;
+            let observer = StaticPrObserver(crate::land_sync_recovery::ObservedPr {
+                url: pr_url.clone(),
+                number: 42,
+                open: true,
+                head: head.clone(),
+                base_branch: Some("main".to_owned()),
+            });
+            crate::land_sync_recovery_control::recover_with(
+                &queue,
+                home,
+                crate::land_sync_recovery_control::Request {
+                    run: state.id.clone(),
+                    head: head.clone(),
+                    actor: "cli".into(),
+                    request: format!("req-cap-{grant_num}"),
+                },
+                &observer,
+            )
+            .await
+            .unwrap();
+
+            // Simulate execution consuming grant, spending the 1 attempt, and hitting exhaustion again.
+            state = RunState::load_under(&state.id, home).unwrap();
+            let mut forge = Scripted::new(
+                vec![
+                    seen(&head, Checks::Green, "BEHIND", false),
+                    seen(&head, Checks::Green, "BEHIND", false),
+                    seen("@published", Checks::Green, "BEHIND", false),
+                ],
+                vec![],
+            );
+            forge.public_repo = Some(state.repo.clone());
+            let prep = prepare_land_sync_recovery(&mut state, &pr_url, &forge)
+                .await
+                .unwrap();
+            assert!(matches!(prep, LandSyncPrep::Continue(Some(_))));
+            head = resume_landing_head(&mut state, &head, &pr_url, &forge, None)
+                .await
+                .unwrap();
+            assert_eq!(state.land_sync_attempts, 4 + grant_num);
+            assert_eq!(state.land_sync_recovery.extra_attempts, grant_num);
+
+            // Re-exhaust on another base advance.
+            base_step += 1;
+            advance_step(state.repo.clone(), base_step).await;
+            let err = rebase_landing_worktree(&mut state, "origin/main")
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("budget exhausted"), "{err:#}");
+            state.status = RunStatus::Blocked;
+            state.save_under(home).unwrap();
+            assert!(state.land_sync_exhausted());
+
+            // Put task back to Held so the next explicit authorization can queue it.
+            let mut t = queue.get(&task.id).unwrap();
+            t.hold_machine(Some("re-exhausted".into()));
+            queue.put(&mut t).unwrap();
+        }
+
+        assert_eq!(
+            state.land_sync_attempts,
+            4 + crate::land_sync_recovery::MAX_GRANTS
+        );
+        assert_eq!(state.land_sync_grants_remaining(), 0);
+        let observer = StaticPrObserver(crate::land_sync_recovery::ObservedPr {
+            url: pr_url,
+            number: 42,
+            open: true,
+            head: head.clone(),
+            base_branch: Some("main".to_owned()),
+        });
+        let err = crate::land_sync_recovery_control::recover_with(
+            &queue,
+            home,
+            crate::land_sync_recovery_control::Request {
+                run: state.id.clone(),
+                head,
+                actor: "cli".into(),
+                request: "req-cap-overflow".into(),
+            },
+            &observer,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("lifetime landing base-sync recovery limit reached"),
+            "{err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn land_sync_recovery_execution_revalidation_refuses_stale_pr_head_and_rewritten_base() {
+        let pr_url = green_pr().url;
+        // Case A: PR head moves externally between admission and execution.
+        {
+            let (_tmp, home, queue, _task, state, old) = legacy_exhausted_landing_fixture().await;
+            let home = home.as_path();
+            advance_landing_base(&state).await;
+            let observer = StaticPrObserver(crate::land_sync_recovery::ObservedPr {
+                url: pr_url.clone(),
+                number: 42,
+                open: true,
+                head: old.clone(),
+                base_branch: Some("main".to_owned()),
+            });
+            crate::land_sync_recovery_control::recover_with(
+                &queue,
+                home,
+                crate::land_sync_recovery_control::Request {
+                    run: state.id.clone(),
+                    head: old.clone(),
+                    actor: "cli".into(),
+                    request: "req-stale-pr".into(),
+                },
+                &observer,
+            )
+            .await
+            .unwrap();
+
+            let mut run = RunState::load_under(&state.id, home).unwrap();
+            let foreign_head = "f".repeat(40);
+            let forge = Scripted::new(
+                vec![seen(&foreign_head, Checks::Green, "BEHIND", false)],
+                vec![],
+            );
+            land_with(&mut run, &pr_url, &forge).await.unwrap();
+            assert_eq!(run.status, RunStatus::Blocked);
+            assert_eq!(run.land_sync_recovery.extra_attempts, 0);
+            assert_eq!(run.land_sync_attempts, 4);
+            let auth = run.land_sync_recovery.authorizations.last().unwrap();
+            assert!(auth.consumed);
+            assert!(
+                auth.invalidated
+                    .as_deref()
+                    .is_some_and(|why| why.contains("published PR head changed")),
+                "{:?}",
+                auth.invalidated
+            );
+            assert_eq!(run.pr_pushed_head.as_deref(), Some(old.as_str()));
+        }
+
+        // Case B: origin/main rewritten (non-fast-forward) between admission and execution.
+        {
+            let (_tmp, home, queue, _task, state, old) = legacy_exhausted_landing_fixture().await;
+            let home = home.as_path();
+            advance_landing_base(&state).await;
+            let observer = StaticPrObserver(crate::land_sync_recovery::ObservedPr {
+                url: pr_url.clone(),
+                number: 42,
+                open: true,
+                head: old.clone(),
+                base_branch: Some("main".to_owned()),
+            });
+            crate::land_sync_recovery_control::recover_with(
+                &queue,
+                home,
+                crate::land_sync_recovery_control::Request {
+                    run: state.id.clone(),
+                    head: old.clone(),
+                    actor: "cli".into(),
+                    request: "req-rewritten-base".into(),
+                },
+                &observer,
+            )
+            .await
+            .unwrap();
+
+            // Rewrite origin/main by amending the latest base commit and force-pushing.
+            git::git(&state.repo, &["checkout", "main"]).await.unwrap();
+            std::fs::write(state.repo.join("advance"), "rewritten").unwrap();
+            git::git(&state.repo, &["add", "."]).await.unwrap();
+            git::git(&state.repo, &["commit", "--amend", "-m", "rewritten base"])
+                .await
+                .unwrap();
+            git::git(&state.repo, &["push", "--force", "origin", "main"])
+                .await
+                .unwrap();
+            git::git(&state.repo, &["checkout", "winner"])
+                .await
+                .unwrap();
+
+            let mut run = RunState::load_under(&state.id, home).unwrap();
+            let forge = Scripted::new(vec![seen(&old, Checks::Green, "BEHIND", false)], vec![]);
+            land_with(&mut run, &pr_url, &forge).await.unwrap();
+            assert_eq!(run.status, RunStatus::Blocked);
+            assert_eq!(run.land_sync_recovery.extra_attempts, 0);
+            let auth = run.land_sync_recovery.authorizations.last().unwrap();
+            assert!(auth.consumed);
+            assert!(
+                auth.invalidated
+                    .as_deref()
+                    .is_some_and(|why| why.contains("does not fast-forward")),
+                "{:?}",
+                auth.invalidated
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn land_sync_recovery_restart_after_consume_continues_without_double_grant() {
+        let (_tmp, home, queue, _task, state, old) = legacy_exhausted_landing_fixture().await;
+        let home = home.as_path();
+        let pr_url = green_pr().url;
+        advance_landing_base(&state).await;
+        let observer = StaticPrObserver(crate::land_sync_recovery::ObservedPr {
+            url: pr_url.clone(),
+            number: 42,
+            open: true,
+            head: old.clone(),
+            base_branch: Some("main".to_owned()),
+        });
+        crate::land_sync_recovery_control::recover_with(
+            &queue,
+            home,
+            crate::land_sync_recovery_control::Request {
+                run: state.id.clone(),
+                head: old.clone(),
+                actor: "cli".into(),
+                request: "req-crash-after-consume".into(),
+            },
+            &observer,
+        )
+        .await
+        .unwrap();
+
+        // Simulate consuming the authorization and crashing right before rebase starts.
+        let mut crashed = RunState::load_under(&state.id, home).unwrap();
+        let initial_forge = Scripted::new(vec![seen(&old, Checks::Green, "BEHIND", false)], vec![]);
+        let prep = prepare_land_sync_recovery(&mut crashed, &pr_url, &initial_forge)
+            .await
+            .unwrap();
+        assert!(matches!(prep, LandSyncPrep::Continue(Some(_))));
+        assert_eq!(crashed.land_sync_recovery.extra_attempts, 1);
+        assert_eq!(crashed.land_sync_attempts, 4);
+        assert!(crashed.land_sync_recovery.authorizations[0].consumed);
+
+        // Reload after restart and run land_with: uses the 1 already-granted attempt, never double-grants.
+        let mut restarted = RunState::load_under(&state.id, home).unwrap();
+        let mut forge = Scripted::new(
+            vec![
+                seen(&old, Checks::Green, "BEHIND", false),
+                seen(&old, Checks::Green, "BEHIND", false),
+                seen("@published", Checks::Green, "CLEAN", false),
+            ],
+            vec![],
+        );
+        forge.public_repo = Some(restarted.repo.clone());
+        land_with(&mut restarted, &pr_url, &forge).await.unwrap();
+        assert_eq!(restarted.land_sync_recovery.extra_attempts, 1);
+        assert_eq!(restarted.land_sync_attempts, 5);
+        assert_eq!(restarted.land_sync_recovery.authorizations.len(), 1);
+        assert!(!restarted.land_sync_pending);
+    }
+
+    #[tokio::test]
+    async fn land_sync_recovery_dispatch_revalidation_refuses_stale_and_superseded_state() {
+        // 1. Without authorization, dispatch holds without spending budget.
+        let (_tmp, home, queue, task, state, old) = legacy_exhausted_landing_fixture().await;
+        let home = home.as_path();
+        let pr_url = green_pr().url;
+        let observer = StaticPrObserver(crate::land_sync_recovery::ObservedPr {
+            url: pr_url,
+            number: 42,
+            open: true,
+            head: old.clone(),
+            base_branch: Some("main".to_owned()),
+        });
+        assert!(matches!(
+            crate::land_sync_recovery::dispatch_check_with(&queue, home, &task, &observer).await,
+            crate::land_sync_recovery::DispatchDecision::Hold { .. }
+        ));
+
+        // 2. Admit authorization, then supersede with a newer owner decision before dispatch.
+        crate::land_sync_recovery_control::recover_with(
+            &queue,
+            home,
+            crate::land_sync_recovery_control::Request {
+                run: state.id.clone(),
+                head: old.clone(),
+                actor: "cli".into(),
+                request: "req-dispatch-superseded".into(),
+            },
+            &observer,
+        )
+        .await
+        .unwrap();
+        let mut t = queue.get(&task.id).unwrap();
+        t.operator_decided_at = Some(
+            t.operator_decided_at.unwrap_or_else(jiff::Timestamp::now)
+                + jiff::SignedDuration::from_secs(10),
+        );
+        queue.put(&mut t).unwrap();
+        let decision =
+            crate::land_sync_recovery::dispatch_check_with(&queue, home, &t, &observer).await;
+        match decision {
+            crate::land_sync_recovery::DispatchDecision::Hold {
+                reason,
+                state: updated,
+            } => {
+                assert!(
+                    reason.contains("newer owner decision superseded"),
+                    "{reason}"
+                );
+                let auth = updated.land_sync_recovery.authorizations.last().unwrap();
+                assert!(auth.consumed);
+                assert!(auth.invalidated.is_some());
+                assert_eq!(updated.land_sync_recovery.extra_attempts, 0);
+            }
+            crate::land_sync_recovery::DispatchDecision::Proceed => {
+                panic!("superseded authorization must be refused at dispatch");
+            }
+        }
     }
 }

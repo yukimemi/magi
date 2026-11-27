@@ -1123,7 +1123,9 @@ fn apply_deps_answer(
                 question: q.summary.clone(),
                 answer: q.resolution().unwrap_or_default(),
             });
-            if crate::base_sync_recovery::held_task(queue, &root) {
+            if crate::base_sync_recovery::held_task(queue, &root)
+                || crate::land_sync_recovery::held_task(queue, &root)
+            {
                 root.mark_triage_applied(&q.id);
                 return queue.put(&mut root).is_ok();
             }
@@ -1244,7 +1246,9 @@ fn ask_about_stuck_roots(
         let Some(root) = current.task(root_id) else {
             continue;
         };
-        if crate::base_sync_recovery::held_task(queue, root) {
+        if crate::base_sync_recovery::held_task(queue, root)
+            || crate::land_sync_recovery::held_task(queue, root)
+        {
             continue;
         }
         // A monitored disk wait recovers by itself; dependants simply keep
@@ -1380,7 +1384,10 @@ pub fn apply_answers(queue: &Queue, questions: &Questions) -> Vec<String> {
         });
         if !newer_decision {
             match action {
-                AnswerAction::Resume if crate::base_sync_recovery::held_task(queue, &task) => {
+                AnswerAction::Resume
+                    if crate::base_sync_recovery::held_task(queue, &task)
+                        || crate::land_sync_recovery::held_task(queue, &task) =>
+                {
                     // The original answer remains in answers; it cannot authorize
                     // a new implementation or an additional base rebase.
                 }
@@ -1735,7 +1742,9 @@ fn run_once_with_probe(
         if task.status != TaskStatus::Held {
             continue;
         }
-        if crate::base_sync_recovery::held_task(queue, &task) {
+        if crate::base_sync_recovery::held_task(queue, &task)
+            || crate::land_sync_recovery::held_task(queue, &task)
+        {
             continue;
         }
         if !disk_only {
