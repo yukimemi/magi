@@ -112,7 +112,11 @@ async fn lock_worktree_config(repo: &Path) -> Result<std::fs::File> {
         false,
     )
     .await?;
-    ensure!(common.ok(), "resolve shared Git directory: {}", common.stderr);
+    ensure!(
+        common.ok(),
+        "resolve shared Git directory: {}",
+        common.stderr
+    );
     let common = std::fs::canonicalize(&common.stdout)?;
     let path = common.join("magi-worktree-config.lock");
     let file = std::fs::OpenOptions::new()
@@ -125,7 +129,9 @@ async fn lock_worktree_config(repo: &Path) -> Result<std::fs::File> {
     loop {
         match crate::pr_head::try_lock_file(&file) {
             Ok(()) => return Ok(file),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.raw_os_error() == Some(33) => {
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock || e.raw_os_error() == Some(33) =>
+            {
                 ensure!(
                     tokio::time::Instant::now() < deadline,
                     "waiting for shared Git config lock: {}",

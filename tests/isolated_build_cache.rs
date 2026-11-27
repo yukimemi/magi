@@ -90,7 +90,10 @@ async fn relative_worktree_migration_does_not_lock_checkout_hooks() {
             .unwrap()
             .starts_with("gitdir: ../")
     );
-    assert_eq!(fs::read_to_string(second.join("file")).unwrap(), "content\n");
+    assert_eq!(
+        fs::read_to_string(second.join("file")).unwrap(),
+        "content\n"
+    );
 }
 
 common::e2e! {
