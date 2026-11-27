@@ -110,7 +110,12 @@ async fn a_review_with_no_loop_runs_against_its_own_claimed_task() {
     drop(claim);
 
     let stored = queue.get(&task.id).unwrap();
-    assert_eq!(stored.status, TaskStatus::Done, "{:?}", stored.last_error);
+    assert_eq!(stored.status, TaskStatus::Held, "{:?}", stored.last_error);
+    assert!(
+        stored.has_awaiting_landing_cause(),
+        "unlanded Ready holds awaiting landing: {:?}",
+        stored.hold_reason
+    );
     assert_eq!(stored.attempts, 1, "counted as the daemon counts");
     assert_eq!(stored.runs.len(), 1, "the run is linked to its task");
     let state = magi::run::RunState::load(&stored.runs[0]).unwrap();

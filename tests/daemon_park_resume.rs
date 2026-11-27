@@ -159,12 +159,6 @@ async fn park_resume(upgrade: bool) {
         .expect("serve");
 
     let after = queue.get(&task.id).unwrap();
-    assert_ne!(
-        after.status,
-        TaskStatus::Held,
-        "held: {:?}",
-        after.hold_reason
-    );
     // Resuming must neither add a run id nor re-execute completed nodes.
     assert!(
         after.runs == vec![run_id.clone()],
@@ -173,9 +167,14 @@ async fn park_resume(upgrade: bool) {
     );
     assert_eq!(
         after.status,
-        TaskStatus::Done,
-        "the resumed run finished: {:?}",
+        TaskStatus::Held,
+        "unlanded Ready settles to held awaiting landing: {:?}",
         after.last_error
+    );
+    assert!(
+        after.has_awaiting_landing_cause(),
+        "held for landing, not conductor: {:?}",
+        after.hold_reason
     );
     if !upgrade {
         assert!(
@@ -186,11 +185,7 @@ async fn park_resume(upgrade: bool) {
 
     let state = RunState::load(&run_id).unwrap();
     assert!(!state.parked, "the resume clears the park");
-    assert_ne!(
-        state.status,
-        RunStatus::Judging,
-        "it carried on past judging"
-    );
+    assert_eq!(state.status, RunStatus::Ready, "it carried on to Ready");
     assert_eq!(state.judgements.len(), judged, "judging was not run again");
     assert_eq!(
         implementation_evidence(&state),
@@ -200,7 +195,16 @@ async fn park_resume(upgrade: bool) {
     if let Some(fresh) = fresh {
         assert_eq!(after.attempts, 1, "only the completed attempt is spent");
         let fresh = queue.get(&fresh.id).unwrap();
-        assert_eq!(fresh.status, TaskStatus::Done, "fresh work also progresses");
+        assert_eq!(
+            fresh.status,
+            TaskStatus::Held,
+            "fresh work also progresses to Ready/held"
+        );
+        assert!(
+            fresh.has_awaiting_landing_cause(),
+            "{:?}",
+            fresh.hold_reason
+        );
         assert_eq!(fresh.runs.len(), 1);
         let fresh_run = RunState::load(&fresh.runs[0]).unwrap();
         assert_eq!(state.passes.len(), 2, "one parked pass and one resume");

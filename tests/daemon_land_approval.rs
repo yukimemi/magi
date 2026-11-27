@@ -355,8 +355,13 @@ async fn a_task_parked_on_land_approval_does_not_block_another_runnable_task(gh)
     let after_a = queue.get(&task_a.id).expect("task A still on disk");
     assert_eq!(
         after_a.status,
-        TaskStatus::Done,
-        "task A ran to completion while task B sat parked: {after_a:?}"
+        TaskStatus::Held,
+        "task A ran to Ready and held awaiting landing while task B sat parked: {after_a:?}"
+    );
+    assert!(
+        after_a.has_awaiting_landing_cause(),
+        "expected awaiting-landing hold for unmerged Ready run: {:?}",
+        after_a.hold_reason
     );
 
     let after_b = queue.get(&task_b.id).expect("task B still on disk");

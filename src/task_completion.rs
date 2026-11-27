@@ -23,14 +23,47 @@ pub struct CompletionGuards {
     _leases: Vec<crate::driver::ExecutionLease>,
 }
 
-fn completed(status: RunStatus) -> bool {
+/// Statuses that still protect a retained run's work from being reopened into
+/// re-execution. Separate from close admission: `Ready` protects work against
+/// reopen without counting as confirmed landing for closing a change task.
+fn protects_from_reopen(status: RunStatus) -> bool {
     matches!(
         status,
         RunStatus::Ready | RunStatus::Merged | RunStatus::AlreadyInBase
     )
 }
 
-/// Capture local evidence and require explicit abandonment of unfinished work.
+fn verify_run_belongs_to_task(task: &Task, state: &RunState) -> Result<()> {
+    let owner = state
+        .origin
+        .as_ref()
+        .and_then(|origin| origin.task.as_deref());
+    let same_repo = state.repo == task.repo
+        || state
+            .repo
+            .canonicalize()
+            .ok()
+            .zip(task.repo.canonicalize().ok())
+            .is_some_and(|(run, task)| run == task);
+    let implicit_repo = task.repo.as_os_str().is_empty() || task.repo == Path::new(".");
+    ensure!(
+        state.task_assignment == task.reassignments.len()
+            && owner.is_none_or(|owner| owner == task.id)
+            && (same_repo || (implicit_repo && owner == Some(task.id.as_str())))
+            && task.assignment_accepts(state),
+        "retained run {} does not belong to the task's current repository assignment",
+        state.id
+    );
+    ensure!(
+        crate::daemon::compatible_run_instruction(state, task),
+        "retained run {} does not match the current task instruction",
+        state.id
+    );
+    Ok(())
+}
+
+/// Capture local evidence and enforce synchronous close admission (used by
+/// scheduler/conductor paths that cannot perform forge probes).
 /// Call [`admit_close`] when committing an operator decision; this local helper
 /// alone does not exclude run owners or validate the forge.
 pub fn prepare_close(
@@ -47,7 +80,32 @@ pub fn prepare_close(
     );
     let mut context = CompletionContext::new(actor, reason, home, task);
     context.discard = discard;
-    validate_discard(&context)?;
+    if discard {
+        validate_discard_reason(&context)?;
+        return Ok(context);
+    }
+    if task.investigation {
+        task.validate_investigation_result(None)?;
+        return Ok(context);
+    }
+    let assessment = Assessment::new(&context);
+    let Some(latest_id) = task.execution_runs().last() else {
+        anyhow::bail!(
+            "{}; no landed execution matches the current task; use --discard to explicitly abandon unfinished work",
+            assessment.describe()
+        );
+    };
+    let state = crate::landing::load_run(home, task, latest_id).with_context(|| {
+        format!(
+            "{}; use --discard to explicitly abandon unfinished work",
+            assessment.describe()
+        )
+    })?;
+    ensure!(
+        crate::landing::run_landed_for_settle(&state),
+        "{}; landing is not recorded on the base branch; use `magi task done` to verify landing or --discard to explicitly abandon unfinished work",
+        assessment.describe()
+    );
     Ok(context)
 }
 
@@ -60,12 +118,6 @@ impl<'a> Assessment<'a> {
         Self {
             run: context.run.as_ref(),
         }
-    }
-
-    fn unfinished(&self) -> bool {
-        self.run.is_some_and(|run| {
-            !run.status.is_some_and(completed) && run.pr_state.as_deref() != Some("merged")
-        })
     }
 
     fn describe(&self) -> String {
@@ -88,7 +140,7 @@ impl<'a> Assessment<'a> {
     }
 }
 
-fn validate_discard(context: &CompletionContext) -> Result<()> {
+fn validate_discard_reason(context: &CompletionContext) -> Result<()> {
     ensure!(
         !context.discard
             || context
@@ -96,12 +148,6 @@ fn validate_discard(context: &CompletionContext) -> Result<()> {
                 .as_deref()
                 .is_some_and(|reason| !reason.trim().is_empty()),
         "--discard requires a non-empty reason"
-    );
-    let assessment = Assessment::new(context);
-    ensure!(
-        context.discard || !assessment.unfinished(),
-        "{}; use --discard to explicitly abandon unfinished work",
-        assessment.describe()
     );
     Ok(())
 }
@@ -176,7 +222,7 @@ async fn guard_runs(
         );
         if reopening {
             ensure!(
-                !completed(state.status),
+                !protects_from_reopen(state.status),
                 "cannot reopen: retained run {id} is {} (PR {}, state {}); completed work must not execute again",
                 state.status.as_str(),
                 state.pr.as_ref().map_or("none", |pr| pr.url.as_str()),
@@ -235,6 +281,7 @@ pub async fn admit_close(
     home: &Path,
     actor: CompletionActor,
     reason: Option<String>,
+    result: Option<String>,
     discard: bool,
 ) -> Result<(CompletionGuards, CompletionContext)> {
     ensure!(
@@ -242,14 +289,73 @@ pub async fn admit_close(
         "task {} is running; stop its driver before closing it",
         task.id
     );
+    if discard {
+        ensure!(
+            reason.as_deref().is_some_and(|r| !r.trim().is_empty()),
+            "--discard requires a non-empty reason"
+        );
+    } else if task.investigation {
+        task.validate_investigation_result(result.as_deref())?;
+    } else {
+        ensure!(
+            result.is_none(),
+            "--result is only for investigation tasks; use --reason to explain closing a change task"
+        );
+    }
     let (guards, latest, unavailable) = guard_runs(task, home, false, discard).await?;
-    let mut context = match latest {
-        Some(state) => CompletionContext::from_run(actor, reason, task, &state),
+    let mut context = match &latest {
+        Some(state) => CompletionContext::from_run(actor, reason, task, state),
         None => CompletionContext::new(actor, reason, home, task),
     };
     context.discard = discard;
     context.unavailable_runs = unavailable;
-    validate_discard(&context)?;
+    validate_discard_reason(&context)?;
+    if !discard && !task.investigation {
+        let assessment = Assessment::new(&context);
+        let Some(latest_id) = task.execution_runs().last() else {
+            anyhow::bail!(
+                "{}; no landed execution matches the current task; use --discard to explicitly abandon unfinished work",
+                assessment.describe()
+            );
+        };
+        let Some(state) = latest.as_ref().filter(|state| state.id == *latest_id) else {
+            anyhow::bail!(
+                "{}; retained run {latest_id} could not be verified; use --discard to explicitly abandon unfinished work",
+                assessment.describe()
+            );
+        };
+        verify_run_belongs_to_task(task, state).with_context(|| {
+            format!(
+                "{}; use --discard to explicitly abandon unfinished work",
+                assessment.describe()
+            )
+        })?;
+        let landed = if crate::landing::recorded_landing(state) {
+            Ok(())
+        } else if !state.repo.join(".git").exists()
+            && !state.merge.as_ref().is_some_and(|m| m.empty)
+            && !state.winner().is_some_and(|w| w.empty)
+            && state.pr.as_ref().is_some_and(|pr| pr.state == "merged")
+        {
+            // Forge lifecycle was just confirmed live in `guard_runs` when no
+            // local checkout is present to probe further.
+            Ok(())
+        } else {
+            let (verdict, why) =
+                crate::landing::verdict(state, crate::landing::Limits::default()).await;
+            if verdict == crate::landing::State::Landed {
+                Ok(())
+            } else {
+                Err(why)
+            }
+        };
+        if let Err(why) = landed {
+            anyhow::bail!(
+                "{}; landing not confirmed ({why}); use --discard to explicitly abandon unfinished work",
+                assessment.describe()
+            );
+        }
+    }
     Ok((guards, context))
 }
 
@@ -263,12 +369,25 @@ pub async fn close(
     reason: Option<String>,
     discard: bool,
 ) -> Result<Task> {
+    close_with_result(queue, home, reference, actor, reason, None, discard).await
+}
+
+/// Mark an idle task done, optionally recording investigation findings (`result`).
+pub async fn close_with_result(
+    queue: &Queue,
+    home: &Path,
+    reference: &str,
+    actor: CompletionActor,
+    reason: Option<String>,
+    result: Option<String>,
+    discard: bool,
+) -> Result<Task> {
     let id = queue.resolve_id(reference)?;
     let claim = queue
         .claim(&id)
         .context("task is claimed; wait for its driver to stop")?;
     let task = queue.get(&id)?;
-    close_claimed(queue, home, (claim, task), actor, reason, discard).await
+    close_claimed(queue, home, (claim, task), actor, reason, result, discard).await
 }
 
 pub(crate) async fn close_claimed(
@@ -277,13 +396,18 @@ pub(crate) async fn close_claimed(
     (_claim, mut task): (crate::queue::Claim, Task),
     actor: CompletionActor,
     reason: Option<String>,
+    result: Option<String>,
     discard: bool,
 ) -> Result<Task> {
     if task.status == TaskStatus::Done {
         return Ok(task);
     }
     let expected = task.clone();
-    let (_guards, context) = admit_close(&task, home, actor, reason, discard).await?;
+    let (_guards, context) =
+        admit_close(&task, home, actor, reason, result.clone(), discard).await?;
+    if !discard && task.investigation {
+        task.record_investigation_result(result.as_deref())?;
+    }
     task.succeed(context);
     queue.commit_completion(&mut task, &expected)?;
     if !discard {
@@ -500,6 +624,7 @@ mod tests {
             dir.path(),
             CompletionActor::Cli,
             Some("discard unfinished work".into()),
+            None,
             true,
         )
         .await
@@ -528,6 +653,7 @@ mod tests {
                 dir.path(),
                 CompletionActor::Cli,
                 Some("discard".into()),
+                None,
                 true
             )
             .await
@@ -541,6 +667,7 @@ mod tests {
                 dir.path(),
                 CompletionActor::Cli,
                 Some("discard".into()),
+                None,
                 true
             )
             .await
@@ -552,6 +679,7 @@ mod tests {
             dir.path(),
             CompletionActor::Cli,
             Some("discard".into()),
+            None,
             true,
         )
         .await
@@ -595,8 +723,11 @@ mod tests {
         }
         let queue = Queue::at(dir.path().join("queue"));
         let mut task = task();
+        task.repo = dir.path().to_owned();
         let mut run = retained(dir.path(), &mut task, RunStatus::Blocked);
         run.repo = dir.path().to_owned();
+        run.task_instruction = Some(task.instruction.clone());
+        run.task_instruction_rev = Some(task.instruction_rev);
         run.pr_head = Some("magi/task-replacement".into());
         run.pr = Some(crate::run::PrRecord {
             url: "https://example.invalid/pull/1".into(),

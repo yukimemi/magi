@@ -124,12 +124,6 @@ async fn answered_resume_action_is_executed(label: &str) {
         .expect("serve");
 
     let after = queue.get(&task.id).unwrap();
-    assert_ne!(
-        after.status,
-        TaskStatus::Held,
-        "held: {:?}",
-        after.hold_reason
-    );
     assert!(
         after.action_applied(&q.id),
         "the answer was recorded as applied"
@@ -143,17 +137,18 @@ async fn answered_resume_action_is_executed(label: &str) {
     );
     assert_eq!(
         after.status,
-        TaskStatus::Done,
-        "the resumed run finished: {:?}",
+        TaskStatus::Held,
+        "unlanded Ready settles to held awaiting landing: {:?}",
         after.last_error
+    );
+    assert!(
+        after.has_awaiting_landing_cause(),
+        "held for awaiting landing: {:?}",
+        after.hold_reason
     );
     let state = RunState::load(&run_id).unwrap();
     assert!(!state.parked, "the resume clears the park");
-    assert_ne!(
-        state.status,
-        RunStatus::Judging,
-        "it carried on past judging"
-    );
+    assert_eq!(state.status, RunStatus::Ready, "it carried on to Ready");
     assert_eq!(state.judgements.len(), judged, "judging was not run again");
 }
 

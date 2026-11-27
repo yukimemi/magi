@@ -776,7 +776,7 @@ fn apply_one(
     // A conductor answer is never operator authorization.  In particular,
     // do this before questions and blocking too: either would reclassify a
     // manual hold and let a later deterministic resolver queue it.
-    if task.operator_held() {
+    if task.operator_held() || task.has_awaiting_landing_cause() {
         return Ok(());
     }
 

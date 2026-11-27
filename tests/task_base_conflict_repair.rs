@@ -204,7 +204,8 @@ async fn explicit_conflict_grant_resumes_review_only_run_and_requires_fresh_veri
     let after = RunState::load(&request.run).unwrap();
     let queued = Queue::open().get(&task.id).unwrap();
     assert_eq!(queued.runs, vec![request.run.clone()]);
-    assert_eq!(queued.status, TaskStatus::Done, "{:?}", queued.last_error);
+    assert_eq!(queued.status, TaskStatus::Held, "{:?}", queued.last_error);
+    assert!(queued.has_awaiting_landing_cause(), "{:?}", queued.hold_reason);
     assert_eq!(queued.instruction, task.instruction);
     assert_eq!(queued.review_branch, task.review_branch);
     assert_eq!(after.instruction, old_instruction);
@@ -225,7 +226,9 @@ async fn explicit_conflict_grant_resumes_review_only_run_and_requires_fresh_veri
     assert_eq!(after.gate_head.as_ref(), Some(result));
     assert!(!after.verification_history.is_empty());
     assert_eq!(grant(&request).await, receipt);
-    assert_eq!(Queue::open().get(&task.id).unwrap().status, TaskStatus::Done);
+    let settled = Queue::open().get(&task.id).unwrap();
+    assert_eq!(settled.status, TaskStatus::Held);
+    assert!(settled.has_awaiting_landing_cause());
 }
 }
 
@@ -479,7 +482,8 @@ async fn explicit_followup_review_retains_selection_and_rejects_changed_scope() 
     tokio::time::timeout(std::time::Duration::from_secs(120), magi::daemon::serve(opts)).await.unwrap().unwrap();
     let after = RunState::load(&request.run).unwrap();
     let owner = queue.get(&task.id).unwrap();
-    assert_eq!(owner.status, TaskStatus::Done, "{:?}", owner.last_error);
+    assert_eq!(owner.status, TaskStatus::Held, "{:?}", owner.last_error);
+    assert!(owner.has_awaiting_landing_cause(), "{:?}", owner.hold_reason);
     assert_eq!(owner.runs, vec![request.run.clone()]);
     assert_eq!(owner.review_branch, task.review_branch);
     assert_eq!(owner.instruction, task.instruction);
@@ -599,7 +603,8 @@ async fn moved_base_approval_can_be_explicitly_replaced_without_rewinding_or_res
     tokio::time::timeout(std::time::Duration::from_secs(120), magi::daemon::serve(opts)).await.unwrap().unwrap();
     let after = RunState::load(&original.run).unwrap();
     let owner = Queue::open().get(&task.id).unwrap();
-    assert_eq!(owner.status, TaskStatus::Done, "{:?}", owner.last_error);
+    assert_eq!(owner.status, TaskStatus::Held, "{:?}", owner.last_error);
+    assert!(owner.has_awaiting_landing_cause(), "{:?}", owner.hold_reason);
     assert_eq!(owner.runs, vec![original.run.clone()]);
     assert_eq!(owner.instruction, task.instruction);
     assert_eq!(owner.repair_grants, vec![first.clone(), second, third.clone()]);
@@ -621,7 +626,9 @@ async fn moved_base_approval_can_be_explicitly_replaced_without_rewinding_or_res
     assert!(after.reviews.len() > runner.state.reviews.len());
     assert_eq!(grant(&original).await, first);
     assert_eq!(grant(&latest).await, third);
-    assert_eq!(Queue::open().get(&task.id).unwrap().status, TaskStatus::Done);
+    let settled = Queue::open().get(&task.id).unwrap();
+    assert_eq!(settled.status, TaskStatus::Held);
+    assert!(settled.has_awaiting_landing_cause());
 }
 }
 

@@ -2680,6 +2680,10 @@ pub struct RunState {
     /// Authored task criteria before review scaffolding was generated.
     #[serde(default)]
     pub task_instruction: Option<String>,
+    /// Authored instruction generation ([`crate::queue::Task::instruction_rev`])
+    /// active when this run started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_instruction_rev: Option<u64>,
     /// When the run was created.
     pub created_at: Timestamp,
     /// Last state flush.
@@ -3307,6 +3311,7 @@ impl RunState {
             fetched_base: None,
             instruction,
             task_instruction: None,
+            task_instruction_rev: None,
             created_at: now,
             updated_at: now,
             output_activity_at: Some(now),

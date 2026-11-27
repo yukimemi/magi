@@ -117,6 +117,9 @@ pub enum Operation {
         /// Optional explanation retained with the completion event.
         #[serde(default)]
         reason: Option<String>,
+        /// Nonblank findings required to complete an investigation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result: Option<String>,
         /// Close unfinished work without deleting its runs or branches.
         #[serde(default)]
         discard: bool,
@@ -265,6 +268,9 @@ pub struct Filing {
     pub instruction: String,
     /// Validated absolute repository path.
     pub repo: std::path::PathBuf,
+    /// Explicitly file a result-only investigation (exempt from landing audit).
+    #[serde(default)]
+    pub investigation: bool,
     /// Filing provenance prepared by the CLI.
     pub source: crate::queue::Source,
     /// Resolved implementation imports.
@@ -502,6 +508,7 @@ async fn execute(
         Operation::Done {
             task,
             reason,
+            result,
             discard,
         } => {
             let claimed = claimed_for_chat(queue, &task, talks, talk)?;
@@ -511,6 +518,7 @@ async fn execute(
                 claimed,
                 crate::queue::CompletionActor::Chat(talk.to_owned()),
                 reason,
+                result,
                 discard,
             ))
             .await?;
@@ -785,6 +793,7 @@ async fn execute(
 
 fn file_task(queue: &Queue, filing: Filing) -> Result<Task> {
     let mut task = Task::new(filing.title, filing.instruction, filing.repo, filing.source);
+    task.investigation = filing.investigation;
     task.sources = filing.sources;
     if let Some(reason) = filing.hold {
         task.hold_manual(Some(reason));
@@ -1320,7 +1329,10 @@ async fn apply_local_decision(
         let mut close_guard = None;
         let message = match command {
             Operation::Done {
-                reason, discard, ..
+                reason,
+                result,
+                discard,
+                ..
             } => {
                 let (guards, context) = crate::task_completion::admit_close(
                     &task,
@@ -1332,9 +1344,13 @@ async fn apply_local_decision(
                             .context("decision has no chat")?,
                     ),
                     reason.clone(),
+                    result.clone(),
                     *discard,
                 )
                 .await?;
+                if !*discard && task.investigation {
+                    task.record_investigation_result(result.as_deref())?;
+                }
                 close_guard = Some(guards);
                 task.succeed(context);
                 crate::task_completion::describe(&task)
@@ -2289,6 +2305,14 @@ mod tests {
                 crate::config::Config::default(),
             );
             run.status = status;
+            if status == RunStatus::Merged {
+                run.merge = Some(crate::run::MergeOutcome {
+                    mode: crate::config::MergeMode::Pr,
+                    ok: true,
+                    detail: "merged".into(),
+                    empty: false,
+                });
+            }
             run.driver_exited = true;
             run.reserve_under(home).unwrap();
             task.link_run(&run.id);
@@ -2302,6 +2326,7 @@ mod tests {
             Operation::Done {
                 task: task.id.clone(),
                 reason: None,
+                result: None,
                 discard: false,
             },
         )
@@ -2803,6 +2828,7 @@ mod goal_admission_tests {
             Operation::Done {
                 task: task.id.clone(),
                 reason: Some("discard unfinished work".into()),
+                result: None,
                 discard: true,
             },
         )
@@ -2824,12 +2850,22 @@ mod goal_admission_tests {
                 Operation::Done {
                     task: unrelated.id.clone(),
                     reason: None,
+                    result: None,
                     discard: false,
                 },
             )
             .await
             .is_err()
         );
+        // Goal task completion requires a confirmed landing or investigation findings.
+        // Mark as an investigation so the subsequent reopen check in this test has no
+        // merged run blocking reopen.
+        queue
+            .modify(&task.id, |t| {
+                t.investigation = true;
+                true
+            })
+            .unwrap();
         execute_authenticated(
             &queue,
             tmp.path(),
@@ -2839,6 +2875,7 @@ mod goal_admission_tests {
             Operation::Done {
                 task: task.id.clone(),
                 reason: Some("goal work finished".into()),
+                result: Some("goal findings recorded".into()),
                 discard: false,
             },
         )

@@ -245,6 +245,14 @@ pub(crate) fn settle(
     if let Some(state) = state.filter(|state| state.status == RunStatus::AlreadyInBase)
         && pass.is_some_and(|pass| pass.result == Outcome::AlreadyInBase)
     {
+        if task.investigation && task.current_investigation_result().is_none() {
+            task.hold_unrequested_retry(Some(
+                "Investigation finished without recorded findings; complete it with a nonblank --result."
+                    .into(),
+            ));
+            task.last_error = Some(reason);
+            return;
+        }
         task.succeed(CompletionContext::from_run(
             CompletionActor::DaemonSettle,
             Some(reason.clone()),

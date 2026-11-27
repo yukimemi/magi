@@ -135,7 +135,12 @@ fn build_child() {
     let inventory = cache::inventory(&home);
     for task in tasks {
         let branch = task.review_of.as_deref().unwrap();
-        assert_eq!(task.status, TaskStatus::Done, "{branch}: {:?}", task.last_error);
+        assert_eq!(task.status, TaskStatus::Held, "{branch}: {:?}", task.last_error);
+        assert!(
+            task.has_awaiting_landing_cause(),
+            "{branch}: expected awaiting-landing hold, got {:?}",
+            task.hold_reason
+        );
         let run = RunState::load_under(&task.runs[0], &home).unwrap();
         assert_eq!(run.config.verify.build_cache, BuildCache::Isolated);
         let source = if branch == "second" { "urgent" } else { "task-override" };
@@ -190,7 +195,12 @@ fn build_child() {
     ).await.expect("shared resume did not finish").unwrap();
     assert!(resumed.status.success(), "{}\n{}", String::from_utf8_lossy(&resumed.stdout), String::from_utf8_lossy(&resumed.stderr));
     let settled = queue.get(&task.id).unwrap();
-    assert_eq!(settled.status, TaskStatus::Done, "{:?}", settled.last_error);
+    assert_eq!(settled.status, TaskStatus::Held, "{:?}", settled.last_error);
+    assert!(
+        settled.has_awaiting_landing_cause(),
+        "expected awaiting-landing hold: {:?}",
+        settled.hold_reason
+    );
     assert_eq!(settled.runs, task.runs);
     assert_eq!(RunState::load_under(run_id, &home).unwrap().config.verify.build_cache, BuildCache::Shared);
     let binary_name = format!("same_package{}", std::env::consts::EXE_SUFFIX);

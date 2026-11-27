@@ -155,12 +155,19 @@ pub(crate) fn dismiss(home: &std::path::Path, q: &crate::ask::Question) -> anyho
         if task.execution_runs().last() == Some(&q.run)
             && task.status != crate::queue::TaskStatus::Done
         {
-            task.succeed(crate::queue::CompletionContext::from_run(
-                crate::queue::CompletionActor::DaemonSettle,
-                Some(format!("Owner dismissed obsolete approval {}", q.id)),
-                &task,
-                &state,
-            ));
+            if task.investigation && task.current_investigation_result().is_none() {
+                task.hold_unrequested_retry(Some(
+                    "Obsolete approval dismissed, but investigation has no recorded findings; complete it with a nonblank --result."
+                        .into(),
+                ));
+            } else {
+                task.succeed(crate::queue::CompletionContext::from_run(
+                    crate::queue::CompletionActor::DaemonSettle,
+                    Some(format!("Owner dismissed obsolete approval {}", q.id)),
+                    &task,
+                    &state,
+                ));
+            }
             task.mark_action_applied(&q.id);
             queue.put(&mut task)?;
         }
@@ -175,4 +182,69 @@ pub(crate) fn resumable_hold(state: &crate::run::RunState) -> bool {
         && state.merge_decision.as_ref().is_some_and(|decision| {
             !decision.closed && decision.choice.eq_ignore_ascii_case(crate::land::HOLD)
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ask::Question;
+    use crate::config::Config;
+    use crate::queue::{Queue, Source, Task, TaskStatus};
+    use crate::run::{LandApproval, PrRecord, RunState, RunStatus};
+
+    #[test]
+    fn dismiss_holds_investigation_without_findings_while_retiring_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let queue = Queue::at(home.join("queue"));
+        let mut run = RunState::new(
+            home.to_owned(),
+            "main".into(),
+            "base".into(),
+            "investigate".into(),
+            Config::default(),
+        );
+        run.status = RunStatus::Landing;
+        run.parked = true;
+        run.driver_exited = true;
+        run.pr = Some(PrRecord {
+            url: "https://example.invalid/o/r/pull/1".into(),
+            number: 1,
+            state: "open".into(),
+            checks: "green".into(),
+            round: 1,
+            rounds: 1,
+            red_at_merge: Vec::new(),
+        });
+        let q = Question::new(
+            run.id.clone(),
+            crate::land::APPROVAL_NODE.into(),
+            "land".into(),
+            "merge?".into(),
+            String::new(),
+            vec![DISMISS.into()],
+        );
+        run.land_approval = Some(LandApproval {
+            question: q.id.clone(),
+            head: "a".repeat(40),
+        });
+        run.save_under(home).unwrap();
+        let mut task = Task::new(
+            "research".into(),
+            "investigate".into(),
+            home.to_owned(),
+            Source::Human,
+        );
+        task.investigation = true;
+        task.link_run(&run.id);
+        queue.put(&mut task).unwrap();
+
+        dismiss(home, &q).unwrap();
+        let after_run = RunState::load_under(&run.id, home).unwrap();
+        assert_eq!(after_run.status, RunStatus::Superseded);
+        assert_eq!(after_run.merge_decision.unwrap().choice, DISMISS);
+        let after_task = queue.get(&task.id).unwrap();
+        assert_eq!(after_task.status, TaskStatus::Held);
+        assert!(after_task.action_applied(&q.id));
+    }
 }

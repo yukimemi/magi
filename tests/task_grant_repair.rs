@@ -155,7 +155,8 @@ async fn exhausted_gate_grant_is_idempotent_and_repairs_the_exact_queued_run() {
     let after = RunState::load(&request.run).unwrap();
     let queued = Queue::open().get(&task.id).unwrap();
     assert_eq!(queued.runs, vec![request.run.clone()]);
-    assert_eq!(queued.status, TaskStatus::Done, "{:?}", queued.last_error);
+    assert_eq!(queued.status, TaskStatus::Held, "{:?}", queued.last_error);
+    assert!(queued.has_awaiting_landing_cause(), "{:?}", queued.hold_reason);
     assert_eq!(serde_json::to_value(&after.config).unwrap(), snapshot);
     assert_eq!(after.repair_grants.len(), 1);
     assert_eq!(after.repair_grants[0].spent, 1);
@@ -169,7 +170,9 @@ async fn exhausted_gate_grant_is_idempotent_and_repairs_the_exact_queued_run() {
     assert_eq!(after.gate_head.as_ref(), Some(&head));
     assert!(after.gate.iter().all(|o| o.ok()));
     assert_eq!(accepted(&request), receipt, "settled retries do not queue another pass");
-    assert_eq!(Queue::open().get(&task.id).unwrap().status, TaskStatus::Done);
+    let settled = Queue::open().get(&task.id).unwrap();
+    assert_eq!(settled.status, TaskStatus::Held);
+    assert!(settled.has_awaiting_landing_cause());
 }
 }
 
@@ -448,7 +451,8 @@ async fn automatic_budget_hold_admits_only_an_explicit_same_run_repair() {
     queue.put(&mut stale_queued).unwrap();
     assert_eq!(accepted(&request), receipt);
     let finished = queue.get(&task.id).unwrap();
-    assert_eq!(finished.status, TaskStatus::Done);
+    assert_eq!(finished.status, TaskStatus::Held);
+    assert!(finished.has_awaiting_landing_cause());
     assert_eq!(finished.runs, held.runs);
     assert!(finished.resume_override.is_none());
 }

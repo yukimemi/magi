@@ -572,7 +572,7 @@ async fn task_command_receipts_survive_later_transitions_and_lost_projection_wri
         let command = match kind {
             "hold" => Operation::Hold { task: task.id.clone(), reason: "new hold".into() },
             "release" => Operation::Release { task: task.id.clone() },
-            "done" => Operation::Done { task: task.id.clone(), reason: Some("owner closed work".into()), discard: true },
+            "done" => Operation::Done { task: task.id.clone(), reason: Some("owner closed work".into()), result: None, discard: true },
             "reopen" => Operation::Reopen { task: task.id.clone(), reason: "closed by mistake".into() },
             "retry" => Operation::Retry { task: task.id.clone(), title: None, instruction: "revised instruction".into() },
             _ => unreachable!(),
@@ -1239,7 +1239,7 @@ async fn superseded_resume_pins_reconcile_without_starting_or_replaying() {
             assert_eq!(outbox.get(&second.id).unwrap().decision.unwrap().status, Status::Queued);
         } else {
             let operation = if transition == "done" {
-                Operation::Done { task: task.id.clone(), reason: Some("owner discarded work".into()), discard: true }
+                Operation::Done { task: task.id.clone(), reason: Some("owner discarded work".into()), result: None, discard: true }
             } else {
                 Operation::Retry { task: task.id.clone(), title: None, instruction: "New instruction".into() }
             };
@@ -1321,9 +1321,19 @@ async fn applied_legacy_choice_receipts_survive_later_task_transitions() {
     for action in [ChoiceAction::Requeue, ChoiceAction::Hold, ChoiceAction::Done] {
         let mut run = RunState::new(fx.repo.clone(), "main".into(), "base".into(), "work".into(), fx.config.clone());
         run.reserve_under(&home).unwrap();
-        // A non-discard Done choice needs completed work; the other actions
+        // A non-discard Done choice needs confirmed landing; the other actions
         // still operate on an unfinished execution.
-        run.status = if matches!(action, ChoiceAction::Done) { RunStatus::Ready } else { RunStatus::Blocked };
+        run.status = if matches!(action, ChoiceAction::Done) {
+            run.merge = Some(magi::run::MergeOutcome {
+                mode: magi::config::MergeMode::Pr,
+                ok: true,
+                detail: "merged".into(),
+                empty: false,
+            });
+            RunStatus::Merged
+        } else {
+            RunStatus::Blocked
+        };
         run.driver_exited = true; run.save_under(&home).unwrap();
         let mut task = Task::new("work".into(), "work".into(), fx.repo.clone(), Source::Human);
         task.chat = Some(chat.id.clone()); task.runs.push(run.id.clone()); task.hold_manual(Some("Awaiting input".into()));

@@ -432,14 +432,15 @@ default.
 
 | verb | |
 |---|---|
-| `magi task add` | file work; text, `--file`, `--issue`, or stdin |
+| `magi task add` | file work; text, `--file`, `--issue`, `--investigation`, or stdin |
 | `magi task list` | the backlog, newest first |
 | `magi task show <id>` | one task in full |
 | `magi task urgent <id> [--clear]` | enable or disable urgent on an unclaimed queued or held task |
+| `magi task investigation <id> [--clear]` | mark a task as an investigation (findings-only, exempt from landing audit) or return it to a change task |
 | `magi task implementers <id> <count>` | change implementers on a queued or held task (1 = Solo, 2–3 = competition) |
 | `magi task build-cache <id> shared\|isolated\|default` | set or clear the build cache override on an unclaimed queued or held task |
 | `magi task hold` / `release` | park work, or give it a real second chance |
-| `magi task done` | mark it finished, for work that landed by a route the loop did not see |
+| `magi task done` | mark it finished once landing is confirmed (or with `--result` for investigations, or `--discard --reason`) |
 | `magi task rm` | delete it |
 
 `done` and `release` are one keystroke apart and do opposite things. Reach for
@@ -502,9 +503,20 @@ Without a chat control channel, `magi task done` records a supplied chat ID
 as actor provenance even if no conversation record exists. The ID does not
 authorize chat control operations.
 
-**Done is not proof of merge.** Closing an unfinished latest run requires
+**Done requires confirmed landing (or explicit discard / investigation findings).**
+A `Ready` run without a confirmed merge into its target base settles to **Held**
+(awaiting landing) with its branch and attempt count preserved rather than
+closing the task or re-competing. Closing an unlanded change task requires
 `--discard --reason "<text>"` (or the Web discard confirmation and reason); this
-records an intentional closure, not a successful delivery. Web **Mark done**
+records an intentional closure, not a successful delivery. Investigations
+(`magi task add --investigation` or `magi task investigation <ID>`) are exempt
+from landing holds and auditing, but require nonblank findings bound to the
+current instruction generation (`--result "<text>"`); editing the instruction
+invalidates earlier findings even if later reverted (title-only edits preserve
+them). Housekeeping also runs a bounded, timeout-guarded landing audit over
+completed change tasks (caching `landed` / `not_landed` / `unknown` without
+changing task state, alerting only on confirmed non-landings) and promotes
+awaiting-landing holds once landing is confirmed. Web **Mark done**
 opens that explicit confirmation when the server refuses unmerged work, showing
 the retained run, status, branches and PR. Every completion
 path records its evidence, including automatic settlement and structured done.

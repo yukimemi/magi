@@ -5238,6 +5238,20 @@ async fn queue_compact_controls_and_edit_save_fit_and_preserve_drafts() {
     let home = fx.tmp.path().join("magi-home");
     let queue = Queue::at(home.join("queue"));
     let ids = seed_tasks(&queue, &fx.repo, "run");
+    // Mark the exercised task as an investigation with recorded findings so
+    // title-only editing preserves its result and clicking "Yes, mark done"
+    // satisfies the completion contract without needing a merged run.
+    queue
+        .modify(&ids[1], |t| {
+            t.investigation = true;
+            t.completion_result = Some(magi::queue::InvestigationResult {
+                text: "Confirmed findings".into(),
+                instruction_rev: t.instruction_rev,
+                recorded_at: jiff::Timestamp::now(),
+            });
+            true
+        })
+        .unwrap();
     let original = queue.get(&ids[1]).unwrap();
     let base = serve_with_client_probe(
         &home,

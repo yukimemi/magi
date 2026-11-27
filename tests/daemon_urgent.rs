@@ -122,18 +122,25 @@ async fn an_urgent_task_starts_alongside_an_already_running_task() {
 
     block.release();
 
+    let not_ready_failure = |id: &str| {
+        if queue.get(id).is_ok_and(|t| t.has_awaiting_landing_cause()) {
+            None
+        } else {
+            task_failed(&queue, id)
+        }
+    };
     wait_for_completion(
         &mut serve,
         || {
             queue
                 .get(&ordinary.id)
-                .is_ok_and(|t| t.status == TaskStatus::Done)
+                .is_ok_and(|t| t.has_awaiting_landing_cause())
                 && queue
                     .get(&urgent.id)
-                    .is_ok_and(|t| t.status == TaskStatus::Done)
+                    .is_ok_and(|t| t.has_awaiting_landing_cause())
         },
-        || task_failed(&queue, &ordinary.id).or_else(|| task_failed(&queue, &urgent.id)),
-        "both tasks never reached a terminal status",
+        || not_ready_failure(&ordinary.id).or_else(|| not_ready_failure(&urgent.id)),
+        "both tasks never reached Ready/awaiting-landing",
     )
     .await;
 
@@ -147,7 +154,11 @@ async fn an_urgent_task_starts_alongside_an_already_running_task() {
     let after_ordinary = queue.get(&ordinary.id).unwrap();
     assert_eq!(
         after_ordinary.status,
-        TaskStatus::Done,
+        TaskStatus::Held,
+        "{after_ordinary:?}"
+    );
+    assert!(
+        after_ordinary.has_awaiting_landing_cause(),
         "{after_ordinary:?}"
     );
     assert_eq!(
@@ -157,7 +168,8 @@ async fn an_urgent_task_starts_alongside_an_already_running_task() {
     );
 
     let after_urgent = queue.get(&urgent.id).unwrap();
-    assert_eq!(after_urgent.status, TaskStatus::Done, "{after_urgent:?}");
+    assert_eq!(after_urgent.status, TaskStatus::Held, "{after_urgent:?}");
+    assert!(after_urgent.has_awaiting_landing_cause(), "{after_urgent:?}");
     assert_eq!(after_urgent.runs.len(), 1);
 }
 }
@@ -231,14 +243,21 @@ async fn an_ordinary_task_still_waits_for_the_ordinary_slot_to_free() {
 
     block.release();
 
+    let not_ready_failure = |id: &str| {
+        if queue.get(id).is_ok_and(|t| t.has_awaiting_landing_cause()) {
+            None
+        } else {
+            task_failed(&queue, id)
+        }
+    };
     wait_for_completion(
         &mut serve,
         || {
             queue
                 .get(&ordinary.id)
-                .is_ok_and(|t| t.status == TaskStatus::Done)
+                .is_ok_and(|t| t.has_awaiting_landing_cause())
         },
-        || task_failed(&queue, &ordinary.id).or_else(|| task_failed(&queue, &plain.id)),
+        || not_ready_failure(&ordinary.id).or_else(|| not_ready_failure(&plain.id)),
         "the ordinary task never finished",
     )
     .await;
@@ -250,9 +269,9 @@ async fn an_ordinary_task_still_waits_for_the_ordinary_slot_to_free() {
         || {
             queue
                 .get(&plain.id)
-                .is_ok_and(|t| t.status == TaskStatus::Done)
+                .is_ok_and(|t| t.has_awaiting_landing_cause())
         },
-        || task_failed(&queue, &plain.id),
+        || not_ready_failure(&plain.id),
         "the second ordinary task never started once the slot freed",
     )
     .await;
@@ -267,10 +286,15 @@ async fn an_ordinary_task_still_waits_for_the_ordinary_slot_to_free() {
     let after_ordinary = queue.get(&ordinary.id).unwrap();
     assert_eq!(
         after_ordinary.status,
-        TaskStatus::Done,
+        TaskStatus::Held,
+        "{after_ordinary:?}"
+    );
+    assert!(
+        after_ordinary.has_awaiting_landing_cause(),
         "{after_ordinary:?}"
     );
     let after_plain = queue.get(&plain.id).unwrap();
-    assert_eq!(after_plain.status, TaskStatus::Done, "{after_plain:?}");
+    assert_eq!(after_plain.status, TaskStatus::Held, "{after_plain:?}");
+    assert!(after_plain.has_awaiting_landing_cause(), "{after_plain:?}");
 }
 }

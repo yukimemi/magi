@@ -367,7 +367,17 @@ async fn conclusive_head_e2e_stop_holds_once_suppresses_automatic_retries_and_al
     run_serve_lap(serve_opts(&fx.repo, &config_path, &wt_root)).await;
     let t_done = queue.get(&task_id).unwrap();
     let s_done = RunState::load_under(&run_id, &home).unwrap();
-    assert_eq!(t_done.status, TaskStatus::Done, "task should complete: {:?}", t_done.last_error);
+    assert_eq!(
+        t_done.status,
+        TaskStatus::Held,
+        "unlanded Ready settles to awaiting landing: {:?}",
+        t_done.last_error
+    );
+    assert!(
+        t_done.has_awaiting_landing_cause(),
+        "expected awaiting-landing hold: {:?}",
+        t_done.hold_reason
+    );
     assert_eq!(s_done.status, RunStatus::Ready);
     assert_eq!(count(&counter), 3, "passing E2E ran on the updated candidate HEAD");
     assert!(s_done.head_e2e.as_ref().is_some_and(|e| e.passed));

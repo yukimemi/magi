@@ -1043,6 +1043,9 @@ enum TaskCmd {
         /// Repository the task applies to.
         #[arg(long, default_value = ".")]
         repo: PathBuf,
+        /// Investigation only: completion requires recorded findings, not a merge.
+        #[arg(long)]
+        investigation: bool,
         /// File the task already held, with this reason, so it cannot run
         /// before someone releases it - for work that waits on something (a
         /// pull request that has not merged yet). Held by hand, so only
@@ -1177,6 +1180,16 @@ enum TaskCmd {
         #[arg(long)]
         clear: bool,
     },
+    /// Mark a task as an investigation: its result is a finding, not a change
+    /// to land, so it may be `done` with nonblank findings and is exempt from
+    /// the landing audit.
+    Investigation {
+        /// Task id or unambiguous prefix/suffix.
+        id: String,
+        /// Return the task to an ordinary change task.
+        #[arg(long)]
+        clear: bool,
+    },
     /// Change how urgently a queued or held task should run next.
     ///
     /// Refused once the task is running: priority only affects which task the
@@ -1242,6 +1255,9 @@ enum TaskCmd {
         /// Explain why the task is being closed.
         #[arg(long)]
         reason: Option<String>,
+        /// Nonblank findings required to complete an investigation.
+        #[arg(long)]
+        result: Option<String>,
         /// Explicitly close unmerged work; preserves runs and branches.
         #[arg(long)]
         discard: bool,
@@ -3750,6 +3766,7 @@ fn task_cmd_on(
             title,
             priority,
             repo,
+            investigation,
             hold,
             solo,
             urgent,
@@ -3830,6 +3847,7 @@ fn task_cmd_on(
                             title,
                             instruction: text,
                             repo,
+                            investigation,
                             source,
                             sources: selected,
                             hold,
@@ -3845,6 +3863,7 @@ fn task_cmd_on(
                 serde_json::from_str::<Task>(&response)?
             } else {
                 let mut task = Task::new(title, text, repo, source);
+                task.investigation = investigation;
                 task.sources = selected;
                 if let Some(reason) = hold {
                     task.hold_manual(Some(reason));
@@ -4058,8 +4077,11 @@ async fn task_cmd_inner(command: TaskCmd, q: Queue) -> Result<()> {
                 } else {
                     format!("  [blocked on {} - STUCK]", waits.join(", "))
                 };
+                let landing = magi::landing::annotation(t)
+                    .map(|n| format!("  [{n}]"))
+                    .unwrap_or_default();
                 println!(
-                    "{}  {:<9}{:<4} {:<14} {}{urgent}{question}{waits}",
+                    "{}  {:<9}{:<4} {:<14} {}{urgent}{question}{waits}{landing}",
                     t.short(),
                     t.status.as_str(),
                     attempts,
@@ -4101,6 +4123,15 @@ async fn task_cmd_inner(command: TaskCmd, q: Queue) -> Result<()> {
                 println!("build cache (new run)  unknown (configuration unavailable)");
             }
             println!("attempts  {}", t.attempts);
+            if t.investigation {
+                println!("kind      investigation (no landing required)");
+            }
+            if let Some(result) = t.current_investigation_result() {
+                println!("result    {result}");
+            }
+            if let Some(note) = magi::landing::annotation(&t) {
+                println!("landing   {note}");
+            }
             let attachments = q.attachment_paths(&t);
             if !attachments.is_empty() {
                 println!("attachments:");
@@ -4530,6 +4561,33 @@ async fn task_cmd_inner(command: TaskCmd, q: Queue) -> Result<()> {
             Ok(())
         }
 
+        TaskCmd::Investigation { id, clear } => {
+            let resolved = q.resolve_id(&id)?;
+            let _claim = q.claim(&resolved).with_context(|| {
+                format!("task {resolved} is claimed; wait until the daemon releases it, then retry")
+            })?;
+            q.modify(&resolved, |t| {
+                t.investigation = !clear;
+                t.landing = None;
+                if t.investigation && t.has_awaiting_landing_cause() {
+                    t.hold_manual(t.hold_reason.clone());
+                }
+                true
+            })?;
+            let t = q.get(&resolved)?;
+            println!(
+                "{} is now {} - {}",
+                t.short(),
+                if t.investigation {
+                    "an investigation (no landing required)"
+                } else {
+                    "a change task (landing is audited)"
+                },
+                t.title
+            );
+            Ok(())
+        }
+
         TaskCmd::Priority { id, priority } => {
             if chat_has_control_channel() {
                 println!(
@@ -4566,6 +4624,7 @@ async fn task_cmd_inner(command: TaskCmd, q: Queue) -> Result<()> {
         TaskCmd::Done {
             id,
             reason,
+            result,
             discard,
         } => {
             if chat_has_control_channel() {
@@ -4574,7 +4633,8 @@ async fn task_cmd_inner(command: TaskCmd, q: Queue) -> Result<()> {
                     control_from_chat(magi::chat_control::Operation::Done {
                         task: id,
                         reason,
-                        discard
+                        result,
+                        discard,
                     })
                     .await?
                 );
@@ -4586,9 +4646,16 @@ async fn task_cmd_inner(command: TaskCmd, q: Queue) -> Result<()> {
                 }
                 _ => magi::queue::CompletionActor::Cli,
             };
-            let t =
-                magi::task_completion::close(&q, &magi::run::home(), &id, actor, reason, discard)
-                    .await?;
+            let t = magi::task_completion::close_with_result(
+                &q,
+                &magi::run::home(),
+                &id,
+                actor,
+                reason,
+                result,
+                discard,
+            )
+            .await?;
             println!("{}", magi::task_completion::describe(&t));
             Ok(())
         }
@@ -7380,6 +7447,7 @@ mod tests {
                 title: None,
                 priority: 0,
                 repo: PathBuf::from("."),
+                investigation: false,
                 solo: true,
                 hold: None,
                 urgent: false,
@@ -7529,6 +7597,7 @@ mod tests {
                 title: None,
                 priority: 0,
                 repo: PathBuf::from("."),
+                investigation: false,
                 solo: false,
                 hold: None,
                 urgent: true,
@@ -7553,6 +7622,7 @@ mod tests {
                 title: None,
                 priority: 0,
                 repo: PathBuf::from("."),
+                investigation: false,
                 solo: false,
                 hold: None,
                 urgent: false,
@@ -7594,6 +7664,7 @@ mod tests {
                 title: None,
                 priority: 0,
                 repo: PathBuf::from("."),
+                investigation: false,
                 solo: true,
                 hold: None,
                 urgent: false,
@@ -7618,6 +7689,7 @@ mod tests {
                 title: None,
                 priority: 0,
                 repo: PathBuf::from("."),
+                investigation: false,
                 solo: false,
                 hold: None,
                 urgent: false,
@@ -7663,6 +7735,7 @@ mod tests {
                 title: None,
                 priority: 0,
                 repo: PathBuf::from("."),
+                investigation: false,
                 solo: false,
                 hold: None,
                 urgent: false,
@@ -7689,6 +7762,7 @@ mod tests {
                 title: None,
                 priority: 0,
                 repo: PathBuf::from("."),
+                investigation: false,
                 solo: false,
                 hold: None,
                 urgent: false,
@@ -7731,6 +7805,7 @@ mod tests {
                 title: None,
                 priority: 0,
                 repo: PathBuf::from("."),
+                investigation: false,
                 solo: false,
                 hold: None,
                 urgent: false,
@@ -8323,6 +8398,7 @@ done
                 title: None,
                 priority: 0,
                 repo: missing,
+                investigation: false,
                 solo: false,
                 hold: None,
                 urgent: false,
@@ -8356,6 +8432,7 @@ done
                 title: None,
                 priority: 0,
                 repo: repo.clone(),
+                investigation: false,
                 solo: false,
                 hold: None,
                 urgent: false,
@@ -8425,6 +8502,7 @@ command = ['sh', '-c', 'cat >/dev/null; printf "%s" "{\"duplicate\":true,\"reaso
             title: None,
             priority: 0,
             repo: repo.clone(),
+            investigation: false,
             solo: false,
             hold: None,
             urgent: false,

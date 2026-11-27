@@ -7633,6 +7633,7 @@ async fn queue_edit(
 #[serde(default, deny_unknown_fields)]
 struct CompleteBody {
     reason: Option<String>,
+    result: Option<String>,
     discard: bool,
 }
 
@@ -7655,6 +7656,7 @@ async fn queue_done(
         claimed,
         crate::queue::CompletionActor::Web,
         body.reason,
+        body.result,
         body.discard,
     )
     .await

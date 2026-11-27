@@ -808,6 +808,24 @@ pub fn task_held(task: &crate::queue::Task) -> Option<Notice> {
             format!("Task {} is waiting for disk capacity and will resume automatically after admission succeeds.", task.short()))
             .link(Link::Task { id: task.id.clone() }).about([task.id.clone()]).cause("disk-capacity"));
     }
+    if let Some(run_id) = task.awaiting_landing_run() {
+        return Some(
+            Notice::warn(
+                &format!("task:{}", task.id),
+                format!(
+                    "Task {} is ready on its branch (run {}) and awaiting landing.",
+                    task.short(),
+                    crate::run::short_of(run_id)
+                ),
+            )
+            .link(Link::Task {
+                id: task.id.clone(),
+            })
+            .about([task.id.clone()])
+            .since(task.held_at)
+            .cause(format!("awaiting-landing:{run_id}")),
+        );
+    }
     let why = clean_text(task.hold_reason.as_deref())
         .or_else(|| clean_text(task.last_error.as_deref()))
         .unwrap_or("no reason recorded");

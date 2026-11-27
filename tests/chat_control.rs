@@ -1464,17 +1464,23 @@ fn chat_commands_over_the_bridge_settle_native_inquiries_and_dismiss_approvals()
 
             // Completing a task after a successful retry must also retire the
             // prior blocked run, a write the read-only seat cannot perform.
+            let mut completed = f.saved();
             let mut successful = RunState::new(
-                home.to_owned(),
+                completed.repo.clone(),
                 "main".into(),
                 "head".into(),
-                "Retry".into(),
+                completed.instruction.clone(),
                 f.run.config.clone(),
             );
-            successful.status = RunStatus::Ready;
+            successful.status = RunStatus::Merged;
+            successful.merge = Some(magi::run::MergeOutcome {
+                mode: magi::config::MergeMode::Pr,
+                ok: true,
+                detail: "merged".into(),
+                empty: false,
+            });
             successful.driver_exited = true;
             successful.save_under(home).unwrap();
-            let mut completed = f.saved();
             completed.runs.push(successful.id.clone());
             f.queue().put(&mut completed).unwrap();
             let attachment = home.join("follow-up.txt");

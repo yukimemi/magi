@@ -149,7 +149,13 @@ use crate::id_reserve::{IdSource, path_exists};
 /// 25: append-only completion/reopen audit and occurrence-bound completion notices.
 ///
 /// 26: typed conclusive `head_e2e` machine hold cause.
-pub const SCHEMA: u32 = 26;
+///
+/// 27: explicit investigation tasks (`investigation`), monotonic instruction
+/// generations (`instruction_rev`), generation-bound investigation results
+/// (`completion_result`), cached landing audit notes (`landing`), and typed
+/// `awaiting_landing` machine holds. Old records default to change tasks at
+/// generation 0 with no landing note.
+pub const SCHEMA: u32 = 27;
 
 const RECOVERY_HOLD_SCHEMA: u32 = 24;
 
@@ -189,6 +195,27 @@ pub enum MachineHoldCause {
         /// Stable stop identity and failure facts.
         stop: crate::head_e2e_stop::Stop,
     },
+    /// A change run finished `Ready` without confirmed landing on its base.
+    AwaitingLanding {
+        /// Retained run whose work sits on its branch awaiting landing.
+        run: String,
+        /// Why landing was not confirmed when the run settled.
+        reason: String,
+    },
+}
+
+/// Non-empty investigation findings bound to the instruction generation they
+/// answered, so editing an investigation invalidates older results even if the
+/// text is later reverted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InvestigationResult {
+    /// Recorded findings text.
+    pub text: String,
+    /// [`Task::instruction_rev`] active when these findings were recorded.
+    #[serde(default)]
+    pub instruction_rev: u64,
+    /// When the findings were recorded.
+    pub recorded_at: Timestamp,
 }
 
 /// Who placed the current hold.
@@ -533,6 +560,19 @@ pub struct Task {
     pub title: String,
     /// The task itself, handed to the graph verbatim.
     pub instruction: String,
+    /// Monotonic generation bumped on every instruction change (never on title-only edits).
+    #[serde(default)]
+    pub instruction_rev: u64,
+    /// Explicit task kind: produces findings rather than a repository change to land.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub investigation: bool,
+    /// Structured findings required to complete an investigation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_result: Option<InvestigationResult>,
+    /// Cached outcome of the landing audit ([`crate::landing`]). Advisory only
+    /// for completed tasks; never bumps `updated_at`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub landing: Option<crate::landing::LandingNote>,
     /// Explicit, SHA-pinned implementation imports; separate from instruction text.
     #[serde(default, skip_serializing_if = "crate::refs::Sources::is_empty")]
     pub sources: crate::refs::Sources,
@@ -1236,6 +1276,10 @@ impl Task {
             id: new_id(),
             title,
             instruction,
+            instruction_rev: 0,
+            investigation: false,
+            completion_result: None,
+            landing: None,
             sources: crate::refs::Sources::default(),
             repo,
             reassignments: Vec::new(),
@@ -1684,6 +1728,7 @@ impl Task {
         self.record_completion(CompletionAction::Complete, context);
         self.stamp_schema();
         self.status = TaskStatus::Done;
+        self.landing = None;
         if let Some(pin) = self.resume_override.take()
             && !pin.question_id.is_empty()
             && let Some(run) = pin.pinned_run
@@ -2150,6 +2195,101 @@ impl Task {
         )
     }
 
+    /// Hold a change task whose `Ready` run finished without confirmed landing.
+    /// Attempts and retained branches stay intact; no automatic re-competition starts.
+    pub(crate) fn hold_awaiting_landing(&mut self, run: String, reason: String) {
+        self.hold_machine(Some(reason.clone()));
+        self.last_error = Some(reason.clone());
+        self.machine_hold_cause = Some(MachineHoldCause::AwaitingLanding { run, reason });
+        self.stamp_schema();
+    }
+
+    /// Whether this task is held specifically because its `Ready` run has not landed.
+    pub fn has_awaiting_landing_cause(&self) -> bool {
+        self.status == TaskStatus::Held
+            && matches!(
+                self.machine_hold_cause,
+                Some(MachineHoldCause::AwaitingLanding { .. })
+            )
+    }
+
+    /// The run ID bound to an active `AwaitingLanding` hold, if any.
+    pub fn awaiting_landing_run(&self) -> Option<&str> {
+        if self.status != TaskStatus::Held {
+            return None;
+        }
+        match &self.machine_hold_cause {
+            Some(MachineHoldCause::AwaitingLanding { run, .. }) => Some(run.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Whether this completed task was explicitly closed via `--discard`.
+    pub fn completed_by_discard(&self) -> bool {
+        self.status == TaskStatus::Done
+            && self
+                .completion_history
+                .last()
+                .is_some_and(|event| event.action == CompletionAction::Complete && event.discard)
+    }
+
+    /// Non-empty investigation findings recorded for the current instruction generation.
+    pub fn current_investigation_result(&self) -> Option<&str> {
+        self.completion_result
+            .as_ref()
+            .filter(|res| {
+                res.instruction_rev == self.instruction_rev && !res.text.trim().is_empty()
+            })
+            .map(|res| res.text.as_str())
+    }
+
+    /// Validate that an investigation has non-blank findings for the current
+    /// instruction generation, either supplied now (`result`) or already recorded.
+    pub fn validate_investigation_result<'a>(
+        &'a self,
+        result: Option<&'a str>,
+    ) -> Result<Option<&'a str>> {
+        if !self.investigation {
+            return Ok(None);
+        }
+        if let Some(raw) = result {
+            let trimmed = raw.trim();
+            anyhow::ensure!(
+                !trimmed.is_empty(),
+                "an investigation requires a nonblank --result"
+            );
+            return Ok(Some(trimmed));
+        }
+        self.current_investigation_result()
+            .map(Some)
+            .context("an investigation requires a nonblank --result")
+    }
+
+    /// Persist validated investigation findings bound to [`Task::instruction_rev`].
+    pub fn record_investigation_result(&mut self, result: Option<&str>) -> Result<()> {
+        if !self.investigation {
+            return Ok(());
+        }
+        let text = self
+            .validate_investigation_result(result)?
+            .expect("investigation validated nonblank")
+            .to_owned();
+        if result.is_some()
+            || self
+                .completion_result
+                .as_ref()
+                .is_none_or(|existing| existing.instruction_rev != self.instruction_rev)
+        {
+            self.completion_result = Some(InvestigationResult {
+                text,
+                instruction_rev: self.instruction_rev,
+                recorded_at: Timestamp::now(),
+            });
+            self.stamp_schema();
+        }
+        Ok(())
+    }
+
     /// Stable stop identifier when this task is held on a conclusive `head_e2e` failure.
     pub fn head_e2e_stop_id(&self) -> Option<&str> {
         if let Some(MachineHoldCause::HeadE2e { stop }) = &self.machine_hold_cause {
@@ -2505,15 +2645,24 @@ impl Task {
         if self.review_branch.is_some() && self.review_instruction.is_none() {
             self.review_instruction = Some(self.instruction.clone());
         }
-        if self.instruction != instruction {
-            // A run selected for earlier criteria is no longer authorized by
-            // this revised instruction. Title-only edits preserve the pin.
+        let instruction_changed = self.instruction != instruction;
+        if instruction_changed {
+            // A run or investigation result recorded for earlier criteria is no
+            // longer authorized by this revised instruction. Title-only edits
+            // preserve both.
+            self.instruction_rev = self.instruction_rev.saturating_add(1);
+            self.completion_result = None;
+            self.landing = None;
             self.resume_override = None;
+            self.stamp_schema();
         }
-        if self.status == TaskStatus::Held && self.machine_hold_cause.is_some() {
-            self.hold_manual(self.hold_reason.clone());
+        let keep_awaiting_landing = !instruction_changed && self.has_awaiting_landing_cause();
+        if !keep_awaiting_landing {
+            if self.status == TaskStatus::Held && self.machine_hold_cause.is_some() {
+                self.hold_manual(self.hold_reason.clone());
+            }
+            self.machine_hold_cause = None;
         }
-        self.machine_hold_cause = None;
         self.disk_resume_run = None;
         self.disk_checked_at = None;
         self.title = title;
@@ -3660,7 +3809,46 @@ impl Queue {
             {
                 task.chat_notice = Some(n);
             }
+            // Preserve a cached landing audit note written without bumping `updated_at`.
+            if task.landing.is_none()
+                && let Some(note) = stored.landing
+                && task.status == stored.status
+                && task.instruction_rev == stored.instruction_rev
+                && task.investigation == stored.investigation
+                && task.execution_runs().last() == Some(&note.run)
+            {
+                task.landing = Some(note);
+            }
         }
+    }
+
+    /// Audit-only cache update: save a landing verdict only while the observed
+    /// snapshot is unchanged, without bumping `updated_at` or raising notices.
+    pub(crate) fn cache_landing(
+        &self,
+        observed: &Task,
+        note: crate::landing::LandingNote,
+    ) -> Result<()> {
+        let Ok(_claim) = self.claim(&observed.id) else {
+            return Ok(());
+        };
+        let _lock = self.lock_task(&observed.id)?;
+        let mut task = self.get(&observed.id)?;
+        if task.updated_at == observed.updated_at
+            && task.status == observed.status
+            && task.investigation == observed.investigation
+            && task.instruction_rev == observed.instruction_rev
+            && task.landing == observed.landing
+            && task.repo == observed.repo
+            && task.reassignments == observed.reassignments
+            && (crate::landing::audited_run(&task) == Some(note.run.as_str())
+                || crate::landing::awaiting_landing_run(&task) == Some(note.run.as_str()))
+        {
+            task.stamp_schema();
+            task.landing = Some(note);
+            self.write_startup_history(&task)?;
+        }
+        Ok(())
     }
 
     /// Audit-only update; caller holds the task write lock and claim. Preserve
@@ -3679,6 +3867,13 @@ impl Queue {
     }
 
     fn write_record_inner(&self, task: &mut Task, notify: bool) -> Result<()> {
+        if task.investigation
+            || task.completion_result.is_some()
+            || task.instruction_rev > 0
+            || task.landing.is_some()
+        {
+            task.stamp_schema();
+        }
         task.import_chat_notice();
         if task.status != TaskStatus::Held && task.sync_only.is_none() {
             task.recovery_budget_hold = None;

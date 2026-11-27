@@ -2052,8 +2052,58 @@ fn settle_in(
         {
             task.hold_manual(Some("Public delivery is not confirmed. Inspect the selected PR and run, then use recover-pr --disposition land with the intended source and validation configuration.".into()));
         }
-        RunStatus::Merged | RunStatus::Ready => task.succeed(completion(task)),
-        RunStatus::AlreadyInBase => task.already_landed(detail, completion(task)),
+        RunStatus::Merged => {
+            if task.investigation && task.current_investigation_result().is_none() {
+                task.hold_unrequested_retry(Some(
+                    "Investigation finished without recorded findings; complete it with a nonblank --result."
+                        .into(),
+                ));
+            } else {
+                task.succeed(completion(task));
+            }
+        }
+        RunStatus::Ready => {
+            if task.investigation {
+                if task.current_investigation_result().is_some() {
+                    task.succeed(completion(task));
+                } else {
+                    task.hold_unrequested_retry(Some(
+                        "Investigation finished without recorded findings; complete it with a nonblank --result."
+                            .into(),
+                    ));
+                }
+            } else if state.is_some_and(crate::landing::run_landed_for_settle) {
+                task.succeed(completion(task));
+            } else {
+                // `Ready` means mergeable, not merged: `[merge] mode = "none"`,
+                // an empty winner, or an unmerged PR all stop here. Keep the
+                // branch and attempt intact without re-competing.
+                let reason = "Ready but not landed: the run finished without a confirmed merge \
+                    into the base branch, so the task is not done. Review the retained branch \
+                    and land it (then `magi task done`), release the task to run it again, or \
+                    mark it with `magi task investigation` if it was never meant to change the \
+                    repository."
+                    .to_owned();
+                if let Some(run_id) = state
+                    .map(|s| s.id.clone())
+                    .or_else(|| task.execution_runs().last().cloned())
+                {
+                    task.hold_awaiting_landing(run_id, reason);
+                } else {
+                    task.hold_unrequested_retry(Some(reason));
+                }
+            }
+        }
+        RunStatus::AlreadyInBase => {
+            if task.investigation && task.current_investigation_result().is_none() {
+                task.hold_unrequested_retry(Some(
+                    "Investigation finished without recorded findings; complete it with a nonblank --result."
+                        .into(),
+                ));
+            } else {
+                task.already_landed(detail, completion(task));
+            }
+        }
         RunStatus::Stalled if verdict.quota_hit => task.stall(detail),
         RunStatus::Failed if verdict.quota_hit && verdict.no_viable_candidates => {
             task.stall(detail)
@@ -2225,12 +2275,19 @@ fn settle_and_diagnose(
             return;
         }
         if (d.choice == md::WITHDRAW && d.closed) || d.choice == md::DISMISS {
-            task.succeed(CompletionContext::from_run(
-                CompletionActor::DaemonSettle,
-                Some(format!("Owner merge decision {}: {}", d.question, d.choice)),
-                task,
-                state,
-            ));
+            if task.investigation && task.current_investigation_result().is_none() {
+                task.hold_unrequested_retry(Some(
+                    "Investigation finished without recorded findings; complete it with a nonblank --result."
+                        .into(),
+                ));
+            } else {
+                task.succeed(CompletionContext::from_run(
+                    CompletionActor::DaemonSettle,
+                    Some(format!("Owner merge decision {}: {}", d.question, d.choice)),
+                    task,
+                    state,
+                ));
+            }
         } else if let Some(agent) = md::selected_agent(&d.choice).filter(|_| d.closed) {
             if state.liveness(false) != Liveness::Dead {
                 task.hold_manual(Some("Previous driver is still live; replacement held until it exits. Release the task after checking the driver.".into()));
@@ -2420,12 +2477,19 @@ fn settle_and_diagnose(
         )
     {
         if state.pr_recovery == task.pr_recovery && state.public_delivery_complete() {
-            task.succeed(CompletionContext::from_run(
-                CompletionActor::DaemonSettle,
-                Some(detail.to_owned()),
-                task,
-                state,
-            ));
+            if task.investigation && task.current_investigation_result().is_none() {
+                task.hold_unrequested_retry(Some(
+                    "Investigation finished without recorded findings; complete it with a nonblank --result."
+                        .into(),
+                ));
+            } else {
+                task.succeed(CompletionContext::from_run(
+                    CompletionActor::DaemonSettle,
+                    Some(detail.to_owned()),
+                    task,
+                    state,
+                ));
+            }
         } else {
             task.hold_manual(Some("Selected PR delivery is incomplete: local review or publication is not a confirmed public merge. Inspect the run and PR; use recover-pr --disposition land with --source-head <reviewed-full-SHA> and the required verification configuration. No automatic new attempt will start.".into()));
         }
@@ -2497,6 +2561,12 @@ fn settle_and_diagnose(
             task.land_sync_notice(state);
         } else if let Some(stop) = &head_e2e_stop {
             task.head_e2e_notice(stop);
+        } else if task.has_awaiting_landing_cause() {
+            task.notice_cause(
+                "awaiting-landing",
+                Some(&state.id),
+                state.passes.last().map(|p| p.index),
+            );
         } else if state.prep_failure.is_none() {
             task.notice_cause(
                 label(verdict.status),
@@ -2504,7 +2574,9 @@ fn settle_and_diagnose(
                 state.passes.last().map(|p| p.index),
             );
         }
-        task.diagnostic = diagnostic(state);
+        if !task.has_awaiting_landing_cause() {
+            task.diagnostic = diagnostic(state);
+        }
         note_open_question(task, &state.id, p);
     }
 }
@@ -5659,6 +5731,7 @@ async fn attempt(
         }
     }
     runner.state.task_instruction = Some(task.instruction.clone());
+    runner.state.task_instruction_rev = Some(task.instruction_rev);
     // The follow-up depth is fixed now, while the task certainly exists:
     // deleting it later must not reset the cap (`crate::followup`).
     runner.state.followup_generation = Some(task.followup.as_ref().map_or(0, |f| f.generation));
@@ -6866,6 +6939,11 @@ fn may_resume_run(run: &RunState, task: &Task) -> bool {
 
 /// Review scaffolding is execution context, not evidence of an operator edit.
 pub(crate) fn compatible_run_instruction(run: &RunState, task: &Task) -> bool {
+    if let Some(rev) = run.task_instruction_rev
+        && rev != task.instruction_rev
+    {
+        return false;
+    }
     if let Some(authored) = &run.task_instruction {
         return compatible_instruction(authored, task);
     }
@@ -8924,7 +9002,7 @@ mod tests {
         // run status, resulting task status, attempts still standing after one
         let table = [
             (RunStatus::Merged, TaskStatus::Done, 1),
-            (RunStatus::Ready, TaskStatus::Done, 1),
+            (RunStatus::Ready, TaskStatus::Held, 1),
             (RunStatus::Stalled, TaskStatus::Failed, 0),
             (RunStatus::Blocked, TaskStatus::Failed, 1),
             (RunStatus::Failed, TaskStatus::Failed, 1),
@@ -9727,24 +9805,21 @@ mod tests {
         t.start(state.id.clone());
         // The final state is newer than disk, as when a worker settles its
         // in-memory outcome or recovery is passed an already loaded run.
-        state.status = RunStatus::Ready;
+        state.status = RunStatus::Merged;
         settle_and_diagnose(
             &mut t,
-            unstarted_verdict(RunStatus::Ready),
-            "Verified local delivery",
+            unstarted_verdict(RunStatus::Merged),
+            "Verified delivery",
             2,
             &state,
         );
         let completion = t.completion_history.last().unwrap();
         assert_eq!(completion.actor, CompletionActor::DaemonSettle);
         assert_eq!(completion.prior_status, TaskStatus::Running);
-        assert_eq!(
-            completion.reason.as_deref(),
-            Some("Verified local delivery")
-        );
+        assert_eq!(completion.reason.as_deref(), Some("Verified delivery"));
         let snapshot = completion.run.as_ref().unwrap();
         assert_eq!(snapshot.id, state.id);
-        assert_eq!(snapshot.status, Some(RunStatus::Ready));
+        assert_eq!(snapshot.status, Some(RunStatus::Merged));
         assert_eq!(
             RunState::load_under(&state.id, dir.path()).unwrap().status,
             RunStatus::Blocked,
@@ -10552,8 +10627,17 @@ mod tests {
         reclaim(&mut t, Some(run_state(RunStatus::Ready)), 2, "en");
         assert_eq!(
             t.status,
+            TaskStatus::Held,
+            "an unlanded Ready run settles to held awaiting landing rather than staying `running`"
+        );
+        assert!(t.has_awaiting_landing_cause());
+        let mut merged = task();
+        merged.start("20260904-000000-4044".to_owned());
+        reclaim(&mut merged, Some(run_state(RunStatus::Merged)), 2, "en");
+        assert_eq!(
+            merged.status,
             TaskStatus::Done,
-            "a run that actually finished must not stay `running` forever"
+            "a merged run closes the task cleanly"
         );
     }
 

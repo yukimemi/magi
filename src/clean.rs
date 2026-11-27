@@ -120,6 +120,14 @@ pub async fn housekeep(
         // pass is idempotent, so a backlog drains over several passes.
         out.stale_pr_states_repaired = crate::land::repair_stale_pr_states(home, 5).await.0;
     }
+    // Bounded and timeout-guarded; audits done tasks without transitioning them
+    // and promotes held awaiting-landing tasks once landing is confirmed.
+    crate::landing::audit_pass(
+        home,
+        crate::landing::Limits::default(),
+        crate::landing::MAX_PER_PASS,
+    )
+    .await;
     match prune_cache_if_over_limit(cfg, home) {
         Ok(Some(pruned)) => {
             out.cache_files = pruned.files;

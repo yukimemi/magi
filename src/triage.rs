@@ -1747,6 +1747,9 @@ fn run_once_with_probe(
         {
             continue;
         }
+        if task.has_awaiting_landing_cause() {
+            continue;
+        }
         if !disk_only {
             match crate::head_e2e_stop::triage_status(queue, &task) {
                 crate::head_e2e_stop::TriageStatus::NotHeadE2e => {}
