@@ -500,15 +500,13 @@ async fn gather_facts(run: &RunState, limits: Limits) -> Facts {
     }
     match tokio::time::timeout(limits.git, local_branch(run, head)).await {
         Ok(Ok(Branch::Empty)) => Facts::Empty,
-        Ok(Ok(Branch::InBase(tested))) => {
-            match base_is_stale(run, &tested, limits).await {
-                None => Facts::InBase,
-                Some(git_error) => Facts::Compared {
-                    git_error: Some(git_error),
-                    forge: Ok(None),
-                },
-            }
-        }
+        Ok(Ok(Branch::InBase(tested))) => match base_is_stale(run, &tested, limits).await {
+            None => Facts::InBase,
+            Some(git_error) => Facts::Compared {
+                git_error: Some(git_error),
+                forge: Ok(None),
+            },
+        },
         Ok(Ok(Branch::OutsideBase(tested))) => {
             // Query remote freshness and forge in parallel so `ls-remote` does
             // not extend worst-case audit latency beyond the forge timeout.
@@ -669,7 +667,10 @@ fn try_promote_awaiting_landing(
     };
     // The asynchronous observation predates these locks. Refuse any changed
     // run snapshot, including head, base, pass and merge evidence.
-    match (serde_json::to_value(run_state), serde_json::to_value(&reloaded)) {
+    match (
+        serde_json::to_value(run_state),
+        serde_json::to_value(&reloaded),
+    ) {
         (Ok(observed), Ok(current)) if observed == current => {}
         _ => return false,
     }
