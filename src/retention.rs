@@ -116,6 +116,51 @@ impl Drop for OutputFile {
     }
 }
 
+/// A source's output lease is held by a live writer, reader or reclaimer.
+/// Typed so that a fold can tell "someone is using it" from a real failure;
+/// the text is what operators and `copies::inspection_outcome` already read.
+#[derive(Debug)]
+pub(crate) struct OutputsInUse(PathBuf);
+
+impl std::fmt::Display for OutputsInUse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "output lease: outputs are in use or being reclaimed: {}",
+            self.0.display()
+        )
+    }
+}
+
+impl std::error::Error for OutputsInUse {}
+
+/// A lock call that failed for a reason other than somebody holding the lock
+/// (`ENOLCK`, `EINTR`, a permission error): a failure of its own. Typed so the
+/// fold boundary reports it as `failed`, not as an unproven source.
+#[derive(Debug)]
+pub(crate) struct LockCallFailed {
+    what: String,
+    source: std::io::Error,
+}
+
+impl LockCallFailed {
+    pub(crate) fn new(what: String, source: std::io::Error) -> Self {
+        Self { what, source }
+    }
+}
+
+impl std::fmt::Display for LockCallFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "lock call failed: {}: {}", self.what, self.source)
+    }
+}
+
+impl std::error::Error for LockCallFailed {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 impl OutputLease {
     #[cfg(unix)]
     pub(crate) fn descriptor(&self) -> std::os::fd::RawFd {
@@ -351,20 +396,23 @@ impl OutputLease {
                 libc::LOCK_SH
             };
             // SAFETY: live file descriptor, no retained pointers.
-            ensure!(
-                unsafe { libc::flock(file.as_raw_fd(), mode | libc::LOCK_NB) } == 0,
-                "output lease: outputs are in use or being reclaimed: {}",
-                path.display()
-            );
+            if unsafe { libc::flock(file.as_raw_fd(), mode | libc::LOCK_NB) } != 0 {
+                let error = std::io::Error::last_os_error();
+                // Contention is somebody else using the outputs; any other
+                // failure of the lock call (ENOLCK, EINTR, ...) is not.
+                if error.kind() == std::io::ErrorKind::WouldBlock {
+                    return Err(OutputsInUse(path.to_owned()).into());
+                }
+                return Err(error)
+                    .with_context(|| format!("output lease: lock {}", path.display()));
+            }
         }
         #[cfg(windows)]
         {
             use std::os::windows::io::AsRawHandle as _;
-            ensure!(
-                crate::chat_watch::windows::lock_file_mode(file.as_raw_handle(), true, exclusive)?,
-                "output lease: outputs are in use or being reclaimed: {}",
-                path.display()
-            );
+            if !crate::chat_watch::windows::lock_file_mode(file.as_raw_handle(), true, exclusive)? {
+                return Err(OutputsInUse(path.to_owned()).into());
+            }
         }
         #[cfg(not(any(unix, windows)))]
         let _ = exclusive;
@@ -1281,8 +1329,19 @@ pub(crate) fn cargo_locks(target: &Path) -> Result<Vec<File>> {
                 .write(true)
                 .open(&lock)
                 .with_context(|| format!("Cargo lock: open {}", lock.display()))?;
-            crate::pr_head::try_lock_file(&file)
-                .with_context(|| format!("Cargo build is active: {}", lock.display()))?;
+            crate::pr_head::try_lock_file(&file).map_err(|error| {
+                let held = error.kind() == std::io::ErrorKind::WouldBlock
+                    || cfg!(windows) && error.raw_os_error() == Some(33);
+                if held {
+                    anyhow::Error::new(error)
+                        .context(format!("Cargo build is active: {}", lock.display()))
+                } else {
+                    anyhow::Error::new(LockCallFailed::new(
+                        format!("Cargo lock {}", lock.display()),
+                        error,
+                    ))
+                }
+            })?;
             held.push(file);
         }
     }
@@ -1294,13 +1353,17 @@ pub(crate) fn cargo_locks(target: &Path) -> Result<Vec<File>> {
 pub(crate) async fn sweep(home: &Path, disk: &crate::config::Disk, now: Timestamp) -> Report {
     let home = home.to_owned();
     let disk = disk.clone();
+    // Asked on the caller's thread: the pass itself runs on a blocking one.
+    let containment = containment_available();
     let runtime = tokio::runtime::Handle::current();
-    tokio::task::spawn_blocking(move || runtime.block_on(sweep_inner(&home, &disk, now)))
-        .await
-        .unwrap_or_else(|e| Report {
-            failures: vec![format!("retention worker failed: {e}")],
-            ..Report::default()
-        })
+    tokio::task::spawn_blocking(move || {
+        runtime.block_on(sweep_inner_on(&home, &disk, now, containment))
+    })
+    .await
+    .unwrap_or_else(|e| Report {
+        failures: vec![format!("retention worker failed: {e}")],
+        ..Report::default()
+    })
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -1309,7 +1372,141 @@ struct Measurement {
     bytes: u64,
 }
 
-async fn sweep_inner(home: &Path, disk: &crate::config::Disk, now: Timestamp) -> Report {
+/// What a pass records when the platform cannot contain a build's descendants.
+/// Not removable by configuration: deleting outputs without that containment
+/// could race a live compile.
+const UNSUPPORTED_PLATFORM: &str = "Automatic output reclamation requires Unix process containment";
+
+/// Whether this platform can contain a build's descendants (Unix process
+/// groups). Tests may turn it off for the calling thread.
+fn containment_available() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = NO_CONTAINMENT.with(std::cell::Cell::get) {
+        return forced;
+    }
+    cfg!(unix)
+}
+
+#[cfg(test)]
+thread_local! {
+    static NO_CONTAINMENT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Makes [`sweep`] behave, for the calling thread, as on a platform without
+/// process containment, until dropped.
+#[cfg(test)]
+pub(crate) struct WithoutContainment;
+
+#[cfg(test)]
+impl WithoutContainment {
+    pub(crate) fn new() -> Self {
+        NO_CONTAINMENT.with(|forced| forced.set(Some(false)));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for WithoutContainment {
+    fn drop(&mut self) {
+        NO_CONTAINMENT.with(|forced| forced.set(None));
+    }
+}
+
+/// Persist the pass report (`retention.json`). A refusal is reported through
+/// the same file as a completed pass, so a platform where reclamation is off
+/// says so instead of leaving no report at all.
+///
+/// Every publication stages into its own uniquely named file and replaces
+/// `retention.json` by rename, so two passes publishing at once (housekeeping
+/// and disk-pressure workers overlap across an idle/busy transition, and a
+/// platform that refuses reclamation takes no `retention.lock`) can neither
+/// truncate nor rename each other's staging file: the report on disk is always
+/// one complete report.
+fn save_report(home: &Path, report: &Report) {
+    if let Err(e) = publish_report(home, report) {
+        tracing::warn!("retention report could not be saved: {e:#}");
+    }
+}
+
+const STAGING_PREFIX: &str = "retention.json.";
+const STAGING_SUFFIX: &str = ".tmp";
+/// A staging file this much older than a publication is the leftover of a
+/// process that died between writing and renaming it.
+const STAGING_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// Remove this report's staging files (including the single shared name earlier
+/// builds used) that were last written more than `max_age` ago. Best effort.
+fn remove_stale_staging(home: &Path, max_age: std::time::Duration) {
+    for entry in std::fs::read_dir(home).into_iter().flatten().flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !(name.starts_with(STAGING_PREFIX) && name.ends_with(STAGING_SUFFIX)) {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|written| written.elapsed().ok())
+            .is_some_and(|age| age > max_age);
+        if stale {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// A new, uniquely named staging file, created exclusively: a name left by a
+/// dead process with the same id is skipped, never written through.
+fn create_staging(home: &Path) -> Result<(PathBuf, std::fs::File)> {
+    static STAGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    create_staging_numbered(home, &mut || {
+        STAGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    })
+}
+
+/// [`create_staging`] with the sequence of numbers supplied by `next`.
+fn create_staging_numbered(
+    home: &Path,
+    next: &mut dyn FnMut() -> u64,
+) -> Result<(PathBuf, std::fs::File)> {
+    for _ in 0..64 {
+        let tmp = home.join(format!(
+            "{STAGING_PREFIX}{}-{}{STAGING_SUFFIX}",
+            std::process::id(),
+            next()
+        ));
+        match OpenOptions::new().write(true).create_new(true).open(&tmp) {
+            Ok(file) => return Ok((tmp, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e).with_context(|| format!("create {}", tmp.display())),
+        }
+    }
+    anyhow::bail!("no unused staging name for the retention report")
+}
+
+fn publish_report(home: &Path, report: &Report) -> Result<()> {
+    use std::io::Write as _;
+    remove_stale_staging(home, STAGING_MAX_AGE);
+    let body = serde_json::to_vec_pretty(report)?;
+    let (tmp, mut file) = create_staging(home)?;
+    let published = file.write_all(&body).and_then(|()| {
+        drop(file);
+        std::fs::rename(&tmp, home.join("retention.json"))
+    });
+    if published.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    Ok(published?)
+}
+
+/// The pass itself, with the platform capability injected, so the refusal is
+/// testable on a platform that has the capability.
+async fn sweep_inner_on(
+    home: &Path,
+    disk: &crate::config::Disk,
+    now: Timestamp,
+    unix_containment: bool,
+) -> Report {
     let mut report = Report {
         checked_at: Some(now),
         limit_bytes: disk.worktree_limit_bytes,
@@ -1317,10 +1514,9 @@ async fn sweep_inner(home: &Path, disk: &crate::config::Disk, now: Timestamp) ->
         reclaim_free_bytes: disk.reclaim_threshold(),
         ..Report::default()
     };
-    if !cfg!(unix) {
-        report
-            .failures
-            .push("Automatic output reclamation requires Unix process containment".into());
+    if !unix_containment {
+        report.failures.push(UNSUPPORTED_PLATFORM.into());
+        save_report(home, &report);
         return report;
     }
     let Ok(_janitor) = OutputLease::lock(&home.join("retention.lock"), true) else {
@@ -1616,13 +1812,7 @@ async fn sweep_inner(home: &Path, disk: &crate::config::Disk, now: Timestamp) ->
             (i128::from(after) - i128::from(before))
                 .clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
         });
-    let store = home.join("retention.json");
-    if let Ok(body) = serde_json::to_vec_pretty(&report) {
-        let tmp = home.join("retention.json.tmp");
-        if let Err(e) = std::fs::write(&tmp, body).and_then(|()| std::fs::rename(tmp, store)) {
-            tracing::warn!("retention report could not be saved: {e}");
-        }
-    }
+    save_report(home, &report);
     tracing::info!(
         measured_bytes = report.measured_bytes,
         freed_bytes = report.freed_bytes,
@@ -2250,6 +2440,25 @@ mod tests {
                 .unwrap();
             task
         }
+    }
+
+    /// A fold that is refused for the rule under test: the record is there and
+    /// readable (the arrangement was saved in `home`), so a refusal that says
+    /// `record gone` or `unreadable` would be the fixture's mistake, not the
+    /// rule's. Returns the error for the caller to assert on.
+    async fn refused(state: &mut RunState, home: &Path) -> anyhow::Error {
+        use crate::graph::FoldRefusal;
+        let error = crate::graph::fold_run(state, true, home)
+            .await
+            .expect_err("the fold is refused");
+        assert!(
+            !matches!(
+                error.downcast_ref::<FoldRefusal>(),
+                Some(FoldRefusal::RecordGone | FoldRefusal::Unreadable(_))
+            ),
+            "refused for the wrong reason: {error:#}"
+        );
+        error
     }
 
     #[cfg(unix)]
@@ -4301,11 +4510,18 @@ mod tests {
         });
         // Publication success and terminal labels alone are insufficient.
         for status in [RunStatus::Ready, RunStatus::Failed, RunStatus::Superseded] {
+            // Each label is saved with the confirmed merge, so the fold decides
+            // on it under its locks; the refusal is the queue's retention
+            // reason, which names the task, not a missing record.
             source.status = status;
+            source.save_under(&f.home).unwrap();
+            let error = refused(&mut source, &f.home).await;
             assert!(
-                crate::graph::fold_run(&mut source, true, &f.home)
-                    .await
-                    .is_err()
+                matches!(
+                    error.downcast_ref::<crate::graph::FoldRefusal>(),
+                    Some(crate::graph::FoldRefusal::Retained(reason)) if reason.contains(&task.id)
+                ),
+                "{status:?}: {error:#}"
             );
             assert!(source.candidates[0].worktree.exists());
         }
@@ -4595,9 +4811,12 @@ mod tests {
                 empty: false,
             });
             state.save_under(&f.home).unwrap();
-            // Unexpected external paths remain protected, even if absent.
+            // Unexpected external paths remain protected, even if absent. A
+            // fold decides on the record it reads under its locks, so the
+            // arranged record is the one on disk, not only the one in memory.
             let owned = state.candidates[0].worktree.clone();
             state.candidates[0].worktree = f.home.join("missing-external");
+            state.save_under(&f.home).unwrap();
             assert!(
                 crate::graph::fold_run(&mut state, true, &f.home)
                     .await
@@ -4606,23 +4825,16 @@ mod tests {
                     .contains("outside the inventoried")
             );
             state.candidates[0].worktree = owned;
+            state.save_under(&f.home).unwrap();
             // A live output borrower blocks the entire preflight.
             let guard = OutputLease::borrow(&reviewer).unwrap().unwrap();
-            assert!(
-                crate::graph::fold_run(&mut state, true, &f.home)
-                    .await
-                    .is_err()
-            );
+            refused(&mut state, &f.home).await;
             assert!(reviewer.exists());
             drop(guard);
             // Failure to persist evidence must not cause partial removal.
             let evidence = artifacts.join("fold-evidence");
             std::fs::write(&evidence, "blocked").unwrap();
-            assert!(
-                crate::graph::fold_run(&mut state, true, &f.home)
-                    .await
-                    .is_err()
-            );
+            refused(&mut state, &f.home).await;
             assert!(reviewer.exists());
             std::fs::remove_file(&evidence).unwrap();
             std::fs::create_dir_all(&evidence).unwrap();
@@ -4631,32 +4843,20 @@ mod tests {
                 .unwrap()
                 .set_len(64 * 1024 * 1024)
                 .unwrap();
-            assert!(
-                crate::graph::fold_run(&mut state, true, &f.home)
-                    .await
-                    .is_err()
-            );
+            refused(&mut state, &f.home).await;
             assert!(reviewer.exists());
             std::fs::remove_file(oversized).unwrap();
             // Ignored recovery files and unfinished Git operations still hold
             // all sources, even for a confirmed merge.
             std::fs::create_dir_all(reviewer.join("scratch")).unwrap();
             std::fs::write(reviewer.join("scratch/recovery"), "keep").unwrap();
-            assert!(
-                crate::graph::fold_run(&mut state, true, &f.home)
-                    .await
-                    .is_err()
-            );
+            refused(&mut state, &f.home).await;
             std::fs::remove_dir_all(reviewer.join("scratch")).unwrap();
             let checkpoint = git::git(&reviewer, &["rev-parse", "--git-path", "CHERRY_PICK_HEAD"])
                 .await
                 .unwrap();
             std::fs::write(&checkpoint, &head).unwrap();
-            assert!(
-                crate::graph::fold_run(&mut state, true, &f.home)
-                    .await
-                    .is_err()
-            );
+            refused(&mut state, &f.home).await;
             std::fs::remove_file(checkpoint).unwrap();
             let (folded, unreadable) = crate::clean::fold_due(
                 &f.home.join("runs"),
@@ -7749,5 +7949,139 @@ mod tests {
                     .driver_exited
             );
         }
+    }
+}
+
+/// Platform-independent: these must run on the platform whose refusal they pin.
+#[cfg(test)]
+mod platform_tests {
+    use super::*;
+
+    /// A platform without process containment refuses to reclaim, and says so
+    /// in the persisted report instead of returning before anything is saved
+    /// (which left a Windows operator with no `retention.json` at all).
+    #[tokio::test]
+    async fn a_platform_without_containment_persists_its_refusal() {
+        let home = tempfile::tempdir().unwrap();
+        let report = sweep_inner_on(
+            home.path(),
+            &crate::config::Disk::default(),
+            Timestamp::now(),
+            false,
+        )
+        .await;
+        assert_eq!(report.failures, [UNSUPPORTED_PLATFORM]);
+        assert_eq!(report.freed_bytes, 0);
+        let saved: Report =
+            serde_json::from_slice(&std::fs::read(home.path().join("retention.json")).unwrap())
+                .unwrap();
+        assert_eq!(saved.failures, [UNSUPPORTED_PLATFORM]);
+        assert!(saved.checked_at.is_some());
+        assert!(
+            !home.path().join("retention.lock").exists(),
+            "a refusal takes no lock and touches no output"
+        );
+    }
+
+    /// The refusal path publishes without `retention.lock`, so publications
+    /// must not share a staging file: concurrent ones leave one complete
+    /// report and nothing behind.
+    #[test]
+    fn concurrent_publications_leave_one_complete_report_and_no_staging_files() {
+        let home = tempfile::tempdir().unwrap();
+        let reports: Vec<Report> = (0..8)
+            .map(|n| Report {
+                failures: vec![format!("pass {n}")],
+                ..Report::default()
+            })
+            .collect();
+        let published = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for report in &reports {
+                scope.spawn(|| {
+                    for _ in 0..25 {
+                        // A rename onto a file another publisher has open may be
+                        // refused on some platforms; the report on disk stays whole.
+                        if publish_report(home.path(), report).is_ok() {
+                            published.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                });
+            }
+        });
+        assert!(
+            published.load(std::sync::atomic::Ordering::Relaxed) >= reports.len(),
+            "publication must succeed, not only leave a whole file behind"
+        );
+        let saved: Report =
+            serde_json::from_slice(&std::fs::read(home.path().join("retention.json")).unwrap())
+                .unwrap();
+        assert!(reports.iter().any(|r| r.failures == saved.failures));
+        let staged: Vec<_> = std::fs::read_dir(home.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(staged.is_empty(), "stray staging files: {staged:?}");
+    }
+
+    /// A staging name a dead process left behind is never written through.
+    #[test]
+    fn staging_files_are_created_exclusively() {
+        let home = tempfile::tempdir().unwrap();
+        let left: Vec<PathBuf> = (0..40)
+            .map(|n| {
+                let path = home.path().join(format!(
+                    "{STAGING_PREFIX}{}-{n}{STAGING_SUFFIX}",
+                    std::process::id()
+                ));
+                std::fs::write(&path, "left by a dead process").unwrap();
+                path
+            })
+            .collect();
+        // The sequence starts at 0 whatever else this process has staged, so
+        // the first forty names are guaranteed to collide.
+        let mut sequence = 0u64..;
+        let (created, file) =
+            create_staging_numbered(home.path(), &mut || sequence.next().unwrap()).unwrap();
+        drop(file);
+        assert!(!left.contains(&created), "{}", created.display());
+        assert!(created.ends_with(format!(
+            "{STAGING_PREFIX}{}-40{STAGING_SUFFIX}",
+            std::process::id()
+        )));
+        for path in left {
+            assert_eq!(std::fs::read(path).unwrap(), b"left by a dead process");
+        }
+    }
+
+    /// A staging file of this report that a crash left behind goes at the next
+    /// publication once it is a day old; a recent one (a publisher in flight)
+    /// and files that are not this report's are never touched.
+    #[test]
+    fn publishing_removes_only_stale_staging_files_of_this_report() {
+        let home = tempfile::tempdir().unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 24 * 60 * 60);
+        let write = |name: &str, modified: std::time::SystemTime| {
+            let path = home.path().join(name);
+            let file = std::fs::File::create(&path).unwrap();
+            file.set_modified(modified).unwrap();
+            path
+        };
+        let crashed = write("retention.json.4242-7.tmp", old);
+        let legacy = write("retention.json.tmp", old);
+        let in_flight = write("retention.json.4243-1.tmp", std::time::SystemTime::now());
+        let unrelated = write("something-else.tmp", old);
+        let other = write("retention.json.bak", old);
+
+        publish_report(home.path(), &Report::default()).unwrap();
+
+        assert!(!crashed.exists());
+        assert!(!legacy.exists());
+        assert!(in_flight.exists());
+        assert!(unrelated.exists());
+        assert!(other.exists());
+        assert!(home.path().join("retention.json").is_file());
     }
 }

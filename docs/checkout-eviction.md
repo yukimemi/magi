@@ -89,6 +89,158 @@ and both cycles' run/seat observations, even for runs with no evicted seats.
 A global validation error prevents inspection and is distinct from an observed
 seat protection. Do not interpret zero evictions or one bounded pass as a census.
 
+### Finished-run folding on a busy machine
+
+Idle housekeeping (`clean::fold_due`) is admitted only with no busy worker and no
+runnable task, so a queue that is never empty folded nothing (issue 1275: 73 merged
+runs, days past `fold_grace_secs`, on a machine whose housekeeping receipt always
+said "active work or runnable task queue"). The idle gate dates from the first
+janitor ("folding worktrees and pruning a cache mid-build would race the very
+compile"); that concern belongs to the shared-cache prune, orphan reclamation and
+worktree-registration pruning, which stay idle-only. Folding a finished run takes
+the run's owner lock, execution lease, per-worktree output leases and the
+repository coordination lease inside `graph::fold_run_when` (the automatic
+callers ask for coordination once and give way when it is busy, see below), and
+`clean::eligibility` refuses anything a live claim holds, so the `fold` service runs
+exactly where housekeeping does not (`daemon::fold_turn_eligible`), under the same
+decision function as the idle pass (same grace, resumable, live, recovery-source
+and preservation checks).
+
+**The record under the locks.** The fold reloads the run record after it holds the
+owner lock and execution lease, and acts on that record only; there is no fallback
+to the caller's earlier read. The reload must succeed and carry the locked id: a
+record deleted meanwhile (or a foreign one) ends the fold as `record_gone` and a
+record that no longer parses as `unreadable`, with nothing touched: the lock files
+stay where they are (an unlinked lock file would let the next caller lock another
+inode) and a run directory that is not there is never created for the sake of a
+lock. A handover that completes between the janitor's first read and the locks
+records `released_to` / `released_branches` and removes the old worktree while
+keeping the branch; the reload sees it, so the handed-over branch survives and the
+successor's ownership record is not overwritten. The automatic callers (idle pass,
+busy turn, and the janitor's fold after it recorded a merge it found on the forge)
+read the record as saved, whatever schema wrote it; the first two re-ask the
+eligibility decision on it (a run that became resumable, or live, is left alone),
+the last re-checks that it is still a confirmed merge. `magi fold` and the phone
+route read it with the migrating loader they used themselves and apply the same
+preservation checks to that fresh record; `--override-recovery-retention` assesses
+liveness before it holds the execution lease (a held lease reads as a live driver)
+and reads and checks the record again once both locks are held. A record whose
+embedded id is not the name of its directory (a copy of one run's `run.json` in
+another run's directory) is `unreadable` at the first read for the automatic
+callers and an error for `magi fold` and the phone route; nothing is touched.
+
+**A handover in flight is not folded by an automatic caller.** A run that names a
+successor (`released_to`) whose startup is still running, whose driver is live, or
+whose record cannot be read is `live`: when that startup fails, the rollback
+(`handover::Released::restore`) needs the predecessor's owner lock, and a fold
+holding it at that moment would make the rollback abandon. A missing successor
+record, a failed or completed startup and a stopped driver settle it. A startup
+killed mid-way keeps its predecessor out of automatic folding until an operator
+settles that run.
+
+**Lock order between a handover and a fold.** A handover (a review taking a branch
+over) holds repository coordination and then asks for the predecessor's owner lock
+(`handover::release`, and `Released::restore` for the rollback); an automatic fold
+holds the owner lock and the execution lease and, last, asks for coordination.
+Before `released_to` is recorded `handover_settled` protects nothing, so the two
+orders meet: a bounded wait on one side cannot resolve a wait on the other. The
+fold therefore never *waits* for coordination while it holds the owner lock: it
+asks once and, when the lease is busy, releases everything, changes and saves
+nothing and reports `live` (the run is judged again on a later pass). The
+handover asks for the owner lock with a bounded retry - up to two seconds, 10 ms
+doubling to 250 ms, the last pause clipped to what is left - in `release` and in
+the rollback, so a fold that holds the lock only long enough to reload and refuse
+neither fails the successor's startup (which would cost the task an attempt) nor
+abandons a rollback. A lock still held after the bound fails the handover, or
+gives up the rollback, as before. `magi fold` and the phone route were asked for
+by a person and keep waiting for coordination, bounded by `timeout_resource_wait`.
+
+Every other writer of the record takes the same two locks. Deleting a run (`magi
+run rm`, the phone's delete button) takes the owner lock and execution lease
+without waiting, reads the record under them and judges the unfolded-candidate
+guard on that read: a fold in progress makes the deletion a refusal ("try again
+later"), so a record cannot disappear under a fold and its worktree suffix cannot
+be reserved by a new run while the fold removes that suffix's directories. The
+directory is then renamed to a tombstone under `<home>/deleted-runs/` and removed
+there while both guards are held, so the lock files and `run.json` disappear
+together (where a directory with open files cannot be renamed, as on Windows,
+`run.json` is removed first). The wholesale removal of an unreadable run
+(`clean::fold_unreadable`, `magi fold` / the phone for a record that cannot be
+read) leaves through the same helper once it holds both locks. A process killed
+between the rename and the removal leaves the run's directory in
+`<home>/deleted-runs/`, which no inventory or report reads: the next run deletion
+(or unreadable-run removal) and idle housekeeping remove whatever is there
+(`clean::sweep_graveyard`) - the run was already authorised for deletion when it
+was moved, and nothing else reads that directory. The
+abandoned-seat cleanup that `magi fold` and the phone run after a fold that removed
+nothing writes under the locks as well, from a fresh read, so it cannot erase a
+handover that landed after the fold released its own locks.
+
+One `service:daemon-fold` worker runs per pass (at most every 120 s, never beside a
+housekeeping worker). A pass judges at most 64 run records, starts at most 4 folds
+(charged when the fold begins, whatever it returns) and starts no further fold after
+5 minutes (a started fold finishes); at least one run is always judged. Judging
+reads files (`run.json`, the live-claim sources and, for an eligible run, the queue
+for recovery sources), so its wall time depends on the disk; the time budget covers
+it as well as the folds.
+
+**Cycles.** `<home>/fold-turn-cursor` holds `{cursor, high_water}`: the pass works
+through the run ids after `cursor` up to `high_water`, the newest id present when
+the cycle began, and removes the file when it has judged the last one; the next
+pass starts a new cycle with a new high-water mark. With N records at the start of
+a cycle, every one is judged within `ceil(N / 64)` passes plus the passes its fold
+invocations consume (`ceil(F / 4)` for F invocations), plus one for each pass the
+time budget cut short (a pass can spend it judging without starting a fold), and a
+run that left its grace after being judged is folded within the next cycle. Run ids
+start with the local wall-clock time of creation, so
+runs created after the mark sort after it and wait for the next cycle; a run created
+in the same second as the mark, or after the clock stepped backwards, may join the
+current cycle. Each such run adds at most its own judgement, and that is the whole
+bound on them - no list of the cycle's members is kept. The inventory holds only
+directories whose name is a run id: a stray directory with a `run.json` would
+become the saved high-water mark and restart the cycle on every pass. A cycle file
+that is unreadable, names an id that is not a run id, has a `high_water` newer than
+every run, a `high_water` below the cursor, a cursor naming a run that no longer
+exists, or an empty range starts a clean cycle (`cycle_restart` says why). Every pass
+lists `runs/` and checks each record once (O(history) syscalls); that inventory is
+counted in `elapsed_ms`.
+
+**Runs that were folded long ago.** A fold that completes under its locks having
+found nothing left to remove, with the run's worktree bay gone (`try_exists` answered
+`Ok(false)`), records that in `run.json` (`fold_settled_at`; absent on every older
+record means unknown). The busy turn skips such a run without starting a fold or
+spending the fold budget - counted `already_folded` - only while the mark is present
+and the bay is still confirmed absent by a fallible check: a failing check, or a bay
+that exists even empty, means the run is judged normally and the fold is invoked, and
+a fold that finds work clears the mark in the same locked save. The mark says nothing
+about branches or Git registrations: a stale registration or a branch without a bay is
+not disk and is left to the ordinary paths. The idle `fold_due` never skips.
+
+`source-eviction-fold-{dispatch,worker}.json` carry the skip reason (cadence, idle
+machine, `auto_fold` off, unreadable startup configuration, a sibling folding
+service) and, for a completed pass, a `fold` object: `records`, `inspected`,
+`invoked`, counts `folded`, `nothing_left`, `already_folded`, `live` (a daemon
+claim, or an owner lock, execution lease, output lease, Cargo build or repository
+lease held - contention only; any other failure of a lock call is `failed`),
+`resumable`, `within_grace`, `recovery_retained`, `proof_incomplete` (startup,
+candidate preservation or the confirmed-merge source proof: Cargo residue, Git
+checkpoints, the fetched base), `unreadable` (at the first read or under the locks),
+`record_gone` and `failed` (git or filesystem errors of the deletion, or a lock call
+that failed for a reason other than contention), the `cursor` and `high_water`, why
+the pass `stopped`, `cycle_restart`, `cursor_error` if the cycle could not be saved
+(the next pass then repeats the slice), `elapsed_ms` and `notes`: the scrubbed,
+clipped text of up to eight `proof_incomplete` and `failed` runs. The turn owns no
+deletion authority of its own: it never sweeps retained outputs, copies or orphans.
+
+On a platform without Unix process containment, `retention::sweep` records its
+refusal ("Automatic output reclamation requires Unix process containment") in
+`retention.json` like any pass, and the housekeeping and disk-pressure worker
+receipts carry the report's failures under `retention` (state `retention swept`).
+The report is staged in a uniquely named file created exclusively and renamed over
+`retention.json` (the refusal takes no `retention.lock`, and two passes may publish
+at once); a staging file of this report older than a day is removed when a report
+is published.
+
 The former timestamp-ordered run-ID continuation could skip seats when records
 moved across the cursor; a budget stop also marked an entire partially visited run
 as passed. Isolated historical fixtures reproduce these progress failures. This

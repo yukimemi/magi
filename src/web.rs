@@ -1606,6 +1606,7 @@ impl Ui {
             .route("/api/queue/{id}/release", post(queue_release))
             .route("/api/queue/{id}/priority", post(queue_priority))
             .route("/api/queue/{id}/urgent", post(queue_urgent))
+            .route("/api/queue/{id}/immediate", post(queue_immediate))
             .route("/api/queue/{id}/implementers", post(queue_implementers))
             .route("/api/queue/{id}/attempt-limit", post(queue_attempt_limit))
             .route("/api/queue/{id}/edit", post(queue_edit))
@@ -4586,15 +4587,16 @@ async fn run_delete(State(ui): State<Arc<Ui>>, Path(id): Path<String>) -> ApiRes
         blocking(move || {
             let id = resolve_run(&ui.runs, &id)?;
             match read_run(&ui.runs, &id) {
-                Ok(state) => {
-                    let in_flight =
-                        crate::daemon::is_working_on(&ui.home, &id, jiff::Timestamp::now());
-                    state
-                        .ensure_can_delete(in_flight)
-                        .map_err(|e| ApiError::conflict(format!("{e:#}")))?;
-                    let dir = ui.runs.join(&id);
-                    std::fs::remove_dir_all(&dir)
-                        .with_context(|| format!("remove run directory {}", dir.display()))?;
+                Ok(_) => {
+                    // The record's locks and the guards are judged on what is
+                    // read under them (`clean::delete_run`): a fold in progress
+                    // refuses the deletion rather than racing it.
+                    crate::clean::delete_run(&ui.home, &id, jiff::Timestamp::now()).map_err(
+                        |e| match e.downcast_ref::<crate::clean::DeleteRefused>() {
+                            Some(refused) => ApiError::conflict(refused.0.clone()),
+                            None => ApiError::internal(format!("{e:#}")),
+                        },
+                    )?;
                     Ok((id, false))
                 }
                 Err(_) => {
@@ -4665,7 +4667,17 @@ async fn run_fold(State(ui): State<Arc<Ui>>, Path(id): Path<String>) -> ApiResul
                     "run {id} is being worked on by a live daemon right now"
                 )));
             }
-            let state = read_run(&ui.runs, &id).ok();
+            crate::clean::ensure_record_identity(&ui.runs, &id)
+                .map_err(|e| ApiError::internal(format!("{e:#}")))?;
+            let state = match read_run(&ui.runs, &id) {
+                Ok(state) => {
+                    state
+                        .ensure_directory(&id)
+                        .map_err(|e| ApiError::internal(format!("{e:#}")))?;
+                    Some(state)
+                }
+                Err(_) => None,
+            };
             Ok((id, state))
         })
         .await?
@@ -4751,6 +4763,9 @@ async fn run_fold_merged(
                 )));
             }
             let state = read_run(&ui.runs, &id)?;
+            state
+                .ensure_directory(&id)
+                .map_err(|e| ApiError::internal(format!("{e:#}")))?;
             Ok((id, state))
         })
         .await?
@@ -5008,6 +5023,10 @@ struct TaskView {
     stuck_roots: Vec<String>,
     blockers: Vec<crate::blockers::BlockerView>,
     recovery: Option<String>,
+    /// Shared read-only admission status (configured mode, active reservation
+    /// lane, and concrete non-concurrency or capacity blocker).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    admission: Option<daemon::TaskAdmission>,
 }
 
 impl From<Task> for TaskView {
@@ -5023,12 +5042,24 @@ impl From<Task> for TaskView {
             stuck_roots: Vec::new(),
             blockers: Vec::new(),
             recovery: task_recovery(&task),
+            admission: None,
             task,
         }
     }
 }
 
 impl TaskView {
+    fn with_admission(
+        mut self,
+        snapshot: &daemon::AdmissionSnapshot,
+        queue: &Queue,
+        inv: Option<&crate::blockers::Inventory>,
+        home: &std::path::Path,
+    ) -> Self {
+        self.admission = Some(snapshot.evaluate(&self.task, queue, inv, home));
+        self
+    }
+
     fn with_recovery_decisions(mut self, questions: &ask::Questions) -> Self {
         if matches!(self.task.status, TaskStatus::Held | TaskStatus::Blocked) {
             let pending = crate::blockers::Inventory::recovery_views(&self.task, questions);
@@ -5267,11 +5298,19 @@ async fn queue_list(
         let tasks = ui.queue.list();
         let inv =
             crate::blockers::Inventory::load_with_tasks(&ui.queue, &ui.questions, tasks.clone());
+        let admission = daemon::AdmissionSnapshot::capture(&ui.home, Timestamp::now());
         Ok(Json(
             tasks
                 .into_iter()
                 .filter(|t| q.contains(&t.id) || t.status == crate::queue::TaskStatus::Blocked)
-                .map(|t| TaskView::with_inventory(t, &inv))
+                .map(|t| {
+                    TaskView::with_inventory(t, &inv).with_admission(
+                        &admission,
+                        &ui.queue,
+                        Some(&inv),
+                        &ui.home,
+                    )
+                })
                 .collect(),
         ))
     })
@@ -5406,9 +5445,17 @@ async fn queue_page(
             .filter_map(|id| ui.queue.get(&id).ok())
             .collect();
         let inv = crate::blockers::Inventory::load_for_tasks(&ui.queue, &ui.questions, &tasks);
+        let admission = daemon::AdmissionSnapshot::capture(&ui.home, Timestamp::now());
         let rows = tasks
             .into_iter()
-            .map(|task| TaskView::with_inventory(task, &inv))
+            .map(|task| {
+                TaskView::with_inventory(task, &inv).with_admission(
+                    &admission,
+                    &ui.queue,
+                    Some(&inv),
+                    &ui.home,
+                )
+            })
             .collect();
         Ok(Json(StorePage { rows, next }))
     })
@@ -6923,7 +6970,16 @@ fn mark_badges(ui: &Ui, task: &Task, history: &mut [TaskRunView]) {
 async fn task_core(State(ui): State<Arc<Ui>>, Path(id): Path<String>) -> ApiResult<Json<TaskView>> {
     blocking(move || {
         let id = resolve_task(&ui.queue, &id)?;
-        Ok(Json(TaskView::from(ui.queue.get(&id)?)))
+        let task = ui.queue.get(&id)?;
+        let inv = (task.status == TaskStatus::Blocked)
+            .then(|| crate::blockers::Inventory::load_for(&ui.queue, &ui.questions, &task));
+        let admission = daemon::AdmissionSnapshot::capture(&ui.home, Timestamp::now());
+        let view = match inv.as_ref() {
+            Some(inv) => TaskView::with_inventory(task, inv),
+            None => TaskView::from(task),
+        }
+        .with_admission(&admission, &ui.queue, inv.as_ref(), &ui.home);
+        Ok(Json(view))
     })
     .await
 }
@@ -6959,10 +7015,12 @@ async fn task_detail(
             )
         });
         let flow = task_flow(&task, &history, max_attempts, origin.as_ref());
+        let admission = daemon::AdmissionSnapshot::capture(&ui.home, Timestamp::now());
         let task_view = match inv.as_ref() {
             Some(inv) => TaskView::with_inventory(task, inv),
             None => TaskView::from(task),
         }
+        .with_admission(&admission, &ui.queue, inv.as_ref(), &ui.home)
         .with_recovery_decisions(&ui.questions);
         Ok(Json(TaskDetailView {
             max_attempts,
@@ -7536,6 +7594,21 @@ async fn queue_urgent(
     mutate(ui, id, move |t| t.set_urgent(body.urgent)).await
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImmediateBody {
+    immediate: bool,
+}
+
+async fn queue_immediate(
+    State(ui): State<Arc<Ui>>,
+    Path(id): Path<String>,
+    body: std::result::Result<Json<ImmediateBody>, JsonRejection>,
+) -> ApiResult<Json<TaskView>> {
+    let Json(body) = body.map_err(|e| ApiError::bad_request(e.body_text()))?;
+    mutate(ui, id, move |t| t.set_immediate(body.immediate)).await
+}
+
 /// The body of `POST /api/queue/{id}/priority`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -7733,16 +7806,27 @@ async fn mutate(
     change: impl FnOnce(&mut Task) -> Result<()> + Send + 'static,
 ) -> ApiResult<Json<TaskView>> {
     blocking(move || {
-        let (_claim, mut task) = claim_task(&ui.queue, &id)?;
-        change(&mut task).map_err(|e| match e.downcast::<crate::dupes::Duplicate>() {
-            Ok(dup) => ApiError::conflict(dup.render(
-                "Nothing was saved. If it is not a duplicate, repeat the request with \
-                 \"force\": true.",
-            )),
-            Err(e) => ApiError::bad_request_from(e),
-        })?;
-        ui.queue.put(&mut task)?;
-        Ok(Json(TaskView::from(task)))
+        let task = {
+            let (_claim, mut task) = claim_task(&ui.queue, &id)?;
+            change(&mut task).map_err(|e| match e.downcast::<crate::dupes::Duplicate>() {
+                Ok(dup) => ApiError::conflict(dup.render(
+                    "Nothing was saved. If it is not a duplicate, repeat the request with \
+                     \"force\": true.",
+                )),
+                Err(e) => ApiError::bad_request_from(e),
+            })?;
+            ui.queue.put(&mut task)?;
+            task
+        };
+        let inv = (task.status == TaskStatus::Blocked)
+            .then(|| crate::blockers::Inventory::load_for(&ui.queue, &ui.questions, &task));
+        let admission = daemon::AdmissionSnapshot::capture(&ui.home, Timestamp::now());
+        let view = match inv.as_ref() {
+            Some(inv) => TaskView::with_inventory(task, inv),
+            None => TaskView::from(task),
+        }
+        .with_admission(&admission, &ui.queue, inv.as_ref(), &ui.home);
+        Ok(Json(view))
     })
     .await
 }
@@ -18276,6 +18360,124 @@ mod tests {
         );
     }
 
+    #[test]
+    fn immediate_request_requires_a_boolean_and_rejects_unknown_fields() {
+        for immediate in [true, false] {
+            let body: ImmediateBody =
+                serde_json::from_value(serde_json::json!({ "immediate": immediate })).unwrap();
+            assert_eq!(body.immediate, immediate);
+        }
+        for input in [
+            r#"{}"#,
+            r#"{"immediate":null}"#,
+            r#"{"immediate":"true"}"#,
+            r#"{"immediate":1}"#,
+            r#"{"immediate":true,"extra":false}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<ImmediateBody>(input).is_err(),
+                "{input}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn immediate_api_updates_preserves_urgent_returns_admission_and_validates_tasks() {
+        let f = Fixture::start().await;
+        let q = f.queue();
+        let mut t = Task::new(
+            "immediate API".into(),
+            "unchanged".into(),
+            PathBuf::from("/repo/magi"),
+            Source::Human,
+        );
+        t.attempts = 2;
+        t.priority = 9;
+        t.interrupt = true;
+        t.urgent = true;
+        t.hold_reason = Some("waiting for approval".into());
+        for status in [TaskStatus::Queued, TaskStatus::Held] {
+            t.status = status;
+            q.put(&mut t).unwrap();
+            for immediate in [true, true, false, false] {
+                let response = f
+                    .post(
+                        &format!("/api/queue/{}/immediate", t.short()),
+                        Some(&format!("{{\"immediate\":{immediate}}}")),
+                    )
+                    .await;
+                assert_eq!(response.status, 200, "{}", response.body);
+                let payload = response.json();
+                assert_eq!(payload["immediate"], immediate);
+                assert_eq!(payload["urgent"], true);
+                if immediate {
+                    assert_eq!(payload["admission"]["mode"], "immediate");
+                    let label = payload["admission"]["label"].as_str().unwrap_or_default();
+                    assert!(
+                        !label.contains("claimed by another process"),
+                        "mutate must drop its claim before computing admission: {payload}"
+                    );
+                    if status == TaskStatus::Held {
+                        assert_eq!(label, "Immediate: waiting — held (waiting for approval)");
+                    }
+                }
+                let saved = q.get(&t.id).unwrap();
+                let mut before = serde_json::to_value(&t).unwrap();
+                let mut after = serde_json::to_value(saved).unwrap();
+                before["immediate"] = immediate.into();
+                before.as_object_mut().unwrap().remove("updated_at");
+                after.as_object_mut().unwrap().remove("updated_at");
+                assert_eq!(after, before);
+            }
+        }
+        let route = format!("/api/queue/{}/immediate", t.id);
+        for body in [
+            r#"{}"#,
+            r#"{"immediate":null}"#,
+            r#"{"immediate":"true"}"#,
+            r#"{"immediate":1}"#,
+            r#"{"immediate":true,"extra":false}"#,
+            "{",
+        ] {
+            assert_eq!(f.post(&route, Some(body)).await.status, 400);
+        }
+        t.status = TaskStatus::Queued;
+        q.put(&mut t).unwrap();
+        let claim = q.claim(&t.id).unwrap();
+        let response = f.post(&route, Some(r#"{"immediate":true}"#)).await;
+        assert_eq!(response.status, 409, "{}", response.body);
+        assert!(!q.get(&t.id).unwrap().immediate);
+        drop(claim);
+        for status in [
+            TaskStatus::Running,
+            TaskStatus::Done,
+            TaskStatus::Failed,
+            TaskStatus::Blocked,
+            TaskStatus::Parked,
+        ] {
+            t.status = status;
+            q.put(&mut t).unwrap();
+            for immediate in [true, false] {
+                let response = f
+                    .post(&route, Some(&format!("{{\"immediate\":{immediate}}}")))
+                    .await;
+                assert_eq!(response.status, 400, "{}", response.body);
+                assert!(response.body.contains(status.as_str()));
+                assert!(response.body.contains("queued or held"));
+                assert!(!q.get(&t.id).unwrap().immediate);
+            }
+        }
+        assert_eq!(
+            f.post(
+                "/api/queue/missing/immediate",
+                Some(r#"{"immediate":true}"#)
+            )
+            .await
+            .status,
+            404
+        );
+    }
+
     #[tokio::test]
     async fn priority_can_be_raised_from_the_phone_and_moves_the_task_ahead() {
         let f = Fixture::start().await;
@@ -23605,6 +23807,34 @@ mod tests {
         );
     }
 
+    /// `runs/<A>/run.json` holding run B's record is not run A: the phone's fold
+    /// routes refuse it instead of folding B on A's say, and change nothing.
+    #[tokio::test]
+    async fn folding_a_record_that_names_another_run_is_refused() {
+        let fx = Fixture::start().await;
+        let runs = fx.runs();
+        let (a, b) = ("20260901-000000-aaaa", "20260901-000000-bbbb");
+        write_run(&runs, a, RunStatus::Stalled);
+        write_run(&runs, b, RunStatus::Stalled);
+        std::fs::copy(runs.join(b).join("run.json"), runs.join(a).join("run.json")).unwrap();
+        let record = std::fs::read(runs.join(a).join("run.json")).unwrap();
+
+        let res = fx.post(&format!("/api/runs/{a}/fold"), None).await;
+        assert_eq!(res.status, 500, "{}", res.body);
+        assert!(res.body.contains("not run"), "{}", res.body);
+        let res = fx
+            .post(
+                &format!("/api/runs/{a}/fold-merged"),
+                Some(r#"{"pr_url":"https://github.com/owner/repo/pull/1"}"#),
+            )
+            .await;
+        assert_eq!(res.status, 500, "{}", res.body);
+        assert_eq!(
+            std::fs::read(runs.join(a).join("run.json")).unwrap(),
+            record
+        );
+    }
+
     #[tokio::test]
     async fn folding_an_unreadable_run_falls_back_to_removing_it_wholesale() {
         let fx = Fixture::start().await;
@@ -23625,6 +23855,32 @@ mod tests {
             !runs.join(id).exists(),
             "an unreadable run has no candidate list to fold selectively, so \
              the whole record goes - same as `magi fold` on the CLI"
+        );
+    }
+
+    #[tokio::test]
+    async fn folding_a_record_of_another_run_in_a_refused_schema_is_an_identity_error() {
+        let fx = Fixture::start().await;
+        let runs = fx.runs();
+        let id = "20260901-000000-mism";
+        std::fs::create_dir_all(runs.join(id)).expect("run dir");
+        let record = br#"{"schema": 99999, "id": "20260901-000000-else"}"#.to_vec();
+        std::fs::write(runs.join(id).join("run.json"), &record).expect("record");
+
+        let res = fx.post(&format!("/api/runs/{id}/fold"), None).await;
+        assert_eq!(res.status, 500, "{}", res.body);
+        assert!(
+            res.json()["error"]
+                .as_str()
+                .unwrap()
+                .contains("records run 20260901-000000-else"),
+            "{}",
+            res.body
+        );
+        assert_eq!(
+            std::fs::read(runs.join(id).join("run.json")).unwrap(),
+            record,
+            "nothing is removed"
         );
     }
 
@@ -25585,6 +25841,23 @@ mod tests {
         let v = serde_json::to_value(TaskView::from(t)).expect("json");
         assert_eq!(v["urgent"], true, "{v}");
         assert!(APP_JS.contains("task.urgent === true"));
+    }
+
+    #[test]
+    fn task_view_serializes_immediate_flag_and_ui_hooks() {
+        let mut t = Task::new(
+            "t".to_owned(),
+            "t".to_owned(),
+            PathBuf::from("/repo"),
+            Source::Human,
+        );
+        let v = serde_json::to_value(TaskView::from(t.clone())).expect("json");
+        assert_eq!(v["immediate"], false, "{v}");
+        t.immediate = true;
+        let v = serde_json::to_value(TaskView::from(t)).expect("json");
+        assert_eq!(v["immediate"], true, "{v}");
+        assert!(APP_JS.contains("task.immediate === true"));
+        assert!(APP_JS.contains("/immediate"));
     }
 
     #[tokio::test]

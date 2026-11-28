@@ -788,6 +788,21 @@ pub struct Task {
     /// to, exactly as before.
     #[serde(default)]
     pub urgent: bool,
+    /// Marked by the owner (`magi task add --immediate`, `magi task immediate`,
+    /// or the Web UI toggle). Stronger than [`Task::urgent`]:
+    /// `crate::daemon::poll` dispatches every runnable immediate task on the
+    /// next scan even when both ordinary and urgent lanes are full, without
+    /// consuming ordinary or urgent permits and without parking or cancelling
+    /// existing workers. Independent of [`Task::urgent`] so clearing immediate
+    /// preserves any saved urgent setting. Non-concurrency gates (dependencies,
+    /// holds, interrupt gate, quota cooldown, disk admission, repository
+    /// coordination, resource waits, merge approvals, and claim exclusivity)
+    /// still apply.
+    ///
+    /// `#[serde(default)]` so a queue file written before this field existed
+    /// still reads as `false`.
+    #[serde(default)]
+    pub immediate: bool,
     /// Set by [`Task::new`], cleared once a queue has stored the task. Never
     /// persisted: a task read from disk is always an existing one. While set,
     /// [`Queue::put`] reserves the id (see [`Queue::file_with`]) instead of
@@ -1283,6 +1298,7 @@ impl Task {
             replacement: None,
             interrupt: false,
             urgent: false,
+            immediate: false,
             unfiled: true,
             attachments: Vec::new(),
             followup: None,
@@ -2324,6 +2340,22 @@ impl Task {
         Ok(())
     }
 
+    /// Change the owner-selected immediate execution setting without releasing
+    /// a held task or altering `urgent`, priority, interrupt, attempts, or
+    /// resume state.
+    pub fn set_immediate(&mut self, immediate: bool) -> Result<()> {
+        if !matches!(self.status, TaskStatus::Queued | TaskStatus::Held) {
+            bail!(
+                "task {} is {}; immediate can only change while queued or held; \
+                 wait for the active attempt to finish and requeue or hold the task first",
+                self.short(),
+                self.status.as_str()
+            );
+        }
+        self.immediate = immediate;
+        Ok(())
+    }
+
     /// Change how urgently this task should run next.
     ///
     /// Refused once the task is `running`: priority only feeds the sort
@@ -2397,8 +2429,9 @@ impl Task {
     }
 
     /// Task-level policy for a new run in `config`, before falling back to its
-    /// layered value: the explicit per-task choice, else isolated for an urgent
-    /// task where that helps and works (`build_target::urgent_isolation`).
+    /// layered value: the explicit per-task choice, else isolated for an
+    /// immediate or urgent task where that helps and works
+    /// (`build_target::urgent_isolation`).
     pub fn build_cache_override(
         &self,
         config: &crate::config::Config,
@@ -2408,8 +2441,15 @@ impl Task {
             .and_then(|o| o.build_cache)
             .map(|mode| (mode, "task-override"))
             .or_else(|| {
-                (self.urgent && crate::build_target::urgent_isolation(config))
-                    .then_some((BuildCache::Isolated, "urgent"))
+                ((self.immediate || self.urgent) && crate::build_target::urgent_isolation(config))
+                    .then_some((
+                        BuildCache::Isolated,
+                        if self.immediate {
+                            "immediate"
+                        } else {
+                            "urgent"
+                        },
+                    ))
             })
     }
 
@@ -4259,6 +4299,13 @@ impl Queue {
         }
     }
 
+    /// Read-only check for whether a queue claim lock file currently exists for
+    /// `id`. Never acquires, modifies, or removes the lock.
+    #[must_use]
+    pub fn is_claimed(&self, id: &str) -> bool {
+        self.lock_path(id).exists()
+    }
+
     /// Expand an id prefix to exactly one task id.
     pub fn resolve_id(&self, prefix: &str) -> Result<String> {
         if !prefix.is_empty()
@@ -5889,6 +5936,114 @@ mod tests {
                 assert_eq!(serde_json::to_value(&t).unwrap(), expected);
             }
         }
+    }
+
+    #[test]
+    fn immediate_only_changes_queued_or_held_and_preserves_settings() {
+        for status in [
+            TaskStatus::Queued,
+            TaskStatus::Held,
+            TaskStatus::Running,
+            TaskStatus::Done,
+            TaskStatus::Failed,
+            TaskStatus::Blocked,
+            TaskStatus::Parked,
+        ] {
+            let mut t = task("immediate settings");
+            t.status = status;
+            t.attempts = 2;
+            t.hold_reason = Some("waiting".into());
+            t.priority = 7;
+            t.interrupt = true;
+            t.urgent = true;
+            let before = serde_json::to_value(&t).unwrap();
+            for immediate in [true, true, false, false] {
+                let result = t.set_immediate(immediate);
+                let mut expected = before.clone();
+                if matches!(status, TaskStatus::Queued | TaskStatus::Held) {
+                    result.unwrap();
+                    expected["immediate"] = immediate.into();
+                } else {
+                    let error = result.unwrap_err().to_string();
+                    assert!(error.contains(status.as_str()), "{error}");
+                    assert!(error.contains("queued or held"), "{error}");
+                }
+                assert_eq!(serde_json::to_value(&t).unwrap(), expected);
+                assert!(t.urgent, "changing immediate must preserve saved urgent");
+            }
+        }
+    }
+
+    #[test]
+    fn a_task_recorded_without_an_immediate_field_still_reads_as_not_immediate() {
+        let (_dir, q) = queue();
+        let path = q.path_of("20260101-000000-imm0");
+        std::fs::create_dir_all(q.root()).unwrap();
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "schema": SCHEMA,
+                "id": "20260101-000000-imm0",
+                "title": "from before immediate existed",
+                "instruction": "from before immediate existed",
+                "repo": ".",
+                "source": { "kind": "human" },
+                "status": "queued",
+                "urgent": true,
+                "created_at": Timestamp::now().to_string(),
+                "updated_at": Timestamp::now().to_string(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let task = q.get("20260101-000000-imm0").expect("must still read");
+        assert!(!task.immediate);
+        assert!(task.urgent);
+    }
+
+    #[test]
+    fn immediate_reuses_urgent_isolation_and_explicit_cache_wins() {
+        let mut cfg = crate::config::Config::default();
+        cfg.verify.e2e = vec!["CARGO_TARGET_DIR=/tmp/shared-target cargo test".into()];
+        let mut t = task("immediate cache");
+
+        t.set_immediate(true).unwrap();
+        assert_eq!(
+            t.build_cache_override(&cfg),
+            Some((BuildCache::Isolated, "immediate"))
+        );
+
+        // Coexisting with urgent still attributes isolation to immediate.
+        t.set_urgent(true).unwrap();
+        assert_eq!(
+            t.build_cache_override(&cfg),
+            Some((BuildCache::Isolated, "immediate"))
+        );
+
+        // Explicit task cache override always wins over immediate.
+        t.change_build_cache(Some(BuildCache::Shared)).unwrap();
+        assert_eq!(
+            t.build_cache_override(&cfg),
+            Some((BuildCache::Shared, "task-override"))
+        );
+
+        // Clearing explicit override restores immediate; clearing immediate reverts to urgent.
+        t.change_build_cache(None).unwrap();
+        assert_eq!(
+            t.build_cache_override(&cfg),
+            Some((BuildCache::Isolated, "immediate"))
+        );
+        t.set_immediate(false).unwrap();
+        assert_eq!(
+            t.build_cache_override(&cfg),
+            Some((BuildCache::Isolated, "urgent"))
+        );
+
+        // Unsupported isolation falls back cleanly even for immediate tasks.
+        t.set_immediate(true).unwrap();
+        cfg.verify.e2e = vec!["CARGO_TARGET_DIR=/tmp/shared-target cargo test | tee log".into()];
+        assert_eq!(t.build_cache_override(&cfg), None);
     }
 
     #[test]

@@ -2965,6 +2965,16 @@ pub struct RunState {
     /// fold must leave them alone.
     #[serde(default)]
     pub released_branches: Vec<String>,
+    /// A fold completed under the run's locks, found nothing left to remove,
+    /// and the run's worktree bay was gone: this much was true then, and it is
+    /// what the busy-time fold turn (`clean::fold_turn`) may rely on to skip the
+    /// run without starting a fold - only together with a confirmed-absent bay
+    /// (`Path::try_exists` returned `Ok(false)`). Absent means unknown, which is
+    /// every record written before this field existed. A fold that finds work
+    /// to do clears it in the same save. Not about branches or Git
+    /// registrations: those are not disk and are left to the ordinary paths.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fold_settled_at: Option<Timestamp>,
     /// Turns whose Git/artifact preservation is not confirmed. A resume retries
     /// persistence before deciding whether an interrupted turn needs execution.
     #[serde(default)]
@@ -3378,6 +3388,7 @@ impl RunState {
             resource_block: None,
             released_to: None,
             released_branches: Vec::new(),
+            fold_settled_at: None,
             candidate_preservation: BTreeMap::new(),
             interrupted_implementations: BTreeSet::new(),
             seeds: Vec::new(),
@@ -4390,6 +4401,36 @@ impl RunState {
         let state: Self =
             serde_json::from_str(&body).with_context(|| format!("parse {}", path.display()))?;
         migrate_schema(state)
+    }
+
+    /// The record at `path` exactly as saved: no schema migration and no
+    /// schema check. For housekeeping, which only reads worktree paths,
+    /// branches and ownership marks, every schema bump so far only added a
+    /// field or a variant, and [`Self::load`]'s refusal of a record this build
+    /// does not speak would otherwise stop the janitor fleet-wide.
+    pub(crate) fn read_unmigrated(path: &Path) -> Result<Self> {
+        let body =
+            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        serde_json::from_str(&body).with_context(|| format!("parse {}", path.display()))
+    }
+
+    /// [`Self::read_unmigrated`] for a run under `home`.
+    pub(crate) fn load_tolerant_under(id: &str, home: &Path) -> Result<Self> {
+        Self::read_unmigrated(&home.join("runs").join(id).join("run.json"))
+    }
+
+    /// This record is the one that belongs in `runs/<dir_id>/`: a copy of one
+    /// run's `run.json` placed in another run's directory would otherwise make
+    /// whoever read the directory act on, and report about, the other run.
+    /// Checked at the first read of a fold; the locked reload checks the same
+    /// thing against the id it locked.
+    pub fn ensure_directory(&self, dir_id: &str) -> Result<()> {
+        anyhow::ensure!(
+            self.id == dir_id,
+            "runs/{dir_id}/run.json records run {}, not run {dir_id}",
+            self.id
+        );
+        Ok(())
     }
 }
 
