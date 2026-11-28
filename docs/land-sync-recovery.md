@@ -113,8 +113,10 @@ inside `land.rs` after acquiring the execution lease, before changing `status` t
   operation.
   A restart before the authorized synchronization starts revalidates the same
   binding without consuming another grant. A rewritten base is refused.
-  If the retained head already contains the base, successful fresh
-  verification and publication still spend the authorized attempt.
+  If the retained head already contains the base, the attempt is charged and
+  saved before verification or gate repair begins, not after publication.
+  An interrupted repair resumes the same attempt without another charge or
+  revalidation against the original authorized HEAD.
 - Prior gate, pre-gate, `head_e2e`, `gate_repair_e2e`, and review `verified_head`
   markers are archived into `land_sync_recovery.authorizations[*].archived_verification`
   and `verification_history` and cleared so **fresh head-bound E2E and gate**
