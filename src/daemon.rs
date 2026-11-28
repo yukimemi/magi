@@ -12105,8 +12105,14 @@ mod tests {
             opts.once = true;
             opts.poll = Duration::from_millis(1);
             // This test exercises answer scheduling, not explicit discard:
-            // ordinary Done requires a completed retained execution.
-            let mut state = run_state(RunStatus::Ready);
+            // ordinary Done requires confirmed landing.
+            let mut state = run_state(RunStatus::Merged);
+            state.merge = Some(crate::run::MergeOutcome {
+                mode: MergeMode::Pr,
+                ok: true,
+                detail: "confirmed merge".into(),
+                empty: false,
+            });
             state.reserve_under(&home).unwrap();
             state.save_under(&home).unwrap();
             let mut task = task();
