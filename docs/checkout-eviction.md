@@ -99,7 +99,8 @@ janitor ("folding worktrees and pruning a cache mid-build would race the very
 compile"); that concern belongs to the shared-cache prune, orphan reclamation and
 worktree-registration pruning, which stay idle-only. Folding a finished run takes
 the run's owner lock, execution lease, per-worktree output leases and the
-repository coordination lease inside `graph::fold_run_when`, and
+repository coordination lease inside `graph::fold_run_when` (the automatic
+callers ask for coordination once and give way when it is busy, see below), and
 `clean::eligibility` refuses anything a live claim holds, so the `fold` service runs
 exactly where housekeeping does not (`daemon::fold_turn_eligible`), under the same
 decision function as the idle pass (same grace, resumable, live, recovery-source
@@ -123,17 +124,36 @@ the last re-checks that it is still a confirmed merge. `magi fold` and the phone
 route read it with the migrating loader they used themselves and apply the same
 preservation checks to that fresh record; `--override-recovery-retention` assesses
 liveness before it holds the execution lease (a held lease reads as a live driver)
-and reads and checks the record again once both locks are held.
+and reads and checks the record again once both locks are held. A record whose
+embedded id is not the name of its directory (a copy of one run's `run.json` in
+another run's directory) is `unreadable` at the first read for the automatic
+callers and an error for `magi fold` and the phone route; nothing is touched.
 
 **A handover in flight is not folded by an automatic caller.** A run that names a
 successor (`released_to`) whose startup is still running, whose driver is live, or
 whose record cannot be read is `live`: when that startup fails, the rollback
 (`handover::Released::restore`) needs the predecessor's owner lock, and a fold
 holding it at that moment would make the rollback abandon. A missing successor
-record, a failed or completed startup and a stopped driver settle it. The rollback
-also waits up to two seconds for the lock before it gives up, so a short hold
-cannot abandon it; a startup killed mid-way keeps its predecessor out of automatic
-folding until an operator settles that run.
+record, a failed or completed startup and a stopped driver settle it. A startup
+killed mid-way keeps its predecessor out of automatic folding until an operator
+settles that run.
+
+**Lock order between a handover and a fold.** A handover (a review taking a branch
+over) holds repository coordination and then asks for the predecessor's owner lock
+(`handover::release`, and `Released::restore` for the rollback); an automatic fold
+holds the owner lock and the execution lease and, last, asks for coordination.
+Before `released_to` is recorded `handover_settled` protects nothing, so the two
+orders meet: a bounded wait on one side cannot resolve a wait on the other. The
+fold therefore never *waits* for coordination while it holds the owner lock: it
+asks once and, when the lease is busy, releases everything, changes and saves
+nothing and reports `live` (the run is judged again on a later pass). The
+handover asks for the owner lock with a bounded retry - up to two seconds, 10 ms
+doubling to 250 ms, the last pause clipped to what is left - in `release` and in
+the rollback, so a fold that holds the lock only long enough to reload and refuse
+neither fails the successor's startup (which would cost the task an attempt) nor
+abandons a rollback. A lock still held after the bound fails the handover, or
+gives up the rollback, as before. `magi fold` and the phone route were asked for
+by a person and keep waiting for coordination, bounded by `timeout_resource_wait`.
 
 Every other writer of the record takes the same two locks. Deleting a run (`magi
 run rm`, the phone's delete button) takes the owner lock and execution lease
@@ -144,7 +164,14 @@ be reserved by a new run while the fold removes that suffix's directories. The
 directory is then renamed to a tombstone under `<home>/deleted-runs/` and removed
 there while both guards are held, so the lock files and `run.json` disappear
 together (where a directory with open files cannot be renamed, as on Windows,
-`run.json` is removed first). The
+`run.json` is removed first). The wholesale removal of an unreadable run
+(`clean::fold_unreadable`, `magi fold` / the phone for a record that cannot be
+read) leaves through the same helper once it holds both locks. A process killed
+between the rename and the removal leaves the run's directory in
+`<home>/deleted-runs/`, which no inventory or report reads: the next run deletion
+(or unreadable-run removal) and idle housekeeping remove whatever is there
+(`clean::sweep_graveyard`) - the run was already authorised for deletion when it
+was moved, and nothing else reads that directory. The
 abandoned-seat cleanup that `magi fold` and the phone run after a fold that removed
 nothing writes under the locks as well, from a fresh read, so it cannot erase a
 handover that landed after the fold released its own locks.

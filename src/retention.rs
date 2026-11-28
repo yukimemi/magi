@@ -2435,6 +2435,25 @@ mod tests {
         }
     }
 
+    /// A fold that is refused for the rule under test: the record is there and
+    /// readable (the arrangement was saved in `home`), so a refusal that says
+    /// `record gone` or `unreadable` would be the fixture's mistake, not the
+    /// rule's. Returns the error for the caller to assert on.
+    async fn refused(state: &mut RunState, home: &Path) -> anyhow::Error {
+        use crate::graph::FoldRefusal;
+        let error = crate::graph::fold_run(state, true, home)
+            .await
+            .expect_err("the fold is refused");
+        assert!(
+            !matches!(
+                error.downcast_ref::<FoldRefusal>(),
+                Some(FoldRefusal::RecordGone | FoldRefusal::Unreadable(_))
+            ),
+            "refused for the wrong reason: {error:#}"
+        );
+        error
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn incremental_only_reclamation_preserves_legacy_and_unknown_data() {
@@ -4443,11 +4462,18 @@ mod tests {
         });
         // Publication success and terminal labels alone are insufficient.
         for status in [RunStatus::Ready, RunStatus::Failed, RunStatus::Superseded] {
+            // Each label is saved with the confirmed merge, so the fold decides
+            // on it under its locks; the refusal is the queue's retention
+            // reason, which names the task, not a missing record.
             source.status = status;
+            source.save_under(&f.home).unwrap();
+            let error = refused(&mut source, &f.home).await;
             assert!(
-                crate::graph::fold_run(&mut source, true, &f.home)
-                    .await
-                    .is_err()
+                matches!(
+                    error.downcast_ref::<crate::graph::FoldRefusal>(),
+                    Some(crate::graph::FoldRefusal::Retained(reason)) if reason.contains(&task.id)
+                ),
+                "{status:?}: {error:#}"
             );
             assert!(source.candidates[0].worktree.exists());
         }
@@ -4754,21 +4780,13 @@ mod tests {
             state.save_under(&f.home).unwrap();
             // A live output borrower blocks the entire preflight.
             let guard = OutputLease::borrow(&reviewer).unwrap().unwrap();
-            assert!(
-                crate::graph::fold_run(&mut state, true, &f.home)
-                    .await
-                    .is_err()
-            );
+            refused(&mut state, &f.home).await;
             assert!(reviewer.exists());
             drop(guard);
             // Failure to persist evidence must not cause partial removal.
             let evidence = artifacts.join("fold-evidence");
             std::fs::write(&evidence, "blocked").unwrap();
-            assert!(
-                crate::graph::fold_run(&mut state, true, &f.home)
-                    .await
-                    .is_err()
-            );
+            refused(&mut state, &f.home).await;
             assert!(reviewer.exists());
             std::fs::remove_file(&evidence).unwrap();
             std::fs::create_dir_all(&evidence).unwrap();
@@ -4777,32 +4795,20 @@ mod tests {
                 .unwrap()
                 .set_len(64 * 1024 * 1024)
                 .unwrap();
-            assert!(
-                crate::graph::fold_run(&mut state, true, &f.home)
-                    .await
-                    .is_err()
-            );
+            refused(&mut state, &f.home).await;
             assert!(reviewer.exists());
             std::fs::remove_file(oversized).unwrap();
             // Ignored recovery files and unfinished Git operations still hold
             // all sources, even for a confirmed merge.
             std::fs::create_dir_all(reviewer.join("scratch")).unwrap();
             std::fs::write(reviewer.join("scratch/recovery"), "keep").unwrap();
-            assert!(
-                crate::graph::fold_run(&mut state, true, &f.home)
-                    .await
-                    .is_err()
-            );
+            refused(&mut state, &f.home).await;
             std::fs::remove_dir_all(reviewer.join("scratch")).unwrap();
             let checkpoint = git::git(&reviewer, &["rev-parse", "--git-path", "CHERRY_PICK_HEAD"])
                 .await
                 .unwrap();
             std::fs::write(&checkpoint, &head).unwrap();
-            assert!(
-                crate::graph::fold_run(&mut state, true, &f.home)
-                    .await
-                    .is_err()
-            );
+            refused(&mut state, &f.home).await;
             std::fs::remove_file(checkpoint).unwrap();
             let (folded, unreadable) = crate::clean::fold_due(
                 &f.home.join("runs"),

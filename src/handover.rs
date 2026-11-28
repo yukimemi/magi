@@ -133,17 +133,25 @@ pub struct Released {
     pub audit: String,
 }
 
-/// How long a rollback waits for the predecessor's owner lock. Whoever holds
-/// it - an automatic fold that reloads the record and refuses, a liveness
-/// check, a janitor - holds it for a moment; abandoning the rollback over one
-/// of them would leave the predecessor marked as released to a run that never
-/// started.
-const ROLLBACK_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+/// How long a handover waits for the predecessor's owner lock, whether it is
+/// taking the worktree (`release`) or putting it back (`Released::restore`).
+/// Whoever holds it - an automatic fold that reloads the record and refuses, a
+/// liveness check, a janitor - holds it for a moment. Failing the successor's
+/// startup over one of them would spend a task attempt on a run that never
+/// started; abandoning a rollback would leave the predecessor marked as
+/// released to a run that never started.
+///
+/// Lock order, for whoever changes either side: a handover holds repository
+/// coordination and then asks for the owner lock. An automatic fold holds the
+/// owner lock (and the execution lease) and must therefore never *wait* for
+/// coordination - `graph::fold_run_when` asks for it once and gives way - or
+/// the two would wait for each other and this bound could not resolve it.
+const OWNER_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// The owner lock of `id`, retried with a growing pause (10 ms, doubling, at
-/// most 250 ms) for at most `wait` while somebody else holds it. Only
-/// contention is retried; any other failure is the answer.
-async fn owner_lock_for_rollback(
+/// most 250 ms and never past the deadline) for at most `wait` while somebody
+/// else holds it. Only contention is retried; any other failure is the answer.
+async fn owner_lock_retrying(
     home: &Path,
     id: &str,
     wait: std::time::Duration,
@@ -152,11 +160,12 @@ async fn owner_lock_for_rollback(
     let mut pause = std::time::Duration::from_millis(10);
     loop {
         match crate::pr_head::owner_lock(home, id) {
-            Err(error)
-                if crate::graph::held_by_live_owner(&error)
-                    && tokio::time::Instant::now() < deadline =>
-            {
-                tokio::time::sleep(pause).await;
+            Err(error) if crate::graph::held_by_live_owner(&error) => {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(error);
+                }
+                tokio::time::sleep(pause_within(pause, remaining)).await;
                 pause = (pause * 2).min(std::time::Duration::from_millis(250));
             }
             result => return result,
@@ -164,16 +173,22 @@ async fn owner_lock_for_rollback(
     }
 }
 
+/// The pause before the next attempt: the schedule's own, never longer than
+/// what is left of the bound.
+fn pause_within(pause: std::time::Duration, remaining: std::time::Duration) -> std::time::Duration {
+    pause.min(remaining)
+}
+
 impl Released {
     /// Undo the release after the new run failed to start: check the branch
     /// out again at the old path and unmark the old run. Best-effort - if the
     /// worktree cannot be re-added the old run stays marked, which is true.
     pub async fn restore(&self, repo: &Path, branch: &str) {
-        self.restore_within(repo, branch, ROLLBACK_LOCK_WAIT).await;
+        self.restore_within(repo, branch, OWNER_LOCK_WAIT).await;
     }
 
     async fn restore_within(&self, repo: &Path, branch: &str, wait: std::time::Duration) {
-        let Ok(_owner) = owner_lock_for_rollback(&self.home, &self.old_id, wait).await else {
+        let Ok(_owner) = owner_lock_retrying(&self.home, &self.old_id, wait).await else {
             tracing::warn!("could not lock run {} for handover rollback", self.old_id);
             return;
         };
@@ -649,12 +664,21 @@ pub(crate) fn has_resume_checkpoint(state: &RunState, home: &Path) -> bool {
 
 /// The scan only finds a possible holder. Driver claims share this lock, so
 /// reload and validate the candidate while holding it through removal/rollback.
-fn locked_holder(
+async fn locked_holder(
     home: &Path,
     id: &str,
     path: &Path,
 ) -> Result<(RunState, usize, crate::pr_head::OwnerLock)> {
-    let owner = crate::pr_head::owner_lock(home, id)?;
+    locked_holder_within(home, id, path, OWNER_LOCK_WAIT).await
+}
+
+async fn locked_holder_within(
+    home: &Path,
+    id: &str,
+    path: &Path,
+    wait: std::time::Duration,
+) -> Result<(RunState, usize, crate::pr_head::OwnerLock)> {
+    let owner = owner_lock_retrying(home, id, wait).await?;
     let state = RunState::load_under(id, home)?;
     let index = state
         .candidates
@@ -731,7 +755,7 @@ pub async fn release(
         return Ok(None);
     };
 
-    let (mut state, index, _owner) = locked_holder(&takeover.home, &state.id, &path)?;
+    let (mut state, index, _owner) = locked_holder(&takeover.home, &state.id, &path).await?;
     if has_resume_checkpoint(&state, &takeover.home) {
         return Err(Refused::Unsafe {
             branch: branch.to_owned(),
@@ -882,8 +906,8 @@ mod tests {
         (state, path)
     }
 
-    #[test]
-    fn handover_reloads_a_driver_claim_after_the_scan_and_excludes_new_claims() {
+    #[tokio::test]
+    async fn handover_reloads_a_driver_claim_after_the_scan_and_excludes_new_claims() {
         let home = tempfile::tempdir().unwrap();
         let (mut state, path) = recorded_holder(home.path());
         let scanned = state.clone();
@@ -895,7 +919,9 @@ mod tests {
         state.save_under(home.path()).unwrap();
         let mut driver = crate::driver::DriverGuard::acquire(home.path(), &state).unwrap();
         driver.record(&state).unwrap();
-        let (fresh, _, owner) = locked_holder(home.path(), &scanned.id, &path).unwrap();
+        let (fresh, _, owner) = locked_holder(home.path(), &scanned.id, &path)
+            .await
+            .unwrap();
         assert!(!fresh.driver_exited);
         assert_eq!(fresh.passes, state.passes);
         assert_ne!(fresh.liveness_under(home.path(), false), Liveness::Dead);
@@ -911,14 +937,14 @@ mod tests {
         assert!(crate::pr_head::owner_lock(home.path(), &state.id).is_ok());
     }
 
-    #[test]
-    fn handover_revalidates_candidate_ownership_under_the_claim_lock() {
+    #[tokio::test]
+    async fn handover_revalidates_candidate_ownership_under_the_claim_lock() {
         let home = tempfile::tempdir().unwrap();
         let (mut state, path) = recorded_holder(home.path());
         state.candidates[0].folded = true;
         state.released_to = Some("next".into());
         state.save_under(home.path()).unwrap();
-        assert!(locked_holder(home.path(), &state.id, &path).is_err());
+        assert!(locked_holder(home.path(), &state.id, &path).await.is_err());
         assert!(path.exists());
     }
 
@@ -1020,6 +1046,116 @@ mod tests {
         assert!(!released.path.exists());
         assert_eq!(disk.released_to.as_deref(), Some("successor"));
         assert!(disk.candidates[0].folded);
+    }
+
+    /// A stopped run holding its worktree on a real branch, ready to be taken
+    /// over by a successor.
+    async fn held_predecessor(home: &Path, repo: &Path) -> (RunState, PathBuf, Takeover) {
+        crate::clean::tests::init_repo(repo);
+        let mut state = RunState::new(
+            repo.to_owned(),
+            "main".into(),
+            "base".into(),
+            "task".into(),
+            crate::config::Config::default(),
+        );
+        state.config.graph.worktree_root = Some(home.join("worktrees"));
+        let path = state.worktree_root().join("cand-A");
+        let branch = "magi/take/A";
+        git::worktree_add_branch(repo, &path, branch, "main")
+            .await
+            .unwrap();
+        state.driver_exited = true;
+        state.status = RunStatus::Gating;
+        state.candidates.push(crate::run::Candidate {
+            index: 0,
+            label: 'A',
+            agent: "existing".into(),
+            branch: branch.into(),
+            worktree: path.clone(),
+            summary: String::new(),
+            stat: String::new(),
+            files: 1,
+            commits: 1,
+            empty: false,
+            failed: None,
+            verified_noop: None,
+            duration_ms: 0,
+            folded: false,
+        });
+        state.save_under(home).unwrap();
+        let takeover = Takeover {
+            earlier: vec![state.id.clone()],
+            home: home.to_owned(),
+            choice: None,
+            task_instruction: None,
+        };
+        (state, path, takeover)
+    }
+
+    /// An automatic fold holds the predecessor's owner lock for a moment while
+    /// it reloads the record and refuses. The handover waits it out: an error
+    /// here is a failed startup, which the daemon charges to the task.
+    #[tokio::test]
+    async fn a_handover_waits_out_a_brief_hold_on_the_owner_lock() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = home.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let (state, path, takeover) = held_predecessor(home.path(), &repo).await;
+        let held = crate::pr_head::owner_lock(home.path(), &state.id).unwrap();
+        let fold = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            drop(held);
+        });
+        let released = release(&repo, "magi/take/A", "successor", &takeover)
+            .await
+            .expect("the handover is not failed by a brief hold")
+            .expect("the worktree is released");
+        fold.join().unwrap();
+        assert_eq!(released.old_id, state.id);
+        assert!(!path.exists(), "the worktree was released");
+        let disk = RunState::load_under(&state.id, home.path()).unwrap();
+        assert_eq!(disk.released_to.as_deref(), Some("successor"));
+    }
+
+    /// Held longer than the bound, the lock still fails the handover as it
+    /// always did, and nothing is touched.
+    #[tokio::test]
+    async fn a_handover_fails_on_a_lock_held_beyond_its_bound() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = home.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let (state, path, _) = held_predecessor(home.path(), &repo).await;
+        let held = crate::pr_head::owner_lock(home.path(), &state.id).unwrap();
+        let error = locked_holder_within(
+            home.path(),
+            &state.id,
+            &path,
+            std::time::Duration::from_millis(150),
+        )
+        .await
+        .err()
+        .expect("the lock is still held after the bound");
+        assert!(crate::graph::held_by_live_owner(&error), "{error:#}");
+        drop(held);
+        assert!(path.exists());
+        let disk = RunState::load_under(&state.id, home.path()).unwrap();
+        assert!(disk.released_to.is_none() && !disk.candidates[0].folded);
+    }
+
+    /// The last pause is clipped to what is left of the bound, so the bound is
+    /// the bound and not "the bound plus the longest pause".
+    #[test]
+    fn the_last_pause_is_clipped_to_the_remaining_bound() {
+        use std::time::Duration;
+        assert_eq!(
+            pause_within(Duration::from_millis(80), Duration::from_millis(500)),
+            Duration::from_millis(80)
+        );
+        assert_eq!(
+            pause_within(Duration::from_millis(80), Duration::from_millis(30)),
+            Duration::from_millis(30)
+        );
     }
 
     #[tokio::test]

@@ -4418,6 +4418,20 @@ impl RunState {
     pub(crate) fn load_tolerant_under(id: &str, home: &Path) -> Result<Self> {
         Self::read_unmigrated(&home.join("runs").join(id).join("run.json"))
     }
+
+    /// This record is the one that belongs in `runs/<dir_id>/`: a copy of one
+    /// run's `run.json` placed in another run's directory would otherwise make
+    /// whoever read the directory act on, and report about, the other run.
+    /// Checked at the first read of a fold; the locked reload checks the same
+    /// thing against the id it locked.
+    pub fn ensure_directory(&self, dir_id: &str) -> Result<()> {
+        anyhow::ensure!(
+            self.id == dir_id,
+            "runs/{dir_id}/run.json records run {}, not run {dir_id}",
+            self.id
+        );
+        Ok(())
+    }
 }
 
 pub(crate) fn migrate_schema(mut state: RunState) -> Result<RunState> {

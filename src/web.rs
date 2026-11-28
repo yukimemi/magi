@@ -4666,7 +4666,15 @@ async fn run_fold(State(ui): State<Arc<Ui>>, Path(id): Path<String>) -> ApiResul
                     "run {id} is being worked on by a live daemon right now"
                 )));
             }
-            let state = read_run(&ui.runs, &id).ok();
+            let state = match read_run(&ui.runs, &id) {
+                Ok(state) => {
+                    state
+                        .ensure_directory(&id)
+                        .map_err(|e| ApiError::internal(format!("{e:#}")))?;
+                    Some(state)
+                }
+                Err(_) => None,
+            };
             Ok((id, state))
         })
         .await?
@@ -4752,6 +4760,9 @@ async fn run_fold_merged(
                 )));
             }
             let state = read_run(&ui.runs, &id)?;
+            state
+                .ensure_directory(&id)
+                .map_err(|e| ApiError::internal(format!("{e:#}")))?;
             Ok((id, state))
         })
         .await?
@@ -23603,6 +23614,34 @@ mod tests {
         assert!(
             runs.join(id).exists(),
             "a fold keeps the run's record; only the worktrees go"
+        );
+    }
+
+    /// `runs/<A>/run.json` holding run B's record is not run A: the phone's fold
+    /// routes refuse it instead of folding B on A's say, and change nothing.
+    #[tokio::test]
+    async fn folding_a_record_that_names_another_run_is_refused() {
+        let fx = Fixture::start().await;
+        let runs = fx.runs();
+        let (a, b) = ("20260901-000000-aaaa", "20260901-000000-bbbb");
+        write_run(&runs, a, RunStatus::Stalled);
+        write_run(&runs, b, RunStatus::Stalled);
+        std::fs::copy(runs.join(b).join("run.json"), runs.join(a).join("run.json")).unwrap();
+        let record = std::fs::read(runs.join(a).join("run.json")).unwrap();
+
+        let res = fx.post(&format!("/api/runs/{a}/fold"), None).await;
+        assert_eq!(res.status, 500, "{}", res.body);
+        assert!(res.body.contains("not run"), "{}", res.body);
+        let res = fx
+            .post(
+                &format!("/api/runs/{a}/fold-merged"),
+                Some(r#"{"pr_url":"https://github.com/owner/repo/pull/1"}"#),
+            )
+            .await;
+        assert_eq!(res.status, 500, "{}", res.body);
+        assert_eq!(
+            std::fs::read(runs.join(a).join("run.json")).unwrap(),
+            record
         );
     }
 

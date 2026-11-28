@@ -2174,7 +2174,8 @@ the first janitor's "folding worktrees and pruning a cache mid-build would race
 the very compile"; that is about the shared-cache prune, `fold_orphaned_worktrees`
 and `worktree_prune`, which stay idle-only. Folding a finished run is protected
 per run (owner lock, execution lease, output leases, repository coordination in
-`graph::fold_run_when`; a live claim in `clean::eligibility`) and is already done
+`graph::fold_run_when`, which the automatic callers ask for once and give way on, see
+"A handover in flight"; a live claim in `clean::eligibility`) and is already done
 beside live runs by `magi fold` and the phone's fold route, so
 `daemon::fold_turn_eligible` admits `service:daemon-fold` exactly where
 housekeeping is not (never beside a housekeeping worker).
@@ -2189,8 +2190,14 @@ housekeeping is not (never beside a housekeeping worker).
   **touches nothing**: the lock files are never unlinked (`pr_head::owner_lock`: an
   unlinked lock file lets the next caller lock another inode) and a run directory
   that is not there is never created to lock it - a missing directory at the lock
-  or the reload is `record gone`. Tests that fold a synthetic record save it first
-  (and save every arrangement they make to it: a fold decides on the record on
+  or the reload is `record gone`. A record whose embedded id is not its directory's
+  name is `unreadable` at the first read for the automatic callers
+  (`clean::read_meta` / `read_state`) and an error for the explicit ones
+  (`RunState::ensure_directory` in `magi fold` and the phone routes), nothing
+  touched. Tests that fold a synthetic record save it first
+  (and save every arrangement they make to it, and assert the refusal the rule
+  produces - `FoldRefusal` or its message - never a bare `is_err()`, which `record
+  gone` would also satisfy: a fold decides on the record on
   disk, so a change made only to the in-memory copy is not seen). The loader is the
   caller's: `fold_run_when` (idle pass, busy turn, the janitor's fold after it
   recorded an external merge) uses `RunState::load_tolerant_under` (no schema check,
@@ -2214,10 +2221,21 @@ housekeeping is not (never beside a housekeeping worker).
   failed or completed startup and a stopped driver settle it. A startup killed
   mid-way leaves the same marker as one in progress and so keeps its predecessor
   out of automatic folding until an operator settles that run (the safe
-  direction). `handover::Released::restore` additionally waits for the
-  predecessor's owner lock for up to two seconds (10 ms doubling to 250 ms) before
-  it gives up, so a fold that holds the lock only long enough to reload and refuse
-  cannot make a rollback abandon; a lock held longer is still given up on.
+  direction). **Lock order with a handover.** A handover holds repository
+  coordination and then asks for the predecessor's owner lock (`handover::release`,
+  `Released::restore`); an automatic fold holds the owner lock and execution lease
+  and, last, asks for coordination - and `released_to`, which `handover_settled`
+  reads, is only recorded after the handover has the owner lock, so before it the
+  two orders meet. The automatic fold therefore never *waits* for coordination while
+  it holds the owner lock: `graph::fold_run_when` asks once
+  (`repo_lock::WaitPolicy::immediate`) and, when it is busy, releases everything,
+  changes and saves nothing and is `live`. The handover side retries the owner lock
+  for up to two seconds (`handover::owner_lock_retrying`: 10 ms doubling to 250 ms,
+  the last pause clipped to the remaining time) in `release` and in the rollback, so
+  a fold that holds the lock only long enough to reload and refuse neither fails the
+  successor's startup (charged to the task as an attempt) nor makes a rollback
+  abandon; a lock held longer still fails the handover / gives up the rollback.
+  `magi fold` and the phone route keep waiting for coordination (`timeout_resource_wait`).
 - **Everything that writes the record takes the same two locks.** Deleting a run
   (`magi run rm`, the phone's delete button) is `clean::delete_run`: owner lock and
   execution lease without waiting (a held lock is `clean::DeleteRefused`, "try again
@@ -2225,7 +2243,12 @@ housekeeping is not (never beside a housekeeping worker).
   directory renamed to a tombstone under `<home>/deleted-runs/` (outside `runs/`,
   which nothing scans) and removed there while both guards are held, so its lock
   files and `run.json` disappear together; where a directory with open files cannot
-  be renamed (Windows), `run.json` is removed first. So a record cannot vanish under
+  be renamed (Windows), `run.json` is removed first. The wholesale removal of an
+  unreadable run (`clean::fold_unreadable`) leaves through the same helper once it
+  holds both locks. A deletion killed between the rename and the removal leaves the
+  directory in `deleted-runs/`; `clean::sweep_graveyard` removes it before the next
+  deletion and in idle housekeeping (nothing else reads it). So a record cannot
+  vanish under
   a fold, and its four-character worktree suffix cannot be reserved again while the
   fold deletes that suffix's directories. The abandoned-seat
   cleanup of `magi fold` / the phone (`clean::clear_abandoned_active`) writes under

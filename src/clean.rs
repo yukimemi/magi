@@ -144,6 +144,9 @@ pub async fn housekeep(
     // banner and title all keep counting a decision nobody is left to read.
     out.questions_abandoned =
         abandon_settled_questions(&Questions::at(home.join("questions")), &home.join("runs"));
+    // Also unconditional: leftovers of run deletions that were killed between
+    // moving the directory away and removing it (see `sweep_graveyard`).
+    sweep_graveyard(home);
     out
 }
 
@@ -590,9 +593,9 @@ pub struct FoldBounds {
 /// local file reads and are bounded by `inspect`, but their wall time depends
 /// on the disk and on how loaded the machine is, which is why the time budget
 /// also applies to them. A fold can take a minute (Git plus deleting
-/// gigabytes of build output) and may wait out repository coordination, so
-/// the fold bound, not the inspect bound, is what limits how long a pass holds
-/// run ownership locks.
+/// gigabytes of build output), so the fold bound, not the inspect bound, is
+/// what limits how long a pass holds run ownership locks. It never waits for
+/// repository coordination while it holds them (see `graph::fold_run_when`).
 ///
 /// The inventory (listing `runs/`, sorting the ids) is not bounded by
 /// `inspect`: it costs one directory listing plus one `is_file` per record on
@@ -1003,19 +1006,30 @@ pub fn due(now: Timestamp, updated: Timestamp, grace_secs: u64) -> bool {
 /// everything else about the run being unreadable.
 #[derive(Deserialize)]
 struct Meta {
+    /// Absent from records too broken to say; present, it must name the
+    /// directory the record was read from.
+    #[serde(default)]
+    id: Option<String>,
     status: RunStatus,
     updated_at: Timestamp,
 }
 
 /// Read `status` and `updated_at` straight off the state file, asking for
-/// nothing else. `Err` when the file is missing, not parseable, or a status in
-/// a version this build does not speak - all of which mean "unreadable".
+/// nothing else. `Err` when the file is missing, not parseable, a status in
+/// a version this build does not speak, or the record of another run than the
+/// directory's - all of which mean "unreadable".
 fn read_meta(runs: &Path, id: &str) -> Result<Meta> {
     let path = runs.join(id).join("run.json");
     let body =
         std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
     let meta: Meta =
         serde_json::from_str(&body).with_context(|| format!("parse {}", path.display()))?;
+    if let Some(recorded) = &meta.id {
+        anyhow::ensure!(
+            recorded == id,
+            "runs/{id}/run.json records run {recorded}, not run {id}"
+        );
+    }
     Ok(meta)
 }
 
@@ -1271,7 +1285,9 @@ where
 /// older record has nothing to say about it. What this cannot tolerate, and
 /// what still surfaces as an `Err`, is `run.json` failing to parse at all.
 fn read_state(runs: &Path, id: &str) -> Result<RunState> {
-    RunState::read_unmigrated(&runs.join(id).join("run.json"))
+    let state = RunState::read_unmigrated(&runs.join(id).join("run.json"))?;
+    state.ensure_directory(id)?;
+    Ok(state)
 }
 
 /// Remove only verified clean Git worktrees and empty directory scaffolding.
@@ -1339,7 +1355,7 @@ pub async fn fold_unreadable(runs: &Path, worktrees_root: &Path, id: &str) -> Re
     let run_dir = runs.join(&resolved);
     // The two locks every writer of the record takes, held until the directory
     // is gone: a fold in progress makes this a refusal, not a race.
-    let _locks = if run_dir.is_dir()
+    let locks = if run_dir.is_dir()
         && let Some(home) = runs.parent()
     {
         let busy = busy_run(&resolved);
@@ -1357,8 +1373,13 @@ pub async fn fold_unreadable(runs: &Path, worktrees_root: &Path, id: &str) -> Re
     }
     // Keep the recovery artifacts if any worktree could not be removed safely.
     if run_dir.exists() {
-        std::fs::remove_dir_all(&run_dir)
-            .with_context(|| format!("remove {}", run_dir.display()))?;
+        // With both guards held the directory leaves through the tombstone, like
+        // a deleted run's, so its lock files and `run.json` disappear together.
+        match (&locks, runs.parent()) {
+            (Some(_), Some(home)) => remove_run_dir(home, &resolved, &run_dir)?,
+            _ => std::fs::remove_dir_all(&run_dir)
+                .with_context(|| format!("remove {}", run_dir.display()))?,
+        }
         removed.push(format!("runs/{resolved}"));
     }
     Ok(removed)
@@ -1647,6 +1668,41 @@ pub fn delete_run(home: &Path, id: &str, now: Timestamp) -> Result<()> {
     remove_run_dir(home, id, &dir)
 }
 
+/// Where a removed run's directory waits, for the moment between its rename
+/// and its removal. Nothing scans it: `runs/` is what every reader lists.
+fn graveyard(home: &Path) -> PathBuf {
+    home.join("deleted-runs")
+}
+
+/// Remove what earlier deletions left in the graveyard: a process killed
+/// between the rename and the removal leaves a complete run directory there,
+/// invisible to every inventory and report. The run was already authorised for
+/// deletion when it was moved and nothing else reads the directory, so any
+/// entry is a leftover. Best effort: an entry that cannot be removed now (a
+/// deletion in another process is removing it this very moment, a file in use)
+/// is tried again by the next deletion or housekeeping pass. Returns how many
+/// entries are gone.
+pub fn sweep_graveyard(home: &Path) -> usize {
+    let mut removed = 0;
+    for entry in std::fs::read_dir(graveyard(home))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let path = entry.path();
+        let gone = match std::fs::remove_dir_all(&path) {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => {
+                tracing::warn!("housekeep: remove leftover {}: {e}", path.display());
+                false
+            }
+        };
+        removed += usize::from(gone);
+    }
+    removed
+}
+
 /// Remove a run's directory while the caller still holds both of its guards, so
 /// that the lock files and `run.json` disappear together.
 ///
@@ -1657,8 +1713,13 @@ pub fn delete_run(home: &Path, id: &str, now: Timestamp) -> Result<()> {
 /// tombstone outside `runs/`, which nothing scans, and removed there. Where a
 /// directory with open files in it cannot be renamed (Windows), `run.json` goes
 /// first instead, so a reader that finds the lock files finds no record.
+///
+/// A crash between the rename and the removal leaves the tombstone behind;
+/// [`sweep_graveyard`] removes such leftovers, here before this deletion
+/// starts (so it never meets its own tombstone) and in idle housekeeping.
 fn remove_run_dir(home: &Path, id: &str, dir: &Path) -> Result<()> {
-    let graveyard = home.join("deleted-runs");
+    sweep_graveyard(home);
+    let graveyard = graveyard(home);
     let tombstone = graveyard.join(format!("{id}-{}", Timestamp::now().as_nanosecond()));
     let renamed = std::fs::create_dir_all(&graveyard)
         .and_then(|()| std::fs::rename(dir, &tombstone))
@@ -4741,5 +4802,221 @@ pub(crate) mod tests {
         let removed = fold_unreadable(&runs, &wt, id).await.unwrap();
         assert_eq!(removed, [format!("runs/{id}")]);
         assert!(!runs.join(id).exists());
+    }
+
+    /// What a deletion killed between the rename and the removal leaves behind.
+    fn leftover_tombstone(home: &Path, name: &str) -> PathBuf {
+        let leftover = home.join("deleted-runs").join(name);
+        std::fs::create_dir_all(leftover.join("artifacts")).unwrap();
+        std::fs::write(leftover.join("run.json"), "{}").unwrap();
+        std::fs::write(leftover.join("artifacts/review.json"), "findings").unwrap();
+        leftover
+    }
+
+    /// A tombstone is removed by the next run deletion, by the wholesale removal
+    /// of an unreadable run (which now leaves through the tombstone too) and by
+    /// idle housekeeping: it was authorised for deletion when it was moved and
+    /// nothing else reads the directory.
+    #[tokio::test]
+    async fn a_leftover_tombstone_is_removed_by_the_next_deletion_and_by_housekeeping() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let now = Timestamp::now();
+
+        let first = leftover_tombstone(home, "20260701-000000-dead-1");
+        let id = "20260801-000000-z009";
+        let mut state = RunState::new(
+            PathBuf::from("/repo"),
+            "main".to_owned(),
+            "abc".to_owned(),
+            "fixture".to_owned(),
+            crate::config::Config::default(),
+        );
+        state.id = id.to_owned();
+        state.status = RunStatus::Failed;
+        state.save_under(home).unwrap();
+        delete_run(home, id, now).unwrap();
+        assert!(!home.join("runs").join(id).exists());
+        assert!(!first.exists(), "the next deletion removed the leftover");
+
+        let second = leftover_tombstone(home, "20260701-000000-dead-2");
+        let mut cfg = crate::config::Config::default();
+        cfg.disk.auto_fold = false;
+        cfg.disk.cache_limit_bytes = 0;
+        housekeep(&cfg, home, &home.join("wt"), &home.join("repo"), now).await;
+        assert!(!second.exists(), "idle housekeeping removed the leftover");
+        assert_eq!(sweep_graveyard(home), 0, "nothing is left to remove");
+    }
+
+    /// An unreadable run's directory leaves through the same tombstone as a
+    /// deleted run's, whose sweep is what removes the earlier leftover here.
+    #[tokio::test]
+    async fn an_unreadable_run_leaves_through_the_tombstone_helper() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let runs = home.join("runs");
+        let id = "20260801-000000-z010";
+        write_meta(&runs, id, "failed", "2026-08-01T00:00:00Z");
+        let leftover = leftover_tombstone(home, "20260701-000000-dead-3");
+        let removed = fold_unreadable(&runs, &home.join("wt"), id).await.unwrap();
+        assert_eq!(removed, [format!("runs/{id}")]);
+        assert!(!runs.join(id).exists());
+        assert!(!leftover.exists(), "it went through `remove_run_dir`");
+        assert_eq!(
+            std::fs::read_dir(home.join("deleted-runs"))
+                .map(|entries| entries.count())
+                .unwrap_or(0),
+            0
+        );
+    }
+
+    /// `runs/<A>/run.json` holding run B's record is not run A: the automatic
+    /// callers judge it unreadable at the first read and touch nothing, and the
+    /// explicit entry points refuse it.
+    #[tokio::test]
+    async fn a_record_naming_another_run_is_unreadable_at_the_first_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let runs = home.join("runs");
+        let (a, b) = ("20260801-000000-m001", "20260801-000000-m002");
+        let (_, wt_a) = due_superseded(home, a).await;
+        let (_, wt_b) = due_superseded(home, b).await;
+        std::fs::copy(runs.join(b).join("run.json"), runs.join(a).join("run.json")).unwrap();
+        let record_a = std::fs::read(runs.join(a).join("run.json")).unwrap();
+        let now = well_after_every_fold();
+
+        let judged = fold_one(&runs, home, &Disk::default(), now, a, false, &mut || {}).await;
+        assert_eq!(judged.outcome, FoldOutcome::Unreadable);
+        assert!(read_state(&runs, a).is_err());
+        assert!(
+            RunState::read_unmigrated(&runs.join(a).join("run.json"))
+                .unwrap()
+                .ensure_directory(a)
+                .is_err()
+        );
+
+        let turn = one_pass(home, now).await;
+        assert_eq!((turn.unreadable, turn.folded), (1, 1), "{turn:?}");
+        assert!(wt_a.exists() && !wt_b.exists(), "only run B was folded");
+        assert_eq!(
+            std::fs::read(runs.join(a).join("run.json")).unwrap(),
+            record_a,
+            "nothing was saved over the directory's record"
+        );
+    }
+
+    /// The real operations in the window that matters: a `Ready` predecessor
+    /// is handed over by `handover::release`, then an automatic fold with no
+    /// grace judges it - `live`, nothing read back differently - and the
+    /// rollback after the successor's startup failed still finds the worktree,
+    /// the branch tip and the ownership record where it left them.
+    #[tokio::test]
+    async fn an_automatic_fold_between_a_real_release_and_its_rollback_finds_the_run_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let runs = home.join("runs");
+        let wt = home.join("wt");
+        let repo = home.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let (id, next) = ("20260801-000000-h001", "20260901-000000-h002");
+        let (_, worktree) =
+            due_run_with_winner_worktree(&runs, &wt, &repo, id, RunStatus::Ready).await;
+        let branch = format!("magi/{id}/A");
+        let tip = crate::git::rev_parse(&repo, &branch).await.unwrap();
+        let mut stopped = RunState::load_under(id, home).unwrap();
+        stopped.driver_exited = true;
+        let aged = stopped.updated_at;
+        stopped.save_under_at(home, aged).unwrap();
+        due_run(&runs, &wt, next, SCHEMA);
+        start_of(home, next, false, None);
+
+        let takeover = crate::handover::Takeover {
+            earlier: vec![id.to_owned()],
+            home: home.to_owned(),
+            choice: None,
+            task_instruction: None,
+        };
+        let released = crate::handover::release(&repo, &branch, next, &takeover)
+            .await
+            .unwrap()
+            .expect("the stopped worktree is released");
+        assert!(!worktree.exists());
+        let record = std::fs::read(runs.join(id).join("run.json")).unwrap();
+
+        let disk = Disk {
+            fold_grace_secs: 0,
+            ..Disk::default()
+        };
+        let now = well_after_every_fold();
+        let judged = fold_one(&runs, home, &disk, now, id, false, &mut || {}).await;
+        assert_eq!(judged.outcome, FoldOutcome::Live, "{:?}", judged.note);
+        assert_eq!(
+            std::fs::read(runs.join(id).join("run.json")).unwrap(),
+            record,
+            "the fold saved nothing over the handover"
+        );
+
+        start_of(home, next, false, Some("setup failed"));
+        released.restore(&repo, &branch).await;
+        let restored = run_json(home, id);
+        assert!(restored.released_to.is_none() && !restored.candidates[0].folded);
+        assert!(restored.driver_exited);
+        assert_eq!(restored.status, RunStatus::Ready);
+        assert!(worktree.exists(), "the worktree is back");
+        assert_eq!(crate::git::rev_parse(&worktree, "HEAD").await.unwrap(), tip);
+        assert_eq!(crate::git::rev_parse(&repo, &branch).await.unwrap(), tip);
+    }
+
+    /// A successor whose startup completed and whose execution lease is held is
+    /// being driven: the handover is still in flight, whatever its record says
+    /// about the predecessor. Once the lease is gone nothing protects it.
+    #[tokio::test]
+    async fn a_successor_holding_its_execution_lease_protects_its_predecessor() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let runs = home.join("runs");
+        let wt = home.join("wt");
+        let repo = home.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let (id, next) = ("20260801-000000-l001", "20260901-000000-l002");
+        let (_, worktree) =
+            due_run_with_winner_worktree(&runs, &wt, &repo, id, RunStatus::Superseded).await;
+        due_run(&runs, &wt, next, SCHEMA);
+        hand_over_to(home, id, next);
+        // Complete startup, no process identity: the held lease is the only
+        // evidence the successor is running.
+        let mut successor = RunState::load_under(next, home).unwrap();
+        successor.startup = Some(crate::run::Startup {
+            kind: "review".to_owned(),
+            branch: None,
+            stage: "open-review".to_owned(),
+            complete: true,
+            failure: None,
+        });
+        successor.status = RunStatus::Reviewing;
+        successor.driver_exited = false;
+        successor.driver_pid = None;
+        successor.driver_started_at = None;
+        successor.begin_pass();
+        let aged = successor.updated_at;
+        successor.save_under_at(home, aged).unwrap();
+        let mut driving = crate::driver::DriverGuard::acquire(home, &successor).unwrap();
+        driving.record(&successor).unwrap();
+
+        let disk = Disk {
+            fold_grace_secs: 0,
+            ..Disk::default()
+        };
+        let now = well_after_every_fold();
+        let judged = fold_one(&runs, home, &disk, now, id, false, &mut || {}).await;
+        assert_eq!(judged.outcome, FoldOutcome::Live, "{:?}", judged.note);
+        assert!(worktree.exists());
+
+        drop(driving);
+        let judged = fold_one(&runs, home, &disk, now, id, false, &mut || {}).await;
+        assert_eq!(judged.outcome, FoldOutcome::Folded, "{:?}", judged.note);
+        assert!(!worktree.exists());
     }
 }

@@ -2177,6 +2177,8 @@ async fn dispatch(command: Command) -> Result<()> {
             // so it refuses instead of silently skipping the correction.
             let removed = match RunState::load(&id) {
                 Ok(mut state) => {
+                    // A record that is another run's is not folded on this one's say.
+                    state.ensure_directory(&id)?;
                     if let Some(url) = merged {
                         // Boxed defensively: `land::correct_manual_merge` calls
                         // into `land::land`, whose own loop nests
