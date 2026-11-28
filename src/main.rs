@@ -2194,8 +2194,13 @@ async fn dispatch(command: Command) -> Result<()> {
             // so fold it wholesale instead. `--merged` has nothing to correct
             // in that case - there is no `status` or `merge` field to write -
             // so it refuses instead of silently skipping the correction.
+            // Before the migrating loader: a record that names another run is an
+            // identity error even when its schema is one this build refuses.
+            magi::clean::ensure_record_identity(&magi::run::runs_root(), &id)?;
             let removed = match RunState::load(&id) {
                 Ok(mut state) => {
+                    // A record that is another run's is not folded on this one's say.
+                    state.ensure_directory(&id)?;
                     if let Some(url) = merged {
                         // Boxed defensively: `land::correct_manual_merge` calls
                         // into `land::land`, whose own loop nests
@@ -4957,13 +4962,9 @@ fn repos_text(found: &[repos::Repo]) -> String {
 /// Delete a recorded run directory.
 fn run_rm_cmd(id: &str) -> Result<()> {
     let resolved = resolve_id(id)?;
-    let state = RunState::load(&resolved)?;
-    let in_flight =
-        magi::daemon::is_working_on(&magi::run::home(), &resolved, jiff::Timestamp::now());
-    state.ensure_can_delete(in_flight)?;
-    let dir = magi::run::run_dir(&resolved);
-    std::fs::remove_dir_all(&dir)
-        .with_context(|| format!("remove run directory {}", dir.display()))?;
+    // Under the run's owner lock and execution lease, like every writer of the
+    // record: a fold in progress refuses the deletion instead of racing it.
+    magi::clean::delete_run(&magi::run::home(), &resolved, jiff::Timestamp::now())?;
     // The agent that asked died with the run, so an open question would keep
     // asking for a decision nobody can deliver.
     let abandoned = ask::Questions::open().abandon_for_run(

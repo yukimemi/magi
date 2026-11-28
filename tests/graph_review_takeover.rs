@@ -573,6 +573,81 @@ async fn failed_review_setup_records_the_failure_and_restores_the_predecessor() 
 }
 }
 
+// The window the owner-lock retry and the fold's give-way exist for, with the
+// real operations and no sleeps: a `Ready` predecessor is handed over
+// (`release`), an automatic fold with no grace runs *after* the release and
+// *before* the successor's startup fails, and the rollback then restores the
+// predecessor. The fold must find the handover in flight and touch nothing,
+// or the rollback finds its worktree folded away and its record rewritten.
+common::e2e! {
+async fn an_automatic_fold_between_the_release_and_the_rollback_leaves_the_handover_alone() {
+    let _home = common::home_lock().await;
+    let fx = fixture(_home, Judges::Unanimous, true);
+    let (mut old, wt) = old_run(&fx);
+    old.status = RunStatus::Ready;
+    old.save().unwrap();
+    let tip = run_git(&fx.repo, &["rev-parse", BRANCH]);
+
+    // The successor is starting: reserved, startup neither complete nor failed.
+    let mut successor = RunState::new(
+        fx.repo.clone(),
+        "main".to_owned(),
+        old.base_commit.clone(),
+        "review".to_owned(),
+        fx.config.clone(),
+    );
+    successor.reserve().unwrap();
+    successor.startup = Some(magi::run::Startup {
+        kind: "review".to_owned(),
+        branch: Some(BRANCH.to_owned()),
+        stage: "handover".to_owned(),
+        complete: false,
+        failure: None,
+    });
+    successor.save().unwrap();
+
+    let released = magi::handover::release(&fx.repo, BRANCH, &successor.id, &takeover(&[&old]))
+        .await
+        .unwrap()
+        .expect("the stopped worktree is released");
+    assert!(!wt.exists());
+    let record = || std::fs::read(old.dir().join("run.json")).unwrap();
+    let released_record = record();
+
+    // The automatic fold: no grace, no bound, a long way past every record.
+    let home = magi::run::home();
+    let mut disk = fx.config.disk.clone();
+    disk.fold_grace_secs = 0;
+    let late = jiff::Timestamp::now()
+        .checked_add(jiff::SignedDuration::from_hours(48))
+        .unwrap();
+    let bounds = magi::clean::FoldBounds {
+        inspect: usize::MAX,
+        fold: usize::MAX,
+        budget: std::time::Duration::from_secs(3600),
+    };
+    let turn = magi::clean::fold_turn(&home.join("runs"), &home, &disk, late, bounds).await;
+    assert!(turn.live >= 1, "the handover in flight is live: {turn:?}");
+    assert_eq!(record(), released_record, "the fold saved nothing over the handover");
+    assert_eq!(run_git(&fx.repo, &["rev-parse", BRANCH]), tip);
+
+    // The successor's startup fails; the rollback puts the predecessor back.
+    let mut failed = RunState::load(&successor.id).unwrap();
+    failed.startup.as_mut().unwrap().failure = Some("setup failed".to_owned());
+    failed.status = RunStatus::Failed;
+    failed.save().unwrap();
+    released.restore(&fx.repo, BRANCH).await;
+    let restored = RunState::load(&old.id).unwrap();
+    assert!(!restored.released());
+    assert!(!restored.candidates[0].folded);
+    assert!(restored.driver_exited);
+    assert_eq!(restored.status, RunStatus::Ready);
+    assert!(wt.exists(), "the worktree is back");
+    assert_eq!(run_git(&wt, &["rev-parse", "HEAD"]), tip);
+    assert_eq!(run_git(&fx.repo, &["rev-parse", BRANCH]), tip);
+}
+}
+
 common::e2e! {
 async fn queue_review_refusal_records_startup_without_spending_an_attempt() {
     let _home = common::home_lock().await;

@@ -1427,6 +1427,8 @@ pub(super) fn seat_inspections(home: &Path, id: &str) -> Result<Vec<String>> {
         "source-eviction-housekeeping-worker.json",
         "source-eviction-disk-pressure-dispatch.json",
         "source-eviction-disk-pressure-worker.json",
+        "source-eviction-fold-dispatch.json",
+        "source-eviction-fold-worker.json",
     ] {
         let path = home.join(name);
         if path.try_exists()? {

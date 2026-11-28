@@ -4682,20 +4682,95 @@ fn retention_service_receipt(
     detail: &str,
     cfg: Option<&Config>,
 ) {
-    if !matches!(operation, "housekeeping" | "disk-pressure") {
+    retention_service_receipt_with(
+        home,
+        operation,
+        phase,
+        outcome,
+        detail,
+        cfg,
+        serde_json::Value::Null,
+    );
+}
+
+/// [`retention_service_receipt`] plus `extra`: an object whose fields (the
+/// fold turn's per-outcome counts and cursor, a retention pass's failures) are
+/// added to the same receipt file rather than to a store of their own.
+fn retention_service_receipt_with(
+    home: &Path,
+    operation: &str,
+    phase: &str,
+    outcome: &str,
+    detail: &str,
+    cfg: Option<&Config>,
+    extra: serde_json::Value,
+) {
+    if !matches!(operation, "housekeeping" | "disk-pressure" | "fold") {
         return;
     }
-    let receipt = serde_json::json!({"checked_at": Timestamp::now(),
+    let mut receipt = serde_json::json!({"checked_at": Timestamp::now(),
         "version": env!("CARGO_PKG_VERSION"), "pid": std::process::id(),
         "operation": operation, "outcome": outcome, "detail": detail,
         "auto_fold": cfg.map(|c| c.disk.auto_fold),
         "reclaim_bytes": cfg.map(|c| c.disk.worktree_reclaim_bytes)});
+    if let (Some(receipt), serde_json::Value::Object(extra)) = (receipt.as_object_mut(), extra) {
+        receipt.extend(extra);
+    }
     if let Err(error) = crate::fold_evidence::atomic_write(
         &home.join(format!("source-eviction-{operation}-{phase}.json")),
         &serde_json::to_vec(&receipt).expect("service receipt"),
     ) {
         tracing::warn!("retention service receipt failed: {error:#}");
     }
+}
+
+/// What a retention pass reported, for the service receipt: the same report
+/// `retention.json` holds, reduced to what says whether the pass ran. On a
+/// platform without process containment this carries the refusal.
+fn retention_summary(report: &crate::retention::Report) -> serde_json::Value {
+    let clip = |text: &String| text.chars().take(300).collect::<String>();
+    serde_json::json!({"retention": {
+        "checked_at": report.checked_at,
+        "freed_bytes": report.freed_bytes,
+        "retired": report.retired,
+        "retained": report.retained.len(),
+        "failure_count": report.failures.len(),
+        "failures": report.failures.iter().take(8).map(clip).collect::<Vec<_>>(),
+    }})
+}
+
+/// Why the finished-run folding turn exists, and what keeps it safe.
+///
+/// `housekeeping` (which folds finished runs through `clean::fold_due`) has
+/// only ever been admitted on a fully idle machine: it was written as "the
+/// janitor, called when a task just ended" (e2c10827, "the disk is quiet ...
+/// folding worktrees and pruning a cache mid-build would race the very compile
+/// the prune exists to keep"), and the idle gate survived when the loop was
+/// split into services. Nothing in that reasoning is about folding: it is
+/// about the shared cache prune, `fold_orphaned_worktrees` (a run that has no
+/// `run.json` yet is indistinguishable from an orphan) and `worktree_prune`,
+/// which stay idle-only. Folding a *finished* run is already done beside live
+/// runs of the same repository by `Runner::fold_losers`, `magi fold` and the
+/// phone's fold route, because `graph::fold_run_when` takes the run's owner lock
+/// and execution lease, a per-worktree output lease and the repository
+/// coordination lease itself, acts on the run record it reloads once it holds
+/// them (a handover in between cannot be undone), and `clean::eligibility`
+/// refuses anything a live claim holds. So a queue that is never empty must not
+/// mean runs are never folded (issue 1275): this turn is admitted exactly where
+/// housekeeping is not, in bounded passes (`clean::BUSY_FOLD_BOUNDS`).
+const FOLD_TURN_INTERVAL_SECS: u64 = 120;
+
+/// Idle housekeeping: no worker busy and nothing runnable.
+fn housekeeping_eligible(busy: bool, runnable: bool) -> bool {
+    !busy && !runnable
+}
+
+/// Exactly the machines [`housekeeping_eligible`] never reaches (see
+/// [`FOLD_TURN_INTERVAL_SECS`] for why folding may run beside live work),
+/// and only with a startup configuration that has `auto_fold` on (like the
+/// cache and fetch services, an unreadable one means no service).
+fn fold_turn_eligible(busy: bool, runnable: bool, cfg: Option<&Config>) -> bool {
+    !housekeeping_eligible(busy, runnable) && cfg.is_some_and(|cfg| cfg.disk.auto_fold)
 }
 
 async fn start_service(
@@ -4729,6 +4804,7 @@ async fn start_service(
         .and_then(|body| serde_json::from_slice::<Timestamp>(&body).ok());
     let interval = match operation {
         "disk-pressure" => 30,
+        "fold" => FOLD_TURN_INTERVAL_SECS,
         "chat-goals" => 60,
         "cache" => CACHE_CHECK_INTERVAL_SECS,
         "fetch" => cfg.map_or(60, |cfg| cfg.repos.fetch_interval.max(1)),
@@ -4747,16 +4823,32 @@ async fn start_service(
         return Ok(());
     }
     let key = format!("service:daemon-{operation}");
-    if crate::worker::active(home)?
-        .iter()
-        .any(|job| job.key == key)
-    {
+    let active = crate::worker::active(home)?;
+    if active.iter().any(|job| job.key == key) {
         retention_service_receipt(
             home,
             operation,
             "dispatch",
             "skipped",
             "service worker already active",
+            cfg,
+        );
+        return Ok(());
+    }
+    // Both fold the same runs; the run's owner lock already makes a collision
+    // harmless, but one of them at a time keeps the receipts unambiguous.
+    let sibling = match operation {
+        "housekeeping" => Some("service:daemon-fold"),
+        "fold" => Some("service:daemon-housekeeping"),
+        _ => None,
+    };
+    if sibling.is_some_and(|sibling| active.iter().any(|job| job.key == sibling)) {
+        retention_service_receipt(
+            home,
+            operation,
+            "dispatch",
+            "skipped",
+            "another finished-run folding service is active",
             cfg,
         );
         return Ok(());
@@ -4784,7 +4876,8 @@ async fn start_service(
                             .exists()
                 })
         }
-        "housekeeping" => !busy && runnable(queue).is_empty(),
+        "housekeeping" => housekeeping_eligible(busy, !runnable(queue).is_empty()),
+        "fold" => fold_turn_eligible(busy, !runnable(queue).is_empty(), cfg),
         "cache" => {
             !busy
                 && !runnable(queue).is_empty()
@@ -4811,10 +4904,12 @@ async fn start_service(
             operation,
             "dispatch",
             "skipped",
-            if operation == "housekeeping" {
-                "active work or runnable task queue"
-            } else {
-                "no active work; idle housekeeping owns scan"
+            match operation {
+                "housekeeping" => "active work or runnable task queue",
+                "fold" if cfg.is_none() => "startup configuration unavailable",
+                "fold" if cfg.is_some_and(|cfg| !cfg.disk.auto_fold) => "auto_fold disabled",
+                "fold" => "idle machine; housekeeping owns finished-run folding",
+                _ => "no active work; idle housekeeping owns scan",
             },
             cfg,
         );
@@ -4834,9 +4929,7 @@ async fn start_service(
         worktrees_root: std::path::absolute(worktrees_root)?,
         operation: operation.to_owned(),
     };
-    if let Err(error) =
-        crate::worker::spawn(home, "daemon-service", &key, serde_json::to_value(request)?).await
-    {
+    if let Err(error) = launch_service(home, &key, request).await {
         retention_service_receipt(
             home,
             operation,
@@ -4849,6 +4942,83 @@ async fn start_service(
     }
     std::fs::write(receipt, serde_json::to_vec(&now)?)?;
     Ok(())
+}
+
+/// Hand `request` to a detached `daemon-service` worker reservation.
+///
+/// Unit tests have no `magi` executable to pin and exec as a worker, so they
+/// may run the very same [`run_service_worker`] inline instead (and nothing
+/// else differs: admission, cadence and receipts above are the production path).
+async fn launch_service(home: &Path, key: &str, request: ServiceWorker) -> Result<()> {
+    #[cfg(test)]
+    if INLINE_SERVICES.with(std::cell::Cell::get) {
+        return run_service_worker(home, serde_json::to_value(request)?).await;
+    }
+    crate::worker::spawn(home, "daemon-service", key, serde_json::to_value(request)?).await?;
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static INLINE_SERVICES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// One bounded pass of finished-run folding (`clean::fold_turn`) with its
+/// per-outcome counts and cursor in the service receipt. It reserves no agent
+/// seat and takes only the locks `graph::fold_run` takes for one run at a time.
+async fn fold_service_turn(home: &Path, opts: &Opts) {
+    let worker = |outcome: &str, detail: &str, cfg: Option<&Config>, extra| {
+        retention_service_receipt_with(home, "fold", "worker", outcome, detail, cfg, extra);
+    };
+    let cfg = match prepare(&opts.repo, opts) {
+        Ok(cfg) => cfg,
+        Err(error) => {
+            worker(
+                "error",
+                &format!("configuration: {error:#}"),
+                None,
+                serde_json::Value::Null,
+            );
+            return;
+        }
+    };
+    if !cfg.disk.auto_fold {
+        worker(
+            "skipped",
+            "auto_fold disabled",
+            Some(&cfg),
+            serde_json::Value::Null,
+        );
+        return;
+    }
+    worker(
+        "running",
+        "finished-run fold turn",
+        Some(&cfg),
+        serde_json::Value::Null,
+    );
+    let turn = clean::fold_turn(
+        &home.join("runs"),
+        home,
+        &cfg.disk,
+        Timestamp::now(),
+        clean::BUSY_FOLD_BOUNDS,
+    )
+    .await;
+    if turn.folded > 0 || turn.failed > 0 || turn.unreadable > 0 {
+        tracing::info!(
+            folded = turn.folded,
+            failed = turn.failed,
+            unreadable = turn.unreadable,
+            "housekeep: finished-run fold turn"
+        );
+    }
+    worker(
+        "completed",
+        "finished-run fold turn",
+        Some(&cfg),
+        serde_json::json!({ "fold": turn }),
+    );
 }
 
 /// Finite maintenance jobs survive scheduler replacement without duplicating
@@ -4929,7 +5099,16 @@ pub async fn run_service_worker(home: &Path, payload: serde_json::Value) -> Resu
                     "retention sweep",
                     Some(&cfg),
                 );
-                crate::retention::sweep(home, &cfg.disk, Timestamp::now()).await;
+                let report = crate::retention::sweep(home, &cfg.disk, Timestamp::now()).await;
+                retention_service_receipt_with(
+                    home,
+                    "disk-pressure",
+                    "worker",
+                    "retention swept",
+                    "retention sweep finished; cache cleanup follows",
+                    Some(&cfg),
+                    retention_summary(&report),
+                );
                 if let Err(e) = clean::prune_cache_if_over_limit(&cfg, home) {
                     tracing::warn!("disk pressure cache cleanup failed: {e:#}");
                 }
@@ -4971,6 +5150,7 @@ pub async fn run_service_worker(home: &Path, payload: serde_json::Value) -> Resu
                 );
             }
         }
+        "fold" => fold_service_turn(home, opts).await,
         "housekeeping" => {
             if task_jobs(home)?.is_empty() {
                 match prepare(&opts.repo, opts) {
@@ -4983,7 +5163,17 @@ pub async fn run_service_worker(home: &Path, payload: serde_json::Value) -> Resu
                             "retention sweep",
                             Some(&cfg),
                         );
-                        crate::retention::sweep(home, &cfg.disk, Timestamp::now()).await;
+                        let report =
+                            crate::retention::sweep(home, &cfg.disk, Timestamp::now()).await;
+                        retention_service_receipt_with(
+                            home,
+                            "housekeeping",
+                            "worker",
+                            "retention swept",
+                            "retention sweep finished; janitor follows",
+                            Some(&cfg),
+                            retention_summary(&report),
+                        );
                     }
                     Err(error) => retention_service_receipt(
                         home,
@@ -5162,6 +5352,7 @@ async fn poll(
             "maintenance",
             "housekeeping",
             "disk-pressure",
+            "fold",
             "cache",
             "fetch",
             "chat-goals",
@@ -12698,6 +12889,7 @@ mod tests {
             "maintenance",
             "housekeeping",
             "disk-pressure",
+            "fold",
             "cache",
             "fetch",
             "chat-goals",
@@ -12806,6 +12998,284 @@ mod tests {
             "no active work; idle housekeeping owns scan"
         );
         assert!(crate::worker::active(&home).unwrap().is_empty());
+    }
+
+    /// The folding turn exists exactly where idle housekeeping does not: with
+    /// work busy or runnable. On `origin/main` the only caller of
+    /// `clean::fold_due` was housekeeping, so a queue that was never empty
+    /// admitted no finished-run folding at all.
+    #[test]
+    fn the_fold_turn_is_admitted_exactly_where_housekeeping_is_not() {
+        let on = Config::default();
+        for busy in [false, true] {
+            for runnable in [false, true] {
+                assert_ne!(
+                    housekeeping_eligible(busy, runnable),
+                    fold_turn_eligible(busy, runnable, Some(&on)),
+                    "busy={busy} runnable={runnable}"
+                );
+            }
+        }
+        assert!(!housekeeping_eligible(true, true), "the 1275 machine");
+        assert!(!fold_turn_eligible(true, true, None));
+        let mut off = Config::default();
+        off.disk.auto_fold = false;
+        assert!(!fold_turn_eligible(true, true, Some(&off)));
+        assert!(fold_turn_eligible(true, true, Some(&Config::default())));
+    }
+
+    #[tokio::test]
+    async fn the_fold_service_says_why_it_skipped_a_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let (opts, queue, _, home, worktrees) = idle_loop(dir.path());
+        let read = || -> serde_json::Value {
+            serde_json::from_slice(
+                &std::fs::read(home.join("source-eviction-fold-dispatch.json")).unwrap(),
+            )
+            .unwrap()
+        };
+        let tick = home.join("service-ticks/daemon-fold");
+        let cfg = Config::default();
+        let dispatch = |busy: bool, cfg: Config| {
+            let (home, opts, queue, worktrees) = (&home, &opts, &queue, &worktrees);
+            async move {
+                start_service(home, opts, queue, worktrees, "fold", Some(&cfg), busy)
+                    .await
+                    .unwrap();
+            }
+        };
+        dispatch(true, cfg.clone()).await;
+        assert_eq!(read()["detail"], "cadence not due");
+
+        std::fs::remove_file(&tick).unwrap();
+        dispatch(false, cfg.clone()).await;
+        assert_eq!(
+            read()["detail"],
+            "idle machine; housekeeping owns finished-run folding"
+        );
+        let mut off = cfg.clone();
+        off.disk.auto_fold = false;
+        dispatch(true, off).await;
+        assert_eq!(read()["detail"], "auto_fold disabled");
+        // An unreadable startup configuration is its own reason, not "idle".
+        start_service(&home, &opts, &queue, &worktrees, "fold", None, true)
+            .await
+            .unwrap();
+        assert_eq!(read()["detail"], "startup configuration unavailable");
+
+        // A housekeeping worker already folding: one folding service at a time.
+        let directory = home.join("workers/jobs/abcdef");
+        std::fs::create_dir_all(&directory).unwrap();
+        let lease = std::fs::File::create(directory.join("live.lock")).unwrap();
+        crate::pr_head::try_lock_file(&lease).unwrap();
+        let mut job = crate::worker::Job {
+            id: "abcdef".into(),
+            sequence: 1,
+            kind: "daemon-service".into(),
+            key: "service:daemon-housekeeping".into(),
+            payload: serde_json::Value::Null,
+            generation: "fixture".into(),
+            version: None,
+            status: crate::worker::Status::Running,
+            result: None,
+            pid: Some(std::process::id()),
+            created_at: Timestamp::now().as_second() as u64,
+            finished_at: None,
+        };
+        let record = directory.join("job.json");
+        std::fs::write(&record, serde_json::to_vec(&job).unwrap()).unwrap();
+        dispatch(true, cfg).await;
+        assert_eq!(
+            read()["detail"],
+            "another finished-run folding service is active"
+        );
+        assert_eq!(crate::worker::active(&home).unwrap().len(), 1);
+        job.status = crate::worker::Status::Finished;
+        std::fs::write(record, serde_json::to_vec(&job).unwrap()).unwrap();
+        drop(lease);
+    }
+
+    /// Issue 1275 through the scheduler's own admission: a leased task worker is
+    /// busy, another task is runnable, and a confirmed merged run of the same
+    /// repository is long past its grace. `poll` admits the fold service (the
+    /// worker runs inline here: a unit test has no `magi` executable to exec),
+    /// the historical worktree goes, the repository's active checkout stays and
+    /// the merged run's evidence is kept. Removing `"fold"` from the operation
+    /// list in `poll` leaves the worktree standing and fails this test.
+    #[tokio::test]
+    async fn the_scheduler_folds_a_merged_run_beside_a_busy_worker_and_a_runnable_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let (opts, queue, _, home, worktrees) = idle_loop(dir.path());
+        let repo = dir.path().join("checkout");
+        std::fs::create_dir_all(&repo).unwrap();
+        crate::clean::tests::init_repo(&repo);
+        std::fs::write(
+            opts.config.as_ref().unwrap(),
+            "[disk]\nmin_free_bytes = 0\nauto_fold = true\ncache_limit_bytes = 0\n",
+        )
+        .unwrap();
+        let (id, historical) = crate::clean::tests::merged_run_with_worktree(
+            &home,
+            &repo,
+            &worktrees,
+            "20260801-000000-s001",
+        )
+        .await;
+        let active = dir.path().join("active");
+        crate::git::worktree_add_branch(&repo, &active, "magi/active", "main")
+            .await
+            .unwrap();
+        // The busy worker belongs to the scheduler's own queue and owns a
+        // recorded run of the same repository that is eligible on paper
+        // (finished, past its grace). Its execution lease is held, as a
+        // driving worker holds it.
+        let (owned_id, owned_worktree) = crate::clean::tests::due_run_with_winner_worktree(
+            &home.join("runs"),
+            &worktrees,
+            &repo,
+            "20260801-000000-s002",
+            RunStatus::Superseded,
+        )
+        .await;
+        let owned_run = home.join("runs").join(&owned_id);
+        let owned_record = std::fs::read(owned_run.join("run.json")).unwrap();
+        let mut busy = task();
+        busy.repo = repo.clone();
+        busy.status = TaskStatus::Running;
+        busy.link_run(&owned_id);
+        queue.put(&mut busy).unwrap();
+        let worker_lease = crate::worker::running_fixture(
+            &home,
+            &format!("task:{}", busy.id),
+            serde_json::to_value(TaskWorker {
+                opts: Opts::default(),
+                queue: queue.root().to_owned(),
+                task: busy.id.clone(),
+                lane: PermitKind::default(),
+                standalone: true,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let execution = crate::driver::maintenance(&home, &owned_id).unwrap();
+        let mut waiting = task();
+        waiting.repo = repo.clone();
+        queue.put(&mut waiting).unwrap();
+        std::fs::remove_file(home.join("service-ticks/daemon-fold")).unwrap();
+
+        let mut cfg = Config::default();
+        cfg.disk.auto_fold = true;
+        INLINE_SERVICES.with(|inline| inline.set(true));
+        let status = Arc::new(Mutex::new(Status::new()));
+        let stop = Stop::new();
+        let mut dispatch = Box::pin(poll(
+            &opts,
+            &queue,
+            &status,
+            &home,
+            &worktrees,
+            &stop,
+            DispatchLimits {
+                max_concurrent: 0,
+                pause_for_interrupts: false,
+                recovery_cfg: Some(cfg),
+            },
+        ));
+        let receipt = home.join("source-eviction-fold-worker.json");
+        let completed = async {
+            loop {
+                let done = std::fs::read(&receipt)
+                    .ok()
+                    .and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok())
+                    .is_some_and(|receipt| receipt["outcome"] == "completed");
+                if done {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        };
+        tokio::select! {
+            result = &mut dispatch => panic!("the scheduler stopped before the fold service ran: {result:?}"),
+            result = tokio::time::timeout(Duration::from_secs(120), completed) => {
+                result.expect("the scheduler never admitted the fold service");
+            }
+        }
+        stop.stop();
+        dispatch.await.unwrap();
+        INLINE_SERVICES.with(|inline| inline.set(false));
+
+        assert!(!historical.exists(), "the merged run's worktree is folded");
+        assert!(
+            active.join("README.md").is_file(),
+            "the repository's active checkout is untouched"
+        );
+        let run = home.join("runs").join(&id);
+        assert!(run.join("run.json").is_file());
+        assert!(run.join("artifacts/fold-evidence/manifest.json").is_file());
+        let read = |name: &str| -> serde_json::Value {
+            serde_json::from_slice(&std::fs::read(home.join(name)).unwrap()).unwrap()
+        };
+        assert_eq!(
+            read("source-eviction-fold-dispatch.json")["detail"],
+            "eligible and cadence due"
+        );
+        let worker = read("source-eviction-fold-worker.json");
+        assert_eq!(worker["fold"]["records"], 2);
+        assert_eq!(worker["fold"]["folded"], 1);
+        assert_eq!(worker["fold"]["invoked"], 1);
+        assert_eq!(
+            worker["fold"]["live"], 1,
+            "the busy worker's own run is left alone: {worker}"
+        );
+        // The run the busy worker owns - eligible on paper (finished, past its
+        // grace) - keeps its checkout, its candidate and its record, byte for byte.
+        assert!(owned_worktree.exists());
+        assert_eq!(
+            std::fs::read(owned_run.join("run.json")).unwrap(),
+            owned_record
+        );
+        assert!(
+            !RunState::load_under(&owned_id, &home).unwrap().candidates[0].folded,
+            "the owned run's candidate is not folded"
+        );
+        assert_eq!(queue.get(&busy.id).unwrap().status, TaskStatus::Running);
+        assert_eq!(queue.get(&waiting.id).unwrap().status, TaskStatus::Queued);
+        drop(execution);
+        drop(worker_lease);
+    }
+
+    /// On a platform without process containment the disk-pressure service
+    /// refuses to reclaim, and says so in both places an operator looks: the
+    /// persisted retention report and the worker receipt. Driven through the
+    /// service handler itself, so removing either publication fails this test.
+    #[tokio::test]
+    async fn the_disk_pressure_service_reports_a_platform_without_containment() {
+        let dir = tempfile::tempdir().unwrap();
+        let (opts, queue, _, home, worktrees) = idle_loop(dir.path());
+        let payload = serde_json::to_value(ServiceWorker {
+            opts,
+            queue: queue.root().to_owned(),
+            worktrees_root: worktrees,
+            operation: "disk-pressure".into(),
+        })
+        .unwrap();
+        let _platform = crate::retention::WithoutContainment::new();
+        run_service_worker(&home, payload).await.unwrap();
+
+        let refusal = "Automatic output reclamation requires Unix process containment";
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(home.join("retention.json")).unwrap()).unwrap();
+        assert_eq!(report["failures"], serde_json::json!([refusal]));
+        let receipt: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(home.join("source-eviction-disk-pressure-worker.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(receipt["outcome"], "retention swept");
+        assert_eq!(receipt["retention"]["failure_count"], 1);
+        assert_eq!(
+            receipt["retention"]["failures"],
+            serde_json::json!([refusal])
+        );
     }
 
     #[tokio::test]

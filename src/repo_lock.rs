@@ -68,6 +68,19 @@ impl WaitPolicy {
         }
     }
 
+    /// A policy that never waits: the lease is taken if it is free right now,
+    /// otherwise the call ends in [`ResourceBlocked`] at once. For a caller
+    /// that already holds something the lease's holder may be waiting for and
+    /// must give way instead (`graph::fold_run_when`).
+    ///
+    /// This rests on `wait_inner` polling the future before the cancellation
+    /// and the deadline (`biased`): a lease that is free is taken on the first
+    /// poll, and only a contended one reaches the cancellation, which is
+    /// already set.
+    pub(crate) fn immediate() -> Self {
+        Self::new(Duration::ZERO, || true)
+    }
+
     pub(crate) fn cancelled(&self) -> bool {
         (self.cancelled)()
     }

@@ -14480,6 +14480,168 @@ fn reclaim_fold_target(home: &Path, target: Option<crate::build_target::FoldTarg
     }
 }
 
+/// Why a fold left a run alone. A typed refusal lets the automatic callers
+/// (`clean::fold_one`, and through it the idle janitor and the busy-time fold
+/// turn) say *why* in their receipts; it never changes what is deleted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FoldRefusal {
+    /// A lease or lock a live owner holds - the run's execution lease or
+    /// ownership lock, a source's output lease, a Cargo build, the repository's
+    /// coordination lease - or a live daemon claim on the run.
+    Live(String),
+    /// A resumable status: someone may still continue this run.
+    Resumable,
+    /// Finished less than the fold grace period ago.
+    WithinGrace,
+    /// An explicitly retained recovery source (`pr_recovery`).
+    Retained(String),
+    /// The proof that nothing is lost is not complete: startup or candidate
+    /// preservation unfinished, or the confirmed-merge source proof (Cargo
+    /// residue, Git checkpoints, the fetched base) could not be established.
+    ProofIncomplete(String),
+    /// The run's record is gone, or is not the record that was locked: it was
+    /// deleted while the fold waited for its locks. Nothing is touched and
+    /// nothing is recreated.
+    RecordGone,
+    /// The record was readable when the caller first looked and cannot be read
+    /// once the run's locks are held.
+    Unreadable(String),
+}
+
+impl std::fmt::Display for FoldRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Live(detail) | Self::ProofIncomplete(detail) => f.write_str(detail),
+            Self::Resumable => f.write_str("refusing fold: the run is resumable"),
+            Self::WithinGrace => f.write_str("refusing fold: the run finished within its grace"),
+            Self::Retained(reason) => write!(f, "refusing fold: {reason}"),
+            Self::RecordGone => f.write_str("refusing fold: record gone"),
+            Self::Unreadable(detail) => {
+                write!(
+                    f,
+                    "refusing fold: the run record became unreadable: {detail}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for FoldRefusal {}
+
+/// Is `error` somebody else holding a lock or lease right now? Only
+/// contention is: any other failure of a lock call is a real failure.
+pub(crate) fn held_by_live_owner(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.is::<crate::retention::OutputsInUse>()
+            || cause.is::<crate::repo_lock::ResourceBlocked>()
+            || cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+                io.kind() == std::io::ErrorKind::WouldBlock
+                    || cfg!(windows) && io.raw_os_error() == Some(33)
+            })
+    })
+}
+
+/// `error`, marked as [`FoldRefusal::Live`] when it is a held lock.
+///
+/// The refusal is *added to* the error as context, never substituted for it:
+/// callers match the error underneath (`repo_lock::ResourceBlocked` for a
+/// coordination wait, which several of them treat as a resource stop), and the
+/// receipt's classification reads the refusal. Both downcasts succeed.
+fn live_or(error: anyhow::Error) -> anyhow::Error {
+    if held_by_live_owner(&error) {
+        error.context(FoldRefusal::Live(
+            "a lock or lease is held by another owner".into(),
+        ))
+    } else {
+        error
+    }
+}
+
+/// A failure to take a run's owner lock or execution lease. A run directory
+/// that is not there (deleted, or never was) is `record gone` and is *not*
+/// created for the lock's sake; contention is `live`; anything else stays a
+/// failure with its own text.
+fn lock_refusal(error: anyhow::Error) -> anyhow::Error {
+    if is_missing(&error) {
+        FoldRefusal::RecordGone.into()
+    } else {
+        live_or(error)
+    }
+}
+
+fn is_missing(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+    })
+}
+
+fn preservation_refusal() -> anyhow::Error {
+    FoldRefusal::ProofIncomplete("candidate preservation incomplete; refusing cleanup".into())
+        .into()
+}
+
+/// The record's own preconditions for the explicit recovery-retention override.
+fn ensure_overridable(state: &RunState) -> Result<()> {
+    anyhow::ensure!(
+        state.status.done() && !state.status.resumable(),
+        "recovery retention override requires a finished, non-resumable run"
+    );
+    Ok(())
+}
+
+/// How a failure of the confirmed-merge source verification reaches the fold's
+/// caller: somebody else holding a lock is `live`; a lock call that failed for
+/// another reason is a failure of its own (`failed` in the receipt), not
+/// evidence that the sources are unproven; anything else - missing or changed
+/// evidence - is an incomplete proof.
+fn source_proof_failure(error: anyhow::Error) -> anyhow::Error {
+    if held_by_live_owner(&error) {
+        live_or(error)
+    } else if error
+        .chain()
+        .any(|cause| cause.is::<crate::retention::LockCallFailed>())
+    {
+        error
+    } else {
+        FoldRefusal::ProofIncomplete(format!("{error:#}")).into()
+    }
+}
+
+/// Which loader a fold uses on the record it reads again under its locks.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reload {
+    /// Housekeeping: the record as saved, whatever schema wrote it
+    /// ([`RunState::load_tolerant_under`]), exactly as `clean::fold_due` has
+    /// always read it.
+    Tolerant,
+    /// An explicit fold (`magi fold`, the phone's route): the migrating loader
+    /// the caller itself used ([`RunState::load_under`]), whose derived fields
+    /// the preservation checks and the saved record then rest on.
+    Strict,
+}
+
+/// Why a record read under the locks is no longer the one that was locked.
+fn reload_refusal(error: &anyhow::Error) -> FoldRefusal {
+    if is_missing(error) {
+        FoldRefusal::RecordGone
+    } else {
+        FoldRefusal::Unreadable(format!("{error:#}"))
+    }
+}
+
+/// What a test does after a fold's first look at the record and before it
+/// takes the run's locks: where a deletion or a handover falls.
+#[cfg(test)]
+type BeforeLocks = Box<dyn FnOnce(&Path, &str)>;
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_LOCKS: std::cell::RefCell<Option<BeforeLocks>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Tear a run's worktrees and branches down.
 ///
 /// `home` is where the updated `run.json` is saved (via
@@ -14488,8 +14650,34 @@ fn reclaim_fold_target(home: &Path, target: Option<crate::build_target::FoldTarg
 /// falling through to the global here would write back through whichever
 /// directory some other process or test pinned into that `OnceLock` first,
 /// not the one the caller actually resolved its `runs` and `state` from.
+///
+/// Every deletion decision is made on the record as it is on disk once the
+/// owner lock and execution lease are held, not on the `state` the caller read
+/// earlier: see [`fold_run_when`].
 pub async fn fold_run(state: &mut RunState, drop_winner: bool, home: &Path) -> Result<Vec<String>> {
-    fold_run_with_policy(state, drop_winner, home, false).await
+    fold_run_with_policy(state, home, &|_| Ok(drop_winner), Reload::Strict, false).await
+}
+
+/// [`fold_run`] for the automatic callers, which decide whether the run may be
+/// folded at all, and whether its winner goes too, from the run record.
+///
+/// `decide` is called on the caller's earlier read by the caller itself, and
+/// again here on the record reloaded after taking the run's owner lock and
+/// execution lease. A handover (`handover::release`) records `released_to` /
+/// `released_branches` under that owner lock and removes the old worktree while
+/// keeping the branch; a fold that acted on a record read before the handover
+/// would delete the branch already given to the successor and save the stale
+/// record over the handover. A run no longer eligible under the fresh record
+/// is left alone and the refusal says why. The reload is tolerant of older
+/// schemas, as `clean::fold_due` always was; the explicit entry points
+/// ([`fold_run`], [`fold_run_overriding_recovery_retention`]) use the
+/// migrating loader.
+pub async fn fold_run_when(
+    state: &mut RunState,
+    home: &Path,
+    decide: &(dyn Fn(&RunState) -> Result<bool, FoldRefusal> + Sync),
+) -> Result<Vec<String>> {
+    fold_run_with_policy(state, home, decide, Reload::Tolerant, false).await
 }
 
 /// Explicit CLI-only retention override; automatic callers use [`fold_run`].
@@ -14498,52 +14686,91 @@ pub async fn fold_run_overriding_recovery_retention(
     drop_winner: bool,
     home: &Path,
 ) -> Result<Vec<String>> {
-    fold_run_with_policy(state, drop_winner, home, true).await
+    fold_run_with_policy(state, home, &|_| Ok(drop_winner), Reload::Strict, true).await
 }
 
 async fn fold_run_with_policy(
     state: &mut RunState,
-    drop_winner: bool,
     home: &Path,
+    decide: &(dyn Fn(&RunState) -> Result<bool, FoldRefusal> + Sync),
+    reload: Reload,
     override_recovery_retention: bool,
 ) -> Result<Vec<String>> {
+    // Cheap refusals on the caller's snapshot, before any lock is taken.
     if let Some(reason) = crate::pr_recovery::source_retention_reason(home, state)
         && !override_recovery_retention
     {
-        bail!("refusing fold: {reason}");
+        return Err(FoldRefusal::Retained(reason).into());
     }
     if !state.candidate_preservation.is_empty() || !state.interrupted_implementations.is_empty() {
-        bail!("candidate preservation incomplete; refusing cleanup");
+        return Err(preservation_refusal());
+    }
+    // A fold needs the saved record of the run it locks. Nothing below may
+    // bring a deleted run's directory back, and a fold is never entitled to
+    // write a record of its own making: the caller's `state` is only a first
+    // look, and every decision is made on what is read under the locks.
+    let id = state.id.clone();
+    let record = home.join("runs").join(&id).join("run.json");
+    if !record.try_exists()? {
+        return Err(FoldRefusal::RecordGone.into());
+    }
+    #[cfg(test)]
+    if let Some(hook) = BEFORE_LOCKS.with(|hook| hook.borrow_mut().take()) {
+        hook(home, &id);
     }
     // Serialize ordinary folding with the same starts/resumes as target-only
     // eviction. Otherwise a second janitor could remove the whole worktree
     // around a live output borrower even though target eviction was fenced.
-    std::fs::create_dir_all(home.join("runs").join(&state.id))?;
-    let _owner = crate::pr_head::owner_lock(home, &state.id)?;
+    // Deleting a run record takes these same two locks (`clean::delete_run`).
+    // The lock files are opened where they are and never created in a
+    // directory that is not there: a refusal changes nothing, and the lock
+    // files are never unlinked (`pr_head::owner_lock`).
+    let _owner = crate::pr_head::owner_lock(home, &id).map_err(lock_refusal)?;
     // An override must use current durable ownership, not a pre-lock snapshot.
+    // Its liveness assessment has to be made before this fold holds the
+    // execution lease itself (a held lease reads as a live driver); the record
+    // it is made on is checked for identity like every other, and the final
+    // record, read once both locks are held, is checked again below.
     if override_recovery_retention {
-        *state = RunState::load_under(&state.id, home)?;
+        let current =
+            RunState::load_under(&id, home).map_err(|e| anyhow::Error::from(reload_refusal(&e)))?;
+        if current.id != id {
+            return Err(FoldRefusal::RecordGone.into());
+        }
+        ensure_overridable(&current)?;
+        let claimed = crate::daemon::is_working_on_other(home, &id, Timestamp::now())?;
         anyhow::ensure!(
-            state.status.done() && !state.status.resumable(),
-            "recovery retention override requires a finished, non-resumable run"
-        );
-        let claimed = crate::daemon::is_working_on_other(home, &state.id, Timestamp::now())?;
-        anyhow::ensure!(
-            state.liveness_under(home, claimed) == crate::run::Liveness::Dead,
+            current.liveness_under(home, claimed) == crate::run::Liveness::Dead,
             "run is live or its ownership is unknown"
         );
-        anyhow::ensure!(
-            state.candidate_preservation.is_empty() && state.interrupted_implementations.is_empty(),
-            "candidate preservation incomplete; refusing cleanup"
-        );
+    }
+    let _driver = crate::driver::maintenance(home, &id).map_err(lock_refusal)?;
+    // Both locks are held, so no handover, driver claim, deletion or other
+    // fold can change the record from here on: act on it, not on the earlier
+    // read. There is no fallback to that read - a record that cannot be read
+    // again, or is not this run's, ends the fold and touches nothing.
+    let loaded = match reload {
+        Reload::Tolerant => RunState::load_tolerant_under(&id, home),
+        Reload::Strict => RunState::load_under(&id, home),
+    };
+    match loaded {
+        Ok(fresh) if fresh.id == id => *state = fresh,
+        Ok(_) => return Err(FoldRefusal::RecordGone.into()),
+        Err(e) => return Err(reload_refusal(&e).into()),
+    }
+    if override_recovery_retention {
+        ensure_overridable(state)?;
+    }
+    let drop_winner = decide(state)?;
+    if !state.candidate_preservation.is_empty() || !state.interrupted_implementations.is_empty() {
+        return Err(preservation_refusal());
     }
     let retention_reason = crate::pr_recovery::source_retention_reason(home, state);
     if let Some(reason) = &retention_reason
         && !override_recovery_retention
     {
-        bail!("refusing fold: {reason}");
+        return Err(FoldRefusal::Retained(reason.clone()).into());
     }
-    let _driver = crate::driver::maintenance(home, &state.id)?;
     let mut output_guards = Vec::new();
     for entry in std::fs::read_dir(state.worktree_root())
         .into_iter()
@@ -14551,26 +14778,58 @@ async fn fold_run_with_policy(
         .flatten()
     {
         if entry.path().join(".git").is_file() {
-            output_guards.push(crate::retention::OutputLease::take(&entry.path(), true)?);
+            output_guards
+                .push(crate::retention::OutputLease::take(&entry.path(), true).map_err(live_or)?);
         }
     }
     let repo = state.repo.clone();
     // CLI, Web and automatic cleanup all enter here, independently of
     // Runner::fold_losers. Protect deletion and shared config release too.
-    let wait = repository_wait(state, None);
-    let _coordination = match coordinate_operation(state, &repo, &wait).await {
-        Ok(lease) => lease,
-        Err(e) => {
-            state.save_under(home)?;
-            return Err(e);
+    //
+    // Lock order. A handover (`handover::release`, a review taking a branch
+    // over) holds repository coordination and then asks for this run's owner
+    // lock; this fold already holds the owner lock. An automatic fold must not
+    // *wait* for coordination here: the handover would wait for the owner lock
+    // while the fold waited for coordination, and neither bound (the handover's
+    // short retry, the fold's `timeout_resource_wait`) resolves that inversion
+    // - the handover fails its startup, which costs the task an attempt. So it
+    // asks once; when the lease is busy it gives way: everything it holds is
+    // released on return, nothing was changed or saved, and the run is `live`
+    // for this pass and judged again on a later one. The explicit callers
+    // (`magi fold`, the phone's route) were asked for by a person and still
+    // wait, bounded as before.
+    let _coordination = if reload == Reload::Tolerant {
+        match crate::repo_lock::SeatLease::operation_with(
+            &repo,
+            state.config.coordination.as_ref(),
+            &crate::repo_lock::WaitPolicy::immediate(),
+        )
+        .await
+        {
+            Ok(lease) => lease,
+            Err(e) => return Err(live_or(e)),
+        }
+    } else {
+        let wait = repository_wait(state, None);
+        match coordinate_operation(state, &repo, &wait).await {
+            Ok(lease) => lease,
+            Err(e) => {
+                state.save_under(home)?;
+                return Err(live_or(e));
+            }
         }
     };
     // Confirmed merges dispose of their owned sources after durable evidence
-    // capture. Preflight every source before removing anything.
+    // capture. Preflight every source before removing anything. A failure of
+    // this stage is, by what the stage is for, an incomplete proof - unless
+    // it is only a lock somebody else holds.
     let _source_outputs = if retention_reason.is_some()
         || (state.status == RunStatus::Merged && state.merge.as_ref().is_some_and(|merge| merge.ok))
     {
-        verify_merged_fold_sources(state, drop_winner, home).await?
+        match verify_merged_fold_sources(state, drop_winner, home).await {
+            Ok(held) => held,
+            Err(e) => return Err(source_proof_failure(e)),
+        }
     } else {
         Vec::new()
     };
@@ -14649,6 +14908,12 @@ async fn fold_run_with_policy(
         git::release_worktree_config(&repo).await.ok();
         state.enabled_worktree_config = false;
     }
+    // What this fold itself found, written in the same locked save: nothing
+    // left to remove and no bay on disk (a failed or erroring check is not
+    // "gone"). The busy-time fold turn skips such a run only while the bay is
+    // still confirmed absent; any fold that found work clears the mark.
+    state.fold_settled_at =
+        (removed.is_empty() && matches!(root.try_exists(), Ok(false))).then(Timestamp::now);
     state.save_under(home)?;
     Ok(removed)
 }
@@ -17691,6 +17956,24 @@ mod tests {
             assert!(git::branch_exists(&repo, &winner.branch).await.unwrap());
         }
     }
+
+    /// The recovery-retention override, refused for the rule under test. The
+    /// arrangement is saved in `home` before each call, so `record gone` or
+    /// `unreadable` would be the fixture's mistake and fails here.
+    async fn override_refusal(state: &mut RunState, home: &Path) -> anyhow::Error {
+        let error = fold_run_overriding_recovery_retention(state, true, home)
+            .await
+            .expect_err("the override is refused");
+        assert!(
+            !matches!(
+                error.downcast_ref::<FoldRefusal>(),
+                Some(FoldRefusal::RecordGone | FoldRefusal::Unreadable(_))
+            ),
+            "refused for the wrong reason: {error:#}"
+        );
+        error
+    }
+
     #[tokio::test]
     async fn fold_recovery_override_archives_sources_and_keeps_safety_checks() {
         for sidecar in [false, true] {
@@ -17751,12 +18034,13 @@ mod tests {
             }
             state.save_under(&home).unwrap();
             let reason = crate::pr_recovery::source_retention_reason(&home, &state).unwrap();
+            let refusal = fold_run(&mut state, true, &home).await.unwrap_err();
             assert!(
-                fold_run(&mut state, true, &home)
-                    .await
-                    .unwrap_err()
-                    .to_string()
-                    .contains(&reason)
+                matches!(
+                    refusal.downcast_ref::<FoldRefusal>(),
+                    Some(FoldRefusal::Retained(retained)) if retained == &reason
+                ),
+                "{refusal:#}"
             );
             let mut disk = state.config.disk.clone();
             disk.fold_grace_secs = 0;
@@ -17775,54 +18059,69 @@ mod tests {
             assert!(wt.exists());
             state.status = RunStatus::Blocked;
             state.save_under(&home).unwrap();
+            let error = override_refusal(&mut state, &home).await;
             assert!(
-                fold_run_overriding_recovery_retention(&mut state, true, &home)
-                    .await
-                    .is_err()
+                error
+                    .to_string()
+                    .contains("requires a finished, non-resumable run"),
+                "{error:#}"
             );
             state.status = RunStatus::Superseded;
             state.driver_exited = false;
             state.driver_claimed = None;
             state.save_under(&home).unwrap();
+            let error = override_refusal(&mut state, &home).await;
             assert!(
-                fold_run_overriding_recovery_retention(&mut state, true, &home)
-                    .await
-                    .is_err()
+                error
+                    .to_string()
+                    .contains("run is live or its ownership is unknown"),
+                "{error:#}"
             );
             state.driver_pid = Some(std::process::id());
             state.driver_started_at = crate::proc::process_started_at(std::process::id());
             state.save_under(&home).unwrap();
+            let error = override_refusal(&mut state, &home).await;
             assert!(
-                fold_run_overriding_recovery_retention(&mut state, true, &home)
-                    .await
-                    .is_err()
+                error
+                    .to_string()
+                    .contains("run is live or its ownership is unknown"),
+                "{error:#}"
             );
             state.driver_exited = true;
             state.driver_pid = None;
             state.driver_started_at = None;
             state.save_under(&home).unwrap();
             let lease = crate::driver::maintenance(&home, &state.id).unwrap();
+            let error = override_refusal(&mut state, &home).await;
             assert!(
-                fold_run_overriding_recovery_retention(&mut state, true, &home)
-                    .await
-                    .is_err()
+                matches!(
+                    error.downcast_ref::<FoldRefusal>(),
+                    Some(FoldRefusal::Live(_))
+                ),
+                "{error:#}"
             );
             drop(lease);
             #[cfg(unix)]
             {
                 let output = crate::retention::OutputLease::take(&wt, false).unwrap();
+                let error = override_refusal(&mut state, &home).await;
                 assert!(
-                    fold_run_overriding_recovery_retention(&mut state, true, &home)
-                        .await
-                        .is_err()
+                    matches!(
+                        error.downcast_ref::<FoldRefusal>(),
+                        Some(FoldRefusal::Live(_))
+                    ),
+                    "{error:#}"
                 );
                 drop(output);
             }
             let owner = crate::pr_head::owner_lock(&home, &state.id).unwrap();
+            let error = override_refusal(&mut state, &home).await;
             assert!(
-                fold_run_overriding_recovery_retention(&mut state, true, &home)
-                    .await
-                    .is_err()
+                matches!(
+                    error.downcast_ref::<FoldRefusal>(),
+                    Some(FoldRefusal::Live(_))
+                ),
+                "{error:#}"
             );
             drop(owner);
             let checkpoint = git::git(
@@ -17837,17 +18136,24 @@ mod tests {
             .await
             .unwrap();
             std::fs::write(&checkpoint, &head).unwrap();
+            let error = override_refusal(&mut state, &home).await;
             assert!(
-                fold_run_overriding_recovery_retention(&mut state, true, &home)
-                    .await
-                    .is_err()
+                matches!(
+                    error.downcast_ref::<FoldRefusal>(),
+                    Some(FoldRefusal::ProofIncomplete(detail))
+                        if detail.contains("Git recovery checkpoint retained")
+                ),
+                "{error:#}"
             );
             std::fs::remove_file(checkpoint).unwrap();
             std::fs::write(wt.join("dirty"), "keep").unwrap();
+            let error = override_refusal(&mut state, &home).await;
             assert!(
-                fold_run_overriding_recovery_retention(&mut state, true, &home)
-                    .await
-                    .is_err()
+                matches!(
+                    error.downcast_ref::<FoldRefusal>(),
+                    Some(FoldRefusal::ProofIncomplete(_))
+                ),
+                "{error:#}"
             );
             assert!(wt.join("dirty").exists());
             std::fs::remove_file(wt.join("dirty")).unwrap();
@@ -17857,10 +18163,13 @@ mod tests {
                 .join("artifacts/fold-evidence");
             std::fs::create_dir_all(evidence.parent().unwrap()).unwrap();
             std::fs::write(&evidence, "blocked archive").unwrap();
+            let error = override_refusal(&mut state, &home).await;
             assert!(
-                fold_run_overriding_recovery_retention(&mut state, true, &home)
-                    .await
-                    .is_err()
+                matches!(
+                    error.downcast_ref::<FoldRefusal>(),
+                    Some(FoldRefusal::ProofIncomplete(_))
+                ),
+                "{error:#}"
             );
             assert!(wt.exists());
             assert!(
@@ -17975,8 +18284,21 @@ mod tests {
             "completed implementation"
         );
         assert!(runner.after_implement().is_err());
-        let home = tmp.path().join("fold-home");
-        assert!(fold_run(&mut runner.state, true, &home).await.is_err());
+        // The record the fold locks is the one on disk, so the arrangement is
+        // saved first; the refusal asserted is the preservation rule's own,
+        // never `record gone`.
+        runner.state.save().unwrap();
+        let refusal = fold_run(&mut runner.state, true, &crate::run::home())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                refusal.downcast_ref::<FoldRefusal>(),
+                Some(FoldRefusal::ProofIncomplete(detail))
+                    if detail.contains("candidate preservation incomplete")
+            ),
+            "{refusal:#}"
+        );
         assert!(wt.join("new-file").exists());
         let recovery = runner.state.dir().join("artifacts/candidate-A-recovery");
         assert!(recovery.join("staged.patch").exists());
@@ -18053,11 +18375,18 @@ mod tests {
             folded: false,
         });
         std::fs::write(wt.join("uncommitted"), "keep").unwrap();
+        // Saved in the home the fold uses: without a record the fold would
+        // refuse as `record gone` and say nothing about the dirty tree.
+        let home = tmp.path().join("home");
+        runner.state.save_under(&home).unwrap();
+        let refusal = fold_run(&mut runner.state, true, &home).await.unwrap_err();
         assert!(
-            fold_run(&mut runner.state, true, &tmp.path().join("home"))
-                .await
-                .is_err()
+            refusal
+                .to_string()
+                .contains("worktree has uncommitted work; refusing removal"),
+            "{refusal:#}"
         );
+        assert!(refusal.downcast_ref::<FoldRefusal>().is_none());
         assert!(!runner.state.candidates[0].folded);
         assert!(git::branch_exists(&repo, "candidate").await.unwrap());
         std::fs::remove_file(wt.join("uncommitted")).unwrap();
@@ -21280,6 +21609,7 @@ esac
             panic!("fixture target must be free");
         };
 
+        state.save_under(&home).unwrap();
         fold_run(&mut state, true, &home).await.unwrap();
         assert!(!root.exists());
         assert!(!outputs[0].1.exists());
@@ -21377,6 +21707,7 @@ esac
         });
         state.status = RunStatus::Ready;
 
+        state.save_under(&crate::run::home()).unwrap();
         fold_run(&mut state, false, &crate::run::home())
             .await
             .expect("fold_run");
@@ -21515,6 +21846,115 @@ esac
         assert!(!enabled.ok(), "the last config reference was released");
     }
 
+    /// A handover holds repository coordination and then asks for the
+    /// predecessor's owner lock; an automatic fold already holds that lock. The
+    /// fold asks for coordination once and gives way, so the handover's short
+    /// retry succeeds - waiting for it would leave both waiting for each other.
+    /// Nothing is changed or saved on the way out and the refusal is `live`;
+    /// the explicit entry points (`magi fold`) still wait, bounded as before.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn an_automatic_fold_gives_way_to_busy_coordination_instead_of_waiting() {
+        use std::os::fd::AsRawFd as _;
+        use std::time::Duration;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let common = repo.join(".git");
+        std::fs::write(common.join("updater.contract"), "test-protocol-v1\n").unwrap();
+        let home = tmp.path().join("home");
+        let mut config = Config::default();
+        config.coordination = crate::config::test_coordination();
+        config.graph.worktree_root = Some(tmp.path().join("wt"));
+        config.graph.timeout_resource_wait = 60;
+        let mut state = RunState::new(
+            repo.clone(),
+            "main".into(),
+            "deadbeef".into(),
+            "task".into(),
+            config,
+        );
+        let candidate = state.worktree_root().join("cand-A");
+        let branch = state.branch_for('A');
+        git::worktree_add_branch(&repo, &candidate, &branch, "main")
+            .await
+            .unwrap();
+        state.status = RunStatus::Ready;
+        state.driver_exited = true;
+        state.candidates.push(Candidate {
+            index: 0,
+            label: 'A',
+            agent: "implement".into(),
+            branch: branch.clone(),
+            worktree: candidate.clone(),
+            summary: String::new(),
+            stat: String::new(),
+            files: 0,
+            commits: 0,
+            empty: false,
+            failed: None,
+            verified_noop: None,
+            duration_ms: 0,
+            folded: false,
+        });
+        state.save_under(&home).unwrap();
+        let id = state.id.clone();
+        let record = std::fs::read(home.join("runs").join(&id).join("run.json")).unwrap();
+
+        // A separate OS handle bypasses the launcher's local gate, exactly as
+        // another process holding coordination does.
+        let external = std::fs::File::create(common.join("updater.lock")).unwrap();
+        assert_eq!(
+            unsafe { libc::flock(external.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let error = tokio::time::timeout(
+            Duration::from_secs(10),
+            fold_run_when(&mut state, &home, &|_| Ok(true)),
+        )
+        .await
+        .expect("the automatic fold does not wait out the 60 s resource wait")
+        .unwrap_err();
+        assert!(
+            matches!(
+                error.downcast_ref::<FoldRefusal>(),
+                Some(FoldRefusal::Live(_))
+            ),
+            "{error:#}"
+        );
+        assert!(error.is::<crate::repo_lock::ResourceBlocked>(), "{error:#}");
+        // It gave way: both locks it held are free, nothing was removed and
+        // nothing was saved (no resource block recorded on the record either).
+        drop(crate::pr_head::owner_lock(&home, &id).expect("the owner lock was released"));
+        drop(crate::driver::maintenance(&home, &id).expect("the execution lease was released"));
+        assert!(candidate.exists() && git::branch_exists(&repo, &branch).await.unwrap());
+        assert_eq!(
+            std::fs::read(home.join("runs").join(&id).join("run.json")).unwrap(),
+            record
+        );
+
+        // The explicit entry point was asked for by a person and still waits.
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(300),
+                fold_run(&mut state, true, &home)
+            )
+            .await
+            .is_err(),
+            "an explicit fold keeps waiting for coordination"
+        );
+        assert!(candidate.exists());
+
+        drop(external);
+        let removed = fold_run_when(&mut state, &home, &|_| Ok(true))
+            .await
+            .unwrap();
+        assert!(removed.contains(&branch));
+        assert!(!candidate.exists());
+    }
+
     /// A branch handed to a later run is that run's (and its pull request's):
     /// folding the run that released it must not delete it.
     #[tokio::test]
@@ -21557,6 +21997,7 @@ esac
         state.released_to = Some("20260901-000000-new1".to_owned());
         state.released_branches = vec!["magi/x/A".to_owned()];
 
+        state.save_under(&home).unwrap();
         fold_run(&mut state, true, &home).await.expect("fold_run");
         state.status = RunStatus::Merged;
         state.base_commit = git::rev_parse(&repo, "main").await.unwrap();
@@ -21566,6 +22007,7 @@ esac
             detail: "confirmed merged".into(),
             empty: false,
         });
+        state.save_under(&home).unwrap();
         fold_run(&mut state, true, &home)
             .await
             .expect("merged fold");
@@ -26512,5 +26954,191 @@ mod resource_wait_tests {
         assert_eq!(class, FailClass::Timeout);
         assert!(should_hand_over(None, &class), "existing handover policy");
         assert!(st.resource_block.is_none());
+    }
+}
+
+/// A fold acts on the record it locked, and on nothing else.
+#[cfg(test)]
+mod fold_record_tests {
+    use super::*;
+
+    fn refusal(error: &anyhow::Error) -> Option<&FoldRefusal> {
+        error.downcast_ref::<FoldRefusal>()
+    }
+
+    /// A deletion that lands after the fold's look at the record and before its
+    /// locks must neither be undone (the fold's lock files bring the directory
+    /// back, its stale copy the record) nor be acted on.
+    #[tokio::test]
+    async fn a_run_deleted_between_the_look_and_the_locks_is_refused_and_not_recreated() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let repo = home.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        crate::clean::tests::init_repo(&repo);
+        let (id, worktree) = crate::clean::tests::due_run_with_winner_worktree(
+            &home.join("runs"),
+            &home.join("wt"),
+            &repo,
+            "20260801-000000-y001",
+            RunStatus::Superseded,
+        )
+        .await;
+        let mut state = RunState::load_under(&id, home).unwrap();
+        BEFORE_LOCKS.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|home: &Path, id: &str| {
+                std::fs::remove_dir_all(home.join("runs").join(id)).unwrap();
+            }));
+        });
+
+        let error = fold_run(&mut state, true, home).await.unwrap_err();
+        assert_eq!(refusal(&error), Some(&FoldRefusal::RecordGone), "{error:#}");
+        assert!(
+            !home.join("runs").join(&id).exists(),
+            "the fold's own lock files must not bring a deleted run back"
+        );
+        assert!(worktree.exists(), "nothing of a deleted run is removed");
+    }
+
+    /// The caller's `state` is only a first look: a record that was never
+    /// saved is not a record the fold may write.
+    #[tokio::test]
+    async fn a_record_that_was_never_saved_is_not_folded_or_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let mut state = RunState::new(
+            home.join("repo"),
+            "main".to_owned(),
+            "abc".to_owned(),
+            "fixture".to_owned(),
+            crate::config::Config::default(),
+        );
+        state.status = RunStatus::Superseded;
+        let error = fold_run(&mut state, true, home).await.unwrap_err();
+        assert_eq!(refusal(&error), Some(&FoldRefusal::RecordGone), "{error:#}");
+        assert!(
+            !home.join("runs").exists(),
+            "nothing was created: {error:#}"
+        );
+    }
+
+    /// A refusal changes nothing. A directory whose record is another run's is
+    /// not the run that was locked: every entry point answers `record gone`,
+    /// the other run's worktree is left alone, the record stays as it was, and
+    /// the lock files are not unlinked (an unlinked lock file lets the next
+    /// caller lock a different inode - `pr_head::owner_lock`).
+    #[tokio::test]
+    async fn a_record_naming_another_run_is_refused_by_every_entry_point_and_nothing_is_touched() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let repo = home.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        crate::clean::tests::init_repo(&repo);
+        let runs = home.join("runs");
+        let (id, own) = crate::clean::tests::due_run_with_winner_worktree(
+            &runs,
+            &home.join("wt"),
+            &repo,
+            "20260801-000000-y101",
+            RunStatus::Superseded,
+        )
+        .await;
+        let (other, theirs) = crate::clean::tests::due_run_with_winner_worktree(
+            &runs,
+            &home.join("wt"),
+            &repo,
+            "20260801-000000-y102",
+            RunStatus::Superseded,
+        )
+        .await;
+        let first_look = RunState::load_under(&id, home).unwrap();
+        let record = runs.join(&id).join("run.json");
+        std::fs::copy(runs.join(&other).join("run.json"), &record).unwrap();
+        let before = std::fs::read(&record).unwrap();
+        for entry in ["fold_run", "fold_run_when", "override"] {
+            let mut state = first_look.clone();
+            let result = match entry {
+                "fold_run" => fold_run(&mut state, true, home).await,
+                "fold_run_when" => fold_run_when(&mut state, home, &|_| Ok(true)).await,
+                _ => fold_run_overriding_recovery_retention(&mut state, true, home).await,
+            };
+            let error = result.unwrap_err();
+            assert_eq!(
+                refusal(&error),
+                Some(&FoldRefusal::RecordGone),
+                "{entry}: {error:#}"
+            );
+            assert!(own.exists() && theirs.exists(), "{entry}");
+            assert_eq!(std::fs::read(&record).unwrap(), before, "{entry}");
+            for lock in ["pr-owner.lock", "driver.lock"] {
+                assert!(
+                    runs.join(&id).join(lock).exists(),
+                    "{entry}: {lock} stays in place"
+                );
+            }
+            assert!(
+                !RunState::load_under(&other, home).unwrap().candidates[0].folded,
+                "{entry}: the other run was not folded"
+            );
+        }
+    }
+
+    /// The refusal is added to the error underneath, never substituted for it:
+    /// callers match `ResourceBlocked` for a coordination wait.
+    #[test]
+    fn a_live_refusal_keeps_the_error_callers_match() {
+        let blocked = anyhow::Error::new(crate::repo_lock::ResourceBlocked(
+            "repository coordination".into(),
+        ));
+        let error = live_or(blocked);
+        assert!(error.is::<crate::repo_lock::ResourceBlocked>(), "{error:#}");
+        assert!(matches!(refusal(&error), Some(FoldRefusal::Live(_))));
+        // Anything that is not a held lock is passed through untouched.
+        let other = live_or(anyhow::anyhow!("git exploded"));
+        assert!(refusal(&other).is_none());
+    }
+
+    /// Contention is `live`, a lock call that failed for another reason is a
+    /// failure of its own (`failed`), missing evidence is an incomplete proof.
+    #[test]
+    fn source_verification_failures_are_told_apart() {
+        let contended = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+            .context("Cargo build is active");
+        let error = source_proof_failure(contended);
+        assert!(
+            matches!(refusal(&error), Some(FoldRefusal::Live(_))),
+            "{error:#}"
+        );
+
+        let failed = anyhow::Error::new(crate::retention::LockCallFailed::new(
+            "Cargo lock target/debug/.cargo-lock".into(),
+            std::io::Error::from(std::io::ErrorKind::Interrupted),
+        ));
+        let error = source_proof_failure(failed);
+        assert!(refusal(&error).is_none(), "{error:#}");
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.is::<crate::retention::LockCallFailed>())
+        );
+
+        let error = source_proof_failure(anyhow::anyhow!("Cargo residue changed"));
+        assert!(matches!(
+            refusal(&error),
+            Some(FoldRefusal::ProofIncomplete(_))
+        ));
+    }
+
+    /// A run directory that is not there is `record gone` at the lock, not
+    /// something to create for the lock's sake.
+    #[test]
+    fn a_missing_run_directory_at_the_lock_is_record_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let error = crate::pr_head::owner_lock(dir.path(), "20260801-000000-y103")
+            .map(drop)
+            .map_err(lock_refusal)
+            .unwrap_err();
+        assert_eq!(refusal(&error), Some(&FoldRefusal::RecordGone), "{error:#}");
+        assert!(!dir.path().join("runs").exists());
     }
 }
