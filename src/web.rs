@@ -18898,7 +18898,7 @@ mod tests {
         // `queue_done` is the phone's way to close a task the loop never
         // settled itself - after confirming a manual GitHub merge, say - and
         // that is just as much "this task's story is over" as the loop's own
-        // `Merged`/`Ready` path, so it must trigger the same cleanup.
+        // `Merged` path, so it must trigger the same cleanup.
         let f = Fixture::start().await;
         let queue = f.queue();
         let runs = f.runs();
@@ -18916,6 +18916,16 @@ mod tests {
         );
         task.runs.push("20260101-000000-doa1".to_owned());
         task.runs.push("20260101-000000-doa2".to_owned());
+        let mut landed = read_run(&runs, "20260101-000000-doa2").unwrap();
+        landed.task_instruction = Some(task.instruction.clone());
+        landed.task_instruction_rev = Some(task.instruction_rev);
+        landed.merge = Some(crate::run::MergeOutcome {
+            mode: crate::config::MergeMode::Pr,
+            ok: true,
+            detail: "confirmed merge".into(),
+            empty: false,
+        });
+        write_state(&runs, &landed);
         queue.put(&mut task).expect("file the task");
 
         let done = f.post(&format!("/api/queue/{}/done", task.id), None).await;
