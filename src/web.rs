@@ -439,6 +439,72 @@ fn file_identity(path: &FsPath) -> std::io::Result<FileIdentity> {
     })
 }
 
+// Cache bounded goal headers using actual file identity and change time,
+// not just size and write time.
+#[derive(Debug, PartialEq, Eq)]
+struct GoalIdentity {
+    file: FileIdentity,
+    #[cfg(windows)]
+    windows: (u64, [u8; 16], i64),
+}
+
+fn goal_identity(path: &FsPath) -> std::io::Result<GoalIdentity> {
+    #[cfg(windows)]
+    fn windows_identity(path: &FsPath) -> std::io::Result<(u64, [u8; 16], i64)> {
+        use std::os::windows::io::AsRawHandle;
+        #[repr(C)]
+        struct FileId {
+            volume: u64,
+            id: [u8; 16],
+        }
+        #[repr(C)]
+        struct Basic {
+            created: i64,
+            accessed: i64,
+            written: i64,
+            changed: i64,
+            attributes: u32,
+        }
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetFileInformationByHandleEx(
+                file: *mut std::ffi::c_void,
+                class: i32,
+                output: *mut std::ffi::c_void,
+                size: u32,
+            ) -> i32;
+        }
+        let file = std::fs::File::open(path)?;
+        let mut id = std::mem::MaybeUninit::<FileId>::uninit();
+        let mut basic = std::mem::MaybeUninit::<Basic>::uninit();
+        // Both buffers have the layout and size of the requested Win32 structures.
+        unsafe {
+            if GetFileInformationByHandleEx(
+                file.as_raw_handle(),
+                18,
+                id.as_mut_ptr().cast(),
+                std::mem::size_of::<FileId>() as u32,
+            ) == 0
+                || GetFileInformationByHandleEx(
+                    file.as_raw_handle(),
+                    0,
+                    basic.as_mut_ptr().cast(),
+                    std::mem::size_of::<Basic>() as u32,
+                ) == 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            let id = id.assume_init();
+            Ok((id.volume, id.id, basic.assume_init().changed))
+        }
+    }
+    Ok(GoalIdentity {
+        file: file_identity(path)?,
+        #[cfg(windows)]
+        windows: windows_identity(path)?,
+    })
+}
+
 type Revisions = (u64, u64, u64, u64, u64, u64);
 type MonitorSnapshot = Option<(Revisions, [Stamps; 3])>;
 
@@ -454,6 +520,10 @@ pub(crate) struct SharedMonitor {
     disk_cache: Mutex<DiskCache>,
     talk_index: Mutex<HashMap<String, (FileIdentity, TalkListView)>>,
     talk_status_index: Mutex<TalkStatusIndex>,
+    closed_goal_index: Mutex<HashMap<String, (GoalIdentity, bool)>>,
+    /// Conversation status evidence, rebuilt only when a source store moved.
+    chat_inventory: Mutex<Option<(Revisions, Arc<crate::chat_status::Inventory>)>>,
+    chat_sources_unreadable: std::sync::atomic::AtomicBool,
     bulk_slots: Arc<tokio::sync::Semaphore>,
     talk_core_slots: Arc<tokio::sync::Semaphore>,
     #[cfg(test)]
@@ -614,6 +684,7 @@ struct DiskCache {
 /// Keep a failed store's last observation without suppressing healthy stores.
 fn monitor_scan(ui: &Ui, previous: MonitorSnapshot) -> (Revisions, [Stamps; 3]) {
     let (mut rev, mut stamps) = previous.unwrap_or_default();
+    let mut failed = 0u8;
     for (index, root, runs) in [
         (0, ui.queue.root(), false),
         (1, ui.runs.as_path(), true),
@@ -627,15 +698,55 @@ fn monitor_scan(ui: &Ui, previous: MonitorSnapshot) -> (Revisions, [Stamps; 3]) 
                 _ => rev.3 = value,
             }
             stamps[index] = next;
+        } else {
+            failed |= 1 << index;
         }
     }
     if let Ok(next) = try_stamps(ui.questions.root(), false, true) {
         rev.2 = stamps_revision(&next);
+    } else {
+        failed |= 1 << 3;
     }
     if let Ok(next) = notice_and_decision_stamps(ui) {
         rev.4 = stamps_revision(&next);
+    } else {
+        failed |= 1 << 4;
     }
     rev.5 = ui.lock_loop().rev;
+    // Live worker ownership can change without any transcript write.
+    use std::hash::{Hash, Hasher};
+    let mut activity = std::collections::hash_map::DefaultHasher::new();
+    rev.3 = stamps_revision(&stamps[2]);
+    rev.3.hash(&mut activity);
+    let mut changed = failed != 0;
+    failed.hash(&mut activity);
+    match crate::worker::observe_active(&ui.home) {
+        Ok(jobs) => {
+            let mut ids: Vec<_> = jobs
+                .iter()
+                .map(|job| (&job.id, job.status == crate::worker::Status::Running))
+                .collect();
+            ids.sort_unstable();
+            changed |= !ids.is_empty();
+            ids.hash(&mut activity);
+        }
+        Err(_) => {
+            changed = true;
+            "unknown workers".hash(&mut activity);
+        }
+    }
+    if let Ok(mut ids) = crate::queue::record_ids(ui.talks.root(), "turn") {
+        ids.retain(|id| ui.talks.turn_held(id));
+        ids.sort_unstable();
+        changed |= !ids.is_empty();
+        ids.hash(&mut activity);
+    }
+    if changed {
+        rev.3 = activity.finish();
+    }
+    ui.monitor
+        .chat_sources_unreadable
+        .store(failed != 0, std::sync::atomic::Ordering::Release);
     (rev, stamps)
 }
 
@@ -653,6 +764,9 @@ impl SharedMonitor {
             disk_cache: Mutex::default(),
             talk_index: Mutex::default(),
             talk_status_index: Mutex::default(),
+            closed_goal_index: Mutex::default(),
+            chat_inventory: Mutex::default(),
+            chat_sources_unreadable: std::sync::atomic::AtomicBool::new(false),
             bulk_slots: Arc::new(tokio::sync::Semaphore::new(2)),
             talk_core_slots: Arc::new(tokio::sync::Semaphore::new(2)),
             #[cfg(test)]
@@ -752,6 +866,14 @@ impl SharedMonitor {
                     .into_iter()
                     .enumerate()
                     {
+                        // Talk revisions also contain live ownership evidence.
+                        // A transcript-only delta cannot describe that change.
+                        if index == 2
+                            && (base.3 != stamps_revision(&prev[index])
+                                || revisions.3 != stamps_revision(&next_stamps[index]))
+                        {
+                            continue;
+                        }
                         let delta = diff_stamps(&prev[index], &next_stamps[index], rev);
                         if delta.changed.len() + delta.removed.len() > 0
                             && delta.changed.len() <= 50
@@ -5346,8 +5468,79 @@ struct ListWalk {
     initial_end: usize,
 }
 
+/// Read only the bounded goal header. Legacy layouts with goals after turns
+/// are classified when their ordinary paginated row is loaded.
+fn read_owner_goal(reader: impl std::io::Read) -> bool {
+    use serde::de::{IgnoredAny, MapAccess, Visitor};
+    struct Header<'a>(&'a mut bool);
+    impl<'de> Visitor<'de> for Header<'_> {
+        type Value = ();
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("conversation goals")
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+            while let Some(key) = map.next_key::<String>()? {
+                if key == "turns" {
+                    return Err(serde::de::Error::custom("transcript boundary"));
+                }
+                if key == "goals" {
+                    let goals: Vec<crate::chat_goal::Goal> = map.next_value()?;
+                    *self.0 = crate::chat_status::Goals::of(&goals).owner > 0;
+                    return Err(serde::de::Error::custom("goals read"));
+                }
+                map.next_value::<IgnoredAny>()?;
+            }
+            Ok(())
+        }
+    }
+    let mut owner = false;
+    let reader = std::io::BufReader::with_capacity(1024, reader.take(64 * 1024));
+    let mut json = serde_json::Deserializer::from_reader(reader);
+    let _ = serde::Deserializer::deserialize_map(&mut json, Header(&mut owner));
+    owner
+}
+
 fn page_ids(ui: &Ui, talks: bool, q: PageQuery) -> ApiResult<(Vec<String>, Option<String>)> {
-    page_ids_with(ui, talks, q, open_talk_ids)
+    page_ids_with(ui, talks, q, |ui, ids| {
+        // A conversation owing the owner a decision is listed with the open
+        // ones even when closed, so the Needs owner filter never depends on
+        // walking closed history.
+        let mut open = open_talk_ids(ui, ids);
+        let inventory = chat_inventory(ui);
+        let owing = inventory.needs_owner();
+        open.extend(ids.iter().filter(|id| owing.contains(id.as_str())).cloned());
+        let mut goals = ui
+            .monitor
+            .closed_goal_index
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let present: HashSet<_> = ids.iter().collect();
+        goals.retain(|id, _| present.contains(id));
+        for id in ids {
+            if open.contains(id) {
+                continue;
+            }
+            let path = ui.talks.path_of(id);
+            let identity = goal_identity(&path).ok();
+            let owner = if let Some((old, owner)) = goals.get(id)
+                && identity.as_ref() == Some(old)
+            {
+                *owner
+            } else {
+                let owner = std::fs::File::open(&path).ok().is_some_and(read_owner_goal);
+                if let Some(identity) = identity
+                    && goal_identity(&path).is_ok_and(|after| after == identity)
+                {
+                    goals.insert(id.clone(), (identity, owner));
+                }
+                owner
+            };
+            if owner {
+                open.insert(id.clone());
+            }
+        }
+        open
+    })
 }
 
 fn page_ids_with(
@@ -5477,7 +5670,11 @@ struct TalkListView {
     context: talk::ContextUsage,
     #[serde(skip)]
     agent_times: Vec<Timestamp>,
+    #[serde(skip)]
+    goals: crate::chat_status::Goals,
     thinking: bool,
+    /// Display-only triage state derived from durable evidence.
+    chat_status: crate::chat_status::ChatStatus,
     created_at: Timestamp,
     updated_at: Timestamp,
 }
@@ -5489,12 +5686,61 @@ struct TalkListTurn {
     body: String,
 }
 
+/// Shared status evidence. Keyed by the monitor's queue, question, decision and
+/// loop revisions so a list read never re-parses the stores unless one moved;
+/// without a published revision (before the first scan) it is built per call.
+fn chat_inventory(ui: &Ui) -> Arc<crate::chat_status::Inventory> {
+    let unreadable = ui
+        .monitor
+        .chat_sources_unreadable
+        .load(std::sync::atomic::Ordering::Acquire);
+    let key = ui
+        .monitor
+        .latest
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_ref()
+        .map(|(revisions, _)| *revisions);
+    if !unreadable
+        && let Some(key) = key
+        && let Some((cached, inventory)) = ui
+            .monitor
+            .chat_inventory
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+        && *cached == key
+    {
+        return Arc::clone(inventory);
+    }
+    let tasks = ui.queue.list();
+    let questions = ui.questions.list();
+    let mut inventory = crate::chat_status::Inventory::collect(&ui.home, &tasks, &questions);
+    if unreadable
+        || crate::queue::record_ids(ui.queue.root(), "json")
+            .map_or(true, |ids| ids.len() > tasks.len())
+        || crate::queue::record_ids(ui.questions.root(), "json")
+            .map_or(true, |ids| ids.len() > questions.len())
+    {
+        inventory.mark_unreadable();
+    }
+    let inventory = Arc::new(inventory);
+    if !unreadable && let Some(key) = key {
+        *ui.monitor
+            .chat_inventory
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some((key, Arc::clone(&inventory)));
+    }
+    inventory
+}
+
 fn talk_rows(ui: &Ui, ids: Vec<String>, headers: &header::HeaderMap) -> Vec<TalkListView> {
     let reads: HashMap<String, Timestamp> = headers
         .get("x-talk-reads")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| serde_json::from_str(v).ok())
         .unwrap_or_default();
+    let inventory = chat_inventory(ui);
     let mut index = ui
         .monitor
         .talk_index
@@ -5546,6 +5792,8 @@ fn talk_rows(ui: &Ui, ids: Vec<String>, headers: &header::HeaderMap) -> Vec<Talk
                         .map(|t| t.at)
                         .collect(),
                     turn_count: talk.turns.len(),
+                    goals: crate::chat_status::Goals::of(&talk.goals),
+                    chat_status: crate::chat_status::ChatStatus::placeholder(),
                     unread_count: 0,
                     context: talk::context_usage(&talk, None),
                     turns,
@@ -5568,6 +5816,8 @@ fn talk_rows(ui: &Ui, ids: Vec<String>, headers: &header::HeaderMap) -> Vec<Talk
                     .filter(|at| reads.get(&id).is_none_or(|read| *at > read))
                     .count(),
                 agent_times: Vec::new(),
+                goals: row.goals,
+                chat_status: row.chat_status.clone(),
                 id: row.id.clone(),
                 repo: row.repo.clone(),
                 agent: row.agent.clone(),
@@ -5579,7 +5829,9 @@ fn talk_rows(ui: &Ui, ids: Vec<String>, headers: &header::HeaderMap) -> Vec<Talk
                 created_at: row.created_at,
                 updated_at: row.updated_at,
             };
-            row.thinking = ui.is_thinking(&id);
+            let turn_held = ui.talks.turn_held(&id);
+            row.thinking = turn_held || inventory.busy(&id);
+            row.chat_status = inventory.status_of(&id, row.status.open(), row.goals, turn_held);
             Some(row)
         })
         .collect()
@@ -11515,6 +11767,13 @@ mod tests {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     use super::*;
+
+    // Embedded assets preserve checkout line endings. Source assertions use
+    // logical lines, independent of the platform's checkout conversion.
+    static APP_JS: std::sync::LazyLock<String> =
+        std::sync::LazyLock::new(|| super::APP_JS.replace("\r\n", "\n"));
+    static APP_CSS: std::sync::LazyLock<String> =
+        std::sync::LazyLock::new(|| super::APP_CSS.replace("\r\n", "\n"));
     use crate::config::Config;
     use crate::queue::Source;
 
@@ -22909,7 +23168,34 @@ mod tests {
         assert_eq!(after.0.3, stamps_revision(&after.1[2]));
         // A failed first scan also permits healthy stores to publish.
         std::fs::write(ui.questions.root(), "not a directory").unwrap();
-        assert_eq!(monitor_scan(&ui, None).0.3, after.0.3);
+        assert_ne!(monitor_scan(&ui, None).0.3, after.0.3);
+    }
+
+    #[test]
+    fn chat_status_cached_inventory_invalidates_on_store_failure_and_recovery() {
+        let home = TempDir::new().unwrap();
+        let ui = delta_test_ui(home.path());
+        let root = ui.queue.root();
+        std::fs::create_dir_all(root).unwrap();
+        let before = monitor_scan(&ui, None);
+        *ui.monitor.latest.lock().unwrap() = Some(before.clone());
+        let status = || {
+            chat_inventory(&ui)
+                .status_of("chat", true, crate::chat_status::Goals::default(), false)
+                .kind
+        };
+        assert_eq!(status(), crate::chat_status::Kind::Idle);
+        std::fs::remove_dir(root).unwrap();
+        std::fs::write(root, "not a directory").unwrap();
+        let failed = monitor_scan(&ui, Some(before.clone()));
+        assert_ne!(failed.0.3, before.0.3);
+        *ui.monitor.latest.lock().unwrap() = Some(failed.clone());
+        assert_eq!(status(), crate::chat_status::Kind::Unknown);
+        std::fs::remove_file(root).unwrap();
+        std::fs::create_dir(root).unwrap();
+        let recovered = monitor_scan(&ui, Some(failed));
+        *ui.monitor.latest.lock().unwrap() = Some(recovered);
+        assert_eq!(status(), crate::chat_status::Kind::Idle);
     }
 
     #[tokio::test]
@@ -27044,6 +27330,85 @@ mod tests {
     }
 
     #[test]
+    fn chat_status_promotes_closed_owner_goal_in_header() {
+        let home = tempfile::tempdir().unwrap();
+        let ui = delta_test_ui(home.path());
+        for i in 0..STORE_PAGE_SIZE + 5 {
+            seed_talk_at(&ui.talks, &format!("new-{i:03}"), "closed");
+        }
+        let id = seed_talk_at(&ui.talks, "ancient", "closed");
+        let path = ui.talks.path_of(&id);
+        let mut raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        raw["goals"] = serde_json::json!([{
+            "id": "g", "purpose": "ship", "scope": "task",
+            "condition": {"description": "done", "kind": "tasks_done"},
+            "state": "owner", "step": "decision", "source_turn": 0,
+            "owner_input": "ship", "tasks": [], "runs": [], "watches": [],
+            "evidence": "", "wake": 0, "handled": 0, "started": null,
+            "wakes": 0, "last_checked": null, "fingerprint": ""
+        }]);
+        let chat: talk::Talk = serde_json::from_value(raw.clone()).unwrap();
+        std::fs::write(&path, serde_json::to_vec(&chat).unwrap()).unwrap();
+        let (ids, _) = page_ids(&ui, true, PageQuery::default()).unwrap();
+        assert!(ids.contains(&id));
+        let rows = talk_rows(&ui, ids, &header::HeaderMap::new());
+        let row = rows.iter().find(|row| row.id == id).unwrap();
+        assert_eq!(row.chat_status.kind, crate::chat_status::Kind::NeedsOwner);
+        {
+            let cache = ui.monitor.closed_goal_index.lock().unwrap();
+            assert!(cache.get(&id).is_some_and(|(_, owner)| *owner));
+            assert!(cache.len() > STORE_PAGE_SIZE);
+        }
+        // A second request must retain the projection even for promoted rows.
+        let (again, _) = page_ids(&ui, true, PageQuery::default()).unwrap();
+        assert!(again.contains(&id));
+        // A same-length rewrite preserving write time still changes identity.
+        let modified = path.metadata().unwrap().modified().unwrap();
+        raw["goals"][0]["state"] = serde_json::json!("paused");
+        raw["goals"][0]["step"] = serde_json::json!("waiting");
+        let chat: talk::Talk = serde_json::from_value(raw).unwrap();
+        std::fs::write(&path, serde_json::to_vec(&chat).unwrap()).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        let (changed, _) = page_ids(&ui, true, PageQuery::default()).unwrap();
+        assert!(!changed.contains(&id));
+        // A legacy file with goals after turns is deferred to its history page.
+        let mut raw = serde_json::to_value(&chat).unwrap();
+        raw["goals"][0]["state"] = serde_json::json!("owner");
+        let goals = raw.as_object_mut().unwrap().remove("goals").unwrap();
+        let mut body = serde_json::to_string(&raw).unwrap();
+        body.pop();
+        body.push_str(&format!(",\"goals\":{goals}}}"));
+        std::fs::write(&path, body).unwrap();
+        let (initial, _) = page_ids(&ui, true, PageQuery::default()).unwrap();
+        assert!(!initial.contains(&id));
+        let rows = talk_rows(&ui, vec![id], &header::HeaderMap::new());
+        assert_eq!(
+            rows[0].chat_status.kind,
+            crate::chat_status::Kind::NeedsOwner
+        );
+    }
+
+    #[test]
+    fn chat_status_revision_tracks_turn_lease_without_transcript_changes() {
+        let home = tempfile::tempdir().unwrap();
+        let ui = delta_test_ui(home.path());
+        let id = seed_talk_at(&ui.talks, "chat", "open");
+        let before = monitor_scan(&ui, None);
+        let lease = ui.talks.claim_turn(&id).unwrap().unwrap();
+        let during = monitor_scan(&ui, Some(before.clone()));
+        assert_ne!(during.0.3, before.0.3);
+        drop(lease);
+        let after = monitor_scan(&ui, Some(during));
+        assert_eq!(after.0.3, before.0.3);
+    }
+
+    #[test]
     fn talk_status_header_reads_are_bounded_independently_of_transcript_size() {
         struct Counted<R> {
             inner: R,
@@ -27094,6 +27459,16 @@ mod tests {
             bytes: 0,
         };
         assert_eq!(read_talk_status(&mut reader), Some(talk::TalkStatus::Open));
+        assert!(reader.bytes <= 1024);
+        let legacy = format!(
+            r#"{{"status":"closed","turns":[{{"body":"{}"}}],"goals":[]}}"#,
+            "x".repeat(1024 * 1024)
+        );
+        let mut reader = Counted {
+            inner: legacy.as_bytes(),
+            bytes: 0,
+        };
+        assert!(!read_owner_goal(&mut reader));
         assert!(reader.bytes <= 1024);
         let oversized = format!(
             r#"{{"agent":"{}","status":"open"}}"#,

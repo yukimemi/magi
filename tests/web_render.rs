@@ -476,6 +476,18 @@ async fn pages_render_with_visible_titles_and_no_console_errors() {
         talk::record(&mut t, &talks, text, Vec::new()).expect("seed turn");
         talk_ids.push(t.id.clone());
     }
+    // One conversation owes the owner a decision; the others owe nothing.
+    let mut owed = Task::new(
+        "Pick a storage engine".into(),
+        "decide".into(),
+        fx.repo.clone(),
+        Source::Human,
+    );
+    owed.chat = Some(talk_ids[1].clone());
+    queue.put(&mut owed).expect("seed owed task");
+    magi::task_inquiry::Outbox::at(&home)
+        .file(&owed, None, "test".into(), "Pick a database", "details")
+        .expect("seed decision");
 
     // --- serve on an OS-chosen port ---------------------------------------
     let base = serve(&home, queue, talks, runs_root, &fx.repo).await;
@@ -550,6 +562,41 @@ async fn pages_render_with_visible_titles_and_no_console_errors() {
                 .eval(&page, &script)
                 .await
                 .unwrap_or_else(|e| panic!("{tag}: measure: {e}"));
+
+            if case.name == "chat" {
+                let states = browser
+                    .eval(
+                        &page,
+                        "JSON.stringify([...document.querySelectorAll('#talks-list li')].map(li => ({ \
+                           id: li.querySelector('a.card').dataset.talkId, \
+                           label: li.querySelector('.talk-state-label').textContent, \
+                           visible: li.querySelector('.talk-state').getClientRects().length > 0, \
+                           width: li.querySelector('.talk-state').getBoundingClientRect().right \
+                             <= document.documentElement.clientWidth })))",
+                    )
+                    .await
+                    .unwrap_or_else(|e| panic!("{tag}: states: {e}"));
+                let states: Vec<Value> =
+                    serde_json::from_str(states.as_str().unwrap_or("[]")).unwrap_or_default();
+                for st in &states {
+                    let id = st["id"].as_str().unwrap_or("");
+                    let label = st["label"].as_str().unwrap_or("");
+                    let want = if id == talk_ids[1] {
+                        "Needs owner"
+                    } else {
+                        "Idle"
+                    };
+                    if !label.starts_with(want) {
+                        failures.push(format!("{tag}: {id} status {label:?}, expected {want}"));
+                    }
+                    if st["visible"] != true || st["width"] != true {
+                        failures.push(format!("{tag}: {id} status badge hidden or clipped"));
+                    }
+                }
+                if states.len() < talk_ids.len() {
+                    failures.push(format!("{tag}: only {} status badges", states.len()));
+                }
+            }
 
             let rows = out["rows"].as_u64().unwrap_or(0);
             if (rows as usize) < case.expect {

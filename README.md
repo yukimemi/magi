@@ -741,6 +741,21 @@ search and updates as replies arrive or are marked read, including Mark all
 read. Use **Load older conversations** to include more history. Filtering
 does not mark messages read or close the conversation you are viewing.
 
+Each conversation also has a status badge based on saved decisions, tasks,
+goals and current execution evidence, not the wording of the transcript.
+**Needs owner** includes closed conversations with outstanding decisions or
+owner-waiting goals, including older history.
+Resource waits and queued replies are waiting, while
+unverified execution or incomplete records are surfaced as attention/unknown.
+The badges refresh on execution and store changes independently of new replies.
+Closed conversation goal headers are read with a fixed byte limit and cached.
+Older layouts with goals after the transcript are classified when their history
+page is loaded. Selecting Needs owner automatically walks the remaining history
+in pages, showing matches as they arrive; the normal initial list stays bounded.
+Only the current landing approval counts.
+Failed local releases are attention states unless an outstanding decision
+requires the owner.
+
 While a reply is running, Chat accepts the next message as one durable pending
 draft instead of starting a second CLI turn. The web composer shows that draft;
 use **Resume queued draft** to run it unchanged, **Edit text** to replace only

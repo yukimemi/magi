@@ -1692,6 +1692,39 @@ keep their own stored values.
 - Persona and implementers are set before the single save and the dirty flags
   stay false: the new seat's briefing already carries them.
 
+### Chat list status is derived, display-only triage
+
+`src/chat_status.rs` gives every `TalkListView` row a `chat_status`
+(`kind`, short `reason`, `owner_count`, optional `link`). `Inventory::collect`
+reads the evidence once: native inquiries with a live `Decision`
+(`AwaitingOwner` = owner; `Queued` / `InProgress` / `RetryNeeded` = waiting /
+working-if-the-task-runs / attention; `Resolved` and archived never count),
+still-open legacy `land-approval` questions not mirrored by a native
+`question:<id>` inquiry, and task state through `Task::chat`, then
+`filed_by_chat`, then `origin_chat`. A decision whose `repo` no longer matches
+its task (a superseded assignment) is skipped; items are counted by id, so
+several tasks or decisions aggregate once each. `derive` is pure, precedence:
+needs owner, attention, working, waiting, unknown (unattributable unreadable
+inquiry), closed, completed, idle. A goal contributes only through its saved
+state (`Owner` = owner, `Paused` = attention, `Runnable` = waiting); a bare or
+`Waiting` goal and a `Done` task alone are never activity or approval.
+
+- **Cheap.** The inventory is cached in `SharedMonitor::chat_inventory` keyed by
+  the monitor's queue, question, decision and loop revisions; per-row work is a
+  map lookup. No forge call, agent call or transcript read. The parsed row cache
+  keeps only the goal counts.
+- **Refresh.** `app.js` reloads the Chat list whenever queue, question or
+  notification revisions move, not only `talks_rev`.
+- **Needs owner filter.** `page_ids` lists a chat owing a decision with the open
+  ones even when closed, so the client filter over loaded rows never depends on
+  walking closed history for decisions. Closed goal headers are bounded reads;
+  older layouts with goals after turns are classified when their row is loaded.
+  Selecting Needs owner automatically enumerates history through the existing
+  paginated row endpoint, not through transcript requests or a cold header scan.
+  The ordinary unfiltered initial list remains bounded.
+- **Display only.** Nothing here approves, resolves or controls anything; the
+  link is a plain route (`#/decisions`, `#/tasks/<id>`), a sibling of the card.
+
 ### Chat implementer count changes a command, not a tone
 
 `Talk::implementers` (1..=3, `#[serde(default)]` to 1 = Solo, `talk::SCHEMA`
