@@ -27388,7 +27388,10 @@ mod tests {
         let (initial, _) = page_ids(&ui, true, PageQuery::default()).unwrap();
         assert!(!initial.contains(&id));
         let rows = talk_rows(&ui, vec![id], &header::HeaderMap::new());
-        assert_eq!(rows[0].chat_status.kind, crate::chat_status::Kind::NeedsOwner);
+        assert_eq!(
+            rows[0].chat_status.kind,
+            crate::chat_status::Kind::NeedsOwner
+        );
     }
 
     #[test]
