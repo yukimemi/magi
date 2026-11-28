@@ -3839,7 +3839,10 @@ async fn publish_landing_head<F: Forge>(
     if state.land_sync_unstarted_grant() {
         state.land_sync_attempts += 1;
         state.land_sync_pending = true;
-        state.event("land-sync-recovery", "started recovery attempt without rebase");
+        state.event(
+            "land-sync-recovery",
+            "started recovery attempt without rebase",
+        );
         state.save()?;
     }
     if state.gate_head.as_deref() != Some(&head)
@@ -12714,7 +12717,11 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
         assert_eq!(resumed.land_sync_attempts, 5);
         assert_eq!(resumed.gate_fixes.len(), 1);
         assert!(!resumed.land_sync_pending);
-        assert!(resumed.land_sync_recovery.authorizations[0].invalidated.is_none());
+        assert!(
+            resumed.land_sync_recovery.authorizations[0]
+                .invalidated
+                .is_none()
+        );
         assert_eq!(
             git::remote_head(&resumed.repo, "origin", "task-head")
                 .await
