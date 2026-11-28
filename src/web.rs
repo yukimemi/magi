@@ -439,8 +439,8 @@ fn file_identity(path: &FsPath) -> std::io::Result<FileIdentity> {
     })
 }
 
-// Legacy goal layouts place goals after the transcript. Cache their projection
-// using actual file identity and change time, not just size and write time.
+// Cache bounded goal headers using actual file identity and change time,
+// not just size and write time.
 #[derive(Debug, PartialEq, Eq)]
 struct GoalIdentity {
     file: FileIdentity,
@@ -5468,8 +5468,8 @@ struct ListWalk {
     initial_end: usize,
 }
 
-/// Read goal state only, without allocating transcript messages. Older files
-/// placed goals after turns; skip that field until the first cached read.
+/// Read only the bounded goal header. Legacy layouts with goals after turns
+/// are classified when their ordinary paginated row is loaded.
 fn read_owner_goal(reader: impl std::io::Read) -> bool {
     use serde::de::{IgnoredAny, MapAccess, Visitor};
     struct Header<'a>(&'a mut bool);
@@ -5480,6 +5480,9 @@ fn read_owner_goal(reader: impl std::io::Read) -> bool {
         }
         fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
             while let Some(key) = map.next_key::<String>()? {
+                if key == "turns" {
+                    return Err(serde::de::Error::custom("transcript boundary"));
+                }
                 if key == "goals" {
                     let goals: Vec<crate::chat_goal::Goal> = map.next_value()?;
                     *self.0 = crate::chat_status::Goals::of(&goals).owner > 0;
@@ -5491,7 +5494,8 @@ fn read_owner_goal(reader: impl std::io::Read) -> bool {
         }
     }
     let mut owner = false;
-    let mut json = serde_json::Deserializer::from_reader(std::io::BufReader::new(reader));
+    let reader = std::io::BufReader::with_capacity(1024, reader.take(64 * 1024));
+    let mut json = serde_json::Deserializer::from_reader(reader);
     let _ = serde::Deserializer::deserialize_map(&mut json, Header(&mut owner));
     owner
 }
@@ -27326,7 +27330,7 @@ mod tests {
     }
 
     #[test]
-    fn chat_status_promotes_old_closed_owner_goal() {
+    fn chat_status_promotes_closed_owner_goal_in_header() {
         let home = tempfile::tempdir().unwrap();
         let ui = delta_test_ui(home.path());
         for i in 0..STORE_PAGE_SIZE + 5 {
@@ -27344,7 +27348,8 @@ mod tests {
             "evidence": "", "wake": 0, "handled": 0, "started": null,
             "wakes": 0, "last_checked": null, "fingerprint": ""
         }]);
-        std::fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
+        let chat: talk::Talk = serde_json::from_value(raw.clone()).unwrap();
+        std::fs::write(&path, serde_json::to_vec(&chat).unwrap()).unwrap();
         let (ids, _) = page_ids(&ui, true, PageQuery::default()).unwrap();
         assert!(ids.contains(&id));
         let rows = talk_rows(&ui, ids, &header::HeaderMap::new());
@@ -27362,7 +27367,8 @@ mod tests {
         let modified = path.metadata().unwrap().modified().unwrap();
         raw["goals"][0]["state"] = serde_json::json!("paused");
         raw["goals"][0]["step"] = serde_json::json!("waiting");
-        std::fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
+        let chat: talk::Talk = serde_json::from_value(raw).unwrap();
+        std::fs::write(&path, serde_json::to_vec(&chat).unwrap()).unwrap();
         std::fs::OpenOptions::new()
             .write(true)
             .open(&path)
@@ -27371,6 +27377,18 @@ mod tests {
             .unwrap();
         let (changed, _) = page_ids(&ui, true, PageQuery::default()).unwrap();
         assert!(!changed.contains(&id));
+        // A legacy file with goals after turns is deferred to its history page.
+        let mut raw = serde_json::to_value(&chat).unwrap();
+        raw["goals"][0]["state"] = serde_json::json!("owner");
+        let goals = raw.as_object_mut().unwrap().remove("goals").unwrap();
+        let mut body = serde_json::to_string(&raw).unwrap();
+        body.pop();
+        body.push_str(&format!(",\"goals\":{goals}}}"));
+        std::fs::write(&path, body).unwrap();
+        let (initial, _) = page_ids(&ui, true, PageQuery::default()).unwrap();
+        assert!(!initial.contains(&id));
+        let rows = talk_rows(&ui, vec![id], &header::HeaderMap::new());
+        assert_eq!(rows[0].chat_status.kind, crate::chat_status::Kind::NeedsOwner);
     }
 
     #[test]
@@ -27438,6 +27456,16 @@ mod tests {
             bytes: 0,
         };
         assert_eq!(read_talk_status(&mut reader), Some(talk::TalkStatus::Open));
+        assert!(reader.bytes <= 1024);
+        let legacy = format!(
+            r#"{{"status":"closed","turns":[{{"body":"{}"}}],"goals":[]}}"#,
+            "x".repeat(1024 * 1024)
+        );
+        let mut reader = Counted {
+            inner: legacy.as_bytes(),
+            bytes: 0,
+        };
+        assert!(!read_owner_goal(&mut reader));
         assert!(reader.bytes <= 1024);
         let oversized = format!(
             r#"{{"agent":"{}","status":"open"}}"#,

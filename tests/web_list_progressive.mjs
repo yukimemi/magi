@@ -93,6 +93,21 @@ test('a skipped delta base still finishes enumeration before starting a fresh sn
   assert.equal(h.state.rev.queue, 5);
 });
 
+test('a pending whole status refresh survives a later transcript delta', async () => {
+  const h = harness([row('unchanged'), row('changed')]);
+  h.state.rev.queue = 1;
+  const done = h.load({ rev: 2, delta: { base: 1, changed: ['changed'], removed: [] } });
+  h.load({ rev: 2 });
+  h.load({ rev: 3, delta: { base: 2, changed: ['changed'], removed: [] } });
+  h.requests[0].resolve([row('changed')]);
+  await flush();
+  assert.equal(h.requests[1].url, '/api/queue/page');
+  h.requests[1].resolve({ rows: [row('unchanged', 3), row('changed')], next: null });
+  await done;
+  assert.equal(h.state.queue.find(r => r.id === 'unchanged').priority, 3);
+  assert.equal(h.state.rev.queue, 3);
+});
+
 for (const existing of [null, [], [row('saved')]]) {
   test(`older-entry notice uses the snapshot from before paging (${JSON.stringify(existing)})`, async () => {
     const h = harness(existing);

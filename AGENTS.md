@@ -1717,8 +1717,8 @@ state (`Owner` = owner, `Paused` = attention, `Runnable` = waiting); a bare or
   notification revisions move, not only `talks_rev`.
 - **Needs owner filter.** `page_ids` lists a chat owing a decision with the open
   ones even when closed, so the client filter over loaded rows never depends on
-  walking closed history. Owner-wait of a goal on a closed chat is not parsed
-  there (it needs the transcript file) and shows once that row is loaded.
+  walking closed history for decisions. Closed goal headers are bounded reads;
+  older layouts with goals after turns are classified when their row is loaded.
 - **Display only.** Nothing here approves, resolves or controls anything; the
   link is a plain route (`#/decisions`, `#/task/<id>`), a sibling of the card.
 

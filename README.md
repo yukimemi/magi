@@ -744,12 +744,14 @@ does not mark messages read or close the conversation you are viewing.
 Each conversation also has a status badge based on saved decisions, tasks,
 goals and current execution evidence, not the wording of the transcript.
 **Needs owner** includes closed conversations with outstanding decisions or
-owner-waiting goals. Resource waits and queued replies are waiting, while
+owner-waiting goals in their current-format headers or loaded history.
+Resource waits and queued replies are waiting, while
 unverified execution or incomplete records are surfaced as attention/unknown.
 The badges refresh on execution and store changes independently of new replies.
-Old closed conversations are scanned once per file version for goal state,
-without retaining transcript text; subsequent list refreshes reuse that
-projection on Windows and Unix. Only the current landing approval counts.
+Closed conversation goal headers are read with a fixed byte limit and cached.
+Older layouts with goals after the transcript are classified when their history
+page is loaded; the filter indicates that older rows may contain owner waits.
+Only the current landing approval counts.
 Failed local releases are attention states unless an outstanding decision
 requires the owner.
 

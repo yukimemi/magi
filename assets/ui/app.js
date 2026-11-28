@@ -3697,6 +3697,7 @@ function setTalksOwnerOnly(enabled) {
   if (state.talksOwnerOnly === next) return;
   state.talksOwnerOnly = next;
   renderTalks();
+  showOlderTalks();
   announce(next ? "Showing conversations that need you only." : "Showing all conversations.");
 }
 
@@ -6756,9 +6757,11 @@ async function getTalkRows(url) {
 }
 function showOlderTalks() {
   const message = !talksNext ? ""
-    : state.talksUnreadOnly
-      ? "Older conversations are not loaded yet and may include unread messages."
-      : "Older conversations are available.";
+    : state.talksOwnerOnly
+      ? "Older conversations are not loaded yet and may include owner-waiting goals."
+      : state.talksUnreadOnly
+        ? "Older conversations are not loaded yet and may include unread messages."
+        : "Older conversations are available.";
   sectionNotice("talks-h", "talks-load-state", message);
   const box = $("talks-load-state");
   if (box) for (const button of box.querySelectorAll("button")) button.remove();
@@ -10651,6 +10654,7 @@ function loadStore(name, url, change, apply, settled) {
   let flight = storeReads.get(name);
   if (flight) {
     // An explicit refresh needs a whole read even if followed by a delta.
+    const whole = !change || !change.delta || Boolean(flight.pending && flight.pending.whole);
     const previous = flight.pending && flight.pending.change;
     if (change && previous && change.rev === previous.rev) {
       // The question and queue refresh paths can enqueue the same event.
@@ -10667,7 +10671,7 @@ function loadStore(name, url, change, apply, settled) {
     }
     flight.pending = {
       change: change || previous,
-      whole: !change || Boolean(flight.pending && flight.pending.whole),
+      whole,
     };
     return flight.promise;
   }
