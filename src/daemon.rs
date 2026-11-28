@@ -4082,6 +4082,7 @@ fn conductor_work(queue: &Queue, home: &Path) -> (Vec<Task>, Vec<Task>, Vec<Task
         .into_iter()
         .filter(|t| !live.contains(&t.id) && !stalled_ids.contains(&t.id))
         .filter(|t| !awaiting_resume_with(t, |id| RunState::load_under(id, home)))
+        .filter(|t| !t.has_awaiting_landing_cause())
         .collect();
     let queued = queued_tasks(queue)
         .into_iter()
