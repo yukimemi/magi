@@ -3576,13 +3576,14 @@ never below `min_free_bytes`, so an explicit `0` is not an off switch; the
 *resolved* `0` - only with `min_free_bytes = 0` - means no free-space
 collection, except that the retained-output sweep still treats a failed
 free-space measurement as pressure). Readers of the threshold:
-`clean::prune_cache_under_pressure` (shared cache) and
-`build_target::prune_registered_with` (isolated builds), both through
+`clean::prune_cache_under_pressure` (shared cache), through
 `disk::pressure_limit` / `disk::pressure_reserve` / `disk::pressure_outcome`, the
 free-space tests in `retention::sweep_inner` (pressure flag and per-target
 skip), plus the `reclaim_free_bytes` field of `retention::Report` and of the
 daemon's `disk-pressure` service receipt (the one reporting addition; everything
-else is a log line). Readers that stay on
+else is a log line). The isolated-build pool
+(`build_target::prune_registered`) deliberately does **not** read it (below).
+Readers that stay on
 `min_free_bytes`: `daemon::disk_gate_with` / `disk::gate*` and `main::disk_precheck`
 (admission), `triage` floors and disk-hold recovery, `retention::emergency` and
 `OutputLease::admit*` (the half-floor writer stop and 1 GiB reservations), the
@@ -3593,48 +3594,57 @@ so a volume merely below the threshold with nothing eligible raises nothing).
 `magi cache prune` prunes to the plain cap. A new reader of free space must pick
 one side on purpose and be listed here.
 
-**A pass is estimated-deficit collection.** The shared-cache and isolated-build
-passes measure free space once, compute the deficit against the threshold from
-that one number and remove that many *logical* bytes oldest-first; they never
-re-measure in a loop (hard links and other writers mean the freed space can
-differ - the next pass, a service period later, measures again). Do not write
-"collects until the threshold is reached" anywhere.
+**A pass is estimated-deficit collection.** The shared-cache pass measures free
+space once, computes the deficit against the threshold from that one number and
+removes that many *logical* bytes oldest-first; it never re-measures in a loop
+(hard links and other writers mean the freed space can differ - the next pass, a
+service period later, measures again). Do not write "collects until the
+threshold is reached" anywhere.
 
-**Build caches keep a reserve while free space is at or above the admission
-floor, and it is enforced where files are deleted.** `disk::pressure_limit` has
-three bands: free at or above the threshold (the cap), between the floor and the
-threshold (shrink by the deficit but never below half the cache's configured cap
-- `disk::pressure_reserve`) and below the floor (exactly the pre-threshold rule:
-shrink by the deficit against `min_free_bytes`, to zero if need be). The limit
-alone cannot keep the reserve, because files go whole: one artifact larger than
-`size - reserve` would be deleted, rebuilt and deleted again. So the reserve is
-also passed to the pruning routine as a "keep at least" bound
-(`disk::prune_dir_keeping`, `cache::maintenance_prune_keeping`; `0` for every
-other caller: below the floor, the plain cap, manual `magi cache prune`, which
-go through `prune_dir` / `maintenance_prune` unchanged): oldest-first as always,
-but a file whose removal would leave less is skipped and later candidates are
-still tried while the cache is over its limit. The inventory is the one taken
-under the maintenance lease and Cargo locks. For the isolated-build pool the
-bound is the pool's aggregate (`target_keep = size - (pool bytes above the
-reserve)`). The half-cap ratio is a constant on purpose, not a setting: a cache
-with nothing in it is no cache, and without it a disk whose free space other
-software controls would be emptied and rebuilt cold every pass. A zero cap still
-means pruning is off. Retained worktree outputs get no reserve (nothing rebuilds
-from them).
+**The isolated-build pool is outside the threshold, on purpose.** The collection
+threshold applies to the shared build cache and to retained worktree outputs.
+`build_target::prune_registered` is collected to its cap and, below the
+admission floor, by the deficit against `min_free_bytes`, exactly as before the
+threshold existed (it calls `disk::pressure_limit` with threshold = floor, which
+is that rule). A pool-wide reserve would need a pool-wide inventory that stays
+true across several targets' leases and concurrent passes; that machinery was
+tried and cut. Do not add a threshold reader there without it.
 
-**Reporting is one log line per pass, and nothing else new.** Every shared-cache
-and isolated-build pass logs one `tracing::info!` line from inside
-`clean::prune_cache_under_pressure` / `build_target::prune_registered_with`, so
-every caller (busy-time `disk-pressure` service, idle `housekeep`, between-runs
-`cache` service) gets it: cache, admission floor, collection threshold, free
-bytes, cache size (only from an inventory taken under the maintenance locks -
-never an earlier unlocked measurement repeated as "after"; omitted otherwise),
-logical bytes removed, outcome. `disk::pressure_outcome` puts maintenance
-refusals first: `lease held`, then `collected`, `nothing eligible` (over its
-limit, nothing removable - including everything protected by the reserve), `at
-reserve`, `within limit`. The only persisted value is the resolved threshold in
-the busy-time service receipt and the sweep report: there are no per-pass
-receipts, volume reports or report structs. The shared-cache pass
+**The shared build cache keeps a reserve while free space is at or above the
+admission floor and below the threshold, and it is enforced where files are
+deleted.** `disk::pressure_limit` has three bands: free at or above the
+threshold (the cap), between the floor and the threshold (shrink by the deficit
+but never below half the cache's configured cap - `disk::pressure_reserve`) and
+below the floor (exactly the pre-threshold rule: shrink by the deficit against
+`min_free_bytes`, to zero if need be). The limit alone cannot keep the reserve,
+because files go whole: one artifact larger than `size - reserve` would be
+deleted, rebuilt and deleted again. So the reserve is also passed to the pruning
+routine as a "keep at least" bound (`disk::prune_dir_keeping`,
+`cache::maintenance_prune_keeping`; `0` for every other caller: below the floor,
+the plain cap, manual `magi cache prune`, which go through `prune_dir` /
+`maintenance_prune` unchanged): oldest-first as always, but a file whose removal
+would leave less is skipped and later candidates are still tried while the cache
+is over its limit. The inventory is the one taken under the maintenance lease
+and Cargo locks. The half-cap ratio is a constant on purpose, not a setting: a
+cache with nothing in it is no cache, and without it a disk whose free space
+other software controls would be emptied and rebuilt cold every pass. A zero cap
+still means pruning is off. Retained worktree outputs get no reserve (nothing
+rebuilds from them).
+
+**Reporting is one log line per shared-cache pass, and nothing else new.**
+`clean::prune_cache_under_pressure` documents the contract: a pass that *runs to
+completion* (measured free space, took the maintenance lease, walked the cache)
+emits one `tracing::info!` line - admission floor, collection threshold, free
+bytes measured, the size the prune's own inventory reported, logical bytes
+removed, outcome (`disk::pressure_outcome`: `within limit`, `at reserve`,
+`collected`, `nothing eligible`) - for every caller (busy-time `disk-pressure`
+service, idle `housekeep`, between-runs `cache` service). A pass that is
+*refused or fails* (lease or Cargo lock held, an I/O error, an unreadable
+free-space measurement) keeps exactly the pre-threshold reporting (return value
+or error) and emits no additional line. The only persisted value is the
+resolved threshold in the busy-time service receipt and the sweep report: there
+are no per-pass receipts, volume reports or report structs. Tests assert the
+outcome function and file effects, never log text. The shared-cache pass
 measures the cache (`dir_size`) only below the threshold; the retained-output
 sweep remeasures targets on each sweep while a volume is below the threshold
 (before: below the floor), once per sweep, i.e. once per service period (30 s

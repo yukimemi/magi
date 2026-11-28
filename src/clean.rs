@@ -937,8 +937,15 @@ pub fn prune_cache_if_over_limit(
 /// nothing is not an error. An unreadable measurement prunes to the plain cap.
 /// The cache is measured (`dir_size`, for the limit) only below the threshold.
 ///
-/// Every pass, whoever calls it, logs one `info` line (see
-/// [`crate::disk::PressureOutcome`]).
+/// Log contract: a pass that *runs to completion* - it measured free space,
+/// took the maintenance lease and walked the cache - emits one `info` line
+/// with the admission floor, the collection threshold, the free bytes
+/// measured, the size the pruning routine's own inventory reported, the
+/// logical bytes removed and an outcome ([`crate::disk::PressureOutcome`]:
+/// `within limit`, `at reserve`, `collected`, `nothing eligible`). A pass that
+/// is refused or fails (lease or Cargo lock held, an I/O error, an unreadable
+/// free-space measurement) reports exactly as it did before the threshold
+/// existed - its return value or error - and emits no additional line.
 pub(crate) fn prune_cache_under_pressure(
     cfg: &crate::config::Config,
     home: &Path,
@@ -954,37 +961,29 @@ pub(crate) fn prune_cache_under_pressure(
     let floor = cfg.disk.min_free_bytes;
     let threshold = cfg.disk.reclaim_threshold();
     let free = free_bytes(&cache).ok();
-    let estimate = free
+    let (limit, keep) = free
         .filter(|free| *free < threshold)
-        .map(|free| (free, dir_size(&cache)));
-    let (limit, keep) = estimate.map_or((cap, 0), |(free, size)| {
-        (
-            crate::disk::pressure_limit(size, cap, floor, threshold, free),
-            crate::disk::pressure_reserve(cap, floor, threshold, free),
-        )
-    });
+        .map_or((cap, 0), |free| {
+            (
+                crate::disk::pressure_limit(dir_size(&cache), cap, floor, threshold, free),
+                crate::disk::pressure_reserve(cap, floor, threshold, free),
+            )
+        });
     let prune = crate::cache::maintenance_prune_keeping(home, &cache, limit, keep)?;
-    // The size a pass reports is the locked inventory's, never the earlier
-    // unlocked estimate: a cache in use may have changed since.
-    let locked = prune.map(|pruned| pruned.remaining.saturating_add(pruned.freed));
-    let removed = prune.map_or(0, |pruned| pruned.freed);
-    let outcome = crate::disk::pressure_outcome(
-        prune.is_none(),
-        removed,
-        locked.or(estimate.map(|(_, size)| size)).unwrap_or(0),
-        limit,
-        keep,
-    );
-    tracing::info!(
-        cache = %cache.display(),
-        admission_floor = floor,
-        collection_threshold = threshold,
-        free,
-        size = locked,
-        removed,
-        outcome = outcome.as_str(),
-        "shared build cache pressure pass"
-    );
+    if let (Some(free), Some(pruned)) = (free, prune) {
+        let size = pruned.remaining.saturating_add(pruned.freed);
+        let outcome = crate::disk::pressure_outcome(pruned.freed, size, limit, keep);
+        tracing::info!(
+            cache = %cache.display(),
+            admission_floor = floor,
+            collection_threshold = threshold,
+            free,
+            size,
+            removed = pruned.freed,
+            outcome = outcome.as_str(),
+            "shared build cache pressure pass"
+        );
+    }
     Ok(prune)
 }
 

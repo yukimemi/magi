@@ -181,9 +181,9 @@ pub fn pressure_reserve(cap: u64, min_free: u64, threshold: u64, free: u64) -> u
     }
 }
 
-/// How one pressure-collection pass over a build cache ended, as the pass's
-/// log line says it. None of them is an error: a pass that cannot make
-/// progress says so and the service's next period tries again.
+/// How a shared-cache pressure pass that ran to completion ended, as its log
+/// line says it. None of them is an error: a pass that cannot make progress
+/// says so and the service's next period tries again.
 ///
 /// A pass is *estimated-deficit collection*: it measures free space once,
 /// computes the deficit against the collection threshold, and removes that
@@ -193,9 +193,6 @@ pub fn pressure_reserve(cap: u64, min_free: u64, threshold: u64, free: u64) -> u
 /// continues.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PressureOutcome {
-    /// Maintenance could not take the cache (a build holds it); nothing was
-    /// inspected or removed.
-    LeaseHeld,
     /// Files were removed.
     Collected,
     /// Nothing needed removing, because the cache is at or below the reserve
@@ -212,7 +209,6 @@ impl PressureOutcome {
     /// The wording of the log line.
     pub fn as_str(self) -> &'static str {
         match self {
-            PressureOutcome::LeaseHeld => "lease held",
             PressureOutcome::Collected => "collected",
             PressureOutcome::AtReserve => "at reserve",
             PressureOutcome::NothingEligible => "nothing eligible",
@@ -221,22 +217,12 @@ impl PressureOutcome {
     }
 }
 
-/// Classify a pass, maintenance refusals first. `blocked` is whether
-/// maintenance could not take the cache; `removed` the logical bytes the pass
-/// removed; `size` the cache's size going into the deletion (the locked
-/// inventory's when one was taken, else the estimate the limit came from);
+/// Classify a pass: `removed` is the logical bytes it removed; `size` the
+/// cache's size going into the deletion (the pruning routine's own inventory);
 /// `limit` what [`pressure_limit`] allowed; `keep` the reserve the pruning was
 /// bounded by ([`pressure_reserve`]).
-pub fn pressure_outcome(
-    blocked: bool,
-    removed: u64,
-    size: u64,
-    limit: u64,
-    keep: u64,
-) -> PressureOutcome {
-    if blocked {
-        PressureOutcome::LeaseHeld
-    } else if removed > 0 {
+pub fn pressure_outcome(removed: u64, size: u64, limit: u64, keep: u64) -> PressureOutcome {
+    if removed > 0 {
         PressureOutcome::Collected
     } else if size > limit {
         PressureOutcome::NothingEligible
@@ -1089,31 +1075,23 @@ mod pressure_tests {
     }
 
     #[test]
-    fn the_outcome_puts_a_maintenance_refusal_first() {
-        // Over the cap *and* above the collection threshold (limit = cap), but
-        // maintenance could not take the cache: a refusal, not "within limit".
-        let limit = pressure_limit(12, 10, 8, 16, 20);
-        assert_eq!(limit, 10);
-        assert_eq!(pressure_outcome(true, 0, 12, limit, 0), O::LeaseHeld);
-        // Same facts with maintenance granted and nothing removable.
-        assert_eq!(pressure_outcome(false, 0, 12, limit, 0), O::NothingEligible);
-    }
-
-    #[test]
     fn the_outcome_names_why_a_pass_removed_nothing() {
-        // (blocked, removed, size, limit, keep)
-        assert_eq!(pressure_outcome(false, 4, 9, 5, 5), O::Collected);
-        assert_eq!(pressure_outcome(false, 2, 12, 10, 0), O::Collected);
+        // (removed, size, limit, keep)
+        assert_eq!(pressure_outcome(4, 9, 5, 5), O::Collected);
+        assert_eq!(pressure_outcome(2, 12, 10, 0), O::Collected);
         // Within the limit with no reserve involved (above the threshold).
-        assert_eq!(pressure_outcome(false, 0, 9, 9, 0), O::WithinLimit);
-        assert_eq!(pressure_outcome(false, 0, 0, 0, 0), O::WithinLimit);
+        assert_eq!(pressure_outcome(0, 9, 9, 0), O::WithinLimit);
+        assert_eq!(pressure_outcome(0, 0, 0, 0), O::WithinLimit);
         // At or below the reserve the band keeps.
-        assert_eq!(pressure_outcome(false, 0, 4, 4, 5), O::AtReserve);
-        assert_eq!(pressure_outcome(false, 0, 5, 5, 5), O::AtReserve);
+        assert_eq!(pressure_outcome(0, 4, 4, 5), O::AtReserve);
+        assert_eq!(pressure_outcome(0, 5, 5, 5), O::AtReserve);
         // Over the limit and everything is protected by the reserve (one 6 GiB
         // artifact, reserve 5): nothing eligible, not "at reserve".
-        assert_eq!(pressure_outcome(false, 0, 6, 5, 5), O::NothingEligible);
-        assert_eq!(pressure_outcome(true, 0, 6, 5, 5), O::LeaseHeld);
+        assert_eq!(pressure_outcome(0, 6, 5, 5), O::NothingEligible);
+        // Over the cap, above the collection threshold, nothing removable.
+        let limit = pressure_limit(12, 10, 8, 16, 20);
+        assert_eq!(limit, 10);
+        assert_eq!(pressure_outcome(0, 12, limit, 0), O::NothingEligible);
     }
 
     /// Write `size` bytes at `dir/name`, `age` seconds old.

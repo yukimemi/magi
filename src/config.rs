@@ -948,21 +948,24 @@ pub struct Disk {
     /// is nowhere near the threshold.
     pub min_free_bytes: u64,
     /// Free space, in bytes, below which pressure collection runs: the shared
-    /// build cache, registered isolated builds and retained worktree outputs
-    /// are collected (within their own caps, locks and eligibility rules)
-    /// toward having this much free. This is the *collection* threshold;
+    /// build cache and retained worktree outputs are collected (within their
+    /// own caps, locks and eligibility rules) toward having this much free.
+    /// This is the *collection* threshold;
     /// [`min_free_bytes`](Self::min_free_bytes) stays the *admission* floor
-    /// and nothing here moves a gate.
+    /// and nothing here moves a gate. The registered isolated-build pool is
+    /// not governed by it: it is collected to its cap and, below the
+    /// admission floor, by the deficit against `min_free_bytes`, as before.
     ///
     /// A pass is estimated-deficit collection: it measures free space once,
     /// removes that many *logical* bytes oldest-first and does not re-measure
     /// in a loop. Hard links and other writers mean the space actually freed
     /// can differ; the next pass measures again and continues. A pass that
     /// removes nothing ends without error. While free space is at or above
-    /// the admission floor, a build cache (shared or isolated) keeps a reserve
-    /// of half its configured cap, so a disk whose free space other software
-    /// controls does not empty it on every pass; below the floor there is no
-    /// reserve. Retained worktree outputs of finished runs get no reserve.
+    /// the admission floor and below this threshold, the shared build cache
+    /// keeps a reserve of half its configured cap, so a disk whose free space
+    /// other software controls does not empty it on every pass; elsewhere
+    /// there is no reserve. Retained worktree outputs of finished runs get no
+    /// reserve.
     ///
     /// Unset means twice `min_free_bytes`. A value below `min_free_bytes` is
     /// treated as `min_free_bytes` (collection never aims below the admission
