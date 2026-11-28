@@ -891,6 +891,14 @@ pub fn run_stopped(id: &str, state: &crate::run::RunState) -> Notice {
             .as_ref()
             .filter(|_| state.base_sync_blocked())
             .map(|s| s.at)
+            .or_else(|| {
+                state
+                    .land_sync_recovery
+                    .stop
+                    .as_ref()
+                    .filter(|_| state.land_sync_exhausted())
+                    .map(|s| s.at)
+            })
             .or_else(|| crate::head_e2e_stop::conclusive(state).and_then(|s| s.recorded_at))
             .or_else(|| state.passes.last().map(|p| p.started_at))
             .unwrap_or(state.created_at),
@@ -913,6 +921,13 @@ fn run_cause(state: &crate::run::RunState) -> String {
         })
         .or(verification_cause.as_deref())
         .or_else(|| state.events.last().map(|e| e.message.as_str()));
+    if state.land_sync_exhausted() {
+        return format!(
+            "{} Next: {}",
+            cause.unwrap_or("Landing base synchronization budget exhausted."),
+            state.land_sync_next_action()
+        );
+    }
     if state.base_sync_blocked() || state.resource_block.is_some() {
         return format!(
             "{} Next: {}",

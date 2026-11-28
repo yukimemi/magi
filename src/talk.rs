@@ -3761,6 +3761,15 @@ pub fn briefing_for(
          reuse the same request \
          ID and arguments after interruption. This authorizes one bounded interval \
          and queues the exact existing run; generic resume/release cannot renew it. \
+         Exhausted landing base synchronization on an existing open PR is separate from \
+         pre-publication `recover-base`, review repair grants, and unchanged-tree verification \
+         recovery; on explicit owner input only (never standing or automatic goal turns), run \
+         `magi task control recover-land-sync <full run id> --request <unique-id> \
+         --head <full-40-char-head-sha>` after confirming both the retained worktree HEAD and \
+         open PR head match that exact SHA. Reuse the exact same request ID and arguments after \
+         interruption; never reuse an ID with changed arguments, and inspect the receipt if \
+         uncertain. Each approval grants 1 bounded landing sync attempt (capped over the run's \
+         lifetime) and requires fresh head-bound E2E, gate, and merge approval when required. \
          Do not start a separate run driver. `magi task control hold <task id> \
          [reason]`, `magi task control release <task id>`, `magi task control \
          reassign <task id> --repo <path-or-owner/repo>` (moves future execution \

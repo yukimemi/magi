@@ -71,6 +71,8 @@ pub mod head_e2e_stop;
 mod id_reserve;
 pub mod incremental;
 pub mod land;
+pub mod land_sync_recovery;
+pub mod land_sync_recovery_control;
 pub mod lang;
 mod lock_file;
 pub mod md;
