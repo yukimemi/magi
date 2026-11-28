@@ -223,7 +223,7 @@ pub async fn fold_due(
     Ok((folded, unreadable))
 }
 
-/// Every run directory [`fold_due`] and [`fold_turn`] consider, oldest id first.
+/// Every run directory [`fold_due`] considers, oldest id first.
 fn fold_ids(runs: &Path) -> Vec<String> {
     let mut ids: Vec<String> = std::fs::read_dir(runs)
         .into_iter()
@@ -233,6 +233,18 @@ fn fold_ids(runs: &Path) -> Vec<String> {
         .map(|e| e.file_name().to_string_lossy().into_owned())
         .collect();
     ids.sort_unstable();
+    ids
+}
+
+/// The run directories [`fold_turn`] walks: [`fold_ids`] restricted to names
+/// that are run ids. The turn saves an id as its cursor and high-water mark and
+/// refuses to continue from one that is not a run id, so a stray directory with
+/// a `run.json` (`runs/backup/`) must not be able to become either: it would
+/// restart the cycle on every pass and starve the runs after the inspection
+/// bound. The idle pass keeps its wider inventory.
+fn fold_turn_ids(runs: &Path) -> Vec<String> {
+    let mut ids = fold_ids(runs);
+    ids.retain(|id| crate::run::is_run_id(id));
     ids
 }
 
@@ -326,6 +338,7 @@ fn eligibility(
     if state.startup.as_ref().is_some_and(|s| !s.complete) {
         return Err(FoldRefusal::ProofIncomplete("startup incomplete".into()));
     }
+    handover_settled(state, home, now)?;
     if let Some(reason) = crate::pr_recovery::source_retention_reason(home, state) {
         tracing::info!(id = %state.id, %reason, "housekeep: source retained; fold refused");
         return Err(FoldRefusal::Retained(reason));
@@ -349,6 +362,93 @@ fn eligibility(
         state.status,
         RunStatus::Merged | RunStatus::Superseded | RunStatus::AlreadyInBase
     ))
+}
+
+/// A handover in flight is not folded: a record naming a successor
+/// (`released_to`) whose startup has not settled, or whose driver is live, is
+/// `live` and nothing is touched.
+///
+/// `handover::release` records `released_to` under the predecessor's owner
+/// lock and keeps going; when the successor's startup then fails,
+/// `handover::Released::restore` takes the same owner lock to put the old
+/// worktree back. An automatic fold that holds that lock at that moment would
+/// make the rollback abandon, leaving the predecessor marked as released to a
+/// run that never started. The successor's own record says whether it is still
+/// starting (`startup` present, not complete, no failure recorded - a failed
+/// startup has settled: its rollback is what follows) or driving (a live
+/// driver). A successor record that is not there protects nothing; one that
+/// cannot be read is unknown, which refuses. A startup killed mid-way leaves the
+/// same marker as one in progress, so it keeps its predecessor out of automatic
+/// folding until an operator settles that run - the safe direction. Asked on
+/// the first read and again on the record the fold reloads under its locks.
+fn handover_settled(
+    state: &RunState,
+    home: &Path,
+    now: Timestamp,
+) -> Result<(), crate::graph::FoldRefusal> {
+    use crate::graph::FoldRefusal;
+    let Some(next) = state.released_to.as_deref() else {
+        return Ok(());
+    };
+    let successor = match RunState::load_tolerant_under(next, home) {
+        Ok(successor) => successor,
+        Err(e)
+            if e.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+            }) =>
+        {
+            return Ok(());
+        }
+        Err(e) => {
+            return Err(FoldRefusal::Live(format!(
+                "the successor {next} of a handover cannot be read: {e:#}"
+            )));
+        }
+    };
+    if successor
+        .startup
+        .as_ref()
+        .is_some_and(|startup| !startup.complete && startup.failure.is_none())
+    {
+        return Err(FoldRefusal::Live(format!(
+            "handover in flight: run {next} is still starting"
+        )));
+    }
+    let claimed = crate::daemon::is_working_on(home, next, now);
+    if successor.liveness_under(home, claimed) == crate::run::Liveness::Live {
+        return Err(FoldRefusal::Live(format!(
+            "handover in flight: run {next} is being driven"
+        )));
+    }
+    Ok(())
+}
+
+/// Fold the run whose merge was just recorded from the forge
+/// (`reconcile_external_merges`). An automatic caller like the janitor's own
+/// fold: the record is read again under the run's locks, tolerant of older
+/// schemas, and the conditions that made this a confirmed merge are re-checked
+/// on it - it must still be a confirmed merge, its winner goes too, and a
+/// handover in flight still protects it. There is no grace - the merge is the
+/// news - and every other refusal stays with `graph::fold_run_when`.
+async fn fold_recorded_merge(
+    state: &mut RunState,
+    home: &Path,
+    now: Timestamp,
+) -> Result<Vec<String>> {
+    crate::graph::fold_run_when(state, home, &|fresh| {
+        use crate::graph::FoldRefusal;
+        if fresh.status != RunStatus::Merged || !fresh.merge.as_ref().is_some_and(|merge| merge.ok)
+        {
+            return Err(FoldRefusal::ProofIncomplete(
+                "the run is not a confirmed merge".into(),
+            ));
+        }
+        handover_settled(fresh, home, now)?;
+        Ok(true)
+    })
+    .await
 }
 
 /// May the busy-time turn answer a run without starting a fold?
@@ -504,8 +604,9 @@ pub struct FoldBounds {
 /// in id order, and then ends; the next pass begins a new cycle. With N records
 /// at the start of a cycle, every one of them is judged within
 /// `ceil(N / inspect)` passes plus the passes its fold invocations consume
-/// (`ceil(F / fold)` for F invocations, and one more for each pass the time
-/// budget cuts short, which itself began at least one fold). Ids start with the
+/// (`ceil(F / fold)` for F invocations), plus one more for every pass the time
+/// budget cuts short - a pass can spend the whole budget judging records
+/// without starting a fold, so each such pass is charged by itself. Ids start with the
 /// local wall-clock time of creation, so runs created later sort after the mark
 /// and wait for the next cycle: a growing history cannot postpone the
 /// wraparound. Two things can still put a later run inside the range - one
@@ -696,7 +797,7 @@ async fn fold_turn_from(
     bounds: FoldBounds,
 ) -> (FoldTurn, Option<Cycle>) {
     let began = std::time::Instant::now();
-    let ids = fold_ids(runs);
+    let ids = fold_turn_ids(runs);
     let mut turn = FoldTurn::begin(ids.len());
     let mut cycle = match saved {
         Saved::Absent => None,
@@ -1122,7 +1223,7 @@ where
             Ok(Some(found)) => {
                 match crate::land::correct_confirmed_external_merge(&mut state, &found.url).await {
                     Ok(_) => {
-                        if let Err(e) = crate::graph::fold_run(&mut state, true, home).await {
+                        if let Err(e) = fold_recorded_merge(&mut state, home, now).await {
                             tracing::warn!(
                                 "housekeep: fold {id} after recording its external merge: {e:#}"
                             );
@@ -1543,9 +1644,40 @@ pub fn delete_run(home: &Path, id: &str, now: Timestamp) -> Result<()> {
     state
         .ensure_can_delete(crate::daemon::is_working_on(home, id, now))
         .map_err(|e| DeleteRefused(format!("{e:#}")))?;
-    std::fs::remove_dir_all(&dir)
-        .with_context(|| format!("remove run directory {}", dir.display()))?;
-    Ok(())
+    remove_run_dir(home, id, &dir)
+}
+
+/// Remove a run's directory while the caller still holds both of its guards, so
+/// that the lock files and `run.json` disappear together.
+///
+/// Holding a file lock does not stop the file being unlinked (on Unix), and
+/// unlinking the lock files one by one while `run.json` was still there let a
+/// concurrent fold open replacement lock files and read the record of a run
+/// being deleted. The directory is first renamed - one atomic step - to a
+/// tombstone outside `runs/`, which nothing scans, and removed there. Where a
+/// directory with open files in it cannot be renamed (Windows), `run.json` goes
+/// first instead, so a reader that finds the lock files finds no record.
+fn remove_run_dir(home: &Path, id: &str, dir: &Path) -> Result<()> {
+    let graveyard = home.join("deleted-runs");
+    let tombstone = graveyard.join(format!("{id}-{}", Timestamp::now().as_nanosecond()));
+    let renamed = std::fs::create_dir_all(&graveyard)
+        .and_then(|()| std::fs::rename(dir, &tombstone))
+        .is_ok();
+    if renamed {
+        return std::fs::remove_dir_all(&tombstone).with_context(|| {
+            format!(
+                "run {id} was deleted, but its leftovers remain in {}",
+                tombstone.display()
+            )
+        });
+    }
+    match std::fs::remove_file(dir.join("run.json")) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            return Err(e).with_context(|| format!("remove run record of {id}"));
+        }
+        _ => {}
+    }
+    std::fs::remove_dir_all(dir).with_context(|| format!("remove run directory {}", dir.display()))
 }
 
 /// Delete files from the shared build cache until it fits its cap — but only
@@ -3771,11 +3903,12 @@ pub(crate) mod tests {
                 "2026-08-01T00:00:00Z",
             );
         }
+        // Run ids have a four-character tag, which the turn's inventory requires.
         let arrive = |pass: u32| {
             for k in 0..2 {
                 write_meta(
                     &runs,
-                    &format!("20260802-000000-n{pass}{k}"),
+                    &format!("20260802-000000-n{pass:02}{k}"),
                     "blocked",
                     "2026-08-02T00:00:00Z",
                 );
@@ -3975,6 +4108,195 @@ pub(crate) mod tests {
         let evidence = home.join("runs").join(&id).join("artifacts/fold-evidence");
         assert!(evidence.join("manifest.json").is_file());
         assert!(home.join("runs").join(&id).join("run.json").is_file());
+    }
+
+    /// A directory in `runs/` that is not a run but holds a `run.json` must not
+    /// become the cycle's high-water mark: the turn refuses to continue from an
+    /// id that is not a run id, restarts from the oldest run on every pass and
+    /// never reaches the tail past the inspection bound.
+    #[tokio::test]
+    async fn a_stray_directory_with_a_record_does_not_starve_the_runs_after_the_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let runs = home.join("runs");
+        let wt = home.join("wt");
+        let repo = home.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let mut worktrees = Vec::new();
+        for n in 1..=5 {
+            let id = format!("20260801-000000-s{n:03}");
+            let (_, worktree) =
+                due_run_with_winner_worktree(&runs, &wt, &repo, &id, RunStatus::Superseded).await;
+            worktrees.push(worktree);
+        }
+        // Sorts after every run id.
+        std::fs::create_dir_all(runs.join("backup")).unwrap();
+        std::fs::copy(
+            runs.join("20260801-000000-s001").join("run.json"),
+            runs.join("backup").join("run.json"),
+        )
+        .unwrap();
+        let bounds = FoldBounds {
+            inspect: 2,
+            ..NO_BOUNDS
+        };
+        let now = well_after_every_fold();
+        let mut inspected = Vec::new();
+        for _ in 0..3 {
+            let turn = fold_turn(&runs, home, &Disk::default(), now, bounds).await;
+            assert_eq!(turn.cycle_restart, None, "{turn:?}");
+            assert_eq!(
+                turn.records, 5,
+                "the stray directory is not a record: {turn:?}"
+            );
+            inspected.push(turn.inspected);
+        }
+        assert_eq!(inspected, [2, 2, 1]);
+        assert!(
+            worktrees.iter().all(|w| !w.exists()),
+            "the tail was reached"
+        );
+        assert!(runs.join("backup").join("run.json").is_file());
+    }
+
+    fn start_of(home: &Path, id: &str, complete: bool, failure: Option<&str>) {
+        let mut successor = RunState::load_under(id, home).unwrap();
+        successor.startup = Some(crate::run::Startup {
+            kind: "review".to_owned(),
+            branch: None,
+            stage: "open-review".to_owned(),
+            complete,
+            failure: failure.map(str::to_owned),
+        });
+        let aged = successor.updated_at;
+        successor.save_under_at(home, aged).unwrap();
+    }
+
+    fn hand_over_to(home: &Path, id: &str, successor: &str) {
+        let mut predecessor = RunState::load_under(id, home).unwrap();
+        predecessor.released_to = Some(successor.to_owned());
+        let aged = predecessor.updated_at;
+        predecessor.save_under_at(home, aged).unwrap();
+    }
+
+    /// `handover::Released::restore` needs the predecessor's owner lock, and an
+    /// automatic fold that holds it for a moment makes the rollback abandon. A
+    /// predecessor whose successor is still starting (or cannot be read) is
+    /// left alone; one whose successor has settled - startup failed, or
+    /// completed and nothing drives it - is folded as before.
+    #[tokio::test]
+    async fn a_handover_in_flight_protects_its_predecessor_until_the_successor_settles() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let runs = home.join("runs");
+        let wt = home.join("wt");
+        let repo = home.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let mut folded = Vec::new();
+        for (n, case) in ["starting", "failed", "complete", "unreadable", "gone"]
+            .into_iter()
+            .enumerate()
+        {
+            let id = format!("20260801-000000-p{n:03}");
+            let next = format!("20260901-000000-n{n:03}");
+            let (_, worktree) =
+                due_run_with_winner_worktree(&runs, &wt, &repo, &id, RunStatus::Superseded).await;
+            if case != "gone" {
+                due_run(&runs, &wt, &next, SCHEMA);
+            }
+            match case {
+                "starting" => start_of(home, &next, false, None),
+                "failed" => start_of(home, &next, false, Some("setup failed")),
+                "complete" => start_of(home, &next, true, None),
+                "unreadable" => {
+                    std::fs::write(runs.join(&next).join("run.json"), "not json").unwrap()
+                }
+                _ => {}
+            }
+            hand_over_to(home, &id, &next);
+            folded.push((case, id, worktree));
+        }
+        let turn = pass_from(
+            &runs,
+            home,
+            &Disk::default(),
+            well_after_every_fold(),
+            Saved::Absent,
+            NO_BOUNDS,
+        )
+        .await;
+        for (case, id, worktree) in &folded {
+            let protected = matches!(*case, "starting" | "unreadable");
+            assert_eq!(
+                worktree.exists(),
+                protected,
+                "{case}: protected={protected} {turn:?}"
+            );
+            assert_eq!(
+                run_json(home, id)
+                    .released_to
+                    .as_deref()
+                    .map(|s| s.starts_with("20260901")),
+                Some(true),
+                "{case}: the record still says where the run went"
+            );
+        }
+        assert!(turn.live >= 2, "{turn:?}");
+    }
+
+    /// The janitor's own fold after it recorded an external merge is an
+    /// automatic caller: it reads the record under the run's locks tolerantly
+    /// (the explicit loader refuses a schema it cannot migrate, which left the
+    /// run unfolded until a later pass and another grace period), and the
+    /// conditions that made it a confirmed merge are re-checked on that record.
+    #[tokio::test]
+    async fn a_recorded_external_merge_is_folded_on_the_locked_record_whatever_its_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let wt = home.join("wt");
+        let repo = home.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        init_repo(&repo);
+        let (id, worktree) =
+            merged_run_with_worktree(home, &repo, &wt, "20260801-000000-x001").await;
+        let record = home.join("runs").join(&id).join("run.json");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
+        value["schema"] = serde_json::json!(3);
+        std::fs::write(&record, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+        assert!(
+            RunState::load_under(&id, home).is_err(),
+            "the migrating loader refuses this record"
+        );
+        let mut state = read_state(&home.join("runs"), &id).unwrap();
+        let removed = fold_recorded_merge(&mut state, home, Timestamp::now())
+            .await
+            .unwrap();
+        assert!(!removed.is_empty() && !worktree.exists(), "{removed:?}");
+
+        // Not a confirmed merge any more: refused, nothing removed.
+        let (other, kept) = due_run_with_winner_worktree(
+            &home.join("runs"),
+            &wt,
+            &repo,
+            "20260801-000000-x002",
+            RunStatus::Superseded,
+        )
+        .await;
+        let mut state = read_state(&home.join("runs"), &other).unwrap();
+        let error = fold_recorded_merge(&mut state, home, Timestamp::now())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error.downcast_ref::<crate::graph::FoldRefusal>(),
+                Some(crate::graph::FoldRefusal::ProofIncomplete(_))
+            ),
+            "{error:#}"
+        );
+        assert!(kept.exists());
     }
 
     /// The scenario of issue 1275: a queue that always has something runnable
@@ -4380,6 +4702,13 @@ pub(crate) mod tests {
 
         delete_run(home, id, now).unwrap();
         assert!(!run_dir.exists());
+        assert_eq!(
+            std::fs::read_dir(home.join("deleted-runs"))
+                .map(|entries| entries.count())
+                .unwrap_or(0),
+            0,
+            "the run's lock files and record go together, tombstone included"
+        );
         assert!(refused(delete_run(home, id, now)).contains("record gone"));
         assert!(
             !run_dir.exists(),

@@ -134,6 +134,33 @@ impl std::fmt::Display for OutputsInUse {
 
 impl std::error::Error for OutputsInUse {}
 
+/// A lock call that failed for a reason other than somebody holding the lock
+/// (`ENOLCK`, `EINTR`, a permission error): a failure of its own. Typed so the
+/// fold boundary reports it as `failed`, not as an unproven source.
+#[derive(Debug)]
+pub(crate) struct LockCallFailed {
+    what: String,
+    source: std::io::Error,
+}
+
+impl LockCallFailed {
+    pub(crate) fn new(what: String, source: std::io::Error) -> Self {
+        Self { what, source }
+    }
+}
+
+impl std::fmt::Display for LockCallFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "lock call failed: {}: {}", self.what, self.source)
+    }
+}
+
+impl std::error::Error for LockCallFailed {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 impl OutputLease {
     #[cfg(unix)]
     pub(crate) fn descriptor(&self) -> std::os::fd::RawFd {
@@ -1299,8 +1326,19 @@ pub(crate) fn cargo_locks(target: &Path) -> Result<Vec<File>> {
                 .write(true)
                 .open(&lock)
                 .with_context(|| format!("Cargo lock: open {}", lock.display()))?;
-            crate::pr_head::try_lock_file(&file)
-                .with_context(|| format!("Cargo build is active: {}", lock.display()))?;
+            crate::pr_head::try_lock_file(&file).map_err(|error| {
+                let held = error.kind() == std::io::ErrorKind::WouldBlock
+                    || cfg!(windows) && error.raw_os_error() == Some(33);
+                if held {
+                    anyhow::Error::new(error)
+                        .context(format!("Cargo build is active: {}", lock.display()))
+                } else {
+                    anyhow::Error::new(LockCallFailed::new(
+                        format!("Cargo lock {}", lock.display()),
+                        error,
+                    ))
+                }
+            })?;
             held.push(file);
         }
     }
@@ -1418,11 +1456,21 @@ fn remove_stale_staging(home: &Path, max_age: std::time::Duration) {
 /// dead process with the same id is skipped, never written through.
 fn create_staging(home: &Path) -> Result<(PathBuf, std::fs::File)> {
     static STAGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    create_staging_numbered(home, &mut || {
+        STAGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    })
+}
+
+/// [`create_staging`] with the sequence of numbers supplied by `next`.
+fn create_staging_numbered(
+    home: &Path,
+    next: &mut dyn FnMut() -> u64,
+) -> Result<(PathBuf, std::fs::File)> {
     for _ in 0..64 {
         let tmp = home.join(format!(
             "{STAGING_PREFIX}{}-{}{STAGING_SUFFIX}",
             std::process::id(),
-            STAGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            next()
         ));
         match OpenOptions::new().write(true).create_new(true).open(&tmp) {
             Ok(file) => return Ok((tmp, file)),
@@ -4689,9 +4737,12 @@ mod tests {
                 empty: false,
             });
             state.save_under(&f.home).unwrap();
-            // Unexpected external paths remain protected, even if absent.
+            // Unexpected external paths remain protected, even if absent. A
+            // fold decides on the record it reads under its locks, so the
+            // arranged record is the one on disk, not only the one in memory.
             let owned = state.candidates[0].worktree.clone();
             state.candidates[0].worktree = f.home.join("missing-external");
+            state.save_under(&f.home).unwrap();
             assert!(
                 crate::graph::fold_run(&mut state, true, &f.home)
                     .await
@@ -4700,6 +4751,7 @@ mod tests {
                     .contains("outside the inventoried")
             );
             state.candidates[0].worktree = owned;
+            state.save_under(&f.home).unwrap();
             // A live output borrower blocks the entire preflight.
             let guard = OutputLease::borrow(&reviewer).unwrap().unwrap();
             assert!(
@@ -7934,9 +7986,17 @@ mod platform_tests {
                 path
             })
             .collect();
-        let (created, file) = create_staging(home.path()).unwrap();
+        // The sequence starts at 0 whatever else this process has staged, so
+        // the first forty names are guaranteed to collide.
+        let mut sequence = 0u64..;
+        let (created, file) =
+            create_staging_numbered(home.path(), &mut || sequence.next().unwrap()).unwrap();
         drop(file);
         assert!(!left.contains(&created), "{}", created.display());
+        assert!(created.ends_with(format!(
+            "{STAGING_PREFIX}{}-40{STAGING_SUFFIX}",
+            std::process::id()
+        )));
         for path in left {
             assert_eq!(std::fs::read(path).unwrap(), b"left by a dead process");
         }

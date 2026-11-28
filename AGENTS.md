@@ -2185,25 +2185,49 @@ housekeeping is not (never beside a housekeeping worker).
   record only - deletion decisions, `released_branches`, what is saved. There is
   **no fallback to the caller's earlier read**: the reload must succeed and carry
   the locked id, or the fold refuses (`FoldRefusal::RecordGone` for a missing or
-  foreign record - the fold's own lock files and directory are removed again -,
-  `FoldRefusal::Unreadable` for a record that parses no more) and touches nothing.
-  The record is checked to exist before any lock file is created, so a deleted run
-  is never brought back. Tests that fold a synthetic record save it first. The
-  loader is the caller's: `fold_run_when` (idle pass, busy turn) uses
-  `RunState::load_tolerant_under` (no schema check, like `fold_due`); `fold_run` and
-  `fold_run_overriding_recovery_retention` (`magi fold`, the phone route) use the
-  migrating `RunState::load_under`, followed by the same preservation checks on that
-  fresh record. The automatic callers re-ask `eligibility` on it; a run no longer
+  foreign record, `FoldRefusal::Unreadable` for a record that parses no more) and
+  **touches nothing**: the lock files are never unlinked (`pr_head::owner_lock`: an
+  unlinked lock file lets the next caller lock another inode) and a run directory
+  that is not there is never created to lock it - a missing directory at the lock
+  or the reload is `record gone`. Tests that fold a synthetic record save it first
+  (and save every arrangement they make to it: a fold decides on the record on
+  disk, so a change made only to the in-memory copy is not seen). The loader is the
+  caller's: `fold_run_when` (idle pass, busy turn, the janitor's fold after it
+  recorded an external merge) uses `RunState::load_tolerant_under` (no schema check,
+  like `fold_due`); `fold_run` and `fold_run_overriding_recovery_retention`
+  (`magi fold`, the phone route) use the migrating `RunState::load_under`, followed
+  by the same preservation checks on that fresh record. The override keeps its
+  liveness assessment *before* the fold holds the execution lease (a held lease
+  reads as a live driver), and that record is identity-checked too; the record read
+  once both locks are held is checked again. The automatic callers re-ask
+  `eligibility` on the fresh record (the external-merge fold re-validates only the
+  confirmed-merge conditions - no grace, the merge is the news); a run no longer
   eligible is left alone. A handover (`handover::release`) records `released_to` /
   `released_branches` under the owner lock and keeps the branch; a fold on the
   earlier read would delete the handed-over branch and save the stale record over
   the handover.
+- **A handover in flight is not folded by an automatic caller.**
+  `clean::handover_settled`: a record naming a successor (`released_to`) whose
+  startup is still running (`startup` not complete, no failure recorded - the
+  rollback of a failed start runs *before* the failure is saved), whose driver is
+  live, or whose record cannot be read is `live`; a missing successor record, a
+  failed or completed startup and a stopped driver settle it. A startup killed
+  mid-way leaves the same marker as one in progress and so keeps its predecessor
+  out of automatic folding until an operator settles that run (the safe
+  direction). `handover::Released::restore` additionally waits for the
+  predecessor's owner lock for up to two seconds (10 ms doubling to 250 ms) before
+  it gives up, so a fold that holds the lock only long enough to reload and refuse
+  cannot make a rollback abandon; a lock held longer is still given up on.
 - **Everything that writes the record takes the same two locks.** Deleting a run
   (`magi run rm`, the phone's delete button) is `clean::delete_run`: owner lock and
   execution lease without waiting (a held lock is `clean::DeleteRefused`, "try again
-  later"), the record read under them, `ensure_can_delete` judged on it. So a record
-  cannot vanish under a fold, and its four-character worktree suffix cannot be
-  reserved again while the fold deletes that suffix's directories. The abandoned-seat
+  later"), the record read under them, `ensure_can_delete` judged on it, then the
+  directory renamed to a tombstone under `<home>/deleted-runs/` (outside `runs/`,
+  which nothing scans) and removed there while both guards are held, so its lock
+  files and `run.json` disappear together; where a directory with open files cannot
+  be renamed (Windows), `run.json` is removed first. So a record cannot vanish under
+  a fold, and its four-character worktree suffix cannot be reserved again while the
+  fold deletes that suffix's directories. The abandoned-seat
   cleanup of `magi fold` / the phone (`clean::clear_abandoned_active`) writes under
   the locks too, from a fresh read, and answers `false` for a held lock or a missing
   record; saving the caller's copy after the fold released its locks erased a
@@ -2211,10 +2235,15 @@ housekeeping is not (never beside a housekeeping worker).
 - **Typed refusals.** `graph::FoldRefusal` (`Live`, `Resumable`, `WithinGrace`,
   `Retained`, `ProofIncomplete`, `RecordGone`, `Unreadable`) travels in the
   `anyhow::Error`; `clean` maps it to the receipt without changing what is deleted.
+  A `Live` refusal is *added to* the error as context (`graph::live_or`), never
+  substituted for it: callers match the error underneath
+  (`repo_lock::ResourceBlocked` for a coordination wait) and both downcasts work.
   `Live` is **only contention**: a lock held by somebody (would-block, Windows
   lock violation, `retention::OutputsInUse`, repository coordination). Any other OS
   error from a lock call (`ENOLCK`, `EINTR`, a permission error) is `failed` with its
-  text. Any other failure of the confirmed-merge source proof
+  text, including the Cargo build locks inside the source proof
+  (`retention::LockCallFailed`, kept through `graph::source_proof_failure`). Any
+  other failure of the confirmed-merge source proof
   (`verify_merged_fold_sources`: Cargo residue, Git checkpoints, the fetched base)
   is `ProofIncomplete` by what that stage is for; `failed` is left for the deletion
   itself (git, filesystem). A record readable at the first look and not under the
@@ -2225,7 +2254,8 @@ housekeeping is not (never beside a housekeeping worker).
   range exhausted removes the file, so the next pass begins a new cycle with a new
   high-water mark. A cycle over N records at its start takes at most
   `ceil(N / inspect)` passes plus the passes its fold invocations consume
-  (`ceil(F / fold)`, plus one per pass the time budget cut short), and a run that
+  (`ceil(F / fold)`), plus one per pass the time budget cut short (a pass can spend
+  the budget judging without starting a fold), and a run that
   left its grace after being judged is folded within the next cycle. The bound is
   as honest as the ids: they start with local wall-clock time, so runs created
   after the mark sort after it and wait, while a run created in the same second as
@@ -2237,7 +2267,11 @@ housekeeping is not (never beside a housekeeping worker).
 - **Bounds.** `clean::BUSY_FOLD_BOUNDS`: 64 records judged, 4 `fold_run_when`
   invocations, 5 minutes between runs, always at least one judged. The fold budget
   is charged when an invocation begins, whatever it returns. The inventory of
-  `runs/` is O(history) per pass and counted in `elapsed_ms`; judging a record
+  `runs/` is O(history) per pass and counted in `elapsed_ms`; the busy turn's
+  inventory holds only names for which `run::is_run_id` holds (a stray directory
+  with a `run.json` would become the saved high-water mark, be refused as "not a
+  run id" and restart the cycle on every pass; the idle pass keeps its wider
+  inventory). Judging a record
   reads files whose cost depends on the disk, which is why the time budget covers
   judging as well as folding.
 - **A run is skipped on a fact a fold recorded, never on an inference.**

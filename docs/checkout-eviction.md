@@ -109,17 +109,31 @@ and preservation checks).
 owner lock and execution lease, and acts on that record only; there is no fallback
 to the caller's earlier read. The reload must succeed and carry the locked id: a
 record deleted meanwhile (or a foreign one) ends the fold as `record_gone` and a
-record that no longer parses as `unreadable`, with nothing touched and nothing
-recreated (the fold checks the record exists before it creates a lock file, and
-removes the lock files and directory again if the deletion landed in between). A
-handover that completes between the janitor's first read and the locks records
-`released_to` / `released_branches` and removes the old worktree while keeping the
-branch; the reload sees it, so the handed-over branch survives and the successor's
-ownership record is not overwritten. The automatic callers (idle pass, busy turn)
-read the record as saved, whatever schema wrote it, and re-ask the eligibility
-decision on it (a run that became resumable, or live, is left alone); `magi fold`
-and the phone route read it with the migrating loader they used themselves and
-apply the same preservation checks to that fresh record.
+record that no longer parses as `unreadable`, with nothing touched: the lock files
+stay where they are (an unlinked lock file would let the next caller lock another
+inode) and a run directory that is not there is never created for the sake of a
+lock. A handover that completes between the janitor's first read and the locks
+records `released_to` / `released_branches` and removes the old worktree while
+keeping the branch; the reload sees it, so the handed-over branch survives and the
+successor's ownership record is not overwritten. The automatic callers (idle pass,
+busy turn, and the janitor's fold after it recorded a merge it found on the forge)
+read the record as saved, whatever schema wrote it; the first two re-ask the
+eligibility decision on it (a run that became resumable, or live, is left alone),
+the last re-checks that it is still a confirmed merge. `magi fold` and the phone
+route read it with the migrating loader they used themselves and apply the same
+preservation checks to that fresh record; `--override-recovery-retention` assesses
+liveness before it holds the execution lease (a held lease reads as a live driver)
+and reads and checks the record again once both locks are held.
+
+**A handover in flight is not folded by an automatic caller.** A run that names a
+successor (`released_to`) whose startup is still running, whose driver is live, or
+whose record cannot be read is `live`: when that startup fails, the rollback
+(`handover::Released::restore`) needs the predecessor's owner lock, and a fold
+holding it at that moment would make the rollback abandon. A missing successor
+record, a failed or completed startup and a stopped driver settle it. The rollback
+also waits up to two seconds for the lock before it gives up, so a short hold
+cannot abandon it; a startup killed mid-way keeps its predecessor out of automatic
+folding until an operator settles that run.
 
 Every other writer of the record takes the same two locks. Deleting a run (`magi
 run rm`, the phone's delete button) takes the owner lock and execution lease
@@ -127,6 +141,10 @@ without waiting, reads the record under them and judges the unfolded-candidate
 guard on that read: a fold in progress makes the deletion a refusal ("try again
 later"), so a record cannot disappear under a fold and its worktree suffix cannot
 be reserved by a new run while the fold removes that suffix's directories. The
+directory is then renamed to a tombstone under `<home>/deleted-runs/` and removed
+there while both guards are held, so the lock files and `run.json` disappear
+together (where a directory with open files cannot be renamed, as on Windows,
+`run.json` is removed first). The
 abandoned-seat cleanup that `magi fold` and the phone run after a fold that removed
 nothing writes under the locks as well, from a fresh read, so it cannot erase a
 handover that landed after the fold released its own locks.
@@ -144,18 +162,21 @@ through the run ids after `cursor` up to `high_water`, the newest id present whe
 the cycle began, and removes the file when it has judged the last one; the next
 pass starts a new cycle with a new high-water mark. With N records at the start of
 a cycle, every one is judged within `ceil(N / 64)` passes plus the passes its fold
-invocations consume (`ceil(F / 4)` for F invocations, plus one for each pass the
-time budget cut short), and a run that left its grace after being judged is folded
-within the next cycle. Run ids start with the local wall-clock time of creation, so
+invocations consume (`ceil(F / 4)` for F invocations), plus one for each pass the
+time budget cut short (a pass can spend it judging without starting a fold), and a
+run that left its grace after being judged is folded within the next cycle. Run ids
+start with the local wall-clock time of creation, so
 runs created after the mark sort after it and wait for the next cycle; a run created
 in the same second as the mark, or after the clock stepped backwards, may join the
 current cycle. Each such run adds at most its own judgement, and that is the whole
-bound on them - no list of the cycle's members is kept. A cycle file that is
-unreadable, names an id that is not a run id, has a `high_water` newer than every
-run, a `high_water` below the cursor, a cursor naming a run that no longer exists,
-or an empty range starts a clean cycle (`cycle_restart` says why). Every pass lists
-`runs/` and checks each record once (O(history) syscalls); that inventory is counted
-in `elapsed_ms`.
+bound on them - no list of the cycle's members is kept. The inventory holds only
+directories whose name is a run id: a stray directory with a `run.json` would
+become the saved high-water mark and restart the cycle on every pass. A cycle file
+that is unreadable, names an id that is not a run id, has a `high_water` newer than
+every run, a `high_water` below the cursor, a cursor naming a run that no longer
+exists, or an empty range starts a clean cycle (`cycle_restart` says why). Every pass
+lists `runs/` and checks each record once (O(history) syscalls); that inventory is
+counted in `elapsed_ms`.
 
 **Runs that were folded long ago.** A fold that completes under its locks having
 found nothing left to remove, with the run's worktree bay gone (`try_exists` answered

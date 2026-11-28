@@ -133,12 +133,47 @@ pub struct Released {
     pub audit: String,
 }
 
+/// How long a rollback waits for the predecessor's owner lock. Whoever holds
+/// it - an automatic fold that reloads the record and refuses, a liveness
+/// check, a janitor - holds it for a moment; abandoning the rollback over one
+/// of them would leave the predecessor marked as released to a run that never
+/// started.
+const ROLLBACK_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The owner lock of `id`, retried with a growing pause (10 ms, doubling, at
+/// most 250 ms) for at most `wait` while somebody else holds it. Only
+/// contention is retried; any other failure is the answer.
+async fn owner_lock_for_rollback(
+    home: &Path,
+    id: &str,
+    wait: std::time::Duration,
+) -> Result<crate::pr_head::OwnerLock> {
+    let deadline = tokio::time::Instant::now() + wait;
+    let mut pause = std::time::Duration::from_millis(10);
+    loop {
+        match crate::pr_head::owner_lock(home, id) {
+            Err(error)
+                if crate::graph::held_by_live_owner(&error)
+                    && tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(pause).await;
+                pause = (pause * 2).min(std::time::Duration::from_millis(250));
+            }
+            result => return result,
+        }
+    }
+}
+
 impl Released {
     /// Undo the release after the new run failed to start: check the branch
     /// out again at the old path and unmark the old run. Best-effort - if the
     /// worktree cannot be re-added the old run stays marked, which is true.
     pub async fn restore(&self, repo: &Path, branch: &str) {
-        let Ok(_owner) = crate::pr_head::owner_lock(&self.home, &self.old_id) else {
+        self.restore_within(repo, branch, ROLLBACK_LOCK_WAIT).await;
+    }
+
+    async fn restore_within(&self, repo: &Path, branch: &str, wait: std::time::Duration) {
+        let Ok(_owner) = owner_lock_for_rollback(&self.home, &self.old_id, wait).await else {
             tracing::warn!("could not lock run {} for handover rollback", self.old_id);
             return;
         };
@@ -885,6 +920,106 @@ mod tests {
         state.save_under(home.path()).unwrap();
         assert!(locked_holder(home.path(), &state.id, &path).is_err());
         assert!(path.exists());
+    }
+
+    /// A released predecessor whose worktree is really gone, with a real
+    /// repository to put it back into.
+    async fn released_predecessor(home: &Path, repo: &Path) -> (RunState, Released) {
+        crate::clean::tests::init_repo(repo);
+        let mut state = RunState::new(
+            repo.to_owned(),
+            "main".into(),
+            "base".into(),
+            "task".into(),
+            crate::config::Config::default(),
+        );
+        state.config.graph.worktree_root = Some(home.join("worktrees"));
+        let path = state.worktree_root().join("cand-A");
+        let branch = "magi/restore/A";
+        git::worktree_add_branch(repo, &path, branch, "main")
+            .await
+            .unwrap();
+        let tip = git::rev_parse(repo, branch).await.unwrap();
+        state.driver_exited = true;
+        state.status = RunStatus::Ready;
+        state.candidates.push(crate::run::Candidate {
+            index: 0,
+            label: 'A',
+            agent: "existing".into(),
+            branch: branch.into(),
+            worktree: path.clone(),
+            summary: String::new(),
+            stat: String::new(),
+            files: 1,
+            commits: 1,
+            empty: false,
+            failed: None,
+            verified_noop: None,
+            duration_ms: 0,
+            folded: true,
+        });
+        state.released_to = Some("successor".into());
+        state.released_branches.push(branch.into());
+        state.event("release", "worktree released");
+        state.save_under(home).unwrap();
+        git::git(repo, &["worktree", "remove", path.to_str().unwrap()])
+            .await
+            .unwrap();
+        let released = Released {
+            old_id: state.id.clone(),
+            index: 0,
+            path,
+            home: home.to_owned(),
+            successor: "successor".into(),
+            tip,
+            audit: String::new(),
+        };
+        (state, released)
+    }
+
+    /// An automatic fold, a liveness check or a janitor holds the predecessor's
+    /// owner lock for a moment: the rollback waits it out instead of leaving
+    /// the predecessor marked as released to a run that never started.
+    #[tokio::test]
+    async fn a_rollback_waits_out_a_brief_hold_on_the_owner_lock() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = home.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let (state, released) = released_predecessor(home.path(), &repo).await;
+        let held = crate::pr_head::owner_lock(home.path(), &state.id).unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            drop(held);
+        });
+        released
+            .restore_within(&repo, "magi/restore/A", std::time::Duration::from_secs(30))
+            .await;
+        release.join().unwrap();
+        let disk = RunState::load_under(&state.id, home.path()).unwrap();
+        assert!(released.path.exists(), "the worktree is back");
+        assert!(disk.released_to.is_none() && !disk.candidates[0].folded);
+    }
+
+    /// A lock held for longer than the bound is still given up on, as before.
+    #[tokio::test]
+    async fn a_rollback_gives_up_on_a_lock_held_beyond_its_bound() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = home.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let (state, released) = released_predecessor(home.path(), &repo).await;
+        let held = crate::pr_head::owner_lock(home.path(), &state.id).unwrap();
+        released
+            .restore_within(
+                &repo,
+                "magi/restore/A",
+                std::time::Duration::from_millis(150),
+            )
+            .await;
+        drop(held);
+        let disk = RunState::load_under(&state.id, home.path()).unwrap();
+        assert!(!released.path.exists());
+        assert_eq!(disk.released_to.as_deref(), Some("successor"));
+        assert!(disk.candidates[0].folded);
     }
 
     #[tokio::test]
