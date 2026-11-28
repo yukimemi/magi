@@ -734,7 +734,8 @@ pub fn maintenance_prune(
 
 /// [`maintenance_prune`] that never takes the cache below `keep` bytes
 /// ([`crate::disk::prune_dir_keeping`]): the reserve pressure collection keeps
-/// of a build cache while free space is above the admission floor. The
+/// of a build cache while free space is at or above the admission floor and
+/// below the collection threshold. The
 /// inventory the bound is checked against is the one taken here, under the
 /// lease and the Cargo locks.
 pub fn maintenance_prune_keeping(

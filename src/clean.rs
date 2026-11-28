@@ -1813,7 +1813,8 @@ pub fn prune_cache_if_over_limit(
 /// [`Disk::reclaim_threshold`](crate::config::Disk::reclaim_threshold) - the
 /// collection threshold, not the admission floor - shrinks the limit by the
 /// deficit ([`crate::disk::pressure_limit`]). While free space is at or above
-/// the admission floor the cache also keeps a reserve of half its cap
+/// the admission floor and below the collection threshold the cache also keeps
+/// a reserve of half its cap
 /// ([`crate::disk::pressure_reserve`]), and that is enforced where files are
 /// removed: the pruning routine skips a file whose removal would leave less
 /// ([`crate::disk::prune_dir_keeping`]), so one artifact larger than
@@ -2736,6 +2737,48 @@ pub(crate) mod tests {
             .expect("the cache is free");
         assert_eq!(pruned.files, 1);
         assert!(!artifact.exists());
+    }
+
+    #[test]
+    fn an_oversized_oldest_artifact_is_skipped_and_smaller_files_are_still_collected() {
+        // Cap 500 (reserve 250), free pinned at 11 between the floor (10) and
+        // the threshold. The oldest artifact is 300 bytes of a 400-byte cache:
+        // removing it would leave 100, below the reserve, so it stays - and the
+        // pass goes on to the four newer 25-byte files (400 -> 300), each of
+        // which leaves at least the reserve. A caller that stopped at the
+        // oversized artifact would remove nothing.
+        let (home, dir, cfg) = pressure_fixture(10, Some(1_000_000));
+        for name in ["f1", "f2", "f3", "f4"] {
+            fs::remove_file(dir.path().join(name)).unwrap();
+        }
+        let big = dir.path().join("big");
+        fs::write(&big, vec![0u8; 300]).unwrap();
+        touch(&big, 1_000_000);
+        let small = ["s1", "s2", "s3", "s4"];
+        for (i, name) in small.into_iter().enumerate() {
+            let path = dir.path().join(name);
+            fs::write(&path, vec![0u8; 25]).unwrap();
+            touch(&path, 1_000_001 + i as u64);
+        }
+        let pruned = prune_cache_under_pressure(&cfg, home.path(), |_| Ok(11))
+            .unwrap()
+            .expect("the cache is free");
+        assert_eq!(
+            (pruned.files, pruned.freed, pruned.remaining),
+            (4, 100, 300),
+            "{pruned:?}"
+        );
+        assert!(big.exists());
+        for name in small {
+            assert!(!dir.path().join(name).exists(), "{name} should be gone");
+        }
+
+        // The reserve holds on the next pass: nothing more goes.
+        let again = prune_cache_under_pressure(&cfg, home.path(), |_| Ok(11))
+            .unwrap()
+            .expect("the cache is free");
+        assert_eq!((again.files, again.remaining), (0, 300), "{again:?}");
+        assert!(big.exists());
     }
 
     #[test]
