@@ -2513,6 +2513,31 @@ pub fn resume_incomplete(why: &str) -> String {
     s
 }
 
+/// Follow-up when an implementation turn ended cleanly before any work
+/// happened: the CLI reported no tool call and the worktree is as it was.
+///
+/// Not [`resume_incomplete`]: nothing is running in the background and no
+/// report is merely missing — the reply was a final answer given in place of
+/// the task. So this says the reply is not accepted and asks for the work
+/// itself, in the same conversation, which still holds the task.
+pub fn resume_unstarted() -> String {
+    let mut s = "Your last reply ended the turn before any work happened: you called no tool and \
+                 the working directory is unchanged, so the task is still entirely open. That \
+                 reply is not accepted as this step's result.\n\n\
+                 Carry out the task now, in the same working directory and as the original \
+                 instructions describe: inspect the repository, make the change, run focused \
+                 checks and commit. Write the `## SUMMARY` only once that work is done, in the \
+                 shape already asked for.\n\n\
+                 If you conclude that no change is needed, or that you cannot proceed, show it \
+                 with what you actually checked and what it returned, as the original \
+                 instructions require. A summary written without looking at the repository is \
+                 not an answer."
+        .to_owned();
+    s.push('\n');
+    s.push_str(child_run_ownership());
+    s
+}
+
 /// Follow-up when the CLI hung up before delivering an answer.
 ///
 /// Deliberately not [`nudge`]: nothing was wrong with the reply's *shape*, and

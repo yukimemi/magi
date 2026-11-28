@@ -2984,6 +2984,11 @@ pub struct RunState {
     /// the distinction between an unfinished turn and a completed empty reply.
     #[serde(default)]
     pub interrupted_implementations: BTreeSet<char>,
+    /// Candidates whose implementation seat was already asked once more
+    /// after ending a turn without starting the work. Saved before that
+    /// retry is spawned, so a restart cannot hand the retry back.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub unstarted_retries: BTreeSet<char>,
     /// Legacy automatically inferred references, retained only for audit.
     /// These are never explicit authorization and never seed preparation.
     #[serde(default)]
@@ -3391,6 +3396,7 @@ impl RunState {
             fold_settled_at: None,
             candidate_preservation: BTreeMap::new(),
             interrupted_implementations: BTreeSet::new(),
+            unstarted_retries: BTreeSet::new(),
             seeds: Vec::new(),
             sources: crate::refs::Sources::default(),
             prep_failure: None,
