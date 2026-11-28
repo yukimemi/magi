@@ -3384,6 +3384,16 @@ impl Runner {
         // `resume_unconfirmed_commands`, which reads `sent` afterward, must see
         // whichever agent actually answered, not the one that quota'd out.
         let mut sent = jobs.clone();
+        // Where each seat's checkout stood before its turn. A reply is judged
+        // against this, never against the run's base: a tree that carries an
+        // inherited patch is ahead of the base before the seat does anything.
+        let mut baselines = Vec::with_capacity(sent.len());
+        for (job, &i) in sent.iter().zip(&todo) {
+            baselines.push((
+                self.state.candidates[i].label,
+                git::rev_parse(&job.cwd, "HEAD").await.ok(),
+            ));
+        }
         let cache = self.state.config.cache_dir();
         let ctx = WaveCtx {
             carry_seats: false,
@@ -3398,6 +3408,8 @@ impl Runner {
         if !wave_blocked(&results) {
             self.resume_undelivered(&mut results, &sent, &prompts, &run_id)
                 .await;
+            self.retry_unstarted(&mut results, &sent, &baselines, &prompts, &run_id)
+                .await?;
             self.resume_seat_handovers(&mut results, &mut sent, &prompts, &run_id)
                 .await?;
             self.resume_unconfirmed_commands(&mut results, &sent, &prompts, &run_id)
@@ -4108,6 +4120,121 @@ impl Runner {
             *seat = resumed_seat;
             *out = resumed;
         }
+    }
+
+    /// Ask an implement seat again, once per candidate and run, when its
+    /// turn ended cleanly without starting the work.
+    ///
+    /// The shape behind 86f0, 3ce0 and eca7: the model's first response was a
+    /// final answer ("Implementation incomplete. No files were changed...")
+    /// after six to twelve seconds, with no tool call and no change. That is
+    /// a usable exit-0 reply, so none of the other recoveries sees it — it is
+    /// not a dropped stream, not a failure and names no unconfirmed command —
+    /// and the candidate was recorded as an ordinary empty one.
+    ///
+    /// Decided on evidence, never on the reply's wording (see
+    /// [`ended_unstarted`]), and never for a reply whose `NO CHANGE NEEDED`
+    /// claim verifies: that one did answer the task.
+    ///
+    /// The seat's own conversation is resumed with [`prompt::resume_unstarted`]
+    /// when it has one; without a session the whole prompt goes out again.
+    /// Either way the budget is the full `timeout_implement`, not a nudge's
+    /// quarter: nothing was done yet, so this is the job itself.
+    ///
+    /// Bounded by [`RunState::unstarted_retries`], saved before the agent is
+    /// asked so a restart cannot grant a second retry. A seat that ends the
+    /// same way again becomes an ordinary failure with [`UNSTARTED_TWICE`] as
+    /// its reason, which `resume_seat_handovers` (run next) may hand to the
+    /// next roster agent like any other failure.
+    async fn retry_unstarted(
+        &mut self,
+        results: &mut [(usize, SeatState, AgentOutcome)],
+        sent: &[SeatJob],
+        baselines: &[(char, Option<String>)],
+        prompts: &Prompts,
+        run_id: &str,
+    ) -> Result<()> {
+        for (wi, seat, out) in results.iter_mut() {
+            let (Some(job), Some((label, before))) = (sent.get(*wi), baselines.get(*wi)) else {
+                continue;
+            };
+            if !self.unstarted(out, before.as_deref(), &job.cwd).await {
+                continue;
+            }
+            if !self.state.unstarted_retries.insert(*label) {
+                self.state
+                    .event("implement", format!("{}: {UNSTARTED_TWICE}", seat.key));
+                *out = AgentOutcome::Failed(UNSTARTED_TWICE.to_owned());
+                continue;
+            }
+            let resumed = has_context(&job.spec, seat, job.sessions);
+            self.state.event(
+                "implement",
+                format!(
+                    "{}: the turn ended without starting the work (no tool call, worktree \
+                     unchanged); {}",
+                    seat.key,
+                    if resumed {
+                        "resuming the conversation once"
+                    } else {
+                        "sending the task once more"
+                    }
+                ),
+            );
+            self.state.save()?;
+            let mut retry = job.clone();
+            retry.seat = seat.clone();
+            if resumed {
+                retry.prompt = prompt::resume_unstarted();
+            }
+            retry.stem = format!("{}-unstarted", job.stem);
+            let cache = self.state.config.cache_dir();
+            let ctx = WaveCtx {
+                carry_seats: false,
+                pauses: Some((&self.pause, &self.interrupt)),
+                run: run_id,
+                node: "implement",
+                prompts,
+                cache: cache.as_deref(),
+                round: None,
+            };
+            let (answered_seat, answer) =
+                run_one(retry, Arc::clone(&self.sem), &ctx, &mut self.state, 1).await;
+            *seat = answered_seat;
+            *out = answer;
+            if matches!(out, AgentOutcome::ResourceBlocked(_)) {
+                // No agent was spawned, so the retry was not spent.
+                self.state.unstarted_retries.remove(label);
+                continue;
+            }
+            if self.unstarted(out, before.as_deref(), &job.cwd).await {
+                self.state
+                    .event("implement", format!("{}: {UNSTARTED_TWICE}", seat.key));
+                *out = AgentOutcome::Failed(UNSTARTED_TWICE.to_owned());
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether `out` is a clean reply from a seat that never started the
+    /// work in `cwd`, and whose reply does not verify as a no-op either.
+    async fn unstarted(&self, out: &AgentOutcome, before: Option<&str>, cwd: &Path) -> bool {
+        let AgentOutcome::Ok(o) = out else {
+            return false;
+        };
+        // The CLI's own record first: most replies stop here without git.
+        if o.tool_calls != Some(0) {
+            return false;
+        }
+        let after = git::rev_parse(cwd, "HEAD").await.ok();
+        let clean = git::is_clean(cwd).await.ok();
+        if !ended_unstarted(o, before, after.as_deref(), clean) {
+            return false;
+        }
+        let text = verdict::section(&o.text, "summary").unwrap_or(o.text.clone());
+        verified_noop_claim_in_worktree(true, &o.commands, &text, cwd, &self.state.base_commit)
+            .await
+            != NoopClaimVerdict::Accepted
     }
 
     /// Ask the fixer's own seat again, up to [`MAX_FIX_CONTINUATIONS`] times,
@@ -11186,6 +11313,38 @@ pub(crate) fn record_handover(
 /// at all, and so leaves no evidence here to find).
 fn has_unconfirmed_command(commands: &[agent::CommandEvidence]) -> bool {
     commands.iter().any(|c| c.exit_code.is_none())
+}
+
+/// The reason recorded for a candidate, and named in a handover, when an
+/// implement seat ended its turn without starting the work and did so again
+/// on its one retry. See [`Runner::retry_unstarted`].
+const UNSTARTED_TWICE: &str = "the agent ended its turn without starting the work (no tool call, \
+                               worktree unchanged), and again when asked once more";
+
+/// Did this turn end cleanly without the seat having started the work?
+///
+/// Every part is positive evidence, and a missing one means "no": a usable
+/// reply; a CLI whose stream reports tool calls and reported none
+/// (`tool_calls` is `None` for a backend that does not report them, which is
+/// unknown, never zero); no command evidence; and a checkout whose `HEAD` is
+/// the one recorded before the turn (`before`) with nothing uncommitted. A
+/// dirty tree, a moved `HEAD` or an unreadable repository never authorizes a
+/// retry: partial work is the other recoveries' business.
+///
+/// The comparison is with the seat's own starting point, not the run's base,
+/// so a seat that left an inherited patch untouched is unstarted too.
+fn ended_unstarted(
+    out: &AgentOutput,
+    before: Option<&str>,
+    after: Option<&str>,
+    clean: Option<bool>,
+) -> bool {
+    out.usable()
+        && out.tool_calls == Some(0)
+        && out.commands.is_empty()
+        && before.is_some()
+        && before == after
+        && clean == Some(true)
 }
 
 /// Outcome of evaluating a candidate's reply against the `NO CHANGE NEEDED:`
@@ -26026,6 +26185,89 @@ esac
         // backend with no adapter, or a reply that ran no commands at all,
         // must not be misread as carrying a dangling job.
         assert!(!has_unconfirmed_command(&[]));
+    }
+
+    fn reply(tool_calls: Option<u64>) -> AgentOutput {
+        AgentOutput {
+            text: "## SUMMARY\nImplementation incomplete.".to_owned(),
+            exit_code: Some(0),
+            timed_out: false,
+            duration_ms: 7_000,
+            artifacts: Vec::new(),
+            quota: None,
+            dropped: None,
+            commands: Vec::new(),
+            context_tokens: None,
+            tool_calls,
+        }
+    }
+
+    #[test]
+    fn a_clean_reply_with_no_tool_call_on_an_untouched_tree_is_unstarted() {
+        assert!(ended_unstarted(
+            &reply(Some(0)),
+            Some("abc"),
+            Some("abc"),
+            Some(true)
+        ));
+    }
+
+    #[test]
+    fn unknown_or_real_tool_activity_is_never_unstarted() {
+        // A backend that reports no tool calls says nothing about them.
+        assert!(!ended_unstarted(
+            &reply(None),
+            Some("abc"),
+            Some("abc"),
+            Some(true)
+        ));
+        // A seat that looked and then wrote nothing did start.
+        assert!(!ended_unstarted(
+            &reply(Some(3)),
+            Some("abc"),
+            Some("abc"),
+            Some(true)
+        ));
+        let mut ran = reply(Some(0));
+        ran.commands.push(evidence(Some(0)));
+        assert!(!ended_unstarted(&ran, Some("abc"), Some("abc"), Some(true)));
+    }
+
+    #[test]
+    fn work_in_the_tree_or_an_unreadable_one_is_never_unstarted() {
+        let out = reply(Some(0));
+        // A commit, uncommitted edits, and each unknown: none may be replayed.
+        assert!(!ended_unstarted(&out, Some("abc"), Some("def"), Some(true)));
+        assert!(!ended_unstarted(
+            &out,
+            Some("abc"),
+            Some("abc"),
+            Some(false)
+        ));
+        assert!(!ended_unstarted(&out, None, Some("abc"), Some(true)));
+        assert!(!ended_unstarted(&out, Some("abc"), None, Some(true)));
+        assert!(!ended_unstarted(&out, Some("abc"), Some("abc"), None));
+        assert!(!ended_unstarted(&out, None, None, Some(true)));
+    }
+
+    #[test]
+    fn a_failed_or_empty_turn_is_not_an_unstarted_reply() {
+        let mut failed = reply(Some(0));
+        failed.exit_code = Some(1);
+        assert!(!ended_unstarted(
+            &failed,
+            Some("abc"),
+            Some("abc"),
+            Some(true)
+        ));
+        let mut silent = reply(Some(0));
+        silent.text = String::new();
+        assert!(!ended_unstarted(
+            &silent,
+            Some("abc"),
+            Some("abc"),
+            Some(true)
+        ));
     }
 
     #[test]

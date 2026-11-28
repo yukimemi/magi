@@ -4210,3 +4210,36 @@ return `land::GhOutput { ok, stdout, stderr }` (keeping `GH_REPO` stripped):
   (including `404` responses and refused-merge output) are preserved.
 - Non-empty `stderr` on exit 0 is logged via `tracing::debug!` inside
   `GhOutput::from_output` without recording command arguments.
+
+### An implementation turn that never started is retried once
+
+`graph::Runner::retry_unstarted` runs in `implement` after `resume_undelivered`
+and before `resume_seat_handovers`. It covers a clean exit-0 reply from a seat
+that did nothing: in three days of logs, 14 of 38 `sol` implementation turns
+answered "Implementation incomplete" as their first response, in 6 to 12
+seconds, and were recorded as ordinary empty candidates.
+
+- **Evidence, never wording** (`graph::ended_unstarted`): a usable reply,
+  `AgentOutput::tool_calls == Some(0)`, no command evidence, `HEAD` equal to the
+  one recorded before the turn and a clean tree. The comparison is with the
+  seat's own starting point, not the run's base, so an untouched inherited patch
+  counts as unstarted. A dirty tree, a moved `HEAD` or an unreadable repository
+  never authorizes a retry, and neither does a reply whose `NO CHANGE NEEDED`
+  claim verifies.
+- **`tool_calls` is `None` for unknown, never 0.** Only the omp arm of
+  `agent::extract_answer` fills it (`tool_execution_start` events and
+  `toolCall` parts), so other CLIs are never retried by this. `commands` stays
+  empty for omp and says nothing about tool use.
+- **A `command` agent that relays an omp stream is read as omp**
+  (`agent::relays_omp_stream`: the first line is omp's session line). That is
+  how `tests/graph_unstarted_retry.rs` drives this path.
+- **Once per candidate and run.** `RunState::unstarted_retries`
+  (`#[serde(default)]`, `run::SCHEMA` unchanged) is saved before the agent is
+  asked. The seat's conversation is resumed with `prompt::resume_unstarted`
+  (the whole prompt again when there is no session), on the full
+  `timeout_implement`: nothing was done yet, so it is the job itself. A
+  `ResourceBlocked` retry spawned nothing and gives the retry back.
+- **Exhausted is an ordinary failure** with `graph::UNSTARTED_TWICE` as its
+  reason, so the existing handover may give the seat to the next roster agent
+  and a pinned implementer holds as for any other failure. A quota on the retry
+  stays a quota.

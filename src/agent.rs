@@ -333,6 +333,12 @@ pub struct AgentOutput {
     /// See [`context_tokens`].
     #[serde(default)]
     pub context_tokens: Option<u64>,
+    /// Tool calls the CLI's own stream reported for this turn. `None` when
+    /// the CLI does not report them in a shape this build reads: unknown,
+    /// never 0. `Some(0)` is therefore positive evidence of a turn that
+    /// answered without using a single tool.
+    #[serde(default)]
+    pub tool_calls: Option<u64>,
 }
 
 impl AgentOutput {
@@ -943,6 +949,7 @@ async fn invoke_on_heap(
         dropped: extracted.dropped,
         commands: extracted.commands,
         context_tokens: extracted.context_tokens,
+        tool_calls: extracted.tool_calls,
     })
 }
 
@@ -1498,6 +1505,7 @@ struct Extracted {
     dropped: Option<Dropped>,
     commands: Vec<CommandEvidence>,
     context_tokens: Option<u64>,
+    tool_calls: Option<u64>,
 }
 
 /// Pull the agent's message (and any session id) out of a CLI's stdout.
@@ -1646,6 +1654,7 @@ fn extract_answer(kind: AgentKind, stdout: &str) -> Extracted {
                 dropped: None,
                 commands: Vec::new(),
                 context_tokens: None,
+                tool_calls: None,
             }
         }
         AgentKind::Opencode => {
@@ -1680,6 +1689,7 @@ fn extract_answer(kind: AgentKind, stdout: &str) -> Extracted {
                 dropped: None,
                 commands: Vec::new(),
                 context_tokens: None,
+                tool_calls: None,
             }
         }
         AgentKind::Antigravity => {
@@ -1711,6 +1721,7 @@ fn extract_answer(kind: AgentKind, stdout: &str) -> Extracted {
                 dropped: dropped_stream(&v),
                 commands: Vec::new(),
                 context_tokens: None,
+                tool_calls: None,
             }
         }
         AgentKind::Codex => {
@@ -1777,6 +1788,7 @@ fn extract_answer(kind: AgentKind, stdout: &str) -> Extracted {
                 dropped: None,
                 commands,
                 context_tokens: None,
+                tool_calls: None,
             }
         }
         AgentKind::Omp => {
@@ -1802,27 +1814,39 @@ fn extract_answer(kind: AgentKind, stdout: &str) -> Extracted {
             // answer, the same way the codex arm treats its tracing prefix.
             let mut text = String::new();
             let mut session = None;
+            // Tool activity is read from two records, because a stream can
+            // lack either: the execution events, and the tool-call parts of
+            // the assistant messages. The parts are summed per event type,
+            // since `agent_end` / `turn_end` repeat what `message_end` said.
+            let mut tool_starts = 0u64;
+            let mut tool_parts = [0u64; 3];
+            let mut answered = false;
             for line in stdout.lines() {
                 let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
                     continue;
                 };
-                if v.get("type").and_then(|t| t.as_str()) == Some("session") {
+                let event = v.get("type").and_then(|t| t.as_str());
+                if event == Some("session") {
                     session = v.get("id").and_then(|s| s.as_str()).map(str::to_owned);
+                    continue;
+                }
+                if event == Some("tool_execution_start") {
+                    tool_starts += 1;
                     continue;
                 }
                 // `agent_end` carries the whole thread; `turn_end` and
                 // `message_end` each carry one message. Whichever appears, the
                 // messages are walked the same way.
-                let messages: Vec<&serde_json::Value> = match v.get("type").and_then(|t| t.as_str())
-                {
-                    Some("agent_end") => v
-                        .get("messages")
-                        .and_then(|m| m.as_array())
-                        .map(|m| m.iter().collect())
-                        .unwrap_or_default(),
-                    Some("turn_end") | Some("message_end") => {
-                        v.get("message").into_iter().collect()
-                    }
+                let (messages, echo): (Vec<&serde_json::Value>, usize) = match event {
+                    Some("agent_end") => (
+                        v.get("messages")
+                            .and_then(|m| m.as_array())
+                            .map(|m| m.iter().collect())
+                            .unwrap_or_default(),
+                        0,
+                    ),
+                    Some("turn_end") => (v.get("message").into_iter().collect(), 1),
+                    Some("message_end") => (v.get("message").into_iter().collect(), 2),
                     _ => continue,
                 };
                 for message in messages {
@@ -1832,18 +1856,23 @@ fn extract_answer(kind: AgentKind, stdout: &str) -> Extracted {
                     let Some(parts) = message.get("content").and_then(|c| c.as_array()) else {
                         continue;
                     };
+                    answered = true;
                     for part in parts {
-                        if part.get("type").and_then(|t| t.as_str()) != Some("text") {
-                            continue;
-                        }
-                        if let Some(t) = part.get("text").and_then(|t| t.as_str())
-                            && !t.trim().is_empty()
-                        {
-                            text = t.trim().to_owned();
+                        match part.get("type").and_then(|t| t.as_str()) {
+                            Some("toolCall") => tool_parts[echo] += 1,
+                            Some("text") => {
+                                if let Some(t) = part.get("text").and_then(|t| t.as_str())
+                                    && !t.trim().is_empty()
+                                {
+                                    text = t.trim().to_owned();
+                                }
+                            }
+                            _ => {}
                         }
                     }
                 }
             }
+            let tool_parts = tool_parts.into_iter().max().unwrap_or(0);
             Extracted {
                 text,
                 session,
@@ -1852,9 +1881,19 @@ fn extract_answer(kind: AgentKind, stdout: &str) -> Extracted {
                 dropped: None,
                 commands: Vec::new(),
                 context_tokens: None,
+                // Only a stream that carried an assistant message says
+                // anything about tools; an unread one stays unknown.
+                tool_calls: answered.then(|| tool_starts.max(tool_parts)),
             }
         }
         AgentKind::Command => {
+            // A `command` wrapper or fixture may relay an `omp --mode=json`
+            // stream as it is. Nothing else opens with omp's session line, so
+            // such a stream is read the way omp's own is; left as text, the
+            // whole event log would stand as the answer.
+            if relays_omp_stream(stdout) {
+                return extract_answer(AgentKind::Omp, stdout);
+            }
             // A `command` agent may wrap a subscription CLI (a fixture, or a
             // thin shim around `claude`). If its output is the claude error
             // shape we recognise the quota the same way, so tests and wrappers
@@ -1872,9 +1911,23 @@ fn extract_answer(kind: AgentKind, stdout: &str) -> Extracted {
                 dropped,
                 commands: Vec::new(),
                 context_tokens: None,
+                tool_calls: None,
             }
         }
     }
+}
+
+/// Does this stdout open with the session line of an `omp --mode=json` stream?
+fn relays_omp_stream(stdout: &str) -> bool {
+    stdout
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .and_then(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .is_some_and(|v| {
+            v.get("type").and_then(|t| t.as_str()) == Some("session")
+                && v.get("id").is_some_and(serde_json::Value::is_string)
+        })
 }
 
 /// Build one [`CommandEvidence`] from a Codex `command_execution` item.
@@ -3372,6 +3425,59 @@ mod tests {
         assert_eq!(out.session.as_deref(), Some("s2"));
     }
 
+    /// The evidence the implement node reads to tell a reply that did no
+    /// work from one that did: a stream that answers with text alone reports
+    /// zero tool calls, one that ran tools reports them, and a stream with no
+    /// assistant message at all reports nothing.
+    #[test]
+    fn omp_reports_tool_activity_only_when_the_stream_shows_it() {
+        let session = r#"{"type":"session","version":3,"id":"s3"}"#;
+        let text_only = format!(
+            "{session}\n{}\n",
+            r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"Implementation incomplete."}],"stopReason":"stop"}}"#
+        );
+        assert_eq!(extract(AgentKind::Omp, &text_only).tool_calls, Some(0));
+
+        // The execution events alone are enough.
+        let ran = format!(
+            "{session}\n{}\n{}\n",
+            r#"{"type":"tool_execution_start","toolCallId":"t1","toolName":"read"}"#,
+            r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"done"}],"stopReason":"stop"}}"#
+        );
+        assert_eq!(extract(AgentKind::Omp, &ran).tool_calls, Some(1));
+
+        // So are the tool-call parts, counted once although `turn_end`
+        // repeats the message.
+        let call = r#"{"role":"assistant","content":[{"type":"toolCall","id":"t1","name":"read"}],"stopReason":"toolUse"}"#;
+        let parts = format!(
+            "{session}\n{{\"type\":\"message_end\",\"message\":{call}}}\n{{\"type\":\"turn_end\",\"message\":{call}}}\n"
+        );
+        assert_eq!(extract(AgentKind::Omp, &parts).tool_calls, Some(1));
+
+        // No assistant message: unknown, never zero.
+        assert_eq!(extract(AgentKind::Omp, session).tool_calls, None);
+        assert_eq!(extract(AgentKind::Omp, "").tool_calls, None);
+    }
+
+    /// A `command` agent that relays an omp stream is read like omp; any
+    /// other output stays plain text with no claim about tools.
+    #[test]
+    fn a_command_agent_relaying_an_omp_stream_is_read_as_one() {
+        let stream = concat!(
+            r#"{"type":"session","version":3,"id":"s4"}"#,
+            "\n",
+            r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"the answer"}],"stopReason":"stop"}}"#,
+            "\n",
+        );
+        let out = extract(AgentKind::Command, stream);
+        assert_eq!(out.text, "the answer");
+        assert_eq!(out.tool_calls, Some(0));
+
+        let plain = extract(AgentKind::Command, "## SUMMARY\nTITLE: fix: thing\n");
+        assert_eq!(plain.text, "## SUMMARY\nTITLE: fix: thing");
+        assert_eq!(plain.tool_calls, None);
+    }
+
     /// A real `codex exec --json` stream, tracing prefix included.
     #[test]
     fn codex_takes_the_last_agent_message_and_the_thread_id() {
@@ -3822,6 +3928,7 @@ mod tests {
             dropped: out.dropped,
             commands: out.commands,
             context_tokens: None,
+            tool_calls: None,
         };
         assert!(
             agent_out.usable(),
@@ -3982,6 +4089,7 @@ mod tests {
             }),
             commands: Vec::new(),
             context_tokens: None,
+            tool_calls: None,
         };
         assert!(!out.usable());
         assert!(out.work_undelivered());
@@ -4395,6 +4503,7 @@ mod tests {
             dropped: None,
             commands: Vec::new(),
             context_tokens: None,
+            tool_calls: None,
         }
     }
 
