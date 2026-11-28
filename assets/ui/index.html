@@ -357,6 +357,7 @@
       <div class="run-status" id="task-status"></div>
       <h1 id="task-h">Loading task…</h1>
       <p class="view-sub" id="task-meta"></p>
+      <p class="task-admission" id="task-admission" hidden></p>
     </div>
     <div class="panel" id="task-why-panel" hidden>
       <p class="card-note" id="task-note"></p>
@@ -401,7 +402,7 @@
     </div>
     <p class="queue-focus-status" id="queue-focus-status" role="status" hidden></p>
     <p class="queue-search-status" id="queue-search-status" role="status" hidden></p>
-    <p class="panel-note">Drag ↕ to the yellow insertion line, or focus ↕ and press Arrow Up / Down. Clear search first. Upgrade resumes stay first; eligibility and urgent work still apply.</p>
+    <p class="panel-note">Drag ↕ to the yellow insertion line, or focus ↕ and press Arrow Up / Down. Clear search first. Upgrade resumes stay first; eligibility, urgent, and immediate work still apply.</p>
     <p class="panel-note" id="queue-reorder-status"></p>
     <ol class="cards" id="queue-search-results" hidden></ol>
     <p class="empty" id="queue-search-empty" hidden>No task matches this search.</p>
@@ -806,6 +807,7 @@
   <div class="sheet-body">
     <p class="form-error" id="task-actions-error" role="alert" hidden></p>
     <div class="task-blockers" id="task-actions-blockers" hidden></div>
+    <div id="task-actions-immediate"></div>
     <div id="task-actions-urgent"></div>
     <div id="task-actions-priority"></div>
     <div id="task-actions-edit"></div>

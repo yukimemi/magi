@@ -136,6 +136,11 @@ pub struct Status {
     /// Last completed candidate scan that started no tasks; absent otherwise.
     #[serde(default)]
     pub dispatch_wait: Option<DispatchWait>,
+    /// Per-task skip reasons observed by the latest completed dispatch scan.
+    /// Retained even when another task started in the same scan so skipped
+    /// candidates do not lose their observed blocker.
+    #[serde(default)]
+    pub dispatch_skips: std::collections::BTreeMap<String, String>,
     /// Effective startup capabilities of the question recovery loops.
     #[serde(default)]
     pub question_recovery: Option<crate::question_delivery::Recovery>,
@@ -159,6 +164,7 @@ impl Status {
             completed: 0,
             polls: 0,
             dispatch_wait: None,
+            dispatch_skips: std::collections::BTreeMap::new(),
             question_recovery: None,
             worker_protocol: Some(1),
         }
@@ -410,6 +416,9 @@ pub struct Reading {
     pub polls: u64,
     /// Last no-start scan, retaining unknown reason keys from newer writers.
     pub dispatch_wait: Option<DispatchWait>,
+    /// Per-task skip reasons observed by the latest completed dispatch scan.
+    #[serde(default)]
+    pub dispatch_skips: std::collections::BTreeMap<String, String>,
     /// Effective startup capabilities of the question recovery loops.
     #[serde(default)]
     pub question_recovery: Option<crate::question_delivery::Recovery>,
@@ -3002,7 +3011,11 @@ pub async fn run_task_worker(home: &Path, payload: serde_json::Value) -> Result<
     if !task.status.runnable()
         || (!request.standalone
             && request.lane
-                != permit_kind(land_resume_state(&task) == LandResume::Ready, task.urgent))
+                != permit_kind(
+                    land_resume_state(&task) == LandResume::Ready,
+                    task.immediate,
+                    task.urgent,
+                ))
     {
         return Ok(());
     }
@@ -3058,7 +3071,11 @@ pub async fn spawn_claimed(
         opts: opts.absolute()?,
         queue: std::path::absolute(queue.root())?,
         task: task.id.clone(),
-        lane: permit_kind(land_resume_state(task) == LandResume::Ready, task.urgent),
+        lane: permit_kind(
+            land_resume_state(task) == LandResume::Ready,
+            task.immediate,
+            task.urgent,
+        ),
         standalone: true,
     };
     let job = crate::worker::spawn(
@@ -3742,17 +3759,23 @@ struct DispatchLimits {
 /// from.
 ///
 /// Pure and separate from [`poll`]'s loop body for the same reason
-/// [`advance_interrupt`] is: the choice between "skip the ordinary pool
-/// entirely", "spend the one urgent slot" and "spend an ordinary slot" is
-/// exactly the policy this feature adds, and a policy only exercisable by
-/// running the whole loop is a policy nobody checks.
+/// [`advance_interrupt`] is: the choice between "decision-only land resume",
+/// "owner-selected immediate lane", "spend the one urgent slot" and "spend an
+/// ordinary slot" is explicit and directly unit-testable.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-enum PermitKind {
+pub(crate) enum PermitKind {
     /// A land-merge resume (see [`LandResume::Ready`]): bypasses every slot.
     /// Checked first - a task can be both a land resume and marked
-    /// [`Task::urgent`], and the resume's own "must not queue behind
-    /// anything" guarantee takes precedence.
+    /// [`Task::immediate`] or [`Task::urgent`], and the resume's own
+    /// decision-only lane takes precedence.
     None,
+    /// [`Task::immediate`]: owner-selected immediate execution lane.
+    /// Consumes no semaphore permit and does not count against ordinary or
+    /// urgent capacity, allowing multiple immediate tasks to dispatch even
+    /// when both ordinary and urgent lanes are full. Kept distinct from
+    /// [`PermitKind::None`] so decision-only resumes and immediate runs stay
+    /// separable in persisted worker reservations and diagnostics.
+    Immediate,
     /// [`Task::urgent`]: the one extra slot in `urgent_sem`, spent instead of
     /// (never in addition to trying) the ordinary pool. This is what lets
     /// an urgent task dispatch while every ordinary slot is already checked
@@ -3760,17 +3783,31 @@ enum PermitKind {
     /// waits on this same one-slot semaphore rather than falling through to
     /// the ordinary one.
     Urgent,
-    /// The ordinary `max_concurrent_runs` pool - unaffected by either of the
+    /// The ordinary `max_concurrent_runs` pool - unaffected by any of the
     /// above.
     #[default]
     Ordinary,
 }
 
+impl PermitKind {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::None => "decision",
+            Self::Immediate => "immediate",
+            Self::Urgent => "urgent",
+            Self::Ordinary => "ordinary",
+        }
+    }
+}
+
 /// [`PermitKind`] for one candidate. `priority` is [`LandResume::Ready`]'s
 /// own boolean, already computed by the caller from [`land_resume_state`].
-fn permit_kind(priority: bool, urgent: bool) -> PermitKind {
+/// Precedence: decision resume (`None`) > `Immediate` > `Urgent` > `Ordinary`.
+fn permit_kind(priority: bool, immediate: bool, urgent: bool) -> PermitKind {
     if priority {
         PermitKind::None
+    } else if immediate {
+        PermitKind::Immediate
     } else if urgent {
         PermitKind::Urgent
     } else {
@@ -3784,7 +3821,7 @@ fn available_slots(requests: &[TaskWorker], limit: usize) -> (usize, usize) {
         |(ordinary, urgent), request| match request.lane {
             PermitKind::Ordinary => (ordinary + 1, urgent),
             PermitKind::Urgent => (ordinary, urgent + 1),
-            PermitKind::None => (ordinary, urgent),
+            PermitKind::Immediate | PermitKind::None => (ordinary, urgent),
         },
     );
     (
@@ -3892,14 +3929,628 @@ fn changed_dispatch_skips(previous: &mut DispatchSkips, current: DispatchSkips) 
     true
 }
 
+/// Read-only task-level admission view shared by CLI (`magi task list` / `show`)
+/// and Web (`TaskView`). Distinguishes configured mode, active persisted
+/// reservation lane, and concrete blockers without ever mutating state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskAdmission {
+    /// Configured dispatch mode from the task record (`"immediate"`, `"urgent"`, `"ordinary"`).
+    pub mode: &'static str,
+    /// Persisted active worker reservation lane, if currently reserved/running
+    /// (`"decision"`, `"immediate"`, `"urgent"`, `"ordinary"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reservation_lane: Option<&'static str>,
+    /// True when the active worker reservation is standalone (`magi run`/`review`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub standalone: bool,
+    /// Admission state: `"next_poll"`, `"waiting"`, `"running"`, `"completed"`, `"unknown"`.
+    pub state: &'static str,
+    /// Human-readable admission status label (e.g. `"Immediate: next poll"`,
+    /// `"Immediate: waiting — ..."`).
+    pub label: String,
+    /// Concrete blocker or unconfirmed-state diagnostic when waiting/unknown/resource-blocked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocker: Option<String>,
+}
+
+/// One read-only snapshot of scheduler, worker, cooldown, and interrupt state
+/// captured once per list or detail request.
+#[derive(Debug, Clone)]
+pub struct AdmissionSnapshot {
+    now: Timestamp,
+    daemon: std::result::Result<Option<Reading>, String>,
+    scheduler_running: bool,
+    active_workers:
+        std::result::Result<std::collections::BTreeMap<String, (PermitKind, bool)>, String>,
+    owned_in_flight: Vec<String>,
+    owned_ordinary_count: usize,
+    urgent_busy: bool,
+    cache_service_active: bool,
+    cooldown_until: std::result::Result<Option<Timestamp>, String>,
+    interrupt: std::result::Result<Interrupt, String>,
+}
+
+fn read_status_checked(home: &Path) -> std::result::Result<Option<Reading>, String> {
+    let path = home.join("daemon.json");
+    match std::fs::read_to_string(&path) {
+        Ok(body) => serde_json::from_str(&body)
+            .map(Some)
+            .map_err(|e| format!("parse {}: {e}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("read {}: {e}", path.display())),
+    }
+}
+
+fn read_interrupt_checked(home: &Path) -> std::result::Result<Interrupt, String> {
+    let path = home.join("scheduler-interrupt.json");
+    match std::fs::read(&path) {
+        Ok(body) => {
+            serde_json::from_slice(&body).map_err(|e| format!("parse {}: {e}", path.display()))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Interrupt::Idle),
+        Err(e) => Err(format!("read {}: {e}", path.display())),
+    }
+}
+
+fn skip_reason_label(key: &str) -> String {
+    match key {
+        "claim_unavailable" => "claimed by another process".to_owned(),
+        "reread_failed" => "could not re-read task".to_owned(),
+        "no_longer_runnable" => "no longer runnable".to_owned(),
+        "waiting_on_landing" => "waiting on merge/posting approval".to_owned(),
+        "cooling_down" => "quota cooldown".to_owned(),
+        "ordinary_capacity" => "no free ordinary slot".to_owned(),
+        "urgent_capacity" => "urgent slot busy".to_owned(),
+        "interrupt_gate" => "withheld by active interrupt sequence".to_owned(),
+        other => other.replace('_', " "),
+    }
+}
+
+/// Pure read-only companion to [`land_resume_state`]: reads `home` explicitly
+/// and never abandons or writes any question file.
+fn land_resume_state_readonly(task: &Task, home: &Path, now: Timestamp) -> LandResume {
+    if task.sync_only.is_some() {
+        return LandResume::NotLanding;
+    }
+    let Some(run_id) = task.execution_runs().last() else {
+        return LandResume::NotLanding;
+    };
+    let Ok(state) = RunState::load_under(run_id, home) else {
+        return LandResume::NotLanding;
+    };
+    if !state.parked {
+        return LandResume::NotLanding;
+    }
+    let store = ask::Questions::at(home.join("questions"));
+    if state.status == RunStatus::Landing
+        && state.land_approval.as_ref().is_some_and(|binding| {
+            store.get_for_effects(&binding.question).is_ok_and(|q| {
+                q.run == state.id
+                    && q.resolution()
+                        .as_deref()
+                        .is_some_and(crate::merge_decision::stops)
+            })
+        })
+    {
+        return LandResume::Ready;
+    }
+    if !implementers_match(task, &state) {
+        return LandResume::NotLanding;
+    }
+    let node = if state.status == RunStatus::Landing {
+        land::APPROVAL_NODE
+    } else if state.github_text.as_ref().is_some_and(|g| !g.resolved) {
+        crate::github_text::ASK_NODE
+    } else {
+        return LandResume::NotLanding;
+    };
+    let waiting = store
+        .list_for_effects()
+        .into_iter()
+        .filter(|q| &q.run == run_id && q.node == node)
+        .max_by(|a, b| a.id.cmp(&b.id));
+    let Some(q) = waiting else {
+        return LandResume::Ready;
+    };
+    if !q.status.open() {
+        if q.resolution().as_deref() == Some(land::REPAIR) {
+            return if is_working_on(home, &state.id, now) {
+                LandResume::StillWaiting
+            } else {
+                LandResume::NotLanding
+            };
+        }
+        return LandResume::Ready;
+    }
+    LandResume::StillWaiting
+}
+
+impl AdmissionSnapshot {
+    /// Capture scheduler, worker, cooldown, and interrupt state once, read-only.
+    #[must_use]
+    pub fn capture(home: &Path, now: Timestamp) -> Self {
+        let daemon = read_status_checked(home);
+        let scheduler_running = daemon
+            .as_ref()
+            .ok()
+            .and_then(Option::as_ref)
+            .is_some_and(|reading| reading.running(now));
+        let mut cache_service_active = false;
+        let mut owned_in_flight = Vec::new();
+        let mut owned_ordinary_count = 0usize;
+        let mut urgent_busy = false;
+        let active_workers = match crate::worker::observe_active_detailed(home) {
+            Ok(entries) => {
+                let mut map = std::collections::BTreeMap::new();
+                let mut parse_err = None;
+                for entry in entries {
+                    if entry.job.key == "service:daemon-cache" {
+                        cache_service_active = true;
+                        continue;
+                    }
+                    if entry.job.kind != "task" {
+                        continue;
+                    }
+                    match serde_json::from_value::<TaskWorker>(entry.job.payload) {
+                        Ok(request) => {
+                            if !request.standalone {
+                                owned_in_flight.push(request.task.clone());
+                                match request.lane {
+                                    PermitKind::Ordinary => owned_ordinary_count += 1,
+                                    PermitKind::Urgent => urgent_busy = true,
+                                    PermitKind::Immediate | PermitKind::None => {}
+                                }
+                            }
+                            map.entry(request.task)
+                                .and_modify(|existing: &mut (PermitKind, bool)| {
+                                    if existing.1 && !request.standalone {
+                                        *existing = (request.lane, request.standalone);
+                                    }
+                                })
+                                .or_insert((request.lane, request.standalone));
+                        }
+                        Err(e) => {
+                            parse_err = Some(format!(
+                                "invalid task worker payload for {}: {e}",
+                                entry.job.id
+                            ));
+                            break;
+                        }
+                    }
+                }
+                match parse_err {
+                    Some(err) => Err(err),
+                    None => Ok(map),
+                }
+            }
+            Err(e) => Err(format!("{e:#}")),
+        };
+        let cooldown_until = read_cooldown(home).map_err(|e| format!("{e:#}"));
+        let interrupt = read_interrupt_checked(home);
+        Self {
+            now,
+            daemon,
+            scheduler_running,
+            active_workers,
+            owned_in_flight,
+            owned_ordinary_count,
+            urgent_busy,
+            cache_service_active,
+            cooldown_until,
+            interrupt,
+        }
+    }
+
+    fn format_waiting(task: &Task, reason: &str) -> String {
+        if task.immediate {
+            format!("Immediate: waiting — {reason}")
+        } else if task.urgent {
+            format!("Urgent: waiting — {reason}")
+        } else {
+            format!("Waiting — {reason}")
+        }
+    }
+
+    /// Evaluate admission for `task` using this pre-captured snapshot.
+    /// Read-only: never mutates queue, run, worker, or question files.
+    #[must_use]
+    pub fn evaluate(
+        &self,
+        task: &Task,
+        queue: &Queue,
+        inv: Option<&crate::blockers::Inventory>,
+        home: &Path,
+    ) -> TaskAdmission {
+        let mode = if task.immediate {
+            "immediate"
+        } else if task.urgent {
+            "urgent"
+        } else {
+            "ordinary"
+        };
+
+        if task.status == TaskStatus::Done {
+            return TaskAdmission {
+                mode,
+                reservation_lane: None,
+                standalone: false,
+                state: "completed",
+                label: "Completed".to_owned(),
+                blocker: None,
+            };
+        }
+
+        if let Ok(workers) = &self.active_workers
+            && let Some(&(lane, standalone)) = workers.get(&task.id)
+        {
+            let lane_label = lane.label();
+            let base = if standalone {
+                format!("Running (standalone, {lane_label} lane)")
+            } else {
+                format!("Running ({lane_label} lane)")
+            };
+            let resource_blocker = task
+                .execution_runs()
+                .last()
+                .and_then(|run_id| RunState::load_under(run_id, home).ok())
+                .and_then(|state| state.resource_wait)
+                .map(|wait| {
+                    if wait.holder.trim().is_empty() {
+                        format!("waiting for {}", wait.kind)
+                    } else {
+                        format!("waiting for {} ({})", wait.kind, wait.holder)
+                    }
+                });
+            let label = match &resource_blocker {
+                Some(reason) => format!("{base} — {reason}"),
+                None => base,
+            };
+            return TaskAdmission {
+                mode,
+                reservation_lane: Some(lane_label),
+                standalone,
+                state: "running",
+                label,
+                blocker: resource_blocker,
+            };
+        }
+
+        if task.status == TaskStatus::Running {
+            if self.active_workers.is_err() {
+                let reason = "worker state unreadable".to_owned();
+                return TaskAdmission {
+                    mode,
+                    reservation_lane: None,
+                    standalone: false,
+                    state: "unknown",
+                    label: Self::format_waiting(task, &reason),
+                    blocker: Some(reason),
+                };
+            }
+            return TaskAdmission {
+                mode,
+                reservation_lane: None,
+                standalone: false,
+                state: "running",
+                label: "Running".to_owned(),
+                blocker: None,
+            };
+        }
+
+        if task.status == TaskStatus::Blocked {
+            let waits = inv.map(|i| i.waits_on(task)).unwrap_or_default();
+            let reason = if !waits.is_empty() {
+                format!("waiting on dependencies ({})", waits.join(", "))
+            } else if let Some(block_reason) = &task.block_reason {
+                format!("blocked ({block_reason})")
+            } else if !task.blocked_by.is_empty() {
+                let ids: Vec<_> = task
+                    .blocked_by
+                    .iter()
+                    .map(|id| crate::run::short_of(id))
+                    .collect();
+                format!("waiting on dependencies ({})", ids.join(", "))
+            } else {
+                "blocked on unresolved dependencies".to_owned()
+            };
+            return TaskAdmission {
+                mode,
+                reservation_lane: None,
+                standalone: false,
+                state: "waiting",
+                label: Self::format_waiting(task, &reason),
+                blocker: Some(reason),
+            };
+        }
+
+        if task.status == TaskStatus::Held {
+            let reason = match &task.machine_hold_cause {
+                Some(crate::queue::MachineHoldCause::DiskCapacity { reason, .. }) => {
+                    format!("disk admission ({reason})")
+                }
+                Some(crate::queue::MachineHoldCause::HeadE2e { .. }) => {
+                    let detail = task
+                        .hold_reason
+                        .as_deref()
+                        .unwrap_or("current head verify.e2e failed");
+                    format!("head e2e hold ({detail})")
+                }
+                None if task.hold_source == Some(crate::queue::HoldSource::Machine) => {
+                    let detail = task.hold_reason.as_deref().unwrap_or("held by daemon");
+                    if let Some(rest) = detail.strip_prefix("[resource] ") {
+                        format!("resource hold ({rest})")
+                    } else if let Some(rest) = detail.strip_prefix("[config] ") {
+                        format!("config hold ({rest})")
+                    } else {
+                        format!("machine hold ({detail})")
+                    }
+                }
+                None => match task.hold_reason.as_deref() {
+                    Some(reason) if !reason.trim().is_empty() => format!("held ({reason})"),
+                    _ => "held (release required)".to_owned(),
+                },
+            };
+            return TaskAdmission {
+                mode,
+                reservation_lane: None,
+                standalone: false,
+                state: "waiting",
+                label: Self::format_waiting(task, &reason),
+                blocker: Some(reason),
+            };
+        }
+
+        // Runnable (`Queued` | `Failed` | `Parked`): evaluate non-concurrency
+        // gates first, never claiming dispatchability on unconfirmed state and
+        // never attributing ordinary/urgent capacity waits to immediate tasks.
+        if self.active_workers.is_err() {
+            let reason = "worker state unreadable".to_owned();
+            return TaskAdmission {
+                mode,
+                reservation_lane: None,
+                standalone: false,
+                state: "unknown",
+                label: Self::format_waiting(task, &reason),
+                blocker: Some(reason),
+            };
+        }
+
+        if queue.is_claimed(&task.id) {
+            let reason = "claimed by another process".to_owned();
+            return TaskAdmission {
+                mode,
+                reservation_lane: None,
+                standalone: false,
+                state: "waiting",
+                label: Self::format_waiting(task, &reason),
+                blocker: Some(reason),
+            };
+        }
+
+        if let Some(hold) = crate::head_e2e_stop::dispatch_hold(queue, task) {
+            let reason = format!("head e2e stop ({})", hold.reason);
+            return TaskAdmission {
+                mode,
+                reservation_lane: None,
+                standalone: false,
+                state: "waiting",
+                label: Self::format_waiting(task, &reason),
+                blocker: Some(reason),
+            };
+        }
+
+        let resume = land_resume_state_readonly(task, home, self.now);
+        if resume == LandResume::StillWaiting {
+            let reason = "waiting on merge/posting approval".to_owned();
+            return TaskAdmission {
+                mode,
+                reservation_lane: None,
+                standalone: false,
+                state: "waiting",
+                label: Self::format_waiting(task, &reason),
+                blocker: Some(reason),
+            };
+        }
+        let priority = resume == LandResume::Ready;
+        let effective_lane = permit_kind(priority, task.immediate, task.urgent);
+
+        match &self.interrupt {
+            Err(_) => {
+                let reason = "interrupt state unreadable".to_owned();
+                return TaskAdmission {
+                    mode,
+                    reservation_lane: None,
+                    standalone: false,
+                    state: "unknown",
+                    label: Self::format_waiting(task, &reason),
+                    blocker: Some(reason),
+                };
+            }
+            Ok(interrupt)
+                if *interrupt != Interrupt::Idle
+                    && interrupt_gate(interrupt, &self.owned_in_flight, vec![task.clone()])
+                        .is_empty() =>
+            {
+                let reason = "withheld by active interrupt sequence".to_owned();
+                return TaskAdmission {
+                    mode,
+                    reservation_lane: None,
+                    standalone: false,
+                    state: "waiting",
+                    label: Self::format_waiting(task, &reason),
+                    blocker: Some(reason),
+                };
+            }
+            Ok(_) => {}
+        }
+
+        if effective_lane != PermitKind::None {
+            match &self.cooldown_until {
+                Err(_) => {
+                    let reason = "quota cooldown state unreadable".to_owned();
+                    return TaskAdmission {
+                        mode,
+                        reservation_lane: None,
+                        standalone: false,
+                        state: "unknown",
+                        label: Self::format_waiting(task, &reason),
+                        blocker: Some(reason),
+                    };
+                }
+                Ok(Some(until)) if self.now < *until => {
+                    let secs = (until.as_second() - self.now.as_second()).max(1);
+                    let reason = format!("quota cooldown ({secs}s remaining)");
+                    return TaskAdmission {
+                        mode,
+                        reservation_lane: None,
+                        standalone: false,
+                        state: "waiting",
+                        label: Self::format_waiting(task, &reason),
+                        blocker: Some(reason),
+                    };
+                }
+                Ok(_) => {}
+            }
+        }
+
+        if self.cache_service_active {
+            let reason = "waiting for cache maintenance service".to_owned();
+            return TaskAdmission {
+                mode,
+                reservation_lane: None,
+                standalone: false,
+                state: "waiting",
+                label: Self::format_waiting(task, &reason),
+                blocker: Some(reason),
+            };
+        }
+
+        if self.daemon.is_err() {
+            let reason = "scheduler status unreadable".to_owned();
+            return TaskAdmission {
+                mode,
+                reservation_lane: None,
+                standalone: false,
+                state: "unknown",
+                label: Self::format_waiting(task, &reason),
+                blocker: Some(reason),
+            };
+        }
+
+        if self.scheduler_running
+            && let Ok(Some(reading)) = &self.daemon
+            && let Some(skip_key) = reading.dispatch_skips.get(&task.id)
+        {
+            let stale_capacity_skip = match effective_lane {
+                PermitKind::None | PermitKind::Immediate => {
+                    matches!(skip_key.as_str(), "ordinary_capacity" | "urgent_capacity")
+                }
+                PermitKind::Urgent => skip_key == "ordinary_capacity",
+                PermitKind::Ordinary => skip_key == "urgent_capacity",
+            };
+            if !stale_capacity_skip {
+                let reason = skip_reason_label(skip_key);
+                return TaskAdmission {
+                    mode,
+                    reservation_lane: None,
+                    standalone: false,
+                    state: "waiting",
+                    label: Self::format_waiting(task, &reason),
+                    blocker: Some(reason),
+                };
+            }
+        }
+
+        if !self.scheduler_running {
+            let reason = "scheduler not running".to_owned();
+            return TaskAdmission {
+                mode,
+                reservation_lane: None,
+                standalone: false,
+                state: "waiting",
+                label: Self::format_waiting(task, &reason),
+                blocker: Some(reason),
+            };
+        }
+
+        match effective_lane {
+            PermitKind::Immediate => TaskAdmission {
+                mode,
+                reservation_lane: None,
+                standalone: false,
+                state: "next_poll",
+                label: "Immediate: next poll".to_owned(),
+                blocker: None,
+            },
+            PermitKind::None => TaskAdmission {
+                mode,
+                reservation_lane: None,
+                standalone: false,
+                state: "next_poll",
+                label: if task.immediate {
+                    "Immediate: next poll".to_owned()
+                } else {
+                    "Decision resume: next poll".to_owned()
+                },
+                blocker: None,
+            },
+            PermitKind::Urgent => {
+                if self.urgent_busy {
+                    let reason = "urgent slot busy".to_owned();
+                    TaskAdmission {
+                        mode,
+                        reservation_lane: None,
+                        standalone: false,
+                        state: "waiting",
+                        label: Self::format_waiting(task, &reason),
+                        blocker: Some(reason),
+                    }
+                } else {
+                    TaskAdmission {
+                        mode,
+                        reservation_lane: None,
+                        standalone: false,
+                        state: "next_poll",
+                        label: "Urgent: next poll".to_owned(),
+                        blocker: None,
+                    }
+                }
+            }
+            PermitKind::Ordinary => {
+                if self.owned_ordinary_count == 0 {
+                    TaskAdmission {
+                        mode,
+                        reservation_lane: None,
+                        standalone: false,
+                        state: "next_poll",
+                        label: "Ordinary: next poll".to_owned(),
+                        blocker: None,
+                    }
+                } else {
+                    TaskAdmission {
+                        mode,
+                        reservation_lane: None,
+                        standalone: false,
+                        state: "waiting",
+                        label: "Queued (ordinary lane)".to_owned(),
+                        blocker: None,
+                    }
+                }
+            }
+        }
+    }
+}
+
 struct DispatchClaim {
     task: Task,
     claim: crate::queue::Claim,
+    lane: PermitKind,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 /// Claim and re-read before choosing a lane: a queue listing may predate an
-/// urgent toggle. All unsuccessful paths release the claim without an attempt.
+/// immediate or urgent toggle. All unsuccessful paths release the claim
+/// without an attempt.
 fn claim_dispatch(
     queue: &Queue,
     candidate: &Task,
@@ -3933,9 +4584,11 @@ fn claim_dispatch(
         return Err(SkipReason::CoolingDown);
     }
     // Never borrow an ordinary slot when the single urgent slot is busy.
+    // Immediate tasks consume neither ordinary nor urgent permits.
     // Keep scanning other candidates when either pool has no free slot.
-    let permit = match permit_kind(priority, task.urgent) {
-        PermitKind::None => None,
+    let lane = permit_kind(priority, task.immediate, task.urgent);
+    let permit = match lane {
+        PermitKind::None | PermitKind::Immediate => None,
         PermitKind::Urgent => Some(
             Arc::clone(urgent)
                 .try_acquire_owned()
@@ -3961,6 +4614,7 @@ fn claim_dispatch(
     Ok(DispatchClaim {
         task,
         claim,
+        lane,
         permit,
     })
 }
@@ -4588,7 +5242,16 @@ async fn poll(
         let candidate_ids: Vec<_> = candidates.iter().map(|task| task.id.clone()).collect();
         let candidates = interrupt_gate(&interrupt, &in_flight, candidates);
         let mut skips = interrupt_skips(&candidate_ids, &candidates);
+        // Stable-partition immediate candidates ahead of non-immediate ones
+        // for this poll scan only; shared `dispatch_order` stays unchanged so
+        // upgrade-resume and ordinary priority ordering are preserved.
+        let (mut immediate_candidates, other_candidates): (Vec<Task>, Vec<Task>) =
+            candidates.into_iter().partition(|task| task.immediate);
+        immediate_candidates.extend(other_candidates);
+        let candidates = immediate_candidates;
         let cooling = read_cooldown(home)?.is_some_and(|until| Timestamp::now() < until);
+        let mut known_jobs: std::collections::BTreeSet<String> =
+            jobs.iter().map(|job| job.id.clone()).collect();
         let mut started = false;
         let mut resync = false;
         for candidate in candidates {
@@ -4598,6 +5261,7 @@ async fn poll(
             let DispatchClaim {
                 task,
                 claim,
+                lane,
                 permit,
             } = match claim_dispatch(queue, &candidate, cooling, &sem, &urgent_sem) {
                 Ok(claim) => claim,
@@ -4608,13 +5272,12 @@ async fn poll(
             };
             if crate::worker::active(home)?
                 .iter()
-                .any(|job| job.kind == "task" && !jobs.iter().any(|known| known.id == job.id))
+                .any(|job| job.kind == "task" && !known_jobs.contains(&job.id))
             {
                 drop(claim);
                 resync = true;
                 break;
             }
-            let lane = permit_kind(land_resume_state(&task) == LandResume::Ready, task.urgent);
             let request = TaskWorker {
                 opts: opts.absolute()?,
                 queue: std::path::absolute(queue.root())?,
@@ -4624,7 +5287,7 @@ async fn poll(
             };
             // Keep the claim until spawn acknowledges the worker's durable
             // reservation. The worker then claims and re-reads before attempt.
-            if let Err(error) = crate::worker::spawn(
+            let job = match crate::worker::spawn(
                 home,
                 "task",
                 &format!("task:{}", task.id),
@@ -4632,19 +5295,37 @@ async fn poll(
             )
             .await
             {
-                task_worker_spawn_error(home, &request, error)?;
-                drop(claim);
-                resync = true;
-                break;
-            }
+                Ok(job) => job,
+                Err(error) => {
+                    task_worker_spawn_error(home, &request, error)?;
+                    drop(claim);
+                    resync = true;
+                    break;
+                }
+            };
+            known_jobs.insert(job.id);
             drop(claim);
             permits.extend(permit);
             attempted.push(task.id);
             started = true;
+            // Interrupt transitions depend on the exact in-flight set (in
+            // particular the transition from zero to one worker). Re-scan
+            // before admitting another task, as for ordinary dispatch.
+            if limits.pause_for_interrupts || lane != PermitKind::Immediate {
+                break;
+            }
         }
         if !resync && !stop.stopped() {
-            if !started {
-                lock(status).dispatch_wait = aggregate_dispatch_wait(candidate_ids.len(), &skips);
+            let per_task_skips: std::collections::BTreeMap<String, String> = skips
+                .iter()
+                .map(|(id, reason)| (id.clone(), reason.key().to_owned()))
+                .collect();
+            {
+                let mut snapshot = lock(status);
+                snapshot.dispatch_skips = per_task_skips;
+                if !started {
+                    snapshot.dispatch_wait = aggregate_dispatch_wait(candidate_ids.len(), &skips);
+                }
             }
             if changed_dispatch_skips(&mut previous_skips, skips) {
                 if previous_skips.is_empty() {
@@ -4693,7 +5374,11 @@ async fn poll(
     // Dropping a scheduler only drops dispatch bookkeeping. The workers own
     // every queue claim and Runner driver lease through outcome settlement.
     stop.busy.store(0, Ordering::SeqCst);
-    lock(status).dispatch_wait = None;
+    {
+        let mut snapshot = lock(status);
+        snapshot.dispatch_wait = None;
+        snapshot.dispatch_skips.clear();
+    }
     Ok(())
 }
 
@@ -8329,9 +9014,18 @@ mod tests {
             let DispatchClaim {
                 task: fresh,
                 claim,
+                lane,
                 permit,
             } = claim_dispatch(&queue, &stale, false, &ordinary, &urgent).unwrap();
             assert_eq!(fresh.urgent, enabled);
+            assert_eq!(
+                lane,
+                if enabled {
+                    PermitKind::Urgent
+                } else {
+                    PermitKind::Ordinary
+                }
+            );
             assert_eq!(ordinary.available_permits(), usize::from(enabled));
             assert_eq!(urgent.available_permits(), usize::from(!enabled));
             assert!(queue.claim(&t.id).is_err());
@@ -8384,8 +9078,10 @@ mod tests {
     /// same task was also filed with `--urgent`.
     #[test]
     fn permit_kind_prefers_a_land_resume_over_the_urgent_slot() {
-        assert_eq!(permit_kind(true, false), PermitKind::None);
-        assert_eq!(permit_kind(true, true), PermitKind::None);
+        assert_eq!(permit_kind(true, false, false), PermitKind::None);
+        assert_eq!(permit_kind(true, false, true), PermitKind::None);
+        assert_eq!(permit_kind(true, true, false), PermitKind::None);
+        assert_eq!(permit_kind(true, true, true), PermitKind::None);
     }
 
     /// The one property this whole feature exists for: `--urgent` draws from
@@ -8394,8 +9090,239 @@ mod tests {
     /// untouched by the urgent slot's existence.
     #[test]
     fn permit_kind_separates_urgent_from_ordinary() {
-        assert_eq!(permit_kind(false, true), PermitKind::Urgent);
-        assert_eq!(permit_kind(false, false), PermitKind::Ordinary);
+        assert_eq!(permit_kind(false, false, true), PermitKind::Urgent);
+        assert_eq!(permit_kind(false, false, false), PermitKind::Ordinary);
+        assert_eq!(permit_kind(false, true, false), PermitKind::Immediate);
+        assert_eq!(permit_kind(false, true, true), PermitKind::Immediate);
+    }
+
+    #[test]
+    fn immediate_lane_does_not_consume_ordinary_or_urgent_slots() {
+        let request = |task: &str, lane, standalone| TaskWorker {
+            opts: Opts::default(),
+            queue: PathBuf::from("/queue"),
+            task: task.to_owned(),
+            lane,
+            standalone,
+        };
+        let jobs = vec![
+            request("ordinary", PermitKind::Ordinary, false),
+            request("urgent", PermitKind::Urgent, false),
+            request("immediate-1", PermitKind::Immediate, false),
+            request("immediate-2", PermitKind::Immediate, false),
+            request("decision", PermitKind::None, false),
+        ];
+        assert_eq!(available_slots(&jobs, 1), (0, 0));
+        assert_eq!(available_slots(&jobs, 2), (1, 0));
+        let immediate_only = vec![
+            request("immediate-1", PermitKind::Immediate, false),
+            request("immediate-2", PermitKind::Immediate, false),
+        ];
+        assert_eq!(available_slots(&immediate_only, 1), (1, 1));
+    }
+
+    #[test]
+    fn immediate_dispatch_bypasses_saturated_lanes_and_preserves_non_concurrency_gates() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = Queue::at(dir.path().join("queue"));
+        let ordinary = Arc::new(tokio::sync::Semaphore::new(1));
+        let urgent = Arc::new(tokio::sync::Semaphore::new(1));
+        let _ord_permit = Arc::clone(&ordinary).try_acquire_owned().unwrap();
+        let _urg_permit = Arc::clone(&urgent).try_acquire_owned().unwrap();
+
+        // Both ordinary and urgent lanes are saturated.
+        let mut imm1 = task_with_id("imm-1");
+        imm1.immediate = true;
+        let mut imm2 = task_with_id("imm-2");
+        imm2.immediate = true;
+        imm2.urgent = true;
+        queue.put(&mut imm1).unwrap();
+        queue.put(&mut imm2).unwrap();
+
+        // Stale non-immediate listing still picks up saved immediate under claim.
+        let mut stale = imm1.clone();
+        stale.immediate = false;
+        let claim1 = claim_dispatch(&queue, &stale, false, &ordinary, &urgent).unwrap();
+        assert_eq!(claim1.lane, PermitKind::Immediate);
+        assert!(claim1.permit.is_none());
+
+        // Multiple immediate tasks can claim simultaneously without touching semaphores.
+        let claim2 = claim_dispatch(&queue, &imm2, false, &ordinary, &urgent).unwrap();
+        assert_eq!(claim2.lane, PermitKind::Immediate);
+        assert!(claim2.permit.is_none());
+        assert_eq!(ordinary.available_permits(), 0);
+        assert_eq!(urgent.available_permits(), 0);
+
+        // Duplicate claim on an already-claimed immediate task is refused.
+        assert_eq!(
+            claim_dispatch(&queue, &imm1, false, &ordinary, &urgent).err(),
+            Some(SkipReason::ClaimUnavailable)
+        );
+        drop((claim1, claim2));
+
+        // Cooldown still blocks immediate tasks.
+        assert_eq!(
+            claim_dispatch(&queue, &imm1, true, &ordinary, &urgent).err(),
+            Some(SkipReason::CoolingDown)
+        );
+
+        // Clearing immediate while urgent remains true reverts to urgent lane.
+        imm2.set_immediate(false).unwrap();
+        queue.put(&mut imm2).unwrap();
+        assert_eq!(
+            claim_dispatch(&queue, &imm2, false, &ordinary, &urgent).err(),
+            Some(SkipReason::UrgentCapacity)
+        );
+
+        // Interrupt gate still withholds immediate candidates.
+        let interrupt = Interrupt::Parking {
+            parked: vec!["in-flight".into()],
+            interrupt_task: "other".into(),
+        };
+        assert!(
+            interrupt_gate(&interrupt, &["in-flight".into()], vec![imm1.clone()]).is_empty(),
+            "an active interrupt sequence must withhold immediate tasks too"
+        );
+    }
+
+    #[test]
+    fn admission_snapshot_distinguishes_mode_lane_blockers_and_unknown_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let queue = Queue::at(home.join("queue"));
+        let now = Timestamp::now();
+
+        let mut imm = task_with_id("imm-ready");
+        imm.immediate = true;
+        queue.put(&mut imm).unwrap();
+
+        // No scheduler running -> waiting, never "next poll".
+        let snap = AdmissionSnapshot::capture(home, now);
+        let adm = snap.evaluate(&imm, &queue, None, home);
+        assert_eq!(adm.mode, "immediate");
+        assert_eq!(adm.state, "waiting");
+        assert_eq!(adm.label, "Immediate: waiting — scheduler not running");
+
+        // Live scheduler + saturated ordinary/urgent workers + stale capacity skip -> next poll!
+        let mut status = Status::new();
+        status.updated_at = now;
+        status
+            .dispatch_skips
+            .insert(imm.id.clone(), SkipReason::UrgentCapacity.key().to_owned());
+        write_status_to(&home.join("daemon.json"), &status).unwrap();
+
+        let mut ord = task_with_id("ord-running");
+        ord.status = TaskStatus::Running;
+        queue.put(&mut ord).unwrap();
+        let ord_req = TaskWorker {
+            opts: Opts::default(),
+            queue: queue.root().to_path_buf(),
+            task: ord.id.clone(),
+            lane: PermitKind::Ordinary,
+            standalone: false,
+        };
+        let (_ord_job, _ord_lease) = crate::worker::running_fixture(
+            home,
+            &format!("task:{}", ord.id),
+            serde_json::to_value(&ord_req).unwrap(),
+        )
+        .unwrap();
+
+        let mut urg = task_with_id("urg-running");
+        urg.urgent = true;
+        urg.status = TaskStatus::Running;
+        queue.put(&mut urg).unwrap();
+        let urg_req = TaskWorker {
+            opts: Opts::default(),
+            queue: queue.root().to_path_buf(),
+            task: urg.id.clone(),
+            lane: PermitKind::Urgent,
+            standalone: false,
+        };
+        let (_urg_job, _urg_lease) = crate::worker::running_fixture(
+            home,
+            &format!("task:{}", urg.id),
+            serde_json::to_value(&urg_req).unwrap(),
+        )
+        .unwrap();
+
+        let snap = AdmissionSnapshot::capture(home, now);
+        let adm = snap.evaluate(&imm, &queue, None, home);
+        assert_eq!(adm.state, "next_poll");
+        assert_eq!(adm.label, "Immediate: next poll");
+        assert_eq!(adm.reservation_lane, None);
+
+        // Running worker reports its actual persisted reservation lane.
+        let ord_adm = snap.evaluate(&ord, &queue, None, home);
+        assert_eq!(ord_adm.state, "running");
+        assert_eq!(ord_adm.reservation_lane, Some("ordinary"));
+        assert_eq!(ord_adm.label, "Running (ordinary lane)");
+
+        // Held (manual + disk) and Blocked (dependency) report concrete blockers.
+        let mut held = task_with_id("imm-held");
+        held.immediate = true;
+        held.hold_manual(Some("awaiting signoff".into()));
+        queue.put(&mut held).unwrap();
+        let held_adm = snap.evaluate(&held, &queue, None, home);
+        assert_eq!(held_adm.state, "waiting");
+        assert_eq!(
+            held_adm.label,
+            "Immediate: waiting — held (awaiting signoff)"
+        );
+
+        let mut disk_held = task_with_id("imm-disk");
+        disk_held.immediate = true;
+        disk_held.hold_machine(Some("only 1 GiB free".into()));
+        disk_held.mark_startup_disk_capacity();
+        queue.put(&mut disk_held).unwrap();
+        let disk_adm = snap.evaluate(&disk_held, &queue, None, home);
+        assert_eq!(disk_adm.state, "waiting");
+        assert!(disk_adm.label.contains("disk admission"), "{disk_adm:?}");
+
+        let mut blocked = task_with_id("imm-blocked");
+        blocked.immediate = true;
+        blocked.block(vec![held.id.clone()], Some("needs held task".into()));
+        queue.put(&mut blocked).unwrap();
+        let questions = Questions::at(home.join("questions"));
+        let inv = crate::blockers::Inventory::load(&queue, &questions);
+        let blocked_adm = snap.evaluate(&blocked, &queue, Some(&inv), home);
+        assert_eq!(blocked_adm.state, "waiting");
+        assert!(
+            blocked_adm
+                .label
+                .starts_with("Immediate: waiting — waiting on dependencies"),
+            "{blocked_adm:?}"
+        );
+
+        // Existing claim blocks immediate.
+        let _claim = queue.claim(&imm.id).unwrap();
+        let claimed_adm = snap.evaluate(&imm, &queue, None, home);
+        assert_eq!(claimed_adm.state, "waiting");
+        assert_eq!(
+            claimed_adm.label,
+            "Immediate: waiting — claimed by another process"
+        );
+        drop(_claim);
+
+        // Quota cooldown blocks immediate.
+        let until = now + jiff::SignedDuration::from_secs(120);
+        std::fs::write(
+            home.join("task-quota-cooldown.json"),
+            serde_json::to_vec(&until).unwrap(),
+        )
+        .unwrap();
+        let cool_snap = AdmissionSnapshot::capture(home, now);
+        let cool_adm = cool_snap.evaluate(&imm, &queue, None, home);
+        assert_eq!(cool_adm.state, "waiting");
+        assert!(cool_adm.label.contains("quota cooldown"), "{cool_adm:?}");
+        std::fs::remove_file(home.join("task-quota-cooldown.json")).unwrap();
+
+        // Corrupt interrupt file is reported as unknown, never "next poll".
+        std::fs::write(home.join("scheduler-interrupt.json"), "{broken").unwrap();
+        let bad_snap = AdmissionSnapshot::capture(home, now);
+        let bad_adm = bad_snap.evaluate(&imm, &queue, None, home);
+        assert_eq!(bad_adm.state, "unknown");
+        assert_ne!(bad_adm.label, "Immediate: next poll");
     }
 
     /// The exact wiring `attempt` runs before minting anything: a config's

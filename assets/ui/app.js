@@ -45,6 +45,7 @@ const API = {
   attemptLimit: (id) => `/api/queue/${encodeURIComponent(id)}/attempt-limit`,
   implementers: (id) => `/api/queue/${encodeURIComponent(id)}/implementers`,
   urgent: (id) => `/api/queue/${encodeURIComponent(id)}/urgent`,
+  immediate: (id) => `/api/queue/${encodeURIComponent(id)}/immediate`,
   priority: (id) => `/api/queue/${encodeURIComponent(id)}/priority`,
   editTask: (id) => `/api/queue/${encodeURIComponent(id)}/edit`,
   doneTask: (id) => `/api/queue/${encodeURIComponent(id)}/done`,
@@ -2756,9 +2757,27 @@ function urgentTag() {
   return el("span", { class: "tag tag-urgent", "data-tone": "rust", text: "urgent" });
 }
 
+/* The badge for `Task::immediate` (owner-selected immediate execution, stronger
+   than urgent). Independent of `urgent` so both flags remain visible when set. */
+function immediateTag() {
+  return el("span", { class: "tag tag-immediate", "data-tone": "gold", text: "immediate" });
+}
+
+function taskAdmissionSummary(task) {
+  const adm = task && task.admission;
+  if (!adm || !adm.label) return null;
+  const relevant = task.immediate === true
+    || Boolean(adm.reservation_lane)
+    || (task.urgent === true && Boolean(adm.blocker));
+  if (!relevant) return null;
+  return adm;
+}
+
 function createTaskCard() {
   const chipSlot = el("span");
+  const immediate = immediateTag();
   const urgent = urgentTag();
+  const admission = el("span", { class: "task-admission-status" });
   const priority = el("span", { class: "tag", "data-tone": "ink" });
   const permalink = el("a", { class: "card-permalink" });
   /* `solo` runs one implementer straight into review instead of the usual
@@ -2797,13 +2816,14 @@ function createTaskCard() {
   const priorityValue = el("span", { class: "task-priority-value" });
   const priorityBox = el("span", { class: "task-priority-box" }, priorityDown, priorityValue, priorityUp);
   const editBtn = el("button", { class: "btn btn-quiet", type: "button", text: "Edit" });
+  const immediateBox = el("span", { class: "task-immediate-box" });
   const urgentBox = el("span", { class: "task-urgent-box" });
   const holdBox = el("span", { class: "task-hold-box" });
   const doneBox = el("span", { class: "task-done-box" });
   const deleteBox = el("span", { class: "task-delete-box" });
   const actionMenu = el("details", { class: "task-action-menu" },
     el("summary", { class: "btn btn-quiet", text: "Actions" }),
-    el("div", { class: "task-menu-items" }, urgentBox, holdBox, doneBox, deleteBox));
+    el("div", { class: "task-menu-items" }, immediateBox, urgentBox, holdBox, doneBox, deleteBox));
   actionMenu.addEventListener("keydown", (event) => {
     if (event.key === "Escape") {
       event.preventDefault();
@@ -2816,7 +2836,7 @@ function createTaskCard() {
     priorityBox, editBtn, actionMenu);
 
   const card = el("li", { class: "card task-card", "data-press": "" },
-    el("div", { class: "card-top" }, chipSlot, urgent, priority, solo, followup, permalink, whenSlot),
+    el("div", { class: "card-top" }, chipSlot, immediate, urgent, admission, priority, solo, followup, permalink, whenSlot),
     title, meta, note, snippet, error, instruction, answers, actions,
   );
   /* Tapping the card body opens the task page; anything interactive inside it
@@ -2849,9 +2869,9 @@ function createTaskCard() {
     openTask();
   });
   card.refs = {
-    card, chipSlot, urgent, priority, solo, followup, permalink, whenSlot, title, source, repo, attempts,
+    card, chipSlot, immediate, urgent, admission, priority, solo, followup, permalink, whenSlot, title, source, repo, attempts,
     outcome, note, snippet, error, instruction, answers, answersList, runLink, actionMenu,
-    priorityDown, priorityUp, priorityValue, editBtn, urgentBox, holdBox, doneBox, deleteBox,
+    priorityDown, priorityUp, priorityValue, editBtn, immediateBox, urgentBox, holdBox, doneBox, deleteBox,
   };
   addQueueReorderHandle(card);
   return card;
@@ -2876,7 +2896,12 @@ function updateTaskCard(row, task) {
 
   setChip(r.chipSlot, status, TASK_STATUS);
 
+  show(r.immediate, task.immediate === true);
   show(r.urgent, task.urgent === true);
+  const adm = taskAdmissionSummary(task);
+  setText(r.admission, adm ? adm.label : "");
+  setAttr(r.admission, "data-state", adm ? adm.state : null);
+  show(r.admission, Boolean(adm));
 
   const priority = Number(task.priority) || 0;
   setText(r.priority, priority > 0 ? `priority +${priority}` : `priority ${priority}`);
@@ -3011,6 +3036,7 @@ function updateTaskCard(row, task) {
      claim; a running task has already left that pool (see
      `Task::set_priority`'s doc), so the buttons are disabled rather than
      left to round-trip a 4xx. */
+  renderTaskImmediateBox(task, r.immediateBox);
   renderTaskUrgentBox(task, r.urgentBox);
   setText(r.priorityValue, `Priority ${Number(task.priority) || 0}`);
   const priorityNow = Number(task.priority) || 0;
@@ -3290,6 +3316,55 @@ async function refreshTask(id) {
 }
 
 const urgentPending = new Set();
+const immediatePending = new Set();
+
+function renderTaskImmediateBox(task, box, host = null, detailed = false) {
+  clear(box);
+  const status = String(task.status_str || task.status || "");
+  const enabled = task.immediate === true;
+  const button = el("button", {
+    class: "btn btn-quiet", type: "button",
+    text: `Immediate: ${enabled ? "on" : "off"}${immediatePending.has(task.id) ? " (saving…)" : ""}`,
+    disabled: immediatePending.has(task.id) || !["queued", "held"].includes(status),
+    onclick: () => changeImmediate(task.id, !enabled, host),
+  });
+  setAttr(
+    button,
+    "title",
+    "Owner-only immediate execution dispatches on the next poll even when ordinary and urgent lanes are full, without parking existing workers. No concurrency cap (may increase resource and quota usage); dependencies, holds, disk admission, coordination, resource checks, and merge approvals still apply.",
+  );
+  setAttr(button, "aria-pressed", String(enabled));
+  setAttr(button, "aria-label", `Immediate: ${enabled ? "on" : "off"} for ${task.title || task.id}`);
+  box.append(button);
+  if (detailed) {
+    const note = enabled
+      ? "Immediate has no concurrency cap and may increase CPU, disk, and quota usage; safety gates (dependencies, holds, disk admission, coordination, resource checks, merge approvals) still apply. Turning it off preserves any saved urgent setting."
+      : "Dispatches on the next poll even when ordinary and urgent lanes are full, without parking existing workers. No concurrency cap; safety gates still apply.";
+    box.append(el("p", { class: "hint", text: note }));
+  }
+}
+
+async function changeImmediate(id, immediate, host = null) {
+  if (immediatePending.has(id)) return;
+  immediatePending.add(id);
+  renderQueue();
+  renderTask();
+  try {
+    const saved = await postJson(API.immediate(id), { immediate });
+    if (state.queue) state.queue = state.queue.map((task) => task.id === id ? saved : task);
+    if (state.taskDetail.id === id) state.taskDetail.task = { ...state.taskDetail.task, ...saved };
+    ok();
+    announce(`Task ${shortId(id)} immediate ${saved.immediate ? "enabled" : "disabled"}.`);
+    await refreshTask(id);
+  } catch (error) {
+    const msg = `Could not change immediate for task ${shortId(id)}: ${error.message}`;
+    if (host) host.error(msg); else fail(msg);
+  } finally {
+    immediatePending.delete(id);
+    renderQueue();
+    renderTask();
+  }
+}
 
 function renderTaskUrgentBox(task, box, host = null) {
   clear(box);
@@ -12286,6 +12361,7 @@ function renderTask() {
     if (summary) {
       const status = String(summary.status_str || summary.status || "");
       head.append(chip(status, TASK_STATUS));
+      if (summary.immediate === true) head.append(immediateTag());
       if (summary.urgent === true) head.append(urgentTag());
       setText($("task-h"), summary.title || shortId(summary.id));
       const repoName = typeof summary.repo === "string" ? summary.repo.split(/[\\/]/).filter(Boolean).pop() : "";
@@ -12296,9 +12372,16 @@ function renderTask() {
         summary.solo ? "solo" : "",
       ].filter(Boolean);
       setText($("task-meta"), metaBits.join(" · "));
+      const adm = taskAdmissionSummary(summary);
+      setText($("task-admission"), adm ? adm.label : "");
+      setAttr($("task-admission"), "data-state", adm ? adm.state : null);
+      show($("task-admission"), Boolean(adm));
     } else {
       setText($("task-h"), error ? `Task ${shortId(id || "")} could not be loaded` : "Loading task\u2026");
       setText($("task-meta"), error || "");
+      setText($("task-admission"), "");
+      setAttr($("task-admission"), "data-state", null);
+      show($("task-admission"), false);
     }
     show($("task-why-panel"), false);
     renderTaskBlockers(null, $("task-blockers"));
@@ -12316,6 +12399,7 @@ function renderTask() {
   }
   const status = String(task.status_str || task.status || "");
   head.append(chip(status, TASK_STATUS));
+  if (task.immediate === true) head.append(immediateTag());
   if (task.urgent === true) head.append(urgentTag());
   setText($("task-h"), task.title || shortId(task.id));
   const repoName = typeof task.repo === "string" ? task.repo.split(/[\\/]/).filter(Boolean).pop() : "";
@@ -12335,6 +12419,11 @@ function renderTask() {
   });
   $("task-meta").replaceChildren(...metaKids);
   setAttr($("task-meta"), "title", task.id);
+  const adm = task.admission && task.admission.label ? task.admission : null;
+  const showAdm = Boolean(adm && (task.immediate === true || adm.reservation_lane || adm.blocker));
+  setText($("task-admission"), showAdm ? adm.label : "");
+  setAttr($("task-admission"), "data-state", showAdm ? adm.state : null);
+  show($("task-admission"), showAdm);
 
   const noteBits = [(TASK_STATUS[status] || {}).note,
     status === "blocked" && task.block_reason ? `Dependency reason: ${task.block_reason}` : "",
@@ -12639,7 +12728,7 @@ function renderTaskBlockers(task, box) {
 
 function renderTaskActions(task) {
   renderTaskBlockers(task, $("task-actions-blockers"));
-  const boxes = ["priority", "urgent", "edit", "hold", "done", "delete"].map((k) => $(`task-actions-${k}`));
+  const boxes = ["immediate", "priority", "urgent", "edit", "hold", "done", "delete"].map((k) => $(`task-actions-${k}`));
   if (!task || task.id !== taskSheet.id) {
     taskSheet.id = task ? task.id : null;
     taskSheet.armed = {};
@@ -12657,12 +12746,13 @@ function renderTaskActions(task) {
     closeTaskActions();
     return;
   }
-  const [priorityBox, urgentBox, editBox, holdBox, doneBox, deleteBox] = boxes;
+  const [immediateBox, priorityBox, urgentBox, editBox, holdBox, doneBox, deleteBox] = boxes;
   const host = taskSheetHost(task.id);
   const status = String(task.status_str || task.status || "");
   const running = status === "running";
   const name = task.title || task.id;
 
+  renderTaskImmediateBox(task, immediateBox, host, true);
   renderTaskUrgentBox(task, urgentBox, host);
   clear(priorityBox);
   const now = Number(task.priority) || 0;
