@@ -158,6 +158,15 @@ pub enum Operation {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         evidence_digest: Option<String>,
     },
+    /// Authorize one bounded landing base-sync recovery attempt and queue the existing run.
+    RecoverLandSync {
+        /// Exact retained run ID.
+        run: String,
+        /// Full 40-character HEAD SHA verified on both the retained worktree and open PR.
+        head: String,
+        /// Durable idempotency key; reuse only for identical arguments.
+        request: String,
+    },
     /// 既存 run の再開を queue に登録する。
     Resume {
         /// 完全な run ID。
@@ -307,6 +316,7 @@ pub async fn dispatch(
         &operation,
         Operation::Reassign { .. }
             | Operation::RecoverBase { .. }
+            | Operation::RecoverLandSync { .. }
             | Operation::SyncBaseOnly { .. }
             | Operation::Goal { .. }
             | Operation::Standing { .. }
@@ -624,6 +634,44 @@ async fn execute(
                 )
             }
         }
+        Operation::RecoverLandSync { run, head, request } => {
+            ensure!(
+                matches!(
+                    crate::chat_goal::current_source(),
+                    crate::chat_goal::Source::Input { .. }
+                ),
+                "recover-land-sync requires explicit owner input"
+            );
+            let result = Box::pin(crate::land_sync_recovery_control::recover(
+                queue,
+                home,
+                crate::land_sync_recovery_control::Request {
+                    run,
+                    head,
+                    request,
+                    actor: talk.to_owned(),
+                },
+            ))
+            .await
+            .map_err(|error| {
+                if error.is::<crate::land_sync_recovery_control::BeforeWrite>() {
+                    anyhow::Error::new(BeforeEffect(error))
+                } else {
+                    error
+                }
+            })?;
+            if result.repeated {
+                format!(
+                    "This landing base-sync recovery request was already applied to task {}; inspect its current status before continuing",
+                    result.task.id
+                )
+            } else {
+                format!(
+                    "{}; bounded landing base-sync recovery authorized (1 attempt); the daemon resumes the exact run under its execution lease",
+                    describe(&result.task, "landing sync recovery queued for")
+                )
+            }
+        }
         Operation::Resume { run } => {
             let t = resume(queue, home, &run)?;
             format!(
@@ -837,6 +885,11 @@ fn admit_goal_operation(
         Operation::ReconcileRepairGrant { request } => {
             task_allowed(&request.task)?;
             run_allowed(&request.run)?;
+        }
+        Operation::RecoverLandSync { .. } => {
+            bail!(
+                "automatic goal turns cannot authorize landing base-sync recovery; explicit owner input is required"
+            )
         }
         Operation::Resume { run }
         | Operation::SyncBaseOnly { run }
@@ -2872,5 +2925,104 @@ mod goal_admission_tests {
             .is_err()
         );
         assert_eq!(queue.get(&task.id).unwrap().priority, 3);
+    }
+
+    #[tokio::test]
+    async fn land_sync_recovery_chat_control_requires_explicit_owner_input() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        let queue = Queue::at(home.join("queue"));
+        let talks = Talks::at(home.join("talks"));
+        let repo = home.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let mut config = crate::config::Config::default();
+        config.agents.push(crate::config::AgentSpec {
+            id: "fixture".into(),
+            kind: crate::config::AgentKind::Command,
+            model: None,
+            command: vec!["true".into()],
+            extra_args: vec![],
+            env: Default::default(),
+            prompt_delivery: None,
+            max_turn_secs: None,
+        });
+        let talk = crate::talk::begin(&talks, &config, repo, Some("fixture")).unwrap();
+
+        let make_op = || Operation::RecoverLandSync {
+            run: "20261127-125940-3ce0".into(),
+            head: "a".repeat(40),
+            request: "req-chat-guard".into(),
+        };
+
+        // Automatic turn without owner input must be refused.
+        let err = execute_authenticated(
+            &queue,
+            home,
+            &talks,
+            &talk.id,
+            crate::chat_goal::Source::Automatic,
+            make_op(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("recover-land-sync requires explicit owner input"),
+            "{err:#}"
+        );
+
+        // Standing automatic recovery turn covering a real held task must refuse RecoverLandSync
+        // as outside the standing allowlist.
+        let mut task = crate::queue::Task::new(
+            "held".into(),
+            "held work".into(),
+            home.join("repo"),
+            crate::queue::Source::Agent {
+                run: talk.id.clone(),
+                node: crate::queue::CHAT_NODE.into(),
+            },
+        );
+        task.hold_machine(Some("landing base synchronization budget exhausted".into()));
+        queue.put(&mut task).unwrap();
+        let input: crate::talk::Turn = serde_json::from_value(serde_json::json!({
+            "sender": "magi",
+            "who": "operator",
+            "body": "report",
+            "at": jiff::Timestamp::now(),
+            "messages": [{
+                "sender": "magi",
+                "body": "report",
+                "at": jiff::Timestamp::now(),
+                "attachments": [],
+                "recovery_event": standing::Event::task(&task)
+            }]
+        }))
+        .unwrap();
+        let standing_source = standing::capture(
+            true,
+            home,
+            &talk,
+            Some(&input),
+            crate::chat_goal::Source::Automatic,
+        );
+        let err = execute_authenticated(
+            &queue,
+            home,
+            &talks,
+            &talk.id,
+            standing_source,
+            Operation::Standing {
+                task: task.id.clone(),
+                evidence: "auto".into(),
+                command: Box::new(make_op()),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("outside the standing recovery allowlist"),
+            "{err:#}"
+        );
     }
 }

@@ -1108,6 +1108,67 @@ pub fn run_with_liveness(state: &RunState, liveness: Option<&LivenessAssessment>
         let _ = writeln!(s, "  next: {}", state.base_sync_next_action());
     }
 
+    if state.land_sync_attempts > 0
+        || state.land_sync_recovery.stop.is_some()
+        || !state.land_sync_recovery.authorizations.is_empty()
+    {
+        let _ = writeln!(s, "\n{}", bold("landing base sync"));
+        let status = if state.land_sync_exhausted() {
+            if state.land_sync_recovery_pending() {
+                yellow("exhausted (recovery authorized, pending execution)")
+            } else {
+                red("exhausted")
+            }
+        } else if state.land_sync_pending {
+            yellow("pending")
+        } else {
+            green("ok")
+        };
+        let _ = writeln!(
+            s,
+            "  attempts {}/{}  grants {}/{}  {status}",
+            state.land_sync_attempts,
+            state.land_sync_budget(),
+            state.land_sync_recovery.extra_attempts,
+            crate::land_sync_recovery::MAX_GRANTS
+        );
+        if let Some(stop) = &state.land_sync_recovery.stop {
+            let _ = writeln!(
+                s,
+                "  stop: {} @ head {} (pr #{}, tip {})",
+                stop.detail,
+                short(&stop.head),
+                stop.pr_number,
+                short(&stop.tip)
+            );
+        }
+        if state.land_sync_exhausted()
+            || state
+                .land_sync_recovery
+                .authorizations
+                .last()
+                .is_some_and(|a| a.invalidated.is_some())
+        {
+            let _ = writeln!(s, "  next: {}", state.land_sync_next_action());
+        }
+        for auth in &state.land_sync_recovery.authorizations {
+            let outcome = if let Some(why) = &auth.invalidated {
+                format!("refused ({why})")
+            } else if auth.consumed {
+                "consumed".to_owned()
+            } else {
+                "pending".to_owned()
+            };
+            let _ = writeln!(
+                s,
+                "  grant {}  +{} attempt  head {}  {outcome}",
+                auth.request,
+                auth.granted_attempts,
+                short(&auth.stop.head)
+            );
+        }
+    }
+
     if !state.pre_gate.is_empty() {
         let _ = writeln!(s, "\n{}", bold("pre_gate"));
         for o in &state.pre_gate {

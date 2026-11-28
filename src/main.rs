@@ -867,6 +867,17 @@ enum ControlCmd {
         #[arg(long)]
         evidence_digest: Option<String>,
     },
+    /// Explicitly authorize 1 bounded recovery attempt for exhausted landing base synchronization and queue this run.
+    RecoverLandSync {
+        /// Full retained run ID; must still be its task's latest execution.
+        run: String,
+        /// Unique request ID; repeat the same ID and arguments after interruption.
+        #[arg(long)]
+        request: String,
+        /// Full 40-character HEAD SHA verified on both the retained worktree and open PR.
+        #[arg(long)]
+        head: String,
+    },
     /// Queue a stopped, blocked or parked run (does not recover exhausted base movement).
     Resume {
         /// Full run id.
@@ -4275,6 +4286,43 @@ async fn task_cmd_inner(command: TaskCmd, q: Queue) -> Result<()> {
             );
             // Reopening is also a supported terminal operation. Other controls
             // retain their existing standing-chat authorization.
+            if let ControlCmd::RecoverLandSync { run, request, head } = &op
+                && std::env::var("MAGI_NODE").as_deref() != Ok("chat")
+            {
+                ensure!(
+                    decision.is_none() && standing.standing_task.is_none(),
+                    "--decision and standing authorization require a chat"
+                );
+                ensure!(
+                    std::env::var_os("MAGI_RUN").is_none()
+                        && std::env::var_os("MAGI_NODE").is_none(),
+                    "recover-land-sync requires the operator terminal or authenticated chat control channel"
+                );
+                let result = magi::land_sync_recovery_control::recover(
+                    &q,
+                    &magi::run::home(),
+                    magi::land_sync_recovery_control::Request {
+                        run: run.clone(),
+                        head: head.clone(),
+                        actor: "cli".into(),
+                        request: request.clone(),
+                    },
+                )
+                .await?;
+                if result.repeated {
+                    println!(
+                        "This landing base-sync recovery request was already applied to task {}; inspect its current status before continuing",
+                        result.task.id
+                    );
+                } else {
+                    println!(
+                        "landing sync recovery queued for {} {}; bounded landing base-sync recovery authorized (1 attempt)",
+                        result.task.short(),
+                        result.task.title
+                    );
+                }
+                return Ok(());
+            }
             if let ControlCmd::Reopen { id, reason } = &op
                 && std::env::var("MAGI_NODE").as_deref() != Ok("chat")
             {
@@ -4354,6 +4402,9 @@ async fn task_cmd_inner(command: TaskCmd, q: Queue) -> Result<()> {
                     request,
                     evidence_digest,
                 },
+                ControlCmd::RecoverLandSync { run, head, request } => {
+                    cc::Operation::RecoverLandSync { run, head, request }
+                }
                 ControlCmd::Hold { id, reason } => cc::Operation::Hold {
                     task: id,
                     reason: reason.join(" "),

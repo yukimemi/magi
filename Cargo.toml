@@ -4,7 +4,7 @@
 # publishes as `yui-cli`: the repo, the binary and the library all stay `magi`,
 # only the published package name carries the suffix.
 name = "magi-cli"
-version = "0.266.2"
+version = "0.267.0"
 edition = "2024"
 rust-version = "1.85"
 authors = ["yukimemi <yukimemi@gmail.com>"]
@@ -34,7 +34,7 @@ clap_complete = "4.6.12"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.11.1"
-toml = "1.2.2"
+toml = "1.2.3"
 anyhow = "1.0.105"
 thiserror = "2.0.21"
 tracing = "0.1.44"
