@@ -1799,7 +1799,9 @@ pub fn build_with(
             },
         });
         if let Some(release) = &b.release {
-            let status = if release.finished {
+            let status = if release.abandoned.is_some() {
+                "intentionally abandoned"
+            } else if release.finished {
                 "finished"
             } else {
                 release.failed.as_deref().unwrap_or("unfinished")
@@ -1809,6 +1811,12 @@ pub fn build_with(
                 release.tag(),
                 release.commit
             )];
+            if let Some(id) = &release.abandoned {
+                lines.push(format!("owner decision: {id}"));
+                if let Some(failure) = &release.failed {
+                    lines.push(format!("release failure: {failure}"));
+                }
+            }
             lines.push(format!(
                 "tag on remote: {}; {} command(s) completed",
                 release.tag_done, release.done
@@ -2300,6 +2308,28 @@ mod tests {
                 "release_execution"
             ]
         );
+
+        let release = s.release_bump.as_mut().unwrap().release.as_mut().unwrap();
+        release.abandoned = Some("decision-1".into());
+        let json = serde_json::to_value(build(&s, Liveness::Unknown)).unwrap();
+        let execution = note(&json, "release_execution");
+        assert_eq!(execution["tone"], "warn");
+        assert_eq!(
+            execution["lines"][0],
+            "release v1.2.3 at fedcba9876543210: intentionally abandoned"
+        );
+        assert_eq!(execution["lines"][1], "owner decision: decision-1");
+        assert_eq!(
+            execution["lines"][2],
+            "release failure: registry refused\ntry after approval"
+        );
+        s.release_bump
+            .as_mut()
+            .unwrap()
+            .release
+            .as_mut()
+            .unwrap()
+            .abandoned = None;
 
         let release = s.release_bump.as_mut().unwrap().release.as_mut().unwrap();
         release.failed = None;

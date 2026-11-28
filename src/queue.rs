@@ -4187,6 +4187,26 @@ impl Queue {
         tasks
     }
 
+    /// Scan for a task whose absence is itself evidence. Unlike `list`, a
+    /// failed directory, entry or record read cannot establish absence.
+    pub(crate) fn find_unique_checked(
+        &self,
+        mut matches: impl FnMut(&Task) -> bool,
+    ) -> Result<Option<Task>> {
+        let mut found = None;
+        for entry in std::fs::read_dir(&self.root)? {
+            let path = entry?.path();
+            if path.extension().is_some_and(|ext| ext == "json") {
+                let task = read_path(&path)?;
+                if matches(&task) {
+                    anyhow::ensure!(found.is_none(), "ambiguous task ownership");
+                    found = Some(task);
+                }
+            }
+        }
+        Ok(found)
+    }
+
     /// Task files [`Queue::list`] skips because they cannot be parsed (a
     /// newer schema, a torn write). A guard that looks a task up by scanning
     /// the list must treat any of these as "the task might be there".
