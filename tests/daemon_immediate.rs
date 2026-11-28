@@ -269,6 +269,63 @@ async fn wait_for(mut predicate: impl FnMut() -> bool, what: &str) {
 }
 
 common::e2e! {
+async fn interrupt_rescans_after_first_ordinary_reservation() {
+    let home = home_lock().await;
+    let mut fx = fixture(home, Judges::Unanimous, false);
+    let block = SeatBlock::install(&mut fx, "impl-A", "implement");
+    let mut config = daemon_config(&fx);
+    config.daemon.max_concurrent_runs = 2;
+    config.daemon.pause_for_interrupts = true;
+    let config_path = write_config(fx.tmp.path(), &config);
+    let queue = Queue::open();
+    let ordinary = file_task(&queue, &fx.repo, &config_path, "ordinary", false, false);
+    let mut marked = file_task(&queue, &fx.repo, &config_path, "interrupt", false, false);
+    marked.priority = ordinary.priority - 1;
+    marked.interrupt = true;
+    queue.put(&mut marked).unwrap();
+
+    let magi_home = magi::run::home();
+    let stop = Stop::new();
+    let opts = Opts {
+        repo: fx.repo.clone(),
+        config: Some(config_path),
+        poll: Duration::from_millis(20),
+        merge: Some("none".into()),
+        worktrees_root: Some(fx.tmp.path().join("wt")),
+        ..Opts::default()
+    };
+    let serve = tokio::spawn(daemon::serve_until(opts, stop.clone()));
+    let interrupt_state = magi_home.join("scheduler-interrupt.json");
+    let marked_key = format!("task:{}", marked.id);
+    wait_for(
+        || {
+            interrupt_state.exists()
+                || magi::worker::active(&magi_home)
+                    .unwrap()
+                    .iter()
+                    .any(|job| job.key == marked_key)
+        },
+        "interrupt sequence or premature interrupt dispatch",
+    )
+    .await;
+    assert!(interrupt_state.exists(), "interrupt dispatched without a park sequence");
+    block.release();
+    wait_for(
+        || [&ordinary, &marked].iter().all(|t| queue.get(&t.id).unwrap().status == TaskStatus::Done),
+        "interrupt and resumed ordinary task to finish",
+    )
+    .await;
+    stop.stop();
+    tokio::time::timeout(Duration::from_secs(60), serve)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(queue.get(&ordinary.id).unwrap().runs.len(), 1);
+}
+}
+
+common::e2e! {
 async fn scheduler_restart_preserves_immediate_and_ordinary_lanes_without_duplication() {
     let home = home_lock().await;
     let mut fx = fixture(home, Judges::Unanimous, false);

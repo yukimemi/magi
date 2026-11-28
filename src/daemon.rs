@@ -5308,6 +5308,12 @@ async fn poll(
             permits.extend(permit);
             attempted.push(task.id);
             started = true;
+            // Interrupt transitions depend on the exact in-flight set (in
+            // particular the transition from zero to one worker). Re-scan
+            // before admitting another task, as for ordinary dispatch.
+            if limits.pause_for_interrupts || lane != PermitKind::Immediate {
+                break;
+            }
         }
         if !resync && !stop.stopped() {
             let per_task_skips: std::collections::BTreeMap<String, String> = skips
