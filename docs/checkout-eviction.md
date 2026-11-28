@@ -89,6 +89,42 @@ and both cycles' run/seat observations, even for runs with no evicted seats.
 A global validation error prevents inspection and is distinct from an observed
 seat protection. Do not interpret zero evictions or one bounded pass as a census.
 
+### Finished-run folding on a busy machine
+
+Idle housekeeping (`clean::fold_due`) is admitted only with no busy worker and no
+runnable task, so a queue that is never empty folded nothing (issue 1275: 73 merged
+runs, days past `fold_grace_secs`, on a machine whose housekeeping receipt always
+said "active work or runnable task queue"). The idle gate dates from the first
+janitor ("folding worktrees and pruning a cache mid-build would race the very
+compile"); that concern belongs to the shared-cache prune, orphan reclamation and
+worktree-registration pruning, which stay idle-only. Folding a finished run takes
+the run's owner lock, execution lease, per-worktree output leases and the
+repository coordination lease inside `graph::fold_run`, and `clean::fold_one`
+skips anything a live claim holds, so the `fold` service runs exactly where
+housekeeping does not (`daemon::fold_turn_eligible`), under the same decision
+function as the idle pass (`clean::fold_one`: same grace, resumable, live,
+recovery-source and preservation checks).
+
+One `service:daemon-fold` worker runs per pass (at most every 120 s, never beside a
+housekeeping worker). A pass judges at most 64 run records, starts at most 4 folds
+and starts no further fold after 5 minutes (a started fold finishes); at least one
+run is always judged. It resumes after the run id saved in `<home>/fold-turn-cursor`
+(oldest id first; absent means start over, and the file is removed when a pass
+reaches the end of the history). A fold that waits for repository coordination holds
+only that run's own locks. `source-eviction-fold-{dispatch,worker}.json` carry the
+skip reason, and for a completed pass a `fold` object: run records `inspected` and
+counts `folded`, `nothing_left`, `live`, `resumable`, `within_grace`,
+`recovery_retained`, `proof_incomplete` (startup or candidate preservation
+incomplete), `unreadable` and `failed` (git, filesystem or coordination), the
+`cursor`, why the pass `stopped`, and `cursor_error` if the cursor could not be
+saved (the next pass then repeats the slice). The turn owns no deletion authority of
+its own: it never sweeps retained outputs, copies or orphans.
+
+On a platform without Unix process containment, `retention::sweep` records its
+refusal ("Automatic output reclamation requires Unix process containment") in
+`retention.json` like any pass, and the housekeeping and disk-pressure worker
+receipts carry the report's failures under `retention` (state `retention swept`).
+
 The former timestamp-ordered run-ID continuation could skip seats when records
 moved across the cursor; a budget stop also marked an entire partially visited run
 as passed. Isolated historical fixtures reproduce these progress failures. This

@@ -1306,17 +1306,45 @@ struct Measurement {
     bytes: u64,
 }
 
+/// What a pass records when the platform cannot contain a build's descendants.
+/// Not removable by configuration: deleting outputs without that containment
+/// could race a live compile.
+const UNSUPPORTED_PLATFORM: &str = "Automatic output reclamation requires Unix process containment";
+
 async fn sweep_inner(home: &Path, disk: &crate::config::Disk, now: Timestamp) -> Report {
+    sweep_inner_on(home, disk, now, cfg!(unix)).await
+}
+
+/// Persist the pass report (`retention.json`). A refusal is reported through
+/// the same file as a completed pass, so a platform where reclamation is off
+/// says so instead of leaving no report at all.
+fn save_report(home: &Path, report: &Report) {
+    let store = home.join("retention.json");
+    if let Ok(body) = serde_json::to_vec_pretty(report) {
+        let tmp = home.join("retention.json.tmp");
+        if let Err(e) = std::fs::write(&tmp, body).and_then(|()| std::fs::rename(tmp, store)) {
+            tracing::warn!("retention report could not be saved: {e}");
+        }
+    }
+}
+
+/// [`sweep_inner`] with the platform capability injected, so the refusal is
+/// testable on a platform that has the capability.
+async fn sweep_inner_on(
+    home: &Path,
+    disk: &crate::config::Disk,
+    now: Timestamp,
+    unix_containment: bool,
+) -> Report {
     let mut report = Report {
         checked_at: Some(now),
         limit_bytes: disk.worktree_limit_bytes,
         reclaim_budget_bytes: disk.worktree_reclaim_bytes,
         ..Report::default()
     };
-    if !cfg!(unix) {
-        report
-            .failures
-            .push("Automatic output reclamation requires Unix process containment".into());
+    if !unix_containment {
+        report.failures.push(UNSUPPORTED_PLATFORM.into());
+        save_report(home, &report);
         return report;
     }
     let Ok(_janitor) = OutputLease::lock(&home.join("retention.lock"), true) else {
@@ -1609,13 +1637,7 @@ async fn sweep_inner(home: &Path, disk: &crate::config::Disk, now: Timestamp) ->
             (i128::from(after) - i128::from(before))
                 .clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
         });
-    let store = home.join("retention.json");
-    if let Ok(body) = serde_json::to_vec_pretty(&report) {
-        let tmp = home.join("retention.json.tmp");
-        if let Err(e) = std::fs::write(&tmp, body).and_then(|()| std::fs::rename(tmp, store)) {
-            tracing::warn!("retention report could not be saved: {e}");
-        }
-    }
+    save_report(home, &report);
     tracing::info!(
         measured_bytes = report.measured_bytes,
         freed_bytes = report.freed_bytes,
@@ -7701,5 +7723,37 @@ mod tests {
                     .driver_exited
             );
         }
+    }
+}
+
+/// Platform-independent: these must run on the platform whose refusal they pin.
+#[cfg(test)]
+mod platform_tests {
+    use super::*;
+
+    /// A platform without process containment refuses to reclaim, and says so
+    /// in the persisted report instead of returning before anything is saved
+    /// (which left a Windows operator with no `retention.json` at all).
+    #[tokio::test]
+    async fn a_platform_without_containment_persists_its_refusal() {
+        let home = tempfile::tempdir().unwrap();
+        let report = sweep_inner_on(
+            home.path(),
+            &crate::config::Disk::default(),
+            Timestamp::now(),
+            false,
+        )
+        .await;
+        assert_eq!(report.failures, [UNSUPPORTED_PLATFORM]);
+        assert_eq!(report.freed_bytes, 0);
+        let saved: Report =
+            serde_json::from_slice(&std::fs::read(home.path().join("retention.json")).unwrap())
+                .unwrap();
+        assert_eq!(saved.failures, [UNSUPPORTED_PLATFORM]);
+        assert!(saved.checked_at.is_some());
+        assert!(
+            !home.path().join("retention.lock").exists(),
+            "a refusal takes no lock and touches no output"
+        );
     }
 }

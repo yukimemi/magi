@@ -2166,6 +2166,29 @@ itself keeps the strict check, because *its* callers (`--resume`, the review
 loop, the tally) do recompute against a field's current meaning and must not
 guess at a value an older schema never had a chance to mean correctly.
 
+**Finished runs are folded on a busy machine too (`fold` service).** Idle
+housekeeping was the only caller of `clean::fold_due`, and it is admitted only
+with no busy worker and no runnable task (`daemon::housekeeping_eligible`), so a
+queue that is never empty folded nothing (issue 1275). The idle gate came from
+the first janitor's "folding worktrees and pruning a cache mid-build would race
+the very compile"; that is about the shared-cache prune, `fold_orphaned_worktrees`
+and `worktree_prune`, which stay idle-only. Folding a finished run is protected
+per run (owner lock, execution lease, output leases, repository coordination in
+`graph::fold_run`; a live claim in `clean::fold_one`) and is already done beside
+live runs by `magi fold` and the phone's fold route, so `daemon::fold_turn_eligible`
+admits `service:daemon-fold` exactly where housekeeping is not (never beside a
+housekeeping worker). `clean::fold_one` is the single decision shared with
+`fold_due`; never fork it. A pass is bounded by `clean::BUSY_FOLD_BOUNDS` (64
+records judged, 4 folds, 5 minutes between runs, always at least one judged) and
+continues after the run id in `<home>/fold-turn-cursor` (a plain file like
+`external-merge-cursor`; absent means start over). The receipt
+`source-eviction-fold-worker.json` carries per-outcome counts, the cursor and
+`cursor_error`; see `docs/checkout-eviction.md`. The turn never sweeps retention
+and owns no deletion authority beyond what `fold_run` already has.
+`retention::sweep_inner` persists `retention.json` even when it refuses on a
+platform without Unix containment (`sweep_inner_on` injects the capability for
+the test); do not make that refusal return before `save_report`.
+
 ### Never take a port you did not check
 
 A UI verification fixture was started on **8791** in a temp directory, and that
