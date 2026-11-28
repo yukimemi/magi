@@ -4801,13 +4801,9 @@ fn repos_text(found: &[repos::Repo]) -> String {
 /// Delete a recorded run directory.
 fn run_rm_cmd(id: &str) -> Result<()> {
     let resolved = resolve_id(id)?;
-    let state = RunState::load(&resolved)?;
-    let in_flight =
-        magi::daemon::is_working_on(&magi::run::home(), &resolved, jiff::Timestamp::now());
-    state.ensure_can_delete(in_flight)?;
-    let dir = magi::run::run_dir(&resolved);
-    std::fs::remove_dir_all(&dir)
-        .with_context(|| format!("remove run directory {}", dir.display()))?;
+    // Under the run's owner lock and execution lease, like every writer of the
+    // record: a fold in progress refuses the deletion instead of racing it.
+    magi::clean::delete_run(&magi::run::home(), &resolved, jiff::Timestamp::now())?;
     // The agent that asked died with the run, so an open question would keep
     // asking for a decision nobody can deliver.
     let abandoned = ask::Questions::open().abandon_for_run(

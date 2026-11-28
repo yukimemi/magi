@@ -370,7 +370,14 @@ impl OutputLease {
             };
             // SAFETY: live file descriptor, no retained pointers.
             if unsafe { libc::flock(file.as_raw_fd(), mode | libc::LOCK_NB) } != 0 {
-                return Err(OutputsInUse(path.to_owned()).into());
+                let error = std::io::Error::last_os_error();
+                // Contention is somebody else using the outputs; any other
+                // failure of the lock call (ENOLCK, EINTR, ...) is not.
+                if error.kind() == std::io::ErrorKind::WouldBlock {
+                    return Err(OutputsInUse(path.to_owned()).into());
+                }
+                return Err(error)
+                    .with_context(|| format!("output lease: lock {}", path.display()));
             }
         }
         #[cfg(windows)]
@@ -1305,13 +1312,17 @@ pub(crate) fn cargo_locks(target: &Path) -> Result<Vec<File>> {
 pub(crate) async fn sweep(home: &Path, disk: &crate::config::Disk, now: Timestamp) -> Report {
     let home = home.to_owned();
     let disk = disk.clone();
+    // Asked on the caller's thread: the pass itself runs on a blocking one.
+    let containment = containment_available();
     let runtime = tokio::runtime::Handle::current();
-    tokio::task::spawn_blocking(move || runtime.block_on(sweep_inner(&home, &disk, now)))
-        .await
-        .unwrap_or_else(|e| Report {
-            failures: vec![format!("retention worker failed: {e}")],
-            ..Report::default()
-        })
+    tokio::task::spawn_blocking(move || {
+        runtime.block_on(sweep_inner_on(&home, &disk, now, containment))
+    })
+    .await
+    .unwrap_or_else(|e| Report {
+        failures: vec![format!("retention worker failed: {e}")],
+        ..Report::default()
+    })
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -1325,8 +1336,39 @@ struct Measurement {
 /// could race a live compile.
 const UNSUPPORTED_PLATFORM: &str = "Automatic output reclamation requires Unix process containment";
 
-async fn sweep_inner(home: &Path, disk: &crate::config::Disk, now: Timestamp) -> Report {
-    sweep_inner_on(home, disk, now, cfg!(unix)).await
+/// Whether this platform can contain a build's descendants (Unix process
+/// groups). Tests may turn it off for the calling thread.
+fn containment_available() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = NO_CONTAINMENT.with(std::cell::Cell::get) {
+        return forced;
+    }
+    cfg!(unix)
+}
+
+#[cfg(test)]
+thread_local! {
+    static NO_CONTAINMENT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Makes [`sweep`] behave, for the calling thread, as on a platform without
+/// process containment, until dropped.
+#[cfg(test)]
+pub(crate) struct WithoutContainment;
+
+#[cfg(test)]
+impl WithoutContainment {
+    pub(crate) fn new() -> Self {
+        NO_CONTAINMENT.with(|forced| forced.set(Some(false)));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for WithoutContainment {
+    fn drop(&mut self) {
+        NO_CONTAINMENT.with(|forced| forced.set(None));
+    }
 }
 
 /// Persist the pass report (`retention.json`). A refusal is reported through
@@ -1345,23 +1387,68 @@ fn save_report(home: &Path, report: &Report) {
     }
 }
 
-fn publish_report(home: &Path, report: &Report) -> Result<()> {
+const STAGING_PREFIX: &str = "retention.json.";
+const STAGING_SUFFIX: &str = ".tmp";
+/// A staging file this much older than a publication is the leftover of a
+/// process that died between writing and renaming it.
+const STAGING_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// Remove this report's staging files (including the single shared name earlier
+/// builds used) that were last written more than `max_age` ago. Best effort.
+fn remove_stale_staging(home: &Path, max_age: std::time::Duration) {
+    for entry in std::fs::read_dir(home).into_iter().flatten().flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !(name.starts_with(STAGING_PREFIX) && name.ends_with(STAGING_SUFFIX)) {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|written| written.elapsed().ok())
+            .is_some_and(|age| age > max_age);
+        if stale {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// A new, uniquely named staging file, created exclusively: a name left by a
+/// dead process with the same id is skipped, never written through.
+fn create_staging(home: &Path) -> Result<(PathBuf, std::fs::File)> {
     static STAGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    for _ in 0..64 {
+        let tmp = home.join(format!(
+            "{STAGING_PREFIX}{}-{}{STAGING_SUFFIX}",
+            std::process::id(),
+            STAGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        match OpenOptions::new().write(true).create_new(true).open(&tmp) {
+            Ok(file) => return Ok((tmp, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e).with_context(|| format!("create {}", tmp.display())),
+        }
+    }
+    anyhow::bail!("no unused staging name for the retention report")
+}
+
+fn publish_report(home: &Path, report: &Report) -> Result<()> {
+    use std::io::Write as _;
+    remove_stale_staging(home, STAGING_MAX_AGE);
     let body = serde_json::to_vec_pretty(report)?;
-    let tmp = home.join(format!(
-        "retention.json.{}-{}.tmp",
-        std::process::id(),
-        STAGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
-    let published = std::fs::write(&tmp, body)
-        .and_then(|()| std::fs::rename(&tmp, home.join("retention.json")));
+    let (tmp, mut file) = create_staging(home)?;
+    let published = file.write_all(&body).and_then(|()| {
+        drop(file);
+        std::fs::rename(&tmp, home.join("retention.json"))
+    });
     if published.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
     Ok(published?)
 }
 
-/// [`sweep_inner`] with the platform capability injected, so the refusal is
+/// The pass itself, with the platform capability injected, so the refusal is
 /// testable on a platform that has the capability.
 async fn sweep_inner_on(
     home: &Path,
@@ -7802,17 +7889,24 @@ mod platform_tests {
                 ..Report::default()
             })
             .collect();
+        let published = std::sync::atomic::AtomicUsize::new(0);
         std::thread::scope(|scope| {
             for report in &reports {
                 scope.spawn(|| {
                     for _ in 0..25 {
                         // A rename onto a file another publisher has open may be
                         // refused on some platforms; the report on disk stays whole.
-                        let _ = publish_report(home.path(), report);
+                        if publish_report(home.path(), report).is_ok() {
+                            published.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                     }
                 });
             }
         });
+        assert!(
+            published.load(std::sync::atomic::Ordering::Relaxed) >= reports.len(),
+            "publication must succeed, not only leave a whole file behind"
+        );
         let saved: Report =
             serde_json::from_slice(&std::fs::read(home.path().join("retention.json")).unwrap())
                 .unwrap();
@@ -7824,5 +7918,56 @@ mod platform_tests {
             .filter(|name| name.ends_with(".tmp"))
             .collect();
         assert!(staged.is_empty(), "stray staging files: {staged:?}");
+    }
+
+    /// A staging name a dead process left behind is never written through.
+    #[test]
+    fn staging_files_are_created_exclusively() {
+        let home = tempfile::tempdir().unwrap();
+        let left: Vec<PathBuf> = (0..40)
+            .map(|n| {
+                let path = home.path().join(format!(
+                    "{STAGING_PREFIX}{}-{n}{STAGING_SUFFIX}",
+                    std::process::id()
+                ));
+                std::fs::write(&path, "left by a dead process").unwrap();
+                path
+            })
+            .collect();
+        let (created, file) = create_staging(home.path()).unwrap();
+        drop(file);
+        assert!(!left.contains(&created), "{}", created.display());
+        for path in left {
+            assert_eq!(std::fs::read(path).unwrap(), b"left by a dead process");
+        }
+    }
+
+    /// A staging file of this report that a crash left behind goes at the next
+    /// publication once it is a day old; a recent one (a publisher in flight)
+    /// and files that are not this report's are never touched.
+    #[test]
+    fn publishing_removes_only_stale_staging_files_of_this_report() {
+        let home = tempfile::tempdir().unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 24 * 60 * 60);
+        let write = |name: &str, modified: std::time::SystemTime| {
+            let path = home.path().join(name);
+            let file = std::fs::File::create(&path).unwrap();
+            file.set_modified(modified).unwrap();
+            path
+        };
+        let crashed = write("retention.json.4242-7.tmp", old);
+        let legacy = write("retention.json.tmp", old);
+        let in_flight = write("retention.json.4243-1.tmp", std::time::SystemTime::now());
+        let unrelated = write("something-else.tmp", old);
+        let other = write("retention.json.bak", old);
+
+        publish_report(home.path(), &Report::default()).unwrap();
+
+        assert!(!crashed.exists());
+        assert!(!legacy.exists());
+        assert!(in_flight.exists());
+        assert!(unrelated.exists());
+        assert!(other.exists());
+        assert!(home.path().join("retention.json").is_file());
     }
 }

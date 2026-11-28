@@ -4586,15 +4586,16 @@ async fn run_delete(State(ui): State<Arc<Ui>>, Path(id): Path<String>) -> ApiRes
         blocking(move || {
             let id = resolve_run(&ui.runs, &id)?;
             match read_run(&ui.runs, &id) {
-                Ok(state) => {
-                    let in_flight =
-                        crate::daemon::is_working_on(&ui.home, &id, jiff::Timestamp::now());
-                    state
-                        .ensure_can_delete(in_flight)
-                        .map_err(|e| ApiError::conflict(format!("{e:#}")))?;
-                    let dir = ui.runs.join(&id);
-                    std::fs::remove_dir_all(&dir)
-                        .with_context(|| format!("remove run directory {}", dir.display()))?;
+                Ok(_) => {
+                    // The record's locks and the guards are judged on what is
+                    // read under them (`clean::delete_run`): a fold in progress
+                    // refuses the deletion rather than racing it.
+                    crate::clean::delete_run(&ui.home, &id, jiff::Timestamp::now()).map_err(
+                        |e| match e.downcast_ref::<crate::clean::DeleteRefused>() {
+                            Some(refused) => ApiError::conflict(refused.0.clone()),
+                            None => ApiError::internal(format!("{e:#}")),
+                        },
+                    )?;
                     Ok((id, false))
                 }
                 Err(_) => {

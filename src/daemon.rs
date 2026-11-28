@@ -12181,11 +12181,39 @@ mod tests {
         crate::git::worktree_add_branch(&repo, &active, "magi/active", "main")
             .await
             .unwrap();
+        // The busy worker belongs to the scheduler's own queue and owns a
+        // recorded run of the same repository that is eligible on paper
+        // (finished, past its grace). Its execution lease is held, as a
+        // driving worker holds it.
+        let (owned_id, owned_worktree) = crate::clean::tests::due_run_with_winner_worktree(
+            &home.join("runs"),
+            &worktrees,
+            &repo,
+            "20260801-000000-s002",
+            RunStatus::Superseded,
+        )
+        .await;
+        let owned_run = home.join("runs").join(&owned_id);
+        let owned_record = std::fs::read(owned_run.join("run.json")).unwrap();
         let mut busy = task();
         busy.repo = repo.clone();
         busy.status = TaskStatus::Running;
+        busy.link_run(&owned_id);
         queue.put(&mut busy).unwrap();
-        let _worker = live_task_fixture(&home, &busy.id).unwrap();
+        let worker_lease = crate::worker::running_fixture(
+            &home,
+            &format!("task:{}", busy.id),
+            serde_json::to_value(TaskWorker {
+                opts: Opts::default(),
+                queue: queue.root().to_owned(),
+                task: busy.id.clone(),
+                lane: PermitKind::default(),
+                standalone: true,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let execution = crate::driver::maintenance(&home, &owned_id).unwrap();
         let mut waiting = task();
         waiting.repo = repo.clone();
         queue.put(&mut waiting).unwrap();
@@ -12248,42 +12276,62 @@ mod tests {
             "eligible and cadence due"
         );
         let worker = read("source-eviction-fold-worker.json");
+        assert_eq!(worker["fold"]["records"], 2);
         assert_eq!(worker["fold"]["folded"], 1);
         assert_eq!(worker["fold"]["invoked"], 1);
+        assert_eq!(
+            worker["fold"]["live"], 1,
+            "the busy worker's own run is left alone: {worker}"
+        );
+        // The run the busy worker owns - eligible on paper (finished, past its
+        // grace) - keeps its checkout, its candidate and its record, byte for byte.
+        assert!(owned_worktree.exists());
+        assert_eq!(
+            std::fs::read(owned_run.join("run.json")).unwrap(),
+            owned_record
+        );
+        assert!(
+            !RunState::load_under(&owned_id, &home).unwrap().candidates[0].folded,
+            "the owned run's candidate is not folded"
+        );
         assert_eq!(queue.get(&busy.id).unwrap().status, TaskStatus::Running);
         assert_eq!(queue.get(&waiting.id).unwrap().status, TaskStatus::Queued);
+        drop(execution);
+        drop(worker_lease);
     }
 
-    /// The non-Unix refusal reaches the service receipt through the same
-    /// report `retention.json` carries.
-    #[test]
-    fn a_retention_refusal_is_carried_into_the_service_receipt() {
+    /// On a platform without process containment the disk-pressure service
+    /// refuses to reclaim, and says so in both places an operator looks: the
+    /// persisted retention report and the worker receipt. Driven through the
+    /// service handler itself, so removing either publication fails this test.
+    #[tokio::test]
+    async fn the_disk_pressure_service_reports_a_platform_without_containment() {
         let dir = tempfile::tempdir().unwrap();
-        let report = crate::retention::Report {
-            failures: vec!["Automatic output reclamation requires Unix process containment".into()],
-            ..crate::retention::Report::default()
-        };
-        retention_service_receipt_with(
-            dir.path(),
-            "disk-pressure",
-            "worker",
-            "retention swept",
-            "retention sweep finished",
-            None,
-            retention_summary(&report),
-        );
+        let (opts, queue, _, home, worktrees) = idle_loop(dir.path());
+        let payload = serde_json::to_value(ServiceWorker {
+            opts,
+            queue: queue.root().to_owned(),
+            worktrees_root: worktrees,
+            operation: "disk-pressure".into(),
+        })
+        .unwrap();
+        let _platform = crate::retention::WithoutContainment::new();
+        run_service_worker(&home, payload).await.unwrap();
+
+        let refusal = "Automatic output reclamation requires Unix process containment";
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(home.join("retention.json")).unwrap()).unwrap();
+        assert_eq!(report["failures"], serde_json::json!([refusal]));
         let receipt: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(dir.path().join("source-eviction-disk-pressure-worker.json")).unwrap(),
+            &std::fs::read(home.join("source-eviction-disk-pressure-worker.json")).unwrap(),
         )
         .unwrap();
-        assert_eq!(receipt["retention"]["failure_count"], 1);
-        assert!(
-            receipt["retention"]["failures"][0]
-                .as_str()
-                .unwrap()
-                .contains("Unix process containment")
-        );
         assert_eq!(receipt["outcome"], "retention swept");
+        assert_eq!(receipt["retention"]["failure_count"], 1);
+        assert_eq!(
+            receipt["retention"]["failures"],
+            serde_json::json!([refusal])
+        );
     }
 
     #[tokio::test]

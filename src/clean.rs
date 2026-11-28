@@ -243,8 +243,9 @@ enum FoldOutcome {
     Folded,
     /// `graph::fold_run_when` ran and found nothing left to remove.
     NothingLeft,
-    /// The record itself shows nothing left to fold, so no fold was started
-    /// (only asked for by the busy-time turn; see [`nothing_left`]).
+    /// The run is `settled`: a fold recorded that it found nothing left and
+    /// the bay is confirmed absent, so no fold was started (only the busy-time
+    /// turn asks for this).
     AlreadyFolded,
     /// A live claim, or a held execution/ownership/output lease, protects the run.
     Live,
@@ -257,8 +258,11 @@ enum FoldOutcome {
     /// The proof that nothing is lost is incomplete: startup or candidate
     /// preservation unfinished, or the confirmed-merge source proof.
     ProofIncomplete,
-    /// `run.json` could not be parsed.
+    /// `run.json` could not be parsed, or became unreadable once the fold
+    /// held the run's locks.
     Unreadable,
+    /// The record was deleted while the fold waited for its locks.
+    RecordGone,
     /// `graph::fold_run_when` failed (git, filesystem).
     Failed,
 }
@@ -290,6 +294,8 @@ fn refused(refusal: &crate::graph::FoldRefusal) -> Judged {
             outcome: FoldOutcome::ProofIncomplete,
             note: Some(detail.clone()),
         },
+        FoldRefusal::RecordGone => FoldOutcome::RecordGone.into(),
+        FoldRefusal::Unreadable(_) => FoldOutcome::Unreadable.into(),
     }
 }
 
@@ -345,52 +351,30 @@ fn eligibility(
     ))
 }
 
-/// Does the record already show that `graph::fold_run_when` has nothing left to do?
+/// May the busy-time turn answer a run without starting a fold?
 ///
-/// True when every candidate the fold would process is marked folded, its
-/// worktree is gone and its branch is gone (or was handed to a later run), the
-/// run's worktree bay holds nothing but the winner a non-dropping fold keeps,
-/// and no worktree-config reference is waiting for release. All of it is read
-/// from the record and the filesystem, plus one `git` lookup per candidate; no
-/// lock is taken and nothing is started, so a run that was folded long ago
-/// does not spend the turn's fold budget again every cycle. Any doubt - an
-/// unreadable repository, a leftover directory - answers `false`, which only
-/// means the fold is started and decides for itself.
-async fn nothing_left(state: &RunState, drop_winner: bool) -> bool {
-    if state.enabled_worktree_config && drop_winner {
-        return false;
-    }
-    let winner = state.tally.as_ref().map(|t| t.winner);
-    for candidate in &state.candidates {
-        if Some(candidate.label) == winner && !drop_winner {
-            continue;
-        }
-        if !candidate.folded || candidate.worktree.exists() {
-            return false;
-        }
-        if !state.released_branches.contains(&candidate.branch)
-            && crate::git::branch_exists(&state.repo, &candidate.branch)
-                .await
-                .unwrap_or(true)
-        {
-            return false;
-        }
-    }
-    let kept = winner.filter(|_| !drop_winner).map(|w| format!("cand-{w}"));
-    match std::fs::read_dir(state.worktree_root()) {
-        Ok(entries) => entries
-            .flatten()
-            .all(|e| kept.as_deref().is_some_and(|k| e.file_name() == k)),
-        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
-    }
+/// Only on a fact a fold itself recorded: `graph::fold_run_when` completed under
+/// the run's locks, found nothing left to remove and saw the worktree bay gone
+/// (`RunState::fold_settled_at`), *and* the bay is confirmed absent now -
+/// `bay` is the answer of `Path::try_exists`, so a failing check and a bay that
+/// exists (even an empty one, which a fold removes) both mean "judge normally and
+/// invoke the fold". Nothing is inferred from candidate flags, directory listings
+/// or Git: a stale registration or a leftover branch without a bay is not disk
+/// and is left to the ordinary paths. A pending worktree-config release is work,
+/// so it is not skipped either. This spares a run that was folded long ago the
+/// fold budget every cycle; the idle pass never skips.
+fn settled(state: &RunState, drop_winner: bool, bay: std::io::Result<bool>) -> bool {
+    state.fold_settled_at.is_some()
+        && !(state.enabled_worktree_config && drop_winner)
+        && matches!(bay, Ok(false))
 }
 
 /// Judge one run and, when [`eligibility`] allows it, fold it.
 ///
 /// Shared by the idle janitor ([`fold_due`]) and the bounded busy-time turn
 /// ([`fold_turn`]); neither may decide differently, so the checks live here
-/// and nowhere else. `skip_finished` (the turn only) answers a run with
-/// [`nothing_left`] without starting a fold. `begin_fold` is called right
+/// and nowhere else. `skip_finished` (the turn only) answers a run that is
+/// [`settled`] without starting a fold. `begin_fold` is called right
 /// before `graph::fold_run_when` is entered, whatever it then returns, so the
 /// caller's budget is charged for every invocation, not only for the ones that
 /// removed something.
@@ -446,7 +430,7 @@ async fn fold_one(
             state.schema
         );
     }
-    if skip_finished && nothing_left(&state, drop_winner).await {
+    if skip_finished && settled(&state, drop_winner, state.worktree_root().try_exists()) {
         return FoldOutcome::AlreadyFolded.into();
     }
     // The window a handover can fall into: after the read above, before the
@@ -495,29 +479,41 @@ pub struct FoldBounds {
     pub budget: std::time::Duration,
 }
 
-/// What the scheduler's busy-time turn may do per pass: judging 64 records
-/// costs milliseconds (one `run.json` each, so a 218-run history is four
-/// passes), while one fold can take a minute (git plus deleting gigabytes of
-/// build output) and may wait out repository coordination, so four folds or
-/// five minutes, whichever comes first, bound what one pass holds a run's
-/// ownership locks for.
+/// What the scheduler's busy-time turn may do per pass: judging at most 64
+/// records (a 218-run history is four passes), starting at most four folds and
+/// starting none after five minutes, whichever bound comes first.
+///
+/// The costs are not alike, and none is "milliseconds" in general. Judging a
+/// record reads its `run.json` and asks for a live claim (`daemon.json`, the
+/// worker store); one that is eligible is read in full and its decision
+/// evaluated, which reads the queue for recovery-source retention. Those are
+/// local file reads and are bounded by `inspect`, but their wall time depends
+/// on the disk and on how loaded the machine is, which is why the time budget
+/// also applies to them. A fold can take a minute (Git plus deleting
+/// gigabytes of build output) and may wait out repository coordination, so
+/// the fold bound, not the inspect bound, is what limits how long a pass holds
+/// run ownership locks.
 ///
 /// The inventory (listing `runs/`, sorting the ids) is not bounded by
 /// `inspect`: it costs one directory listing plus one `is_file` per record on
 /// every pass, i.e. O(history) syscalls. It is counted in the pass's elapsed
-/// time and reported (`FoldTurn::records`, `FoldTurn::elapsed_ms`); at the
-/// 218 records of the machine that motivated this it is milliseconds.
+/// time and reported (`FoldTurn::records`, `FoldTurn::elapsed_ms`).
 ///
-/// **The bound on revisiting.** A cycle works through the run ids that existed
-/// when it began (the persisted high-water mark), in id order, and then ends;
-/// the next pass begins a new cycle. With N records at the start of a cycle,
-/// every one of them is judged within `ceil(N / inspect)` passes plus the
-/// passes its fold invocations consume (`ceil(F / fold)` for F invocations,
-/// and one more for each pass the time budget cuts short, which itself began
-/// at least one fold). Runs created during a cycle wait for the next one, so
-/// a history that keeps growing can never postpone the wraparound, and a run
-/// that left its grace period after being judged is folded within the next
-/// cycle: at most one cycle plus one cycle later.
+/// **The bound on revisiting.** A cycle covers the run ids that are not newer
+/// than the persisted high-water mark, the newest id present when it began,
+/// in id order, and then ends; the next pass begins a new cycle. With N records
+/// at the start of a cycle, every one of them is judged within
+/// `ceil(N / inspect)` passes plus the passes its fold invocations consume
+/// (`ceil(F / fold)` for F invocations, and one more for each pass the time
+/// budget cuts short, which itself began at least one fold). Ids start with the
+/// local wall-clock time of creation, so runs created later sort after the mark
+/// and wait for the next cycle: a growing history cannot postpone the
+/// wraparound. Two things can still put a later run inside the range - one
+/// created in the same second as the mark's, or after the clock stepped
+/// backwards - and each such run adds at most its own judgement to the cycle;
+/// there is no cohort list, so that is the whole bound on them. A run that
+/// left its grace period after being judged is folded within the next cycle:
+/// at most one cycle plus one cycle later.
 pub const BUSY_FOLD_BOUNDS: FoldBounds = FoldBounds {
     inspect: 64,
     fold: 4,
@@ -578,8 +574,11 @@ pub struct FoldTurn {
     pub recovery_retained: usize,
     /// Startup, candidate preservation or the confirmed-merge source proof incomplete.
     pub proof_incomplete: usize,
-    /// `run.json` could not be parsed.
+    /// `run.json` could not be parsed, or became unreadable once the run's
+    /// locks were held.
     pub unreadable: usize,
+    /// The record was deleted while the fold waited for its locks.
+    pub record_gone: usize,
     /// `graph::fold_run_when` failed (git, filesystem).
     pub failed: usize,
     /// Run id the next pass continues after; `None`: it starts a new cycle.
@@ -615,6 +614,7 @@ impl FoldTurn {
             recovery_retained: 0,
             proof_incomplete: 0,
             unreadable: 0,
+            record_gone: 0,
             failed: 0,
             cursor: None,
             high_water: None,
@@ -637,6 +637,7 @@ impl FoldTurn {
             FoldOutcome::Retained => self.recovery_retained += 1,
             FoldOutcome::ProofIncomplete => self.proof_incomplete += 1,
             FoldOutcome::Unreadable => self.unreadable += 1,
+            FoldOutcome::RecordGone => self.record_gone += 1,
             FoldOutcome::Failed => self.failed += 1,
         }
         let outcome = match judged.outcome {
@@ -703,17 +704,35 @@ async fn fold_turn_from(
             turn.cycle_restart = Some(format!("cursor file unreadable: {why}"));
             None
         }
-        Saved::Cycle(cycle) => match &cycle.cursor {
-            Some(cursor) if *cursor > cycle.high_water => {
-                turn.cycle_restart = Some("high-water mark is below the cursor".into());
-                None
+        Saved::Cycle(cycle) => {
+            let restart = if !crate::run::is_run_id(&cycle.high_water)
+                || cycle
+                    .cursor
+                    .as_deref()
+                    .is_some_and(|cursor| !crate::run::is_run_id(cursor))
+            {
+                Some("cycle file names an id that is not a run id")
+            } else if ids.last().is_none_or(|newest| cycle.high_water > *newest) {
+                Some("high-water mark is newer than every run")
+            } else {
+                match &cycle.cursor {
+                    Some(cursor) if *cursor > cycle.high_water => {
+                        Some("high-water mark is below the cursor")
+                    }
+                    Some(cursor) if ids.binary_search(cursor).is_err() => {
+                        Some("cursor names a run that no longer exists")
+                    }
+                    _ => None,
+                }
+            };
+            match restart {
+                Some(why) => {
+                    turn.cycle_restart = Some(why.into());
+                    None
+                }
+                None => Some(cycle),
             }
-            Some(cursor) if ids.binary_search(cursor).is_err() => {
-                turn.cycle_restart = Some("cursor names a run that no longer exists".into());
-                None
-            }
-            _ => Some(cycle),
-        },
+        }
     };
     let range = |cycle: &Cycle| {
         let start = cycle
@@ -1191,6 +1210,21 @@ async fn remove_clean_bay(root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// A run's lock is held by somebody: a [`DeleteRefused`] that says so. Any other
+/// failure of the lock call stays what it was.
+fn busy_run(id: &str) -> impl Fn(anyhow::Error) -> anyhow::Error + '_ {
+    move |e| {
+        if crate::graph::held_by_live_owner(&e) {
+            DeleteRefused(format!(
+                "run {id} is being worked on or folded right now ({e:#}); try again later"
+            ))
+            .into()
+        } else {
+            e
+        }
+    }
+}
+
 /// Remove a run that cannot be read: its state directory under `runs` and its
 /// worktree directory under `worktrees_root`.
 ///
@@ -1202,6 +1236,19 @@ pub async fn fold_unreadable(runs: &Path, worktrees_root: &Path, id: &str) -> Re
     let resolved = resolve_id_path(runs, id)?;
     let mut removed = Vec::new();
     let run_dir = runs.join(&resolved);
+    // The two locks every writer of the record takes, held until the directory
+    // is gone: a fold in progress makes this a refusal, not a race.
+    let _locks = if run_dir.is_dir()
+        && let Some(home) = runs.parent()
+    {
+        let busy = busy_run(&resolved);
+        Some((
+            crate::pr_head::owner_lock(home, &resolved).map_err(&busy)?,
+            crate::driver::maintenance(home, &resolved).map_err(&busy)?,
+        ))
+    } else {
+        None
+    };
     let wt = worktrees_root.join(short_of(&resolved));
     if wt.exists() {
         remove_clean_bay(&wt).await?;
@@ -1398,8 +1445,40 @@ fn resolve_id_path(runs: &Path, prefix: &str) -> Result<String> {
 /// Returns `false` without changing anything when a live daemon still claims
 /// the run, or when some active seat has not actually overrun its budget yet
 /// — a run that is merely between waves must never be guessed at.
+///
+/// `state` is only the caller's first look. The record is written under the
+/// run's owner lock and execution lease (the locks `graph::fold_run` and a
+/// handover take), read again once they are held, and the conditions above are
+/// judged on that record; `state` is replaced by it. Saving the caller's copy
+/// would erase a handover (`released_to` / `released_branches`) that landed
+/// after the fold released its own locks. A lock held by somebody else, or a
+/// record that is gone, changes nothing and answers `false`.
 pub fn clear_abandoned_active(state: &mut RunState, home: &Path, now: Timestamp) -> Result<bool> {
-    if crate::daemon::is_working_on(home, &state.id, now) || !state.active_all_overrun(now) {
+    let id = state.id.clone();
+    if !home.join("runs").join(&id).join("run.json").try_exists()? {
+        return Ok(false);
+    }
+    let Some(_owner) = uncontended(crate::pr_head::owner_lock(home, &id))? else {
+        return Ok(false);
+    };
+    let Some(_driver) = uncontended(crate::driver::maintenance(home, &id))? else {
+        return Ok(false);
+    };
+    match RunState::load_under(&id, home) {
+        Ok(fresh) if fresh.id == id => *state = fresh,
+        Err(e)
+            if e.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+            }) =>
+        {
+            return Ok(false);
+        }
+        Ok(_) => return Ok(false),
+        Err(e) => return Err(e),
+    }
+    if crate::daemon::is_working_on(home, &id, now) || !state.active_all_overrun(now) {
         return Ok(false);
     }
     state.abandon("fold");
@@ -1415,6 +1494,58 @@ pub fn clear_abandoned_active(state: &mut RunState, home: &Path, now: Timestamp)
         tracing::warn!("abandon questions for {}: {e:#}", state.id);
     }
     Ok(true)
+}
+
+/// `Some(lock)`, or `None` when somebody else holds it; any other failure of
+/// the lock call stays an error.
+fn uncontended<T>(locked: Result<T>) -> Result<Option<T>> {
+    match locked {
+        Err(e) if crate::graph::held_by_live_owner(&e) => Ok(None),
+        other => other.map(Some),
+    }
+}
+
+/// Why [`delete_run`] left a run record alone: somebody holds the run, it is
+/// not finished with its worktrees, or it is gone. Callers answer a refusal
+/// with a conflict and anything else with a failure.
+#[derive(Debug)]
+pub struct DeleteRefused(pub String);
+
+impl std::fmt::Display for DeleteRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for DeleteRefused {}
+
+/// Delete a run's directory (`magi run rm`, the phone's delete button) under
+/// the protocol every writer of the run record follows.
+///
+/// A fold (`graph::fold_run*`) holds the run's owner lock and execution lease
+/// from the moment it locks the record until it has saved it, and acts on what
+/// it reads once they are held. A deletion that took no part in that let the
+/// record vanish under a fold - which then recreated it from a stale copy - and
+/// let the run's four-character worktree suffix be reserved by a new run while
+/// the fold was still deleting that suffix's directories. So the deletion takes
+/// both locks without waiting (a held lock means the run is busy, and the
+/// answer is a refusal, not a wait), reads the record under them, and judges
+/// [`RunState::ensure_can_delete`] on that read, not on the caller's.
+pub fn delete_run(home: &Path, id: &str, now: Timestamp) -> Result<()> {
+    let dir = home.join("runs").join(id);
+    if !dir.join("run.json").try_exists()? {
+        return Err(DeleteRefused(format!("run {id}: record gone")).into());
+    }
+    let busy = busy_run(id);
+    let _owner = crate::pr_head::owner_lock(home, id).map_err(&busy)?;
+    let _driver = crate::driver::maintenance(home, id).map_err(&busy)?;
+    let state = RunState::load_under(id, home)?;
+    state
+        .ensure_can_delete(crate::daemon::is_working_on(home, id, now))
+        .map_err(|e| DeleteRefused(format!("{e:#}")))?;
+    std::fs::remove_dir_all(&dir)
+        .with_context(|| format!("remove run directory {}", dir.display()))?;
+    Ok(())
 }
 
 /// Delete files from the shared build cache until it fits its cap — but only
@@ -2612,10 +2743,14 @@ pub(crate) mod tests {
                 total: None,
             },
         );
+        // The record is judged as saved, under the run's locks, not as the
+        // caller holds it: so the records are saved first.
+        fresh.save_under(&home).unwrap();
         assert!(!clear_abandoned_active(&mut fresh, &home, now).unwrap());
         assert!(!fresh.active.is_empty());
         assert_eq!(fresh.status, RunStatus::Implementing);
 
+        state.save_under(&home).unwrap();
         let store = Questions::at(home.join("questions"));
         let q = open_question(&store, &state.id);
 
@@ -2626,6 +2761,82 @@ pub(crate) mod tests {
             !store.get(&q.id).unwrap().status.open(),
             "the abandoned seat's own open question must not keep badging the \
              operator until some later daemon startup notices it"
+        );
+    }
+
+    fn overrun_run(now: Timestamp) -> RunState {
+        let mut state = RunState::new(
+            PathBuf::from("/repo"),
+            "main".to_owned(),
+            "abc1234".to_owned(),
+            "fixture".to_owned(),
+            crate::config::Config::default(),
+        );
+        state.status = RunStatus::Implementing;
+        state.active.insert(
+            "impl-A".to_owned(),
+            crate::run::ActiveSeat {
+                node: "implement".to_owned(),
+                started_at: now - SignedDuration::new(21_000, 0),
+                timeout_secs: 3_600,
+                attempt: 0,
+                task: None,
+                command: None,
+                index: None,
+                total: None,
+            },
+        );
+        state
+    }
+
+    /// The cleanup writes the record under the run's locks, from a fresh read:
+    /// a handover that landed after the fold released its own locks is neither
+    /// erased by the caller's copy nor allowed to go unnoticed.
+    #[test]
+    fn clearing_abandoned_seats_keeps_a_handover_that_landed_after_the_fold() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_path_buf();
+        let now = ts("2026-09-14T12:00:00Z");
+        let mut stale = overrun_run(now);
+        stale.save_under(&home).unwrap();
+        let mut handed = RunState::load_under(&stale.id, &home).unwrap();
+        handed.released_to = Some("20260901-000000-succ".to_owned());
+        handed.released_branches.push("magi/branch/A".to_owned());
+        handed.save_under(&home).unwrap();
+
+        assert!(clear_abandoned_active(&mut stale, &home, now).unwrap());
+        let saved = RunState::load_under(&stale.id, &home).unwrap();
+        assert_eq!(saved.released_to.as_deref(), Some("20260901-000000-succ"));
+        assert_eq!(saved.released_branches, ["magi/branch/A"]);
+        assert_eq!(saved.status, RunStatus::Failed);
+        assert!(saved.active.is_empty());
+    }
+
+    /// Held locks and vanished records are "nothing done", never a write.
+    #[test]
+    fn clearing_abandoned_seats_writes_nothing_while_the_run_is_held_or_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_path_buf();
+        let now = ts("2026-09-14T12:00:00Z");
+        let mut state = overrun_run(now);
+        state.save_under(&home).unwrap();
+        let record = home.join("runs").join(&state.id).join("run.json");
+        let before = std::fs::read(&record).unwrap();
+        {
+            let _owner = crate::pr_head::owner_lock(&home, &state.id).unwrap();
+            assert!(!clear_abandoned_active(&mut state, &home, now).unwrap());
+        }
+        {
+            let _lease = crate::driver::maintenance(&home, &state.id).unwrap();
+            assert!(!clear_abandoned_active(&mut state, &home, now).unwrap());
+        }
+        assert_eq!(std::fs::read(&record).unwrap(), before);
+
+        std::fs::remove_dir_all(home.join("runs").join(&state.id)).unwrap();
+        assert!(!clear_abandoned_active(&mut state, &home, now).unwrap());
+        assert!(
+            !home.join("runs").join(&state.id).exists(),
+            "a deleted run is not brought back by its cleanup"
         );
     }
 
@@ -3226,7 +3437,9 @@ pub(crate) mod tests {
                 turn.recovery_retained,
                 turn.failed,
             ),
-            (12, 4, 1, 0, 1, 1, 1, 2, 1, 3, 1, 1),
+            // Run 2 (`Ready`, winner kept) has a bay on disk, so it is not
+            // settled: a fold is invoked and finds nothing to remove.
+            (12, 5, 1, 1, 0, 1, 1, 2, 1, 3, 1, 1),
             "{turn:?}"
         );
         assert_eq!(
@@ -3326,15 +3539,24 @@ pub(crate) mod tests {
         );
         assert_eq!(first.folded + second.folded + third.folded, ids.len());
 
-        // Finished runs do not spend the fold budget again, cycle after cycle:
-        // the whole history is judged in one pass and no fold is started.
-        let fourth = fold_turn(&runs, home, &disk, now, bounds).await;
+        // A fold that removed something has not seen the bay empty yet: the next
+        // cycle's fold finds nothing left and records it (`fold_settled_at`),
+        // so each of these runs spends one more invocation, once.
+        let fourth = fold_turn(&runs, home, &disk, now, NO_BOUNDS).await;
         assert_eq!(
-            (fourth.already_folded, fourth.inspected, fourth.invoked),
-            (5, 5, 0),
+            (fourth.nothing_left, fourth.already_folded, fourth.invoked),
+            (5, 0, 5),
             "{fourth:?}"
         );
-        assert_eq!(fourth.stopped, FoldStop::EndOfCycle);
+        // Then the whole history is judged in one pass and no fold is started:
+        // the fact a fold recorded and a bay confirmed absent are the whole proof.
+        let fifth = fold_turn(&runs, home, &disk, now, bounds).await;
+        assert_eq!(
+            (fifth.already_folded, fifth.inspected, fifth.invoked),
+            (5, 5, 0),
+            "{fifth:?}"
+        );
+        assert_eq!(fifth.stopped, FoldStop::EndOfCycle);
     }
 
     #[tokio::test]
@@ -3426,10 +3648,18 @@ pub(crate) mod tests {
             ),
             (
                 "no longer exists",
-                Some(saved("20260801-000000-r0035", &ids[4])),
+                Some(saved("20260801-000000-q999", &ids[4])),
             ),
             ("below the cursor", Some(saved(&ids[3], &ids[1]))),
             ("nothing left", Some(saved(&ids[4], &ids[4]))),
+            // Ids that cannot be run ids, and a mark newer than every run:
+            // with the latter, arrivals would never end the cycle.
+            ("not a run id", Some(saved("nonsense", &ids[4]))),
+            ("not a run id", Some(saved(&ids[1], "zzzz"))),
+            (
+                "newer than every run",
+                Some(saved(&ids[1], "20260801-000000-zzzz")),
+            ),
             ("unreadable", None), // a directory where the file belongs
         ];
         for (reason, body) in cases {
@@ -3843,6 +4073,7 @@ pub(crate) mod tests {
             "recovery_retained",
             "proof_incomplete",
             "unreadable",
+            "record_gone",
             "failed",
         ] {
             assert_eq!(fold[zero], 0, "{zero}");
@@ -3854,5 +4085,332 @@ pub(crate) mod tests {
         assert!(fold["cycle_restart"].is_null());
         assert!(fold["elapsed_ms"].is_u64());
         assert_eq!(fold["notes"], serde_json::json!([]));
+    }
+
+    /// One pass, no bounds, from the home's own cycle file's absence.
+    async fn one_pass(home: &Path, now: Timestamp) -> FoldTurn {
+        pass_from(
+            &home.join("runs"),
+            home,
+            &Disk::default(),
+            now,
+            Saved::Absent,
+            NO_BOUNDS,
+        )
+        .await
+    }
+
+    /// A due `Superseded` run with a winner worktree under `home`, plus its repo.
+    async fn due_superseded(home: &Path, id: &str) -> (PathBuf, PathBuf) {
+        let repo = home.join("repo");
+        if !repo.exists() {
+            std::fs::create_dir_all(&repo).unwrap();
+            init_repo(&repo);
+        }
+        let (_, worktree) = due_run_with_winner_worktree(
+            &home.join("runs"),
+            &home.join("wt"),
+            &repo,
+            id,
+            RunStatus::Superseded,
+        )
+        .await;
+        (repo, worktree)
+    }
+
+    /// What a fold itself found is what lets the turn skip a run: nothing left
+    /// and no bay, recorded under its locks, and the bay confirmed absent now.
+    #[tokio::test]
+    async fn a_fold_that_finds_nothing_marks_the_run_and_the_turn_then_skips_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let id = "20260801-000000-z001";
+        let (_, worktree) = due_superseded(home, id).await;
+        let now = well_after_every_fold();
+
+        let first = one_pass(home, now).await;
+        assert_eq!((first.folded, first.invoked), (1, 1), "{first:?}");
+        assert!(!worktree.exists());
+        assert!(
+            run_json(home, id).fold_settled_at.is_none(),
+            "a fold that removed something has not yet seen the bay empty"
+        );
+
+        let second = one_pass(home, now).await;
+        assert_eq!((second.nothing_left, second.invoked), (1, 1), "{second:?}");
+        assert!(run_json(home, id).fold_settled_at.is_some());
+
+        let record = home.join("runs").join(id).join("run.json");
+        let before = std::fs::read(&record).unwrap();
+        let third = one_pass(home, now).await;
+        assert_eq!(
+            (third.already_folded, third.invoked, third.nothing_left),
+            (1, 0, 0),
+            "{third:?}"
+        );
+        assert_eq!(std::fs::read(&record).unwrap(), before, "no fold, no save");
+    }
+
+    /// An existing bay - even an empty one - is not "gone": the fold is invoked,
+    /// removes it and records what it saw.
+    #[tokio::test]
+    async fn an_empty_bay_is_work_and_a_marked_run_with_work_is_folded() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let id = "20260801-000000-z002";
+        let (_, worktree) = due_superseded(home, id).await;
+        let now = well_after_every_fold();
+        one_pass(home, now).await;
+        one_pass(home, now).await;
+        let bay = run_json(home, id).worktree_root();
+        assert!(run_json(home, id).fold_settled_at.is_some());
+        assert!(!bay.exists());
+
+        std::fs::create_dir_all(&bay).unwrap();
+        let pass = one_pass(home, now).await;
+        assert_eq!((pass.invoked, pass.already_folded), (1, 0), "{pass:?}");
+        assert!(!bay.exists(), "the fold removed the empty bay");
+        assert!(run_json(home, id).fold_settled_at.is_some());
+
+        // Work behind a mark: a bay that holds a worktree again. The fold that
+        // removes it clears the mark in the same save.
+        std::fs::create_dir_all(worktree.parent().unwrap()).unwrap();
+        crate::git::worktree_add_branch(&home.join("repo"), &worktree, "magi/z002-again", "main")
+            .await
+            .unwrap();
+        let pass = one_pass(home, now).await;
+        assert_eq!((pass.invoked, pass.already_folded), (1, 0), "{pass:?}");
+        assert!(!worktree.exists());
+        assert!(
+            run_json(home, id).fold_settled_at.is_none(),
+            "a fold that found work clears the mark"
+        );
+    }
+
+    #[test]
+    fn settled_needs_the_mark_and_a_bay_confirmed_absent() {
+        let mut state = RunState::new(
+            PathBuf::from("/repo"),
+            "main".to_owned(),
+            "abc".to_owned(),
+            "fixture".to_owned(),
+            crate::config::Config::default(),
+        );
+        assert!(!settled(&state, true, Ok(false)), "no mark: unknown");
+        state.fold_settled_at = Some(Timestamp::now());
+        assert!(settled(&state, true, Ok(false)));
+        assert!(!settled(&state, true, Ok(true)), "a bay on disk is work");
+        let failed = Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        assert!(!settled(&state, true, failed), "an unanswered check is not");
+        state.enabled_worktree_config = true;
+        assert!(
+            !settled(&state, true, Ok(false)),
+            "a pending worktree-config release is work"
+        );
+        assert!(settled(&state, false, Ok(false)));
+    }
+
+    /// A run deleted between the first read and the fold's locks is refused and
+    /// nothing of it is brought back: no record, no directory, no lock files.
+    #[tokio::test]
+    async fn a_run_deleted_after_the_first_read_is_refused_and_not_recreated() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let id = "20260801-000000-z003";
+        let (repo, worktree) = due_superseded(home, id).await;
+        AFTER_FIRST_READ.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|home: &Path, id: &str| {
+                std::fs::remove_dir_all(home.join("runs").join(id)).unwrap();
+            }));
+        });
+
+        let turn = one_pass(home, well_after_every_fold()).await;
+        assert_eq!(
+            (turn.invoked, turn.record_gone, turn.folded, turn.failed),
+            (1, 1, 0, 0),
+            "{turn:?}"
+        );
+        assert!(
+            !home.join("runs").join(id).exists(),
+            "the fold recreated what was deleted"
+        );
+        assert!(worktree.exists(), "nothing of a deleted run is folded");
+        assert!(
+            crate::git::branch_exists(&repo, &format!("magi/{id}/A"))
+                .await
+                .unwrap()
+        );
+    }
+
+    /// A record readable at the first look and not under the locks is
+    /// `unreadable` - the idle pass counts it like any unreadable record - and
+    /// is left exactly as found.
+    #[tokio::test]
+    async fn a_record_that_became_unreadable_under_the_locks_is_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let id = "20260801-000000-z004";
+        let (_, worktree) = due_superseded(home, id).await;
+        AFTER_FIRST_READ.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(|home: &Path, id: &str| {
+                std::fs::write(home.join("runs").join(id).join("run.json"), "{ not json").unwrap();
+            }));
+        });
+        let (folded, unreadable) = fold_due(
+            &home.join("runs"),
+            home,
+            &home.join("wt"),
+            &Disk::default(),
+            well_after_every_fold(),
+        )
+        .await
+        .unwrap();
+        assert_eq!((folded, unreadable), (0, 1));
+        assert!(worktree.exists());
+        assert_eq!(
+            std::fs::read(home.join("runs").join(id).join("run.json")).unwrap(),
+            b"{ not json"
+        );
+    }
+
+    /// Explicit callers keep the migrating loader: a schema-14 record whose
+    /// unfolded candidate is empty and unverified gets its legacy preservation
+    /// marker from the migration, and the explicit fold refuses on that fresh
+    /// record. The tolerant read housekeeping uses never derives the marker.
+    #[tokio::test]
+    async fn an_explicit_fold_applies_the_migration_its_preservation_check_rests_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let id = "20260801-000000-z005";
+        let (_, worktree) = due_superseded(home, id).await;
+        edit_run(&home.join("runs"), id, |v| {
+            v["schema"] = 14.into();
+            v["candidates"][0]["empty"] = true.into();
+        });
+        let record = home.join("runs").join(id).join("run.json");
+        let before = std::fs::read(&record).unwrap();
+
+        let mut first_look = read_state(&home.join("runs"), id).unwrap();
+        assert!(first_look.candidate_preservation.is_empty());
+        let error = crate::graph::fold_run(&mut first_look, true, home)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error.downcast_ref::<crate::graph::FoldRefusal>(),
+                Some(crate::graph::FoldRefusal::ProofIncomplete(_))
+            ),
+            "{error:#}"
+        );
+        assert!(worktree.exists());
+        assert_eq!(std::fs::read(&record).unwrap(), before, "nothing was saved");
+
+        let turn = one_pass(home, well_after_every_fold()).await;
+        assert_eq!(
+            turn.folded, 1,
+            "housekeeping reads the record as saved: {turn:?}"
+        );
+        assert!(!worktree.exists());
+    }
+
+    /// Only contention is "somebody holds it"; any other failure of a lock call
+    /// is a real failure.
+    #[test]
+    fn only_lock_contention_means_a_live_owner() {
+        use crate::graph::held_by_live_owner;
+        let io = |kind| anyhow::Error::from(std::io::Error::from(kind));
+        assert!(held_by_live_owner(&io(std::io::ErrorKind::WouldBlock)));
+        assert!(held_by_live_owner(
+            &io(std::io::ErrorKind::WouldBlock).context("run execution lease unavailable")
+        ));
+        assert!(!held_by_live_owner(&io(std::io::ErrorKind::Interrupted)));
+        assert!(!held_by_live_owner(
+            &anyhow::Error::msg("ENOLCK").context("output lease: lock")
+        ));
+        assert!(!held_by_live_owner(&io(
+            std::io::ErrorKind::PermissionDenied
+        )));
+        let held = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(held.path().join("wt")).unwrap();
+        let lock = held.path().join("magi-output.lock");
+        let _first = crate::retention::OutputLease::lock(&lock, true).unwrap();
+        let error = crate::retention::OutputLease::lock(&lock, true)
+            .err()
+            .unwrap();
+        assert!(held_by_live_owner(&error), "{error:#}");
+    }
+
+    /// Deleting a run record takes the fold's locks: a held lock is a refusal,
+    /// never a record vanishing under a fold.
+    #[tokio::test]
+    async fn deleting_a_run_is_refused_while_a_fold_holds_it_and_leaves_no_trace_when_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let now = Timestamp::now();
+        let refused = |result: Result<()>| -> String {
+            let error = result.unwrap_err();
+            error
+                .downcast_ref::<DeleteRefused>()
+                .unwrap_or_else(|| panic!("not a refusal: {error:#}"))
+                .0
+                .clone()
+        };
+        let id = "20260801-000000-z006";
+        let mut state = RunState::new(
+            PathBuf::from("/repo"),
+            "main".to_owned(),
+            "abc".to_owned(),
+            "fixture".to_owned(),
+            crate::config::Config::default(),
+        );
+        state.id = id.to_owned();
+        state.status = RunStatus::Failed;
+        state.save_under(home).unwrap();
+        let run_dir = home.join("runs").join(id);
+
+        {
+            let _owner = crate::pr_head::owner_lock(home, id).unwrap();
+            assert!(refused(delete_run(home, id, now)).contains("try again later"));
+        }
+        {
+            let _lease = crate::driver::maintenance(home, id).unwrap();
+            assert!(refused(delete_run(home, id, now)).contains("try again later"));
+        }
+        assert!(run_dir.join("run.json").is_file());
+
+        delete_run(home, id, now).unwrap();
+        assert!(!run_dir.exists());
+        assert!(refused(delete_run(home, id, now)).contains("record gone"));
+        assert!(
+            !run_dir.exists(),
+            "refusing must not recreate the directory"
+        );
+
+        // The guard on unfolded candidates is judged on the record read under the locks.
+        let unfolded = "20260801-000000-z007";
+        let (_, worktree) = due_superseded(home, unfolded).await;
+        assert!(refused(delete_run(home, unfolded, now)).contains("magi fold"));
+        assert!(worktree.exists());
+        assert!(home.join("runs").join(unfolded).join("run.json").is_file());
+    }
+
+    /// The wholesale removal of an unreadable run takes the same two locks.
+    #[tokio::test]
+    async fn an_unreadable_run_is_not_removed_while_a_fold_holds_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let runs = home.join("runs");
+        let wt = home.join("wt");
+        let id = "20260801-000000-z008";
+        write_meta(&runs, id, "failed", "2026-08-01T00:00:00Z");
+        {
+            let _lease = crate::driver::maintenance(home, id).unwrap();
+            let error = fold_unreadable(&runs, &wt, id).await.unwrap_err();
+            assert!(error.is::<DeleteRefused>(), "{error:#}");
+            assert!(runs.join(id).join("run.json").is_file());
+        }
+        let removed = fold_unreadable(&runs, &wt, id).await.unwrap();
+        assert_eq!(removed, [format!("runs/{id}")]);
+        assert!(!runs.join(id).exists());
     }
 }

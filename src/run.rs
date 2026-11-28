@@ -2965,6 +2965,16 @@ pub struct RunState {
     /// fold must leave them alone.
     #[serde(default)]
     pub released_branches: Vec<String>,
+    /// A fold completed under the run's locks, found nothing left to remove,
+    /// and the run's worktree bay was gone: this much was true then, and it is
+    /// what the busy-time fold turn (`clean::fold_turn`) may rely on to skip the
+    /// run without starting a fold - only together with a confirmed-absent bay
+    /// (`Path::try_exists` returned `Ok(false)`). Absent means unknown, which is
+    /// every record written before this field existed. A fold that finds work
+    /// to do clears it in the same save. Not about branches or Git
+    /// registrations: those are not disk and are left to the ordinary paths.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fold_settled_at: Option<Timestamp>,
     /// Turns whose Git/artifact preservation is not confirmed. A resume retries
     /// persistence before deciding whether an interrupted turn needs execution.
     #[serde(default)]
@@ -3375,6 +3385,7 @@ impl RunState {
             resource_block: None,
             released_to: None,
             released_branches: Vec::new(),
+            fold_settled_at: None,
             candidate_preservation: BTreeMap::new(),
             interrupted_implementations: BTreeSet::new(),
             seeds: Vec::new(),

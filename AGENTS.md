@@ -2179,60 +2179,99 @@ beside live runs by `magi fold` and the phone's fold route, so
 `daemon::fold_turn_eligible` admits `service:daemon-fold` exactly where
 housekeeping is not (never beside a housekeeping worker).
 
-- **One decision, asked on the record under the locks.** `clean::fold_one` /
-  `clean::eligibility` are shared with `fold_due`; never fork them. `graph::fold_run*`
-  reloads the run record (`RunState::load_tolerant_under`: no schema check, like
-  `fold_due`) *after* it holds the owner lock and the execution lease and acts on
-  that record only - deletion decisions, `released_branches`, what is saved. The
-  automatic callers re-ask `eligibility` on it; a run no longer eligible is left
-  alone. A handover (`handover::release`) records `released_to` /
+- **A fold needs the record it locked.** `clean::fold_one` / `clean::eligibility`
+  are shared with `fold_due`; never fork them. `graph::fold_run*` reloads the run
+  record *after* it holds the owner lock and the execution lease and acts on that
+  record only - deletion decisions, `released_branches`, what is saved. There is
+  **no fallback to the caller's earlier read**: the reload must succeed and carry
+  the locked id, or the fold refuses (`FoldRefusal::RecordGone` for a missing or
+  foreign record - the fold's own lock files and directory are removed again -,
+  `FoldRefusal::Unreadable` for a record that parses no more) and touches nothing.
+  The record is checked to exist before any lock file is created, so a deleted run
+  is never brought back. Tests that fold a synthetic record save it first. The
+  loader is the caller's: `fold_run_when` (idle pass, busy turn) uses
+  `RunState::load_tolerant_under` (no schema check, like `fold_due`); `fold_run` and
+  `fold_run_overriding_recovery_retention` (`magi fold`, the phone route) use the
+  migrating `RunState::load_under`, followed by the same preservation checks on that
+  fresh record. The automatic callers re-ask `eligibility` on it; a run no longer
+  eligible is left alone. A handover (`handover::release`) records `released_to` /
   `released_branches` under the owner lock and keeps the branch; a fold on the
-  earlier read would delete the handed-over branch and save the stale record
-  over the handover. Explicit callers (`magi fold`, the phone route) get the
-  same reload; a record that was never saved is used as given.
+  earlier read would delete the handed-over branch and save the stale record over
+  the handover.
+- **Everything that writes the record takes the same two locks.** Deleting a run
+  (`magi run rm`, the phone's delete button) is `clean::delete_run`: owner lock and
+  execution lease without waiting (a held lock is `clean::DeleteRefused`, "try again
+  later"), the record read under them, `ensure_can_delete` judged on it. So a record
+  cannot vanish under a fold, and its four-character worktree suffix cannot be
+  reserved again while the fold deletes that suffix's directories. The abandoned-seat
+  cleanup of `magi fold` / the phone (`clean::clear_abandoned_active`) writes under
+  the locks too, from a fresh read, and answers `false` for a held lock or a missing
+  record; saving the caller's copy after the fold released its locks erased a
+  handover.
 - **Typed refusals.** `graph::FoldRefusal` (`Live`, `Resumable`, `WithinGrace`,
-  `Retained`, `ProofIncomplete`) travels in the `anyhow::Error`; `clean` maps it to
-  the receipt without changing what is deleted. A lock or lease held by a live
-  owner (owner lock, execution lease, `retention::OutputsInUse`, a Cargo build,
-  repository coordination) is `Live` wherever it is met. Any other failure of the
-  confirmed-merge source proof (`verify_merged_fold_sources`: Cargo residue,
-  Git checkpoints, the fetched base) is `ProofIncomplete` by what that stage is
-  for; `failed` is left for the deletion itself (git, filesystem).
+  `Retained`, `ProofIncomplete`, `RecordGone`, `Unreadable`) travels in the
+  `anyhow::Error`; `clean` maps it to the receipt without changing what is deleted.
+  `Live` is **only contention**: a lock held by somebody (would-block, Windows
+  lock violation, `retention::OutputsInUse`, repository coordination). Any other OS
+  error from a lock call (`ENOLCK`, `EINTR`, a permission error) is `failed` with its
+  text. Any other failure of the confirmed-merge source proof
+  (`verify_merged_fold_sources`: Cargo residue, Git checkpoints, the fetched base)
+  is `ProofIncomplete` by what that stage is for; `failed` is left for the deletion
+  itself (git, filesystem). A record readable at the first look and not under the
+  locks is `unreadable` and counts in the idle pass's unreadable counter.
 - **A cycle covers a fixed range.** A pass works through `(cursor, high_water]` of
   `<home>/fold-turn-cursor` (JSON `{cursor, high_water}`; `high_water` is the last
   run id when the cycle began, absent file = no cycle) and the pass that finds the
   range exhausted removes the file, so the next pass begins a new cycle with a new
-  high-water mark. Runs created during a cycle wait for the next one: a growing
-  history cannot postpone the wraparound. A cycle over N records takes at most
+  high-water mark. A cycle over N records at its start takes at most
   `ceil(N / inspect)` passes plus the passes its fold invocations consume
   (`ceil(F / fold)`, plus one per pass the time budget cut short), and a run that
-  left its grace after being judged is folded within the next cycle. An
-  unreadable file, a cursor naming a vanished run, a high-water mark below the
-  cursor or an empty range starts a clean cycle and says why (`cycle_restart`).
+  left its grace after being judged is folded within the next cycle. The bound is
+  as honest as the ids: they start with local wall-clock time, so runs created
+  after the mark sort after it and wait, while a run created in the same second as
+  the mark, or after a backwards clock step, may join the current cycle (each adds
+  at most its own judgement; no cohort list is kept on purpose). A cycle file that
+  is unreadable, names an id that is not a run id, has a `high_water` newer than
+  every run, a `high_water` below the cursor, a cursor naming a vanished run, or an
+  empty range starts a clean cycle and says why (`cycle_restart`).
 - **Bounds.** `clean::BUSY_FOLD_BOUNDS`: 64 records judged, 4 `fold_run_when`
   invocations, 5 minutes between runs, always at least one judged. The fold budget
-  is charged when an invocation begins, whatever it returns. A run whose record
-  already shows nothing left (`clean::nothing_left`: candidates folded, worktrees
-  and branches gone, bay empty) is answered without a fold and without budget
-  (`already_folded`), so finished runs do not consume it cycle after cycle. The
-  inventory of `runs/` is O(history) per pass and counted in `elapsed_ms`.
+  is charged when an invocation begins, whatever it returns. The inventory of
+  `runs/` is O(history) per pass and counted in `elapsed_ms`; judging a record
+  reads files whose cost depends on the disk, which is why the time budget covers
+  judging as well as folding.
+- **A run is skipped on a fact a fold recorded, never on an inference.**
+  `RunState::fold_settled_at` (`#[serde(default)]`, absent = unknown;
+  `run::SCHEMA` unchanged) is written in the fold's own locked save when it found
+  nothing left to remove **and** the run's worktree bay was gone (`try_exists` was
+  `Ok(false)`); a fold that finds work clears it in the same save. The busy turn
+  (`clean::settled`, counted `already_folded`, no fold, no budget) skips a run only
+  when the mark is present and the bay is confirmed absent *now* by a fallible
+  check: an error, or a bay that exists even empty, means the fold is invoked. A
+  stale Git registration or a branch without a bay is not disk and is left to the
+  ordinary paths. Nothing infers "nothing left" from candidate flags, directory
+  listings or Git; the idle `fold_due` never skips.
 - **Receipt.** `source-eviction-fold-worker.json` carries per-outcome counts
   (`folded`, `nothing_left`, `already_folded`, `live`, `resumable`, `within_grace`,
-  `recovery_retained`, `proof_incomplete`, `unreadable`, `failed`), `records`,
-  `inspected`, `invoked`, `cursor`, `high_water`, `stopped`, `cycle_restart`,
-  `cursor_error`, `elapsed_ms` and `notes` (the text of up to 8 `proof_incomplete`
-  / `failed` runs, scrubbed, 300 chars). A skipped dispatch says why in
-  `source-eviction-fold-dispatch.json`, an unreadable startup configuration
-  included. Test seam: `daemon::launch_service` runs the worker inline under
-  `cfg(test)`; `clean::tests::AFTER_FIRST_READ` runs a closure between the first
-  read and the locks.
+  `recovery_retained`, `proof_incomplete`, `unreadable`, `record_gone`, `failed`),
+  `records`, `inspected`, `invoked`, `cursor`, `high_water`, `stopped`,
+  `cycle_restart`, `cursor_error`, `elapsed_ms` and `notes` (the text of up to 8
+  `proof_incomplete` / `failed` runs, scrubbed, 300 chars). A skipped dispatch says
+  why in `source-eviction-fold-dispatch.json`, an unreadable startup configuration
+  included. Test seams: `daemon::launch_service` runs the worker inline under
+  `cfg(test)`; `clean::tests::AFTER_FIRST_READ` and `graph::BEFORE_LOCKS` run a
+  closure between a look at the record and the locks;
+  `retention::WithoutContainment` makes `sweep` refuse as on a platform without
+  Unix containment.
 
 The turn never sweeps retention and owns no deletion authority beyond what
-`fold_run` already has. `retention::sweep_inner` persists `retention.json` even
-when it refuses on a platform without Unix containment (`sweep_inner_on` injects
-the capability for the test); do not make that refusal return before
-`save_report`. `save_report` stages into a uniquely named file and renames, since
-the refusal path takes no `retention.lock` and two passes may publish at once.
+`fold_run` already has. `retention::sweep` persists `retention.json` even when it
+refuses on a platform without Unix containment (`sweep_inner_on` takes the
+capability); do not make that refusal return before `save_report`. `save_report`
+stages into a uniquely named file created exclusively and renames it, since the
+refusal path takes no `retention.lock` and two passes may publish at once; a
+staging file of this report (`retention.json.*.tmp`) older than a day is removed
+when a report is published.
 
 ### Never take a port you did not check
 
