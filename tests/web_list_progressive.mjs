@@ -6,16 +6,18 @@ const source = readFileSync(new URL('../assets/ui/app.js', import.meta.url), 'ut
 const loading = source.slice(source.indexOf('const storeReads ='), source.indexOf('function loadRuns('));
 const ordering = source.slice(source.indexOf('const priorityOrder ='), source.indexOf('function priorityEdits('));
 const flush = () => new Promise(resolve => setImmediate(resolve));
-function harness(existing = null) {
+function harness(existing = null, name = 'queue') {
   const requests = [], renders = [], notices = [];
-  const state = { queue: existing, talks: null, rev: {}, talkWaits: new Map() };
+  const state = { queue: null, talks: null, [name]: existing, rev: {}, talkWaits: new Map() };
+  const get = url => new Promise((resolve, reject) => requests.push({ url, resolve, reject }));
   const api = runInNewContext(`${ordering}\n${loading}\n({loadStore})`, {
-    state, getJson: url => new Promise((resolve, reject) => requests.push({ url, resolve, reject })),
-    sectionNotice: (...args) => notices.push(args), ok() {},
+    state, getJson: get, getTalkRows: get, talksNext: null, olderTalksRead: null,
+    sortTalks: rows => rows.sort((a, b) => b.id.localeCompare(a.id)),
+    sectionNotice: (...args) => notices.push(args), ok() {}, showOlderTalks() {},
     setTimeout: () => 1, clearTimeout() {},
   });
-  const load = change => api.loadStore('queue', '/api/queue', change, (rows, partial) => {
-    state.queue = rows;
+  const load = change => api.loadStore(name, `/api/${name}`, change, (rows, partial) => {
+    state[name] = rows;
     renders.push({ rows: structuredClone(rows), partial });
   });
   return { state, requests, renders, notices, load };
@@ -106,6 +108,37 @@ test('a pending whole status refresh survives a later transcript delta', async (
   await done;
   assert.equal(h.state.queue.find(r => r.id === 'unchanged').priority, 3);
   assert.equal(h.state.rev.queue, 3);
+});
+
+test('owner filter discovers legacy closed goals through later pages, normal list stays paginated', async () => {
+  const h = harness(null, 'talks');
+  const first = { id: 'new', chat_status: { kind: 'idle' } };
+  const old = { id: 'old', chat_status: { kind: 'needs_owner' } };
+  const initial = h.load();
+  h.requests[0].resolve({ rows: [first], next: 'history' });
+  await initial;
+  assert.equal(h.requests.length, 1);
+  h.state.talksOwnerOnly = true;
+  const filtered = h.load();
+  h.requests[1].resolve({ rows: [first], next: 'history' });
+  await flush();
+  assert.equal(h.requests[2].url, '/api/talks/page?before=history');
+  h.requests[2].resolve({ rows: [old], next: null });
+  await filtered;
+  assert.deepEqual(Array.from(h.state.talks.filter(r => r.chat_status.kind === 'needs_owner'), r => r.id), ['old']);
+});
+
+test('chat status links round-trip through the actual router', () => {
+  const href = source.slice(source.indexOf('function talkStateHref('), source.indexOf('function renderTalkState('));
+  const router = source.slice(source.indexOf('function parseRoute()'), source.indexOf('/* ---- two-pane layout'));
+  const context = { location: { hash: '' }, URLSearchParams, RUN_TABS: ['overview'] };
+  const api = runInNewContext(`${href}\n${router}\n({talkStateHref, parseRoute})`, context);
+  for (const kind of ['task', 'run']) {
+    const id = 'id /?#';
+    context.location.hash = api.talkStateHref({ kind, id });
+    assert.equal(api.parseRoute().name, kind);
+    assert.equal(api.parseRoute().id, id);
+  }
 });
 
 for (const existing of [null, [], [row('saved')]]) {

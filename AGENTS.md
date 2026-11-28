@@ -1719,8 +1719,11 @@ state (`Owner` = owner, `Paused` = attention, `Runnable` = waiting); a bare or
   ones even when closed, so the client filter over loaded rows never depends on
   walking closed history for decisions. Closed goal headers are bounded reads;
   older layouts with goals after turns are classified when their row is loaded.
+  Selecting Needs owner automatically enumerates history through the existing
+  paginated row endpoint, not through transcript requests or a cold header scan.
+  The ordinary unfiltered initial list remains bounded.
 - **Display only.** Nothing here approves, resolves or controls anything; the
-  link is a plain route (`#/decisions`, `#/task/<id>`), a sibling of the card.
+  link is a plain route (`#/decisions`, `#/tasks/<id>`), a sibling of the card.
 
 ### Chat implementer count changes a command, not a tone
 

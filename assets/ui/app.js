@@ -3698,6 +3698,7 @@ function setTalksOwnerOnly(enabled) {
   state.talksOwnerOnly = next;
   renderTalks();
   showOlderTalks();
+  if (next && (talksNext || storeReads.has("talks"))) loadTalks();
   announce(next ? "Showing conversations that need you only." : "Showing all conversations.");
 }
 
@@ -6549,8 +6550,8 @@ function talkStateHref(link) {
   if (!link || typeof link.id !== "string" || !link.id) return null;
   const id = encodeURIComponent(link.id);
   if (link.kind === "decision") return `#/decisions`;
-  if (link.kind === "task") return `#/task/${id}`;
-  if (link.kind === "run") return `#/run/${id}`;
+  if (link.kind === "task") return `#/tasks/${id}`;
+  if (link.kind === "run") return `#/runs/${id}`;
   return null;
 }
 function renderTalkState(r, talk) {
@@ -6688,6 +6689,7 @@ function renderTalks() {
   if (unreadEmpty) {
     setText(
       $("talks-unread-empty-text"),
+      ownerOnly && hasOlder ? "Searching older conversations for owner decisions…" :
       ownerOnly && !unreadOnly ? "No conversations need your decision." : searching
         ? "No unread conversations match this search."
         : hasOlder
@@ -10719,13 +10721,13 @@ function loadStore(name, url, change, apply, settled) {
               // only after a complete enumeration. New pages retain DOM nodes.
               const visible = new Map((state[name] || []).map(row => [row.id, row]));
               for (const row of collected.values()) visible.set(row.id, row);
-              apply(mergeStore(name, [...visible.values()], { changed: [], removed: [] }), true, observed, page.rows);
               cursor = page.next;
-              if (name === "talks") {
-                talksNext = cursor;
-                break;
-              }
-              sectionNotice(`${name}-h`, `${name}-load-state`, cursor ? "Loading older entries…" : "", null, { pending: Boolean(cursor), snapshot });
+              if (name === "talks") talksNext = cursor;
+              apply(mergeStore(name, [...visible.values()], { changed: [], removed: [] }), true, observed, page.rows);
+              if (name === "talks" && !state.talksOwnerOnly) break;
+              sectionNotice(`${name}-h`, `${name}-load-state`, cursor
+                ? (name === "talks" ? "Searching older conversations for owner decisions…" : "Loading older entries…")
+                : "", null, { pending: Boolean(cursor), snapshot });
               // Finish the frozen membership walk even under continuous
               // writes. Queued deltas reconcile it after every page is shown.
             } while (cursor);

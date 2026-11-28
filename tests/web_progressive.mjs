@@ -1359,10 +1359,11 @@ test('chat unread-only filter composes with search, paging notices, and zero-unr
   const unreadSrc = source.slice(source.indexOf('const talkTurns ='), source.indexOf('/* Open first, then newest first'));
   const sortSrc = source.slice(source.indexOf('function sortTalks('), source.indexOf('/* The context meter'));
   const renderSrc = source.slice(source.indexOf('function renderTalks()'), source.indexOf('/* The rail and dock'));
+  const statusSrc = source.slice(source.indexOf('const TALK_STATE ='), source.indexOf('function talkStateHref('));
   const olderSrc = source.slice(source.indexOf('function showOlderTalks('), source.indexOf('function loadOlderTalks('));
   const searchStatusSrc = source.slice(source.indexOf('function renderSearchStatus('), source.indexOf('function wireSearchBox('));
   const api = runInNewContext(`let talksNext = 'older-cursor';
-    ${unreadSrc}\n${sortSrc}\n${searchStatusSrc}\n${renderSrc}\n${olderSrc}
+    ${unreadSrc}\n${sortSrc}\n${searchStatusSrc}\n${statusSrc}\n${renderSrc}\n${olderSrc}
     ({ renderTalks, showOlderTalks, setNext(v) { talksNext = v; } })`, {
     state,
     $: node,
