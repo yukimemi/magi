@@ -1582,6 +1582,33 @@ main:has(> #view-dependencies:not([hidden])) { max-width: none; }
   background: var(--on-rust); color: var(--tint-rust); border-color: var(--on-rust);
   font-weight: 800; flex: none; white-space: nowrap;
 }
+.tag.tag-immediate {
+  background: var(--gold); color: #1b1200; border-color: var(--on-rust);
+  font-weight: 900; flex: none; white-space: nowrap;
+  box-shadow: 0 0 0 1px var(--on-rust);
+}
+.task-admission-status {
+  font-size: var(--t1); font-weight: 600; color: var(--ink-2);
+  padding: 2px 7px; border-radius: 999px; background: var(--sunk);
+  border: 1px solid var(--line-2); max-width: 100%; overflow-wrap: anywhere;
+}
+.task-admission-status[data-state="next_poll"] {
+  background: var(--tint-teal); color: var(--on-teal); border-color: var(--on-teal);
+}
+.task-admission-status[data-state="waiting"],
+.task-admission-status[data-state="unknown"] {
+  background: var(--tint-rust); color: var(--on-rust); border-color: var(--on-rust);
+}
+.task-admission-status[data-state="running"] {
+  background: var(--tint-blue); color: var(--on-blue); border-color: var(--on-blue);
+}
+.task-admission {
+  margin-top: var(--s1); font-size: var(--t2); font-weight: 600; color: var(--ink-2);
+}
+.task-admission[data-state="next_poll"] { color: var(--on-teal); }
+.task-admission[data-state="waiting"],
+.task-admission[data-state="unknown"] { color: var(--on-rust); }
+.task-admission[data-state="running"] { color: var(--on-blue); }
 .tag[data-tone="ink"]  { background: var(--tint-ink);  color: var(--on-ink); }
 .tag[data-tone="gold"] { background: var(--tint-gold); color: var(--on-gold); }
 .tag[data-tone="blue"] { background: var(--tint-blue); color: var(--on-blue); }

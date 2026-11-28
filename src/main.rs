@@ -1052,7 +1052,7 @@ enum TaskCmd {
         /// Parallel implementations (`--candidates` is a deprecated alias).
         #[arg(long, alias = "candidates")]
         implementers: Option<usize>,
-        /// Cargo build output policy. Without an override, urgent tasks isolate.
+        /// Cargo build output policy. Without an override, immediate and urgent tasks isolate.
         #[arg(long, value_enum)]
         build_cache: Option<BuildCache>,
         /// Run this task alone: one implementer, straight into review, rather
@@ -1071,6 +1071,15 @@ enum TaskCmd {
         /// run.
         #[arg(long)]
         urgent: bool,
+        /// Owner-only: dispatch this task on the next scheduler poll even when
+        /// both ordinary and urgent lanes are full, without parking or
+        /// cancelling existing workers. Stronger than `--urgent` and has no
+        /// concurrency cap (may increase CPU, disk, and quota usage);
+        /// non-concurrency gates (dependencies, holds, interrupt gate, quota
+        /// cooldown, disk admission, repository coordination, resource waits,
+        /// and merge approvals) still apply. Independent of `--urgent`.
+        #[arg(long)]
+        immediate: bool,
         /// Attach a file (typically a screenshot). Repeatable. Copied into the
         /// task's own storage, so it outlives the original; the implementer is
         /// handed its absolute path and told to open images first.
@@ -1174,6 +1183,15 @@ enum TaskCmd {
         /// Task id or unambiguous prefix/suffix.
         id: String,
         /// Disable urgent instead of enabling it.
+        #[arg(long)]
+        clear: bool,
+    },
+    /// Owner-only: enable immediate execution (stronger than urgent; no concurrency cap)
+    /// for an unclaimed queued or held task.
+    Immediate {
+        /// Task id or unambiguous prefix/suffix.
+        id: String,
+        /// Disable immediate instead of enabling it (preserves any saved urgent setting).
         #[arg(long)]
         clear: bool,
     },
@@ -1493,6 +1511,7 @@ fn guard_standing_chat_command(command: &Command) -> Result<()> {
                             force: false,
                             issue: None,
                             build_cache: None,
+                            immediate: false,
                             ..
                         }
                 }
@@ -3636,6 +3655,17 @@ async fn answer_cmd(args: AnswerArgs) -> Result<()> {
 
 /// Only launched chats need the bridge; agent environment variables alone
 /// are also used as provenance by ordinary terminal commands.
+fn set_task_immediate(q: &Queue, id: &str, clear: bool) -> Result<Task> {
+    let resolved = q.resolve_id(id)?;
+    let _claim = q.claim(&resolved).with_context(|| {
+        format!("task {resolved} is claimed; wait until the daemon releases it, then retry while queued or held")
+    })?;
+    let mut t = q.get(&resolved)?;
+    t.set_immediate(!clear)?;
+    q.put(&mut t)?;
+    Ok(t)
+}
+
 fn chat_has_control_channel() -> bool {
     std::env::var("MAGI_NODE").as_deref() == Ok(queue::CHAT_NODE)
         && magi::chat_control::has_channel()
@@ -3753,6 +3783,7 @@ fn task_cmd_on(
             hold,
             solo,
             urgent,
+            immediate,
             attach,
             force,
             json,
@@ -3761,12 +3792,21 @@ fn task_cmd_on(
         } => Box::pin(async move {
             let recovery = standing.standing_task.is_some();
             ensure!(
+                !immediate
+                    || (!recovery
+                        && !chat_has_control_channel()
+                        && std::env::var_os("MAGI_RUN").is_none()
+                        && std::env::var_os("MAGI_NODE").is_none()),
+                "--immediate is owner-only and cannot be enabled by agent seats, chats, or standing recovery"
+            );
+            ensure!(
                 !recovery
                     || (!force
                         && issue.is_none()
                         && build_cache.is_none()
+                        && !immediate
                         && std::env::var("MAGI_NODE").as_deref() == Ok(queue::CHAT_NODE)),
-                "standing fix filing requires a chat turn and cannot use --force, --issue, or --build-cache"
+                "standing fix filing requires a chat turn and cannot use --force, --issue, --build-cache, or --immediate"
             );
             if let Some(why) = mistyped_command(
                 "magi task add",
@@ -3852,6 +3892,7 @@ fn task_cmd_on(
                 task.priority = priority;
                 task.solo = solo;
                 task.urgent = urgent;
+                task.immediate = immediate;
                 if implementers.is_some() || build_cache.is_some() {
                     task.overrides = Some(magi::queue::RunOverrides {
                         inherit_daemon_options: implementers.is_none(),
@@ -3871,11 +3912,17 @@ fn task_cmd_on(
             if json {
                 println!("{}", serde_json::to_string_pretty(&task)?);
             } else {
+                let mode_tag = match (task.immediate, task.urgent) {
+                    (true, true) => " immediate urgent",
+                    (true, false) => " immediate",
+                    (false, true) => " urgent",
+                    (false, false) => "",
+                };
                 println!(
                     "filed {} [{}]{} {}",
                     task.short(),
                     task.source.label(),
-                    if task.urgent { " urgent" } else { "" },
+                    mode_tag,
                     task.title
                 );
             }
@@ -4033,11 +4080,18 @@ async fn task_cmd_inner(command: TaskCmd, q: Queue) -> Result<()> {
             // Only queried once, and only for the human-readable listing:
             // `--json` stays a faithful dump of `Task` itself, with nothing
             // triage-specific spliced in that is not on the task's own record.
-            let questions_store = ask::Questions::open();
+            let home = q
+                .root()
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .map_or_else(magi::run::home, Path::to_path_buf);
+            let questions_store = ask::Questions::at(home.join("questions"));
             let waiting_on_triage = triage::open_task_ids(&questions_store);
             // Built from the full listing, not the filtered one: a `done`
             // dependency must still read as resolved rather than missing.
             let inventory = magi::blockers::Inventory::load(&q, &questions_store);
+            let admission_snapshot =
+                magi::daemon::AdmissionSnapshot::capture(&home, jiff::Timestamp::now());
             for t in &tasks {
                 let attempts = if t.attempts > 0 {
                     format!(" x{}", t.attempts)
@@ -4049,7 +4103,14 @@ async fn task_cmd_inner(command: TaskCmd, q: Queue) -> Result<()> {
                 } else {
                     ""
                 };
+                let immediate = if t.immediate { " [immediate]" } else { "" };
                 let urgent = if t.urgent { " [urgent]" } else { "" };
+                let admission = admission_snapshot.evaluate(t, &q, Some(&inventory), &home);
+                let admission_tag = if t.immediate || admission.reservation_lane.is_some() {
+                    format!("  [{}]", admission.label)
+                } else {
+                    String::new()
+                };
                 let waits = inventory.waits_on(t);
                 let waits = if waits.is_empty() {
                     String::new()
@@ -4059,7 +4120,7 @@ async fn task_cmd_inner(command: TaskCmd, q: Queue) -> Result<()> {
                     format!("  [blocked on {} - STUCK]", waits.join(", "))
                 };
                 println!(
-                    "{}  {:<9}{:<4} {:<14} {}{urgent}{question}{waits}",
+                    "{}  {:<9}{:<4} {:<14} {}{immediate}{urgent}{admission_tag}{question}{waits}",
                     t.short(),
                     t.status.as_str(),
                     attempts,
@@ -4072,11 +4133,23 @@ async fn task_cmd_inner(command: TaskCmd, q: Queue) -> Result<()> {
 
         TaskCmd::Show { id, json } => {
             let t = q.get(&id)?;
+            let home = q
+                .root()
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .map_or_else(magi::run::home, Path::to_path_buf);
+            let inv = (t.status == TaskStatus::Blocked).then(|| {
+                let questions = ask::Questions::at(home.join("questions"));
+                magi::blockers::Inventory::load_for(&q, &questions, &t)
+            });
+            let admission = magi::daemon::AdmissionSnapshot::capture(&home, jiff::Timestamp::now())
+                .evaluate(&t, &q, inv.as_ref(), &home);
             let (mode, source) = task_build_cache(&t);
             if json {
                 let mut view = serde_json::to_value(&t)?;
                 view["effective_build_cache"] =
                     serde_json::json!({ "mode": mode, "source": source });
+                view["admission"] = serde_json::to_value(&admission)?;
                 println!("{}", serde_json::to_string_pretty(&view)?);
                 return Ok(());
             }
@@ -4092,9 +4165,25 @@ async fn task_cmd_inner(command: TaskCmd, q: Queue) -> Result<()> {
                 println!("pick commit {} ({})", pick.token, pick.sha);
             }
             println!(
+                "immediate {}",
+                if t.immediate { "enabled" } else { "disabled" }
+            );
+            println!(
                 "urgent    {}",
                 if t.urgent { "enabled" } else { "disabled" }
             );
+            println!("admission {}", admission.label);
+            if let Some(lane) = admission.reservation_lane {
+                println!(
+                    "lane      {}{}",
+                    lane,
+                    if admission.standalone {
+                        " (standalone)"
+                    } else {
+                        ""
+                    }
+                );
+            }
             if let Some(mode) = mode {
                 println!("build cache (new run)  {mode} ({source})");
             } else {
@@ -4525,6 +4614,22 @@ async fn task_cmd_inner(command: TaskCmd, q: Queue) -> Result<()> {
                 "{} urgent now {} - {}",
                 t.short(),
                 if t.urgent { "enabled" } else { "disabled" },
+                t.title
+            );
+            Ok(())
+        }
+        TaskCmd::Immediate { id, clear } => {
+            anyhow::ensure!(
+                !chat_has_control_channel()
+                    && std::env::var_os("MAGI_RUN").is_none()
+                    && std::env::var_os("MAGI_NODE").is_none(),
+                "magi task immediate is owner-only and cannot be used from agent seats or chats"
+            );
+            let t = set_task_immediate(&q, &id, clear)?;
+            println!(
+                "{} immediate now {} - {}",
+                t.short(),
+                if t.immediate { "enabled" } else { "disabled" },
                 t.title
             );
             Ok(())
@@ -7383,6 +7488,7 @@ mod tests {
                 solo: true,
                 hold: None,
                 urgent: false,
+                immediate: false,
                 attach: vec![shot.clone()],
                 force: false,
                 json: false,
@@ -7532,6 +7638,7 @@ mod tests {
                 solo: false,
                 hold: None,
                 urgent: true,
+                immediate: false,
                 attach: Vec::new(),
                 force: false,
                 json: false,
@@ -7556,6 +7663,7 @@ mod tests {
                 solo: false,
                 hold: None,
                 urgent: false,
+                immediate: false,
                 attach: Vec::new(),
                 force: false,
                 json: false,
@@ -7579,6 +7687,105 @@ mod tests {
         assert!(!plain.urgent, "no --urgent must leave the task as false");
     }
 
+    #[test]
+    fn task_add_immediate_parses_coexists_with_urgent_and_defaults_to_false() {
+        let both = Cli::try_parse_from([
+            "magi",
+            "task",
+            "add",
+            "--immediate",
+            "--urgent",
+            "do it now",
+        ])
+        .unwrap();
+        match both.command {
+            Some(Command::Task {
+                command: TaskCmd::Add {
+                    immediate, urgent, ..
+                },
+                ..
+            }) => {
+                assert!(immediate);
+                assert!(urgent);
+            }
+            other => panic!("expected TaskCmd::Add, got {other:?}"),
+        }
+
+        let plain = Cli::try_parse_from(["magi", "task", "add", "do it"]).unwrap();
+        match plain.command {
+            Some(Command::Task {
+                command: TaskCmd::Add { immediate, .. },
+                ..
+            }) => assert!(!immediate, "omitting --immediate must not turn it on"),
+            other => panic!("expected TaskCmd::Add, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn task_immediate_cli_updates_preserves_urgent_and_refuses_claimed_or_ineligible_tasks() {
+        let dir = tempfile::tempdir().unwrap();
+        let q = Queue::at(dir.path().join("queue"));
+        let mut t = Task::new(
+            "immediate CLI".into(),
+            "keep this".into(),
+            dir.path().into(),
+            Source::Human,
+        );
+        t.attempts = 2;
+        t.priority = 8;
+        t.urgent = true;
+        t.hold_reason = Some("wait".into());
+        for status in [TaskStatus::Queued, TaskStatus::Held] {
+            t.status = status;
+            q.put(&mut t).unwrap();
+            for clear in [false, false, true, true] {
+                let mut args = vec!["magi", "task", "immediate", t.short()];
+                if clear {
+                    args.push("--clear");
+                }
+                let cli = Cli::try_parse_from(args).unwrap();
+                let Some(Command::Task {
+                    command: TaskCmd::Immediate { id, clear },
+                    ..
+                }) = cli.command
+                else {
+                    panic!("task immediate command")
+                };
+                set_task_immediate(&q, &id, clear).unwrap();
+                let saved = q.get(&t.id).unwrap();
+                let mut before = serde_json::to_value(&t).unwrap();
+                let mut after = serde_json::to_value(&saved).unwrap();
+                before["immediate"] = (!clear).into();
+                before.as_object_mut().unwrap().remove("updated_at");
+                after.as_object_mut().unwrap().remove("updated_at");
+                assert_eq!(after, before);
+                assert!(saved.urgent, "toggling immediate must preserve urgent");
+            }
+        }
+        t.status = TaskStatus::Queued;
+        q.put(&mut t).unwrap();
+        let claim = q.claim(&t.id).unwrap();
+        let error = set_task_immediate(&q, &t.id, false).unwrap_err();
+        assert!(error.to_string().contains("claimed"));
+        assert!(!q.get(&t.id).unwrap().immediate);
+        drop(claim);
+        for status in [
+            TaskStatus::Running,
+            TaskStatus::Done,
+            TaskStatus::Failed,
+            TaskStatus::Blocked,
+            TaskStatus::Parked,
+        ] {
+            t.status = status;
+            q.put(&mut t).unwrap();
+            for clear in [false, true] {
+                let error = set_task_immediate(&q, &t.id, clear).unwrap_err();
+                assert!(error.to_string().contains(status.as_str()));
+                assert!(!q.get(&t.id).unwrap().immediate);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn task_add_solo_flag_is_what_sets_the_queued_tasks_solo_field() {
         let dir = tempfile::tempdir().unwrap();
@@ -7597,6 +7804,7 @@ mod tests {
                 solo: true,
                 hold: None,
                 urgent: false,
+                immediate: false,
                 attach: Vec::new(),
                 force: false,
                 build_cache: None,
@@ -7621,6 +7829,7 @@ mod tests {
                 solo: false,
                 hold: None,
                 urgent: false,
+                immediate: false,
                 attach: Vec::new(),
                 force: false,
                 build_cache: None,
@@ -7666,6 +7875,7 @@ mod tests {
                 solo: false,
                 hold: None,
                 urgent: false,
+                immediate: false,
                 attach: Vec::new(),
                 force: false,
                 json: false,
@@ -7692,6 +7902,7 @@ mod tests {
                 solo: false,
                 hold: None,
                 urgent: false,
+                immediate: false,
                 attach: Vec::new(),
                 force: false,
                 json: false,
@@ -7734,6 +7945,7 @@ mod tests {
                 solo: false,
                 hold: None,
                 urgent: false,
+                immediate: false,
                 attach: Vec::new(),
                 force: false,
                 json: false,
@@ -8326,6 +8538,7 @@ done
                 solo: false,
                 hold: None,
                 urgent: false,
+                immediate: false,
                 attach: Vec::new(),
                 force: false,
                 json: false,
@@ -8359,6 +8572,7 @@ done
                 solo: false,
                 hold: None,
                 urgent: false,
+                immediate: false,
                 attach: Vec::new(),
                 force: false,
                 json: false,
@@ -8428,6 +8642,7 @@ command = ['sh', '-c', 'cat >/dev/null; printf "%s" "{\"duplicate\":true,\"reaso
             solo: false,
             hold: None,
             urgent: false,
+            immediate: false,
             attach: Vec::new(),
             force,
             json: false,

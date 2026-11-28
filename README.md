@@ -372,7 +372,7 @@ Queue moves persist priorities through the ordinary priority endpoint. Higher
 values run first, and ties use ascending task ID. Running tasks cannot move.
 Upgrade resumes occupy a fixed lane ahead of ordinary priorities; neither input
 method can insert a task next to an upgrade resume. Admission,
-urgent slots, and other eligibility gates still apply. Saves are sequential:
+urgent slots, immediate execution, and other eligibility gates still apply. Saves are sequential:
 if a write is refused, remaining writes stop and the list reloads the saved order.
 The +/− priority controls, Edit and Actions remain available on every row,
 without selecting it first. Open confirmations and drafts survive list refreshes.
@@ -394,7 +394,9 @@ If queued work is not starting, the Web loop's idle line reports the latest
 completed dispatch scan's reason counts (landing waits, cooldown, occupied
 ordinary/urgent slots, interrupt withholding, or claim/re-read failures).
 `daemon.json` exposes the same observation as `dispatch_wait`, including the
-pre-gate runnable count. It is cleared when work starts or the scan is incomplete;
+pre-gate runnable count, and `dispatch_skips` for per-task skip reasons observed
+by the latest completed scan (retained even when another task started in the
+same scan). `dispatch_wait` is cleared when work starts or the scan is incomplete;
 it is not a fresh queue census. Tracing logs a readable explanation per skipped
 task only when the task/reason set changes, and reports when the set clears.
 Claim failures do not distinguish contention from other claim errors.
@@ -430,11 +432,41 @@ never two" guarantee has to win over urgent's own "never wait" one. Both are
 opt-in and, together, a rare combination; `pause_for_interrupts` is off by
 default.
 
+`magi task add --immediate` (or `magi task immediate <ID>` / `magi task
+immediate <ID> --clear`, or **Actions → Immediate: off/on** in the Web Queue
+and task detail action sheet, backed by `POST /api/queue/{id}/immediate`) is
+an **owner-only** immediate execution mode stronger than `--urgent`. Every
+individually marked runnable immediate task dispatches on the next scheduler
+poll even when both ordinary and urgent lanes are full — including multiple
+immediate tasks — without parking or cancelling existing workers and without
+consuming ordinary or urgent concurrency slots.
+
+- **No concurrency cap:** immediate tasks are not bounded by
+  `[daemon] max_concurrent_runs` or the single urgent slot, so running several
+  at once can increase CPU, disk, and agent-CLI quota consumption.
+- **Safety gates still apply:** immediate exempts only concurrency slots.
+  Dependencies (`blocked`), manual/machine holds, the active interrupt gate,
+  quota cooldown, disk admission, repository coordination, resource waits,
+  merge approvals, and claim exclusivity remain enforced.
+- **Owner-only & independent of urgent:** agent seats, chats, and standing
+  recovery cannot enable `--immediate`. `immediate` and `urgent` are stored
+  independently so both may be set on the same task; clearing immediate leaves
+  a saved `urgent` setting intact.
+- **Persisted mode, reservation lane, and admission status:** immediate tasks
+  reserve the dedicated `immediate` lane (separate from `ordinary`, `urgent`,
+  and decision-only `decision` resumes) across scheduler replacement and
+  resumes, while existing claims prevent duplicate execution. `magi task list`,
+  `magi task show <ID>` (and `--json`), and the Web Queue/detail views report
+  configured mode, active reservation lane, and read-only admission status
+  (`Immediate: next poll` or `Immediate: waiting — <blocker>`, never blaming
+  ordinary or urgent concurrency slots for an immediate wait).
+
 | verb | |
 |---|---|
 | `magi task add` | file work; text, `--file`, `--issue`, or stdin |
 | `magi task list` | the backlog, newest first |
 | `magi task show <id>` | one task in full |
+| `magi task immediate <id> [--clear]` | owner-only: enable or disable immediate execution on an unclaimed queued or held task |
 | `magi task urgent <id> [--clear]` | enable or disable urgent on an unclaimed queued or held task |
 | `magi task implementers <id> <count>` | change implementers on a queued or held task (1 = Solo, 2–3 = competition) |
 | `magi task build-cache <id> shared\|isolated\|default` | set or clear the build cache override on an unclaimed queued or held task |
@@ -1391,7 +1423,7 @@ The same binary has three process roles:
 
 - `magi web` serves the screen and API. Its Start/Stop controls operate an
   independent scheduler, including one started by an earlier web process.
-- `magi serve` dispatches the queue and manages ordinary, urgent and
+- `magi serve` dispatches the queue and manages ordinary, urgent, immediate, and
   decision-only lanes. On restart it reconstructs occupied slots from live
   worker reservations, rather than starting those tasks again.
 - Independent workers own task claims, graph execution leases, Chat sessions,
@@ -1412,7 +1444,8 @@ During an upgrade:
 Finishing an old worker needs no ownership transfer, new run, extra pass or
 attempt refund. Its existing owner saves the result normally. Ordinary
 concurrency and the separate urgent lane remain bounded across scheduler
-replacement. Standalone CLI executions remain outside the scheduler's lanes.
+replacement, while immediate reservations stay outside ordinary and urgent slot
+accounting. Standalone CLI executions remain outside the scheduler's lanes.
 
 External supervisors can still terminate an entire process container. On Windows,
 a worker requests breakaway only when the host Job Object permits it; otherwise
@@ -2070,17 +2103,18 @@ or `magi task add --build-cache isolated` to opt in for one task. For new runs,
 magi chooses the mode in this order:
 
 1. An explicit task choice (`shared` or `isolated`), including `shared` on
-   an urgent task.
-2. `isolated` for an urgent task, so its extra slot does not wait on the shared
-   cache. This applies only when the repository has a shared cache and its
-   verification commands are ones isolated mode can run; otherwise the urgent
-   task keeps the configured mode rather than stopping on an unsupported
-   command.
+   an immediate or urgent task.
+2. `isolated` for an immediate or urgent task, so its concurrent run does not
+   wait on the shared cache (reported as source `immediate` when immediate is
+   enabled, else `urgent`). This applies only when the repository has a shared
+   cache and its verification commands are ones isolated mode can run;
+   otherwise the task keeps the configured mode rather than stopping on an
+   unsupported command.
 3. The layered `[verify] build_cache` setting, which defaults to `shared`.
 
 Use `magi task build-cache <id> shared|isolated|default` while the task is
 unclaimed and queued or held. `default` clears the override and restores the
-urgent/config rules. `magi task show <id>` and `--json` show the choice for a
+immediate/urgent/config rules. `magi task show <id>` and `--json` show the choice for a
 new run and its source. Historical tasks retain their shared choice until
 changed. A resumed run always uses its saved mode; `magi run --resume` does
 not accept `--build-cache`.
