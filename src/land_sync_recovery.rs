@@ -315,7 +315,9 @@ impl RunState {
                         && a.archived_verification.is_some()
                         && a.stop.attempts == self.land_sync_attempts
                 })
-                || legacy_exhausted_diagnostic(self)
+                || (self.land_sync_recovery.stops.is_empty()
+                    && self.land_sync_recovery.authorizations.is_empty()
+                    && legacy_exhausted_diagnostic(self))
         }
     }
 

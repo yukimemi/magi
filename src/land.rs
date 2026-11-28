@@ -3834,6 +3834,17 @@ async fn publish_landing_head<F: Forge>(
         git::is_clean(&winner.worktree).await?,
         "landing worktree is dirty"
     );
+    // Even without a rebase, verification can change HEAD through gate repair.
+    // Persist the start before either verification or repair can run.
+    if state.land_sync_unstarted_grant() {
+        state.land_sync_attempts += 1;
+        state.land_sync_pending = true;
+        state.event(
+            "land-sync-recovery",
+            "started recovery attempt without rebase",
+        );
+        state.save()?;
+    }
     if state.gate_head.as_deref() != Some(&head)
         || !state.gate_ran
         || !state.gate_commands_allow_progress()
@@ -3954,11 +3965,6 @@ async fn publish_landing_head<F: Forge>(
         pushed.stderr
     );
     state.pr_pushed_head = Some(checked.clone());
-    // An already-current base still completes the authorized synchronization.
-    // Do not leave its allowance available for a later, unrelated base move.
-    if state.land_sync_unstarted_grant() {
-        state.land_sync_attempts += 1;
-    }
     state.land_sync_pending = false;
     state.save()?;
     Ok(checked)
@@ -12625,6 +12631,103 @@ Read through `src/graph.rs`, `src/main.rs`, `src/prompt.rs`, and the new/edited 
             "old approval before recovery must not be reused"
         );
         assert_ne!(run.land_approval.as_ref().unwrap().question, old_q.id);
+    }
+
+    #[tokio::test]
+    async fn land_sync_recovery_resumes_after_gate_repair_before_push() {
+        let (_tmp, home, queue, _task, mut state, old) = legacy_exhausted_landing_fixture().await;
+        landing_gate_fixer(
+            &mut state,
+            "cat >/dev/null; printf fixed > change; printf '{\"addressed\":[],\"rejected\":[],\"notes\":\"fixed\"}'",
+        );
+        state.config.verify.gate =
+            vec!["grep -q fixed change || { echo 'change needs repair'; exit 1; }".into()];
+        state.save_under(&home).unwrap();
+        let pr_url = green_pr().url;
+        let observer = StaticPrObserver(crate::land_sync_recovery::ObservedPr {
+            url: pr_url.clone(),
+            number: 42,
+            open: true,
+            head: old.clone(),
+            base_branch: Some("main".into()),
+        });
+        crate::land_sync_recovery_control::recover_with(
+            &queue,
+            &home,
+            crate::land_sync_recovery_control::Request {
+                run: state.id.clone(),
+                head: old.clone(),
+                actor: "cli".into(),
+                request: "req-interrupted-gate-repair".into(),
+            },
+            &observer,
+        )
+        .await
+        .unwrap();
+        let mut run = RunState::load_under(&state.id, &home).unwrap();
+        let forge = Scripted::new(vec![seen(&old, Checks::Green, "CLEAN", false)], vec![]);
+        assert!(matches!(
+            prepare_land_sync_recovery(&mut run, &pr_url, &forge)
+                .await
+                .unwrap(),
+            LandSyncPrep::Continue(Some(_))
+        ));
+        // Interrupt at the publication check, after the real gate fixer commits.
+        let changed = Scripted::new(
+            vec![seen("different", Checks::Green, "CLEAN", false)],
+            vec![],
+        );
+        let error = resume_landing_head(&mut run, &old, &pr_url, &changed, None)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("PR head changed while gating"),
+            "{error}"
+        );
+        let repaired = git::rev_parse(&run.repo, "HEAD").await.unwrap();
+        assert_ne!(repaired, old);
+        assert_eq!(run.gate_fixes.len(), 1);
+        assert!(run.gate_fixes[0].committed);
+        assert_eq!(
+            git::remote_head(&run.repo, "origin", "task-head")
+                .await
+                .unwrap(),
+            Some(old.clone())
+        );
+
+        run.status = RunStatus::Blocked;
+        run.save().unwrap();
+        let mut resumed = RunState::load_under(&run.id, &home).unwrap();
+        assert_eq!(resumed.land_sync_attempts, 5);
+        assert!(resumed.land_sync_pending);
+        assert!(!resumed.land_sync_exhausted());
+        assert!(!resumed.land_sync_unstarted_grant());
+        assert!(matches!(
+            prepare_land_sync_recovery(&mut resumed, &pr_url, &forge)
+                .await
+                .unwrap(),
+            LandSyncPrep::Continue(None)
+        ));
+        assert_eq!(
+            resume_landing_head(&mut resumed, &old, &pr_url, &forge, None)
+                .await
+                .unwrap(),
+            repaired
+        );
+        assert_eq!(resumed.land_sync_attempts, 5);
+        assert_eq!(resumed.gate_fixes.len(), 1);
+        assert!(!resumed.land_sync_pending);
+        assert!(
+            resumed.land_sync_recovery.authorizations[0]
+                .invalidated
+                .is_none()
+        );
+        assert_eq!(
+            git::remote_head(&resumed.repo, "origin", "task-head")
+                .await
+                .unwrap(),
+            Some(repaired)
+        );
     }
 
     #[tokio::test]
