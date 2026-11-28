@@ -4387,6 +4387,22 @@ impl RunState {
             serde_json::from_str(&body).with_context(|| format!("parse {}", path.display()))?;
         migrate_schema(state)
     }
+
+    /// The record at `path` exactly as saved: no schema migration and no
+    /// schema check. For housekeeping, which only reads worktree paths,
+    /// branches and ownership marks, every schema bump so far only added a
+    /// field or a variant, and [`Self::load`]'s refusal of a record this build
+    /// does not speak would otherwise stop the janitor fleet-wide.
+    pub(crate) fn read_unmigrated(path: &Path) -> Result<Self> {
+        let body =
+            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        serde_json::from_str(&body).with_context(|| format!("parse {}", path.display()))
+    }
+
+    /// [`Self::read_unmigrated`] for a run under `home`.
+    pub(crate) fn load_tolerant_under(id: &str, home: &Path) -> Result<Self> {
+        Self::read_unmigrated(&home.join("runs").join(id).join("run.json"))
+    }
 }
 
 pub(crate) fn migrate_schema(mut state: RunState) -> Result<RunState> {

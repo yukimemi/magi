@@ -14480,6 +14480,66 @@ fn reclaim_fold_target(home: &Path, target: Option<crate::build_target::FoldTarg
     }
 }
 
+/// Why a fold left a run alone. A typed refusal lets the automatic callers
+/// (`clean::fold_one`, and through it the idle janitor and the busy-time fold
+/// turn) say *why* in their receipts; it never changes what is deleted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FoldRefusal {
+    /// A lease or lock a live owner holds - the run's execution lease or
+    /// ownership lock, a source's output lease, a Cargo build, the repository's
+    /// coordination lease - or a live daemon claim on the run.
+    Live(String),
+    /// A resumable status: someone may still continue this run.
+    Resumable,
+    /// Finished less than the fold grace period ago.
+    WithinGrace,
+    /// An explicitly retained recovery source (`pr_recovery`).
+    Retained(String),
+    /// The proof that nothing is lost is not complete: startup or candidate
+    /// preservation unfinished, or the confirmed-merge source proof (Cargo
+    /// residue, Git checkpoints, the fetched base) could not be established.
+    ProofIncomplete(String),
+}
+
+impl std::fmt::Display for FoldRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Live(detail) | Self::ProofIncomplete(detail) => f.write_str(detail),
+            Self::Resumable => f.write_str("refusing fold: the run is resumable"),
+            Self::WithinGrace => f.write_str("refusing fold: the run finished within its grace"),
+            Self::Retained(reason) => write!(f, "refusing fold: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for FoldRefusal {}
+
+/// Is `error` somebody else holding a lock or lease right now?
+fn held_by_live_owner(error: &anyhow::Error) -> bool {
+    error.is::<crate::retention::OutputsInUse>()
+        || error.is::<crate::repo_lock::ResourceBlocked>()
+        || error.chain().any(|cause| {
+            cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+                io.kind() == std::io::ErrorKind::WouldBlock
+                    || cfg!(windows) && io.raw_os_error() == Some(33)
+            })
+        })
+}
+
+/// `error`, typed as [`FoldRefusal::Live`] when it is a held lock.
+fn live_or(error: anyhow::Error) -> anyhow::Error {
+    if held_by_live_owner(&error) {
+        FoldRefusal::Live(format!("{error:#}")).into()
+    } else {
+        error
+    }
+}
+
+fn preservation_refusal() -> anyhow::Error {
+    FoldRefusal::ProofIncomplete("candidate preservation incomplete; refusing cleanup".into())
+        .into()
+}
+
 /// Tear a run's worktrees and branches down.
 ///
 /// `home` is where the updated `run.json` is saved (via
@@ -14488,8 +14548,31 @@ fn reclaim_fold_target(home: &Path, target: Option<crate::build_target::FoldTarg
 /// falling through to the global here would write back through whichever
 /// directory some other process or test pinned into that `OnceLock` first,
 /// not the one the caller actually resolved its `runs` and `state` from.
+///
+/// Every deletion decision is made on the record as it is on disk once the
+/// owner lock and execution lease are held, not on the `state` the caller read
+/// earlier: see [`fold_run_when`].
 pub async fn fold_run(state: &mut RunState, drop_winner: bool, home: &Path) -> Result<Vec<String>> {
-    fold_run_with_policy(state, drop_winner, home, false).await
+    fold_run_with_policy(state, home, &|_| Ok(drop_winner), false).await
+}
+
+/// [`fold_run`] for the automatic callers, which decide whether the run may be
+/// folded at all, and whether its winner goes too, from the run record.
+///
+/// `decide` is called on the caller's earlier read by the caller itself, and
+/// again here on the record reloaded after taking the run's owner lock and
+/// execution lease. A handover (`handover::release`) records `released_to` /
+/// `released_branches` under that owner lock and removes the old worktree while
+/// keeping the branch; a fold that acted on a record read before the handover
+/// would delete the branch already given to the successor and save the stale
+/// record over the handover. A run no longer eligible under the fresh record
+/// is left alone and the refusal says why.
+pub async fn fold_run_when(
+    state: &mut RunState,
+    home: &Path,
+    decide: &(dyn Fn(&RunState) -> Result<bool, FoldRefusal> + Sync),
+) -> Result<Vec<String>> {
+    fold_run_with_policy(state, home, decide, false).await
 }
 
 /// Explicit CLI-only retention override; automatic callers use [`fold_run`].
@@ -14498,28 +14581,29 @@ pub async fn fold_run_overriding_recovery_retention(
     drop_winner: bool,
     home: &Path,
 ) -> Result<Vec<String>> {
-    fold_run_with_policy(state, drop_winner, home, true).await
+    fold_run_with_policy(state, home, &|_| Ok(drop_winner), true).await
 }
 
 async fn fold_run_with_policy(
     state: &mut RunState,
-    drop_winner: bool,
     home: &Path,
+    decide: &(dyn Fn(&RunState) -> Result<bool, FoldRefusal> + Sync),
     override_recovery_retention: bool,
 ) -> Result<Vec<String>> {
+    // Cheap refusals on the caller's snapshot, before any lock is taken.
     if let Some(reason) = crate::pr_recovery::source_retention_reason(home, state)
         && !override_recovery_retention
     {
-        bail!("refusing fold: {reason}");
+        return Err(FoldRefusal::Retained(reason).into());
     }
     if !state.candidate_preservation.is_empty() || !state.interrupted_implementations.is_empty() {
-        bail!("candidate preservation incomplete; refusing cleanup");
+        return Err(preservation_refusal());
     }
     // Serialize ordinary folding with the same starts/resumes as target-only
     // eviction. Otherwise a second janitor could remove the whole worktree
     // around a live output borrower even though target eviction was fenced.
     std::fs::create_dir_all(home.join("runs").join(&state.id))?;
-    let _owner = crate::pr_head::owner_lock(home, &state.id)?;
+    let _owner = crate::pr_head::owner_lock(home, &state.id).map_err(live_or)?;
     // An override must use current durable ownership, not a pre-lock snapshot.
     if override_recovery_retention {
         *state = RunState::load_under(&state.id, home)?;
@@ -14537,13 +14621,33 @@ async fn fold_run_with_policy(
             "candidate preservation incomplete; refusing cleanup"
         );
     }
+    let _driver = crate::driver::maintenance(home, &state.id).map_err(live_or)?;
+    if !override_recovery_retention {
+        // Both locks are held, so no handover, driver claim or other fold can
+        // change the record from here on: act on it, not on the earlier read.
+        // Tolerant of older schemas (as `clean::fold_due` always was), and a
+        // record that was never saved has no handover to have missed.
+        match RunState::load_tolerant_under(&state.id, home) {
+            Ok(fresh) => *state = fresh,
+            Err(e)
+                if e.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+                }) => {}
+            Err(e) => return Err(e.context("reload the run record under its locks")),
+        }
+    }
+    let drop_winner = decide(state)?;
+    if !state.candidate_preservation.is_empty() || !state.interrupted_implementations.is_empty() {
+        return Err(preservation_refusal());
+    }
     let retention_reason = crate::pr_recovery::source_retention_reason(home, state);
     if let Some(reason) = &retention_reason
         && !override_recovery_retention
     {
-        bail!("refusing fold: {reason}");
+        return Err(FoldRefusal::Retained(reason.clone()).into());
     }
-    let _driver = crate::driver::maintenance(home, &state.id)?;
     let mut output_guards = Vec::new();
     for entry in std::fs::read_dir(state.worktree_root())
         .into_iter()
@@ -14551,7 +14655,8 @@ async fn fold_run_with_policy(
         .flatten()
     {
         if entry.path().join(".git").is_file() {
-            output_guards.push(crate::retention::OutputLease::take(&entry.path(), true)?);
+            output_guards
+                .push(crate::retention::OutputLease::take(&entry.path(), true).map_err(live_or)?);
         }
     }
     let repo = state.repo.clone();
@@ -14562,15 +14667,21 @@ async fn fold_run_with_policy(
         Ok(lease) => lease,
         Err(e) => {
             state.save_under(home)?;
-            return Err(e);
+            return Err(live_or(e));
         }
     };
     // Confirmed merges dispose of their owned sources after durable evidence
-    // capture. Preflight every source before removing anything.
+    // capture. Preflight every source before removing anything. A failure of
+    // this stage is, by what the stage is for, an incomplete proof - unless
+    // it is only a lock somebody else holds.
     let _source_outputs = if retention_reason.is_some()
         || (state.status == RunStatus::Merged && state.merge.as_ref().is_some_and(|merge| merge.ok))
     {
-        verify_merged_fold_sources(state, drop_winner, home).await?
+        match verify_merged_fold_sources(state, drop_winner, home).await {
+            Ok(held) => held,
+            Err(e) if held_by_live_owner(&e) => return Err(live_or(e)),
+            Err(e) => return Err(FoldRefusal::ProofIncomplete(format!("{e:#}")).into()),
+        }
     } else {
         Vec::new()
     };

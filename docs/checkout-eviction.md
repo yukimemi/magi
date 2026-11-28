@@ -99,25 +99,54 @@ janitor ("folding worktrees and pruning a cache mid-build would race the very
 compile"); that concern belongs to the shared-cache prune, orphan reclamation and
 worktree-registration pruning, which stay idle-only. Folding a finished run takes
 the run's owner lock, execution lease, per-worktree output leases and the
-repository coordination lease inside `graph::fold_run`, and `clean::fold_one`
-skips anything a live claim holds, so the `fold` service runs exactly where
-housekeeping does not (`daemon::fold_turn_eligible`), under the same decision
-function as the idle pass (`clean::fold_one`: same grace, resumable, live,
-recovery-source and preservation checks).
+repository coordination lease inside `graph::fold_run_when`, and
+`clean::eligibility` refuses anything a live claim holds, so the `fold` service runs
+exactly where housekeeping does not (`daemon::fold_turn_eligible`), under the same
+decision function as the idle pass (same grace, resumable, live, recovery-source
+and preservation checks).
+
+**The record under the locks.** The fold reloads the run record after it holds the
+owner lock and execution lease, and acts on that record only. A handover that
+completes between the janitor's first read and the locks records `released_to` /
+`released_branches` and removes the old worktree while keeping the branch; the
+reload sees it, so the handed-over branch survives and the successor's ownership
+record is not overwritten. The automatic callers re-ask the eligibility decision on
+the fresh record (a run that became resumable, or live, is left alone), and so do
+`magi fold` and the phone route for the deletion itself.
 
 One `service:daemon-fold` worker runs per pass (at most every 120 s, never beside a
 housekeeping worker). A pass judges at most 64 run records, starts at most 4 folds
-and starts no further fold after 5 minutes (a started fold finishes); at least one
-run is always judged. It resumes after the run id saved in `<home>/fold-turn-cursor`
-(oldest id first; absent means start over, and the file is removed when a pass
-reaches the end of the history). A fold that waits for repository coordination holds
-only that run's own locks. `source-eviction-fold-{dispatch,worker}.json` carry the
-skip reason, and for a completed pass a `fold` object: run records `inspected` and
-counts `folded`, `nothing_left`, `live`, `resumable`, `within_grace`,
-`recovery_retained`, `proof_incomplete` (startup or candidate preservation
-incomplete), `unreadable` and `failed` (git, filesystem or coordination), the
-`cursor`, why the pass `stopped`, and `cursor_error` if the cursor could not be
-saved (the next pass then repeats the slice). The turn owns no deletion authority of
+(charged when the fold begins, whatever it returns) and starts no further fold after
+5 minutes (a started fold finishes); at least one run is always judged.
+
+**Cycles.** `<home>/fold-turn-cursor` holds `{cursor, high_water}`: the pass works
+through the run ids after `cursor` up to `high_water`, the last id that existed
+when the cycle began, and removes the file when it has judged the last one; the next
+pass starts a new cycle with a new high-water mark, so runs created meanwhile cannot
+postpone the wraparound. With N records at the start of a cycle, every one is judged
+within `ceil(N / 64)` passes plus the passes its fold invocations consume
+(`ceil(F / 4)` for F invocations, plus one for each pass the time budget cut short),
+and a run that left its grace after being judged is folded within the next cycle. A
+run whose record already shows nothing left to remove (every candidate folded, its
+worktree and branch gone, the bay empty) is counted as `already_folded` without
+starting a fold or spending the budget. An unreadable file, a cursor naming a run
+that no longer exists, a high-water mark below the cursor or an empty range starts a
+clean cycle (`cycle_restart` says why). Every pass lists `runs/` and checks each
+record once (O(history) syscalls, milliseconds at a few hundred records); that
+inventory is counted in `elapsed_ms`.
+
+`source-eviction-fold-{dispatch,worker}.json` carry the skip reason (cadence, idle
+machine, `auto_fold` off, unreadable startup configuration, a sibling folding
+service) and, for a completed pass, a `fold` object: `records`, `inspected`,
+`invoked`, counts `folded`, `nothing_left`, `already_folded`, `live` (a daemon
+claim, or an owner lock, execution lease, output lease, Cargo build or repository
+lease held), `resumable`, `within_grace`, `recovery_retained`, `proof_incomplete`
+(startup, candidate preservation or the confirmed-merge source proof: Cargo residue,
+Git checkpoints, the fetched base), `unreadable` and `failed` (git or filesystem
+errors of the deletion), the `cursor` and `high_water`, why the pass `stopped`,
+`cycle_restart`, `cursor_error` if the cycle could not be saved (the next pass then
+repeats the slice), `elapsed_ms` and `notes`: the scrubbed, clipped text of up to
+eight `proof_incomplete` and `failed` runs. The turn owns no deletion authority of
 its own: it never sweeps retained outputs, copies or orphans.
 
 On a platform without Unix process containment, `retention::sweep` records its

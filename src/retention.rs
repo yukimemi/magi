@@ -116,6 +116,24 @@ impl Drop for OutputFile {
     }
 }
 
+/// A source's output lease is held by a live writer, reader or reclaimer.
+/// Typed so that a fold can tell "someone is using it" from a real failure;
+/// the text is what operators and `copies::inspection_outcome` already read.
+#[derive(Debug)]
+pub(crate) struct OutputsInUse(PathBuf);
+
+impl std::fmt::Display for OutputsInUse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "output lease: outputs are in use or being reclaimed: {}",
+            self.0.display()
+        )
+    }
+}
+
+impl std::error::Error for OutputsInUse {}
+
 impl OutputLease {
     #[cfg(unix)]
     pub(crate) fn descriptor(&self) -> std::os::fd::RawFd {
@@ -351,20 +369,16 @@ impl OutputLease {
                 libc::LOCK_SH
             };
             // SAFETY: live file descriptor, no retained pointers.
-            ensure!(
-                unsafe { libc::flock(file.as_raw_fd(), mode | libc::LOCK_NB) } == 0,
-                "output lease: outputs are in use or being reclaimed: {}",
-                path.display()
-            );
+            if unsafe { libc::flock(file.as_raw_fd(), mode | libc::LOCK_NB) } != 0 {
+                return Err(OutputsInUse(path.to_owned()).into());
+            }
         }
         #[cfg(windows)]
         {
             use std::os::windows::io::AsRawHandle as _;
-            ensure!(
-                crate::chat_watch::windows::lock_file_mode(file.as_raw_handle(), true, exclusive)?,
-                "output lease: outputs are in use or being reclaimed: {}",
-                path.display()
-            );
+            if !crate::chat_watch::windows::lock_file_mode(file.as_raw_handle(), true, exclusive)? {
+                return Err(OutputsInUse(path.to_owned()).into());
+            }
         }
         #[cfg(not(any(unix, windows)))]
         let _ = exclusive;
@@ -1318,14 +1332,33 @@ async fn sweep_inner(home: &Path, disk: &crate::config::Disk, now: Timestamp) ->
 /// Persist the pass report (`retention.json`). A refusal is reported through
 /// the same file as a completed pass, so a platform where reclamation is off
 /// says so instead of leaving no report at all.
+///
+/// Every publication stages into its own uniquely named file and replaces
+/// `retention.json` by rename, so two passes publishing at once (housekeeping
+/// and disk-pressure workers overlap across an idle/busy transition, and a
+/// platform that refuses reclamation takes no `retention.lock`) can neither
+/// truncate nor rename each other's staging file: the report on disk is always
+/// one complete report.
 fn save_report(home: &Path, report: &Report) {
-    let store = home.join("retention.json");
-    if let Ok(body) = serde_json::to_vec_pretty(report) {
-        let tmp = home.join("retention.json.tmp");
-        if let Err(e) = std::fs::write(&tmp, body).and_then(|()| std::fs::rename(tmp, store)) {
-            tracing::warn!("retention report could not be saved: {e}");
-        }
+    if let Err(e) = publish_report(home, report) {
+        tracing::warn!("retention report could not be saved: {e:#}");
     }
+}
+
+fn publish_report(home: &Path, report: &Report) -> Result<()> {
+    static STAGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let body = serde_json::to_vec_pretty(report)?;
+    let tmp = home.join(format!(
+        "retention.json.{}-{}.tmp",
+        std::process::id(),
+        STAGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let published = std::fs::write(&tmp, body)
+        .and_then(|()| std::fs::rename(&tmp, home.join("retention.json")));
+    if published.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    Ok(published?)
 }
 
 /// [`sweep_inner`] with the platform capability injected, so the refusal is
@@ -7755,5 +7788,41 @@ mod platform_tests {
             !home.path().join("retention.lock").exists(),
             "a refusal takes no lock and touches no output"
         );
+    }
+
+    /// The refusal path publishes without `retention.lock`, so publications
+    /// must not share a staging file: concurrent ones leave one complete
+    /// report and nothing behind.
+    #[test]
+    fn concurrent_publications_leave_one_complete_report_and_no_staging_files() {
+        let home = tempfile::tempdir().unwrap();
+        let reports: Vec<Report> = (0..8)
+            .map(|n| Report {
+                failures: vec![format!("pass {n}")],
+                ..Report::default()
+            })
+            .collect();
+        std::thread::scope(|scope| {
+            for report in &reports {
+                scope.spawn(|| {
+                    for _ in 0..25 {
+                        // A rename onto a file another publisher has open may be
+                        // refused on some platforms; the report on disk stays whole.
+                        let _ = publish_report(home.path(), report);
+                    }
+                });
+            }
+        });
+        let saved: Report =
+            serde_json::from_slice(&std::fs::read(home.path().join("retention.json")).unwrap())
+                .unwrap();
+        assert!(reports.iter().any(|r| r.failures == saved.failures));
+        let staged: Vec<_> = std::fs::read_dir(home.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(staged.is_empty(), "stray staging files: {staged:?}");
     }
 }
