@@ -913,46 +913,37 @@ pub fn prune_cache_if_over_limit(
     cfg: &crate::config::Config,
     home: &Path,
 ) -> Result<Option<Prune>> {
-    Ok(prune_cache_pass(cfg, home)?.and_then(|pass| pass.prune))
-}
-
-/// One pressure pass over the shared build cache: what was removed (`None`
-/// when the cache was in use) and the receipt that says how it went.
-pub struct CachePass {
-    /// What was removed; `None` when the cache was in use.
-    pub prune: Option<Prune>,
-    /// The receipt of the pass.
-    pub report: crate::disk::PressureReport,
-}
-
-/// [`prune_cache_if_over_limit`], keeping the pass's receipt. `Ok(None)` for
-/// the same opt-outs (a zero cap, no `CARGO_TARGET_DIR`).
-pub fn prune_cache_pass(cfg: &crate::config::Config, home: &Path) -> Result<Option<CachePass>> {
     prune_cache_under_pressure(cfg, home, crate::disk::free_bytes)
 }
 
-/// [`prune_cache_pass`] with the free-space measurement supplied by the caller.
+/// [`prune_cache_if_over_limit`] with the free-space measurement supplied by
+/// the caller.
 ///
 /// Free space on the cache's volume below
 /// [`Disk::reclaim_threshold`](crate::config::Disk::reclaim_threshold) - the
 /// collection threshold, not the admission floor - shrinks the limit by the
-/// deficit ([`crate::disk::pressure_limit`], which also keeps a reserve of
-/// half the cap while free space is at or above the admission floor).
+/// deficit ([`crate::disk::pressure_limit`]). While free space is at or above
+/// the admission floor the cache also keeps a reserve of half its cap
+/// ([`crate::disk::pressure_reserve`]), and that is enforced where files are
+/// removed: the pruning routine skips a file whose removal would leave less
+/// ([`crate::disk::prune_dir_keeping`]), so one artifact larger than
+/// `size - reserve` is kept rather than taking the cache to nothing.
 ///
 /// This is estimated-deficit collection: free space is measured once, the
 /// deficit computed from that one number, and that many *logical* bytes are
 /// removed oldest-first. There is no re-measuring loop: hard links and other
 /// writers mean the space freed can differ, and the next pass (the service's
 /// ordinary period away) measures again and continues. A pass that removes
-/// nothing is not an error; its receipt names why. An unreadable measurement
-/// prunes to the plain cap. The cache is measured (`dir_size`) only below
-/// the threshold, once, for the limit; the prune itself measures it as it
-/// always did.
+/// nothing is not an error. An unreadable measurement prunes to the plain cap.
+/// The cache is measured (`dir_size`, for the limit) only below the threshold.
+///
+/// Every pass, whoever calls it, logs one `info` line (see
+/// [`crate::disk::PressureOutcome`]).
 pub(crate) fn prune_cache_under_pressure(
     cfg: &crate::config::Config,
     home: &Path,
     free_bytes: impl Fn(&Path) -> Result<u64>,
-) -> Result<Option<CachePass>> {
+) -> Result<Option<Prune>> {
     let cap = cfg.disk.cache_limit_bytes;
     if cap == 0 {
         return Ok(None);
@@ -962,51 +953,39 @@ pub(crate) fn prune_cache_under_pressure(
     };
     let floor = cfg.disk.min_free_bytes;
     let threshold = cfg.disk.reclaim_threshold();
-    let free_before = free_bytes(&cache).ok();
-    let measured = free_before
+    let free = free_bytes(&cache).ok();
+    let estimate = free
         .filter(|free| *free < threshold)
         .map(|free| (free, dir_size(&cache)));
-    let limit = measured.map_or(cap, |(free, size)| {
-        crate::disk::pressure_limit(size, cap, floor, threshold, free)
+    let (limit, keep) = estimate.map_or((cap, 0), |(free, size)| {
+        (
+            crate::disk::pressure_limit(size, cap, floor, threshold, free),
+            crate::disk::pressure_reserve(cap, floor, threshold, free),
+        )
     });
-    let prune = prune_cache(home, &cache, limit)?;
-    let size_before = measured
-        .map(|(_, size)| size)
-        .or(prune.map(|p| p.remaining.saturating_add(p.freed)));
-    let report = crate::disk::PressureReport {
-        volume: crate::disk::volume_root(&cache),
-        threshold,
-        admission_floor: floor,
-        free_before,
-        free_after: free_before.and_then(|_| free_bytes(&cache).ok()),
-        size_before,
-        size_after: prune.map(|p| p.remaining).or(size_before),
-        removed_bytes: prune.map_or(0, |p| p.freed),
-        files: prune.map_or(0, |p| p.files),
-        outcome: crate::disk::pressure_outcome(
-            free_before,
-            floor,
-            threshold,
-            measured.map_or(0, |(_, size)| size),
-            limit,
-            prune.map_or(0, |p| p.freed),
-            prune.is_none(),
-        ),
-        path: cache,
-    };
-    if report.outcome != crate::disk::PressureOutcome::AboveThreshold {
-        tracing::info!(
-            cache = %report.path.display(),
-            threshold,
-            free_before = report.free_before,
-            free_after = report.free_after,
-            removed = report.removed_bytes,
-            files = report.files,
-            outcome = ?report.outcome,
-            "shared build cache pressure pass"
-        );
-    }
-    Ok(Some(CachePass { prune, report }))
+    let prune = crate::cache::maintenance_prune_keeping(home, &cache, limit, keep)?;
+    // The size a pass reports is the locked inventory's, never the earlier
+    // unlocked estimate: a cache in use may have changed since.
+    let locked = prune.map(|pruned| pruned.remaining.saturating_add(pruned.freed));
+    let removed = prune.map_or(0, |pruned| pruned.freed);
+    let outcome = crate::disk::pressure_outcome(
+        prune.is_none(),
+        removed,
+        locked.or(estimate.map(|(_, size)| size)).unwrap_or(0),
+        limit,
+        keep,
+    );
+    tracing::info!(
+        cache = %cache.display(),
+        admission_floor = floor,
+        collection_threshold = threshold,
+        free,
+        size = locked,
+        removed,
+        outcome = outcome.as_str(),
+        "shared build cache pressure pass"
+    );
+    Ok(prune)
 }
 
 /// The cache's path, size and cap, for `magi cache show` and the health view.
@@ -1735,98 +1714,83 @@ mod tests {
         assert!(!dir.path().join("big").exists());
     }
 
-    /// A shared cache of two 100-byte files, `old` older than `new`, capped
-    /// at 250 (so its reserve is 125), and a config that names it with the
-    /// given admission floor and collection setting.
+    /// A shared cache of four 100-byte files, `f1` the oldest, capped at 500
+    /// (so its reserve is 250), and a config that names it with the given
+    /// admission floor and collection setting. The cache dir is quoted in the
+    /// command, as a path with spaces needs.
     fn pressure_fixture(
         min_free_bytes: u64,
         reclaim_free_bytes: Option<u64>,
     ) -> (tempfile::TempDir, tempfile::TempDir, crate::config::Config) {
         let home = tempfile::tempdir().unwrap();
         let dir = tempfile::tempdir().unwrap();
-        for (name, at) in [("old", 1_000_000), ("new", 2_000_000)] {
+        for (i, name) in ["f1", "f2", "f3", "f4"].into_iter().enumerate() {
             fs::write(dir.path().join(name), vec![0u8; 100]).unwrap();
-            touch(&dir.path().join(name), at);
+            touch(&dir.path().join(name), 1_000_000 + i as u64);
         }
         let mut cfg = crate::config::Config::default();
         cfg.verify.gate = vec![format!(
             "CARGO_TARGET_DIR=\"{}\" cargo make check",
             dir.path().display()
         )];
-        cfg.disk.cache_limit_bytes = 250;
+        cfg.disk.cache_limit_bytes = 500;
         cfg.disk.min_free_bytes = min_free_bytes;
         cfg.disk.reclaim_free_bytes = reclaim_free_bytes;
         (home, dir, cfg)
     }
 
+    /// One pass with `free` as the volume's free space, and the files left.
     fn pass(
         cfg: &crate::config::Config,
         home: &Path,
+        dir: &Path,
         free: u64,
-    ) -> (Option<Prune>, crate::disk::PressureReport) {
-        let pass = prune_cache_under_pressure(cfg, home, |_| Ok(free))
-            .unwrap()
-            .expect("the fixture names a cache");
-        (pass.prune, pass.report)
+    ) -> (Option<Prune>, Vec<&'static str>) {
+        let pruned = prune_cache_under_pressure(cfg, home, |_| Ok(free)).unwrap();
+        let left = ["f1", "f2", "f3", "f4"]
+            .into_iter()
+            .filter(|name| dir.join(name).exists())
+            .collect();
+        (pruned, left)
     }
 
     #[test]
     fn a_pass_removes_the_estimated_deficit_between_the_floor_and_the_threshold() {
-        // free 11 is one byte above the admission floor (10). Threshold 30
-        // means a 19-byte deficit; the cache (200) is above its reserve (125),
-        // so the limit is 181 and the oldest file (100 logical bytes) covers
-        // the deficit and the newer one stays. The pass measures free space
-        // once and does not look again: the injected 11 never changes.
+        // Floor 10, threshold 30, free 11 (one byte above the floor): a 19-byte
+        // deficit on a 400-byte cache above its reserve (250), so the limit is
+        // 381 and the oldest file (100 logical bytes) covers it. The pass
+        // measures free space once: the injected 11 never changes.
         // On origin/main (threshold = floor) the same input has no deficit and
         // removes nothing, so these assertions fail there.
         let (home, dir, cfg) = pressure_fixture(10, Some(30));
-        let (pruned, report) = pass(&cfg, home.path(), 11);
+        let (pruned, left) = pass(&cfg, home.path(), dir.path(), 11);
         let pruned = pruned.expect("cache is free");
-        assert_eq!((pruned.files, pruned.freed), (1, 100));
-        assert!(!dir.path().join("old").exists());
-        assert!(dir.path().join("new").exists());
-        assert_eq!(report.outcome, crate::disk::PressureOutcome::Collected);
         assert_eq!(
-            (report.threshold, report.admission_floor),
-            (30, 10),
-            "the receipt names both floors"
+            (pruned.files, pruned.freed, pruned.remaining),
+            (1, 100, 300)
         );
-        assert_eq!(
-            (report.free_before, report.free_after),
-            (Some(11), Some(11))
-        );
-        assert_eq!(
-            (report.size_before, report.size_after),
-            (Some(200), Some(100))
-        );
-        assert_eq!((report.removed_bytes, report.files), (100, 1));
+        assert_eq!(left, ["f2", "f3", "f4"]);
 
         // The default threshold (twice the floor = 20) collects at free 11 too.
         let (home, dir, cfg) = pressure_fixture(10, None);
-        let (pruned, _) = pass(&cfg, home.path(), 11);
+        let (pruned, left) = pass(&cfg, home.path(), dir.path(), 11);
         assert_eq!(pruned.unwrap().files, 1);
-        assert!(dir.path().join("new").exists());
+        assert_eq!(left, ["f2", "f3", "f4"]);
     }
 
     #[test]
     fn the_shared_cache_is_left_alone_at_or_above_the_threshold() {
         let (home, dir, cfg) = pressure_fixture(10, Some(30));
         for free in [30, 31, u64::MAX] {
-            let (pruned, report) = pass(&cfg, home.path(), free);
+            let (pruned, left) = pass(&cfg, home.path(), dir.path(), free);
             assert_eq!(pruned.unwrap().files, 0, "free {free}");
-            assert_eq!(report.outcome, crate::disk::PressureOutcome::AboveThreshold);
-            assert_eq!(
-                report.size_before,
-                Some(200),
-                "taken from the prune, not a second walk"
-            );
+            assert_eq!(left.len(), 4);
         }
         // A threshold equal to the floor is the old behaviour: nothing at 11.
-        let (home2, _dir2, floor_only) = pressure_fixture(10, Some(10));
-        let (pruned, report) = pass(&floor_only, home2.path(), 11);
+        let (home2, dir2, floor_only) = pressure_fixture(10, Some(10));
+        let (pruned, left) = pass(&floor_only, home2.path(), dir2.path(), 11);
         assert_eq!(pruned.unwrap().files, 0);
-        assert_eq!(report.outcome, crate::disk::PressureOutcome::AboveThreshold);
-        assert!(dir.path().join("old").exists() && dir.path().join("new").exists());
+        assert_eq!(left.len(), 4);
 
         // A zero cap is still "pruning off", whatever the pressure.
         let (home3, dir3, mut off) = pressure_fixture(10, Some(1000));
@@ -1836,93 +1800,95 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert!(dir3.path().join("old").exists());
+        assert!(dir3.path().join("f1").exists());
     }
 
     #[test]
-    fn above_the_floor_a_cache_keeps_its_reserve_and_repeated_passes_converge() {
+    fn above_the_floor_the_reserve_is_enforced_where_files_go_and_passes_converge() {
         // The threshold is out of reach and free space is pinned at 11 by
-        // another program. The first pass takes the cache to its reserve
-        // (half the 250 cap = 125, so one 100-byte file goes); the second
-        // finds it at the reserve and removes nothing, however long the
-        // pressure lasts. Without the reserve both files would go.
+        // another program. Reserve = half the 500 cap = 250. The limit (250)
+        // would take the cache from 400 to 250; the oldest file goes (300),
+        // and the next removal would leave 200, below the reserve, so it is
+        // skipped, as is every later one.
         let (home, dir, cfg) = pressure_fixture(10, Some(1_000_000));
-        let (first, report) = pass(&cfg, home.path(), 11);
-        assert_eq!(first.unwrap().files, 1);
-        assert_eq!(report.outcome, crate::disk::PressureOutcome::Collected);
-        assert!(!dir.path().join("old").exists());
-        assert!(dir.path().join("new").exists());
+        let (first, left) = pass(&cfg, home.path(), dir.path(), 11);
+        let first = first.unwrap();
+        assert_eq!((first.files, first.remaining), (1, 300), "{first:?}");
+        assert_eq!(left, ["f2", "f3", "f4"]);
 
-        let (second, report) = pass(&cfg, home.path(), 11);
-        let second = second.unwrap();
-        assert_eq!((second.files, second.freed), (0, 0));
-        assert_eq!(report.outcome, crate::disk::PressureOutcome::AtReserve);
-        assert_eq!(
-            (report.size_before, report.size_after),
-            (Some(100), Some(100))
-        );
-        assert!(dir.path().join("new").exists());
+        // However long the pressure lasts, nothing more goes.
+        let (second, left) = pass(&cfg, home.path(), dir.path(), 11);
+        assert_eq!(second.unwrap().files, 0);
+        assert_eq!(left, ["f2", "f3", "f4"]);
+    }
+
+    #[test]
+    fn an_artifact_larger_than_size_minus_reserve_survives_every_pass() {
+        // One 300-byte artifact, cap 500 (reserve 250), free pinned at 11
+        // between the floor (10) and the threshold. The limit is 250, which
+        // alone would delete the artifact; the next build recreates it and the
+        // next pass would delete it again. The reserve keeps it.
+        let (home, dir, cfg) = pressure_fixture(10, Some(1_000_000));
+        for name in ["f1", "f2", "f3", "f4"] {
+            fs::remove_file(dir.path().join(name)).unwrap();
+        }
+        let artifact = dir.path().join("artifact");
+        for _ in 0..3 {
+            fs::write(&artifact, vec![0u8; 300]).unwrap();
+            let pruned = prune_cache_under_pressure(&cfg, home.path(), |_| Ok(11))
+                .unwrap()
+                .expect("the cache is free");
+            assert_eq!((pruned.files, pruned.remaining), (0, 300), "{pruned:?}");
+            assert!(artifact.exists());
+        }
+        // Below the admission floor the reserve is gone: space outranks it.
+        let pruned = prune_cache_under_pressure(&cfg, home.path(), |_| Ok(0))
+            .unwrap()
+            .expect("the cache is free");
+        assert_eq!(pruned.files, 1);
+        assert!(!artifact.exists());
     }
 
     #[test]
     fn below_the_admission_floor_there_is_no_reserve() {
         // Floor 150, threshold 300. At free 160 (above the floor) the reserve
-        // keeps 125 of the 200 bytes, so one file goes. At free 0 (below it)
-        // the old rule applies - the limit is 200 - 150 = 50 - and both go.
+        // keeps 250 of the 400 bytes: one file goes (to 300), the next would
+        // leave 200. At free 0 (below the floor) the old rule applies - the
+        // limit is 400 - 150 = 250 - and two go, below the reserve.
         let (home, dir, cfg) = pressure_fixture(150, Some(300));
-        let (pruned, _) = pass(&cfg, home.path(), 160);
+        let (pruned, left) = pass(&cfg, home.path(), dir.path(), 160);
         assert_eq!(pruned.unwrap().files, 1);
-        assert!(dir.path().join("new").exists());
+        assert_eq!(left, ["f2", "f3", "f4"]);
 
         let (home, dir, cfg) = pressure_fixture(150, Some(300));
-        let (pruned, report) = pass(&cfg, home.path(), 0);
-        assert_eq!(pruned.unwrap().files, 2);
-        assert!(!dir.path().join("new").exists());
-        assert_eq!(report.outcome, crate::disk::PressureOutcome::Collected);
-        assert_eq!(report.size_after, Some(0));
-
-        // Nothing left to remove below the floor: a quiet no-op, not at reserve.
-        let (pruned, report) = pass(&cfg, home.path(), 0);
-        assert_eq!(pruned.unwrap().files, 0);
-        assert_eq!(
-            report.outcome,
-            crate::disk::PressureOutcome::NothingEligible
-        );
+        let (pruned, left) = pass(&cfg, home.path(), dir.path(), 0);
+        let pruned = pruned.unwrap();
+        assert_eq!((pruned.files, pruned.remaining), (2, 200));
+        assert_eq!(left, ["f3", "f4"]);
     }
 
     #[test]
-    fn a_cache_in_use_is_left_alone_and_the_receipt_says_so() {
+    fn a_cache_in_use_is_left_alone() {
         let (home, dir, cfg) = pressure_fixture(10, Some(1_000_000));
         let owner = crate::cache::Owner::here("run", "node", "seat", dir.path(), "head");
         let _held = match crate::cache::try_acquire(home.path(), dir.path(), &owner).unwrap() {
             crate::cache::AcquireOutcome::Acquired(guard) => guard,
             crate::cache::AcquireOutcome::Busy(_) => panic!("fresh cache is busy"),
         };
-        let (pruned, report) = pass(&cfg, home.path(), 11);
+        let (pruned, left) = pass(&cfg, home.path(), dir.path(), 11);
         assert!(pruned.is_none());
-        assert_eq!(report.outcome, crate::disk::PressureOutcome::LeaseHeld);
-        assert_eq!(report.removed_bytes, 0);
-        assert_eq!(
-            (report.size_before, report.size_after),
-            (Some(200), Some(200))
-        );
-        assert!(dir.path().join("old").exists());
+        assert_eq!(left.len(), 4);
     }
 
     #[test]
     fn an_unmeasurable_volume_prunes_to_the_plain_cap() {
         let (home, dir, mut cfg) = pressure_fixture(10, Some(1_000_000));
-        cfg.disk.cache_limit_bytes = 150;
-        let pass = prune_cache_under_pressure(&cfg, home.path(), |_| anyhow::bail!("no volume"))
+        cfg.disk.cache_limit_bytes = 350;
+        let pruned = prune_cache_under_pressure(&cfg, home.path(), |_| anyhow::bail!("no volume"))
             .unwrap()
             .unwrap();
-        assert_eq!(pass.prune.unwrap().files, 1, "only the cap applies");
-        assert_eq!(
-            pass.report.outcome,
-            crate::disk::PressureOutcome::Unmeasured
-        );
-        assert_eq!(pass.report.free_before, None);
-        assert!(dir.path().join("new").exists());
+        assert_eq!(pruned.files, 1, "only the cap applies");
+        assert!(!dir.path().join("f1").exists() && dir.path().join("f2").exists());
     }
 
     /// Pin a file's mtime, so a test asserts the policy and not the runner's

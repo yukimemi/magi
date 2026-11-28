@@ -473,13 +473,6 @@ pub(crate) struct Report {
     /// Free-space level the pass collected toward (`[disk] reclaim_free_bytes`,
     /// resolved); `0` means free space did not drive collection.
     pub reclaim_free_bytes: u64,
-    /// The admission floor (`[disk] min_free_bytes`) the same pass left
-    /// untouched; collection never moves it.
-    pub min_free_bytes: u64,
-    /// Absolute free space before and after this pass on each volume holding
-    /// retained outputs it inspected, recorded whether or not anything was
-    /// removed (`observed_home_free_change_bytes` is the home volume only).
-    pub volumes: Vec<VolumeFree>,
     /// Logical inventory, including protected and unproven data.
     pub measured_bytes: u64,
     /// Logical bytes unlinked, not a measurement of physical disk recovery.
@@ -507,32 +500,6 @@ pub(crate) struct Report {
     pub source_evidence_added_allocated_bytes: Option<u64>,
     pub retained: Vec<String>,
     pub failures: Vec<String>,
-}
-
-/// Free space on one volume that holds retained outputs, measured at the
-/// start and the end of a sweep. `None` is a failed measurement. Concurrent
-/// writers mean the change is not attributable to the sweep.
-#[derive(Default, Debug, Serialize, Deserialize)]
-#[serde(default)]
-pub(crate) struct VolumeFree {
-    /// Identifies the volume (the device on Unix).
-    pub volume: String,
-    /// A target checked on that volume.
-    pub path: PathBuf,
-    pub free_before: Option<u64>,
-    pub free_after: Option<u64>,
-}
-
-/// Names the volume `path` lives on, so one volume is measured once.
-fn volume_key(path: &Path) -> String {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if let Ok(metadata) = std::fs::metadata(path) {
-            return format!("dev:{}", metadata.dev());
-        }
-    }
-    crate::disk::volume_root(path).unwrap_or_else(|| path.display().to_string())
 }
 
 #[cfg(unix)]
@@ -1348,7 +1315,6 @@ async fn sweep_inner(home: &Path, disk: &crate::config::Disk, now: Timestamp) ->
         limit_bytes: disk.worktree_limit_bytes,
         reclaim_budget_bytes: disk.worktree_reclaim_bytes,
         reclaim_free_bytes: disk.reclaim_threshold(),
-        min_free_bytes: disk.min_free_bytes,
         ..Report::default()
     };
     if !cfg!(unix) {
@@ -1362,8 +1328,6 @@ async fn sweep_inner(home: &Path, disk: &crate::config::Disk, now: Timestamp) ->
     };
     let mut targets = Vec::new();
     let mut under_pressure = false;
-    let mut volumes: std::collections::BTreeMap<String, (PathBuf, Option<u64>)> =
-        std::collections::BTreeMap::new();
     let mut registrations = std::collections::HashMap::new();
     let measurements_path = home.join("output-measurements.json");
     let mut measurements: std::collections::BTreeMap<PathBuf, Measurement> =
@@ -1433,11 +1397,8 @@ async fn sweep_inner(home: &Path, disk: &crate::config::Disk, now: Timestamp) ->
             }
             let target = path.join("target");
             observed.insert(target.clone());
-            let free = crate::disk::free_bytes(&path).ok();
-            let pressure = free.is_none_or(|free| free < disk.reclaim_threshold());
-            volumes
-                .entry(volume_key(&path))
-                .or_insert_with(|| (path.clone(), free));
+            let pressure =
+                crate::disk::free_bytes(&path).map_or(true, |free| free < disk.reclaim_threshold());
             under_pressure |= pressure;
             let measurement = measurements.entry(target).or_default();
             if pressure
@@ -1649,15 +1610,6 @@ async fn sweep_inner(home: &Path, disk: &crate::config::Disk, now: Timestamp) ->
             ),
         );
     }
-    report.volumes = volumes
-        .into_iter()
-        .map(|(volume, (path, free_before))| VolumeFree {
-            free_after: crate::disk::free_bytes(&path).ok(),
-            volume,
-            path,
-            free_before,
-        })
-        .collect();
     report.observed_home_free_change_bytes = free_before
         .zip(crate::disk::free_bytes(home).ok())
         .map(|(before, after)| {
@@ -3402,7 +3354,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_sweep_below_the_threshold_but_above_the_floor_collects_within_its_budget() {
+    async fn sweep_collects_toward_the_threshold_not_the_admission_floor() {
         let f = Fx::new().await;
         let small = f.run("bb10", true).await;
         let large = f.run("bb11", true).await;
@@ -3425,11 +3377,7 @@ mod tests {
         let idle = sweep(&f.home, &disk, Fx::now()).await;
         assert_eq!(idle.freed_bytes, 0, "{idle:?}");
         assert_eq!(idle.reclaim_free_bytes, 2);
-        assert_eq!(idle.min_free_bytes, 1);
         assert!(output.exists());
-        // A pass that removed nothing still says where free space stood.
-        assert_eq!(idle.volumes.len(), 1, "{idle:?}");
-        assert!(idle.volumes[0].free_before.is_some() && idle.volumes[0].free_after.is_some());
 
         // A collection threshold no volume reaches turns the same state into
         // pressure: the largest eligible output goes first, within the budget.
@@ -3437,8 +3385,6 @@ mod tests {
         let out = sweep(&f.home, &disk, Fx::now()).await;
         assert_eq!(out.freed_bytes, 1000, "{out:?}");
         assert_eq!(out.reclaim_free_bytes, u64::MAX);
-        assert_eq!(out.volumes.len(), 1, "{out:?}");
-        assert!(out.volumes[0].free_before.is_some() && out.volumes[0].free_after.is_some());
         assert!(!output.exists());
         assert!(
             small.candidates[0]

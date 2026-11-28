@@ -63,24 +63,36 @@ a build cache - the shared one and the registered isolated-build pool, each
 against its configured cap - is never collected below half that cap: a cache is
 only useful while something is left in it, and on a disk whose free space other
 software controls a rule without a reserve would empty it on every pass and make
-every build start cold. The ratio is fixed, not a setting. Below the admission
-floor there is no reserve (work is held anyway and space outranks a warm cache):
-the limit shrinks by the deficit against `min_free_bytes`, as before the
-threshold existed. A zero cap still means pruning is off. Retained worktree
-outputs of finished runs get no reserve (nothing rebuilds from them); their
-per-pass byte budget and eligibility rules bound them instead.
+every build start cold. The ratio is fixed, not a setting. The reserve is
+enforced where files are deleted, not only in the limit: the pruning routine
+(`disk::prune_dir_keeping`, reached through `cache::maintenance_prune_keeping`)
+works oldest-first as always but *skips* a file whose removal would leave less
+than the reserve and carries on with later candidates while the cache is still
+over its limit, using the inventory it takes under the maintenance lease and
+Cargo locks. One artifact larger than `size - reserve` is therefore kept, not
+deleted and rebuilt on every pass. For the isolated-build pool the bound is the
+pool's aggregate accounting: each target may give up only the bytes the whole
+pool holds above the reserve. Below the admission floor there is no reserve
+(work is held anyway and space outranks a warm cache): the limit shrinks by the
+deficit against `min_free_bytes`, as before the threshold existed, and the bound
+is zero; so it is for the plain cap and manual `magi cache prune`. A zero cap
+still means pruning is off. Retained worktree outputs of finished runs get no
+reserve (nothing rebuilds from them); their per-pass byte budget and
+eligibility rules bound them instead.
 
-Every pass leaves a receipt, also when it removed nothing. The
-`source-eviction-disk-pressure-worker.json` service receipt records, per
-shared-cache and isolated-build pass, the threshold, the admission floor, the
-volume, free bytes before and after, cache size before and after, logical bytes
-removed and an outcome - `above threshold`, `collected`, `at reserve`,
-`nothing eligible`, `lease held` (or `unmeasured` when the volume's free space
-could not be read and the plain cap applied). None of them is an error. The
-sweep report (`retention.json`) records the resolved `reclaim_free_bytes`, the
-untouched `min_free_bytes` and, per volume holding retained outputs, absolute
-free bytes before and after (`volumes`; `observed_home_free_change_bytes` is the
-home volume only).
+Every shared-cache and isolated-build pass, from every caller (the busy-time
+disk-pressure service, idle housekeeping, the between-runs cache service), logs
+one `info` line: the cache, the admission floor, the collection threshold, the
+free bytes measured, the cache size (only from an inventory taken under the
+maintenance locks; omitted otherwise), the logical bytes removed and an outcome.
+The outcome says why the pass ended, maintenance refusals first: `lease held`
+(maintenance could not take the cache), `collected`, `nothing eligible` (over its
+limit but no file could be removed, including everything protected by the
+reserve), `at reserve` (nothing needed removing because the cache is at or below
+its reserve) and `within limit`. None of them is an error. The busy-time
+disk-pressure service receipt (`source-eviction-disk-pressure-worker.json`)
+records the resolved collection threshold as `reclaim_free_bytes`, and the sweep
+report (`retention.json`) the same value as `reclaim_free_bytes`.
 
 Only plain, canonical, registered worktrees are eligible. A legacy `target` must
 be ignored, contain no tracked files, carry Cargo's standard
