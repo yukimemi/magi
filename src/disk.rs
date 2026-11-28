@@ -129,10 +129,108 @@ pub fn over_limit(size: u64, limit: u64) -> bool {
     size > limit
 }
 
-/// A cache's target size under its cap and the volume's free-space floor.
-/// Pressure can reclaim idle cache files below the ordinary size cap.
-pub fn pressure_limit(size: u64, cap: u64, min_free: u64, free: u64) -> u64 {
-    cap.min(size.saturating_sub(min_free.saturating_sub(free)))
+/// A cache's target size under its cap and the volume's free space: the one
+/// rule every caller of pressure collection goes through.
+///
+/// Three bands, by `free` against the admission floor `min_free` and the
+/// collection threshold `threshold`
+/// ([`Disk::reclaim_threshold`](crate::config::Disk::reclaim_threshold)):
+///
+/// * `free >= threshold`: nothing is short; the limit is the configured cap
+///   (never more than `size`, so nothing is asked to shrink).
+/// * `min_free <= free < threshold`: the limit shrinks by the deficit
+///   (`threshold - free`) but never below a **reserve**, half of `cap`
+///   (see [`pressure_reserve`]; never above the cache's own `size`, so a cache
+///   at or below its reserve is left alone). A build cache is only worth
+///   anything while some of it is left: on a disk whose free space other
+///   software controls, a rule without a reserve would empty every cache on
+///   every pass and start every build cold. The ratio is fixed on purpose,
+///   not a setting. The limit alone does not keep the reserve: the pruning
+///   routine is also given the reserve as a bound ([`prune_dir_keeping`]) and
+///   refuses any removal that would cross it.
+/// * `free < min_free`: below the admission floor work is held anyway and
+///   getting space back outranks a warm cache, so this is exactly the rule
+///   from before the threshold existed: the limit shrinks by the deficit
+///   against `min_free`, down to zero if need be.
+///
+/// A zero `cap` yields zero here; callers that treat a zero cap as "pruning
+/// off" check it before asking. The limit is an *estimate*: the caller removes
+/// that many logical bytes oldest-first and does not re-measure within the
+/// pass (see [`PressureOutcome`]).
+pub fn pressure_limit(size: u64, cap: u64, min_free: u64, threshold: u64, free: u64) -> u64 {
+    if free >= threshold {
+        return cap.min(size);
+    }
+    if free < min_free {
+        return cap.min(size.saturating_sub(min_free - free));
+    }
+    let reserve = pressure_reserve(cap, min_free, threshold, free).min(size);
+    cap.min(reserve.max(size.saturating_sub(threshold - free)))
+}
+
+/// The size a build cache must keep while free space is between the admission
+/// floor and the collection threshold: half its configured `cap`. Zero in
+/// every other band (at or above the threshold nothing is collected beyond the
+/// cap; below the floor getting space back outranks a warm cache), which is
+/// also what makes manual `magi cache prune` and the plain cap unchanged.
+pub fn pressure_reserve(cap: u64, min_free: u64, threshold: u64, free: u64) -> u64 {
+    if free >= min_free && free < threshold {
+        cap / 2
+    } else {
+        0
+    }
+}
+
+/// How a shared-cache pressure pass that ran to completion ended, as its log
+/// line says it. None of them is an error: a pass that cannot make progress
+/// says so and the service's next period tries again.
+///
+/// A pass is *estimated-deficit collection*: it measures free space once,
+/// computes the deficit against the collection threshold, and removes that
+/// many *logical* bytes oldest-first, bounded by [`pressure_limit`]. It does
+/// not re-measure in a loop. Hard links and other writers mean the space
+/// actually freed can be less (or more); the next pass measures again and
+/// continues.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PressureOutcome {
+    /// Files were removed.
+    Collected,
+    /// Nothing needed removing, because the cache is at or below the reserve
+    /// it keeps while free space is below the collection threshold.
+    AtReserve,
+    /// The cache was over its limit but no file could be removed: none left,
+    /// all of them protected by the reserve, or every removal failed.
+    NothingEligible,
+    /// The cache was within its limit; nothing needed removing.
+    WithinLimit,
+}
+
+impl PressureOutcome {
+    /// The wording of the log line.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PressureOutcome::Collected => "collected",
+            PressureOutcome::AtReserve => "at reserve",
+            PressureOutcome::NothingEligible => "nothing eligible",
+            PressureOutcome::WithinLimit => "within limit",
+        }
+    }
+}
+
+/// Classify a pass: `removed` is the logical bytes it removed; `size` the
+/// cache's size going into the deletion (the pruning routine's own inventory);
+/// `limit` what [`pressure_limit`] allowed; `keep` the reserve the pruning was
+/// bounded by ([`pressure_reserve`]).
+pub fn pressure_outcome(removed: u64, size: u64, limit: u64, keep: u64) -> PressureOutcome {
+    if removed > 0 {
+        PressureOutcome::Collected
+    } else if size > limit {
+        PressureOutcome::NothingEligible
+    } else if keep > 0 && size > 0 && size <= keep {
+        PressureOutcome::AtReserve
+    } else {
+        PressureOutcome::WithinLimit
+    }
 }
 
 /// The path a rendered command sets `CARGO_TARGET_DIR=` to, if any.
@@ -401,6 +499,20 @@ pub fn plan_prune(dir: &Path, limit: u64) -> PrunePlan {
 ///
 /// Nothing is deleted when the directory is missing.
 pub fn prune_dir(dir: &Path, limit: u64) -> Result<Prune> {
+    prune_dir_keeping(dir, limit, 0)
+}
+
+/// [`prune_dir`] that never takes the directory below `keep` bytes.
+///
+/// Pressure collection between the admission floor and the collection
+/// threshold keeps a reserve of a build cache ([`pressure_reserve`]): a limit
+/// alone cannot do that, because files are removed whole and one large
+/// artifact can be larger than `size - reserve`. A file whose removal would
+/// leave less than `keep` is *skipped*, and the walk goes on to later (newer)
+/// candidates while the directory is still over `limit`. The inventory is the
+/// one this call takes itself, under whatever maintenance locks the caller
+/// holds. `keep == 0` is exactly [`prune_dir`].
+pub fn prune_dir_keeping(dir: &Path, limit: u64, keep: u64) -> Result<Prune> {
     let Some(tree) = Tree::of(dir) else {
         return Ok(Prune {
             freed: 0,
@@ -430,6 +542,9 @@ pub fn prune_dir(dir: &Path, limit: u64) -> Result<Prune> {
     for (_, size, path) in &tree.files {
         if !over_limit(total, limit) {
             break;
+        }
+        if total.saturating_sub(*size) < keep {
+            continue;
         }
         if std::fs::remove_file(path).is_ok() {
             total = total.saturating_sub(*size);
@@ -850,11 +965,219 @@ mod tests {
 
 #[cfg(test)]
 mod pressure_tests {
+    use super::{
+        PressureOutcome as O, Prune, dir_size, pressure_limit, pressure_outcome, pressure_reserve,
+        prune_dir, prune_dir_keeping,
+    };
+    use std::fs;
+    use std::path::Path;
+    use std::time::{Duration, SystemTime};
+
     #[test]
-    fn pressure_reclaims_below_cap_without_underflow() {
-        assert_eq!(super::pressure_limit(100, 200, 80, 30), 50);
-        assert_eq!(super::pressure_limit(100, 200, 80, 100), 100);
-        assert_eq!(super::pressure_limit(100, 200, 800, 0), 0);
-        assert_eq!(super::pressure_limit(100, 50, 0, 0), 50);
+    fn a_threshold_equal_to_the_floor_is_the_rule_from_before_the_threshold() {
+        assert_eq!(pressure_limit(100, 200, 80, 80, 30), 50);
+        assert_eq!(pressure_limit(100, 200, 80, 80, 100), 100);
+        assert_eq!(pressure_limit(100, 200, 800, 800, 0), 0);
+        assert_eq!(pressure_limit(100, 50, 0, 0, 0), 50);
+        // Free at the floor with threshold == floor: no deficit, no reserve.
+        assert_eq!(pressure_limit(100, 200, 10, 10, 10), 100);
+    }
+
+    #[test]
+    fn above_the_threshold_the_limit_is_the_cap_or_the_size() {
+        // floor 8, threshold 16, cap 10 (units: GiB)
+        assert_eq!(pressure_limit(9, 10, 8, 16, 16), 9);
+        assert_eq!(pressure_limit(9, 10, 8, 16, 500), 9);
+        assert_eq!(
+            pressure_limit(12, 10, 8, 16, 16),
+            10,
+            "over the cap still shrinks"
+        );
+    }
+
+    #[test]
+    fn between_the_floor_and_the_threshold_a_cache_keeps_half_its_cap() {
+        // floor 8, threshold 16, cap 10, so the reserve is 5.
+        // A cache of 4 is below its reserve: untouched (limit == size).
+        assert_eq!(pressure_limit(4, 10, 8, 16, 10), 4);
+        // 9 with free 10: the deficit would leave 3, the reserve keeps 5.
+        assert_eq!(pressure_limit(9, 10, 8, 16, 10), 5);
+        // 9 with free 15: a deficit of 1 leaves 8, above the reserve.
+        assert_eq!(pressure_limit(9, 10, 8, 16, 15), 8);
+        // Exactly at the floor is still this band.
+        assert_eq!(pressure_limit(9, 10, 8, 16, 8), 5);
+        // The cap still bounds from above, and an odd cap rounds the reserve down.
+        assert_eq!(pressure_limit(100, 60, 10, 20, 11), 60);
+        assert_eq!(pressure_limit(9, 11, 8, 16, 8), 5);
+        // The reserve is a fixed ratio of the cap: it does not move with size.
+        assert_eq!(
+            pressure_limit(40, 10, 8, 16, 8),
+            10,
+            "cap bounds the shrink"
+        );
+    }
+
+    #[test]
+    fn below_the_floor_the_rule_is_the_one_from_before_the_threshold() {
+        // floor 8, threshold 16, cap 10: size 9, free 7 -> one short of the floor.
+        assert_eq!(pressure_limit(9, 10, 8, 16, 7), 8);
+        assert_eq!(pressure_limit(9, 10, 8, 16, 0), 1);
+        // No reserve here: a deficit larger than the cache empties it.
+        assert_eq!(pressure_limit(4, 10, 8, 16, 0), 0);
+        assert_eq!(pressure_limit(5, 200, 20, 20, 0), 0);
+    }
+
+    #[test]
+    fn a_zero_cap_stays_zero_in_every_band() {
+        for free in [0, 7, 8, 10, 15, 16, 500] {
+            assert_eq!(pressure_limit(100, 0, 8, 16, free), 0, "free {free}");
+        }
+    }
+
+    #[test]
+    fn repeated_passes_with_free_space_pinned_converge() {
+        // Free space stays at 10 whatever is removed (another program owns the
+        // disk). The first pass takes the cache to its reserve, the second
+        // removes nothing.
+        let mut size = 9;
+        let first = pressure_limit(size, 10, 8, 16, 10);
+        assert_eq!(first, 5);
+        size = size.min(first);
+        let second = pressure_limit(size, 10, 8, 16, 10);
+        assert_eq!(second, size, "nothing left to remove");
+    }
+
+    #[test]
+    fn the_reserve_exists_only_between_the_floor_and_the_threshold() {
+        // floor 8, threshold 16, cap 10
+        assert_eq!(pressure_reserve(10, 8, 16, 7), 0, "below the floor");
+        assert_eq!(pressure_reserve(10, 8, 16, 8), 5);
+        assert_eq!(pressure_reserve(10, 8, 16, 15), 5);
+        assert_eq!(pressure_reserve(10, 8, 16, 16), 0, "at the threshold");
+        assert_eq!(pressure_reserve(11, 8, 16, 10), 5, "odd caps round down");
+        assert_eq!(
+            pressure_reserve(0, 8, 16, 10),
+            0,
+            "a zero cap keeps nothing"
+        );
+        // The collection threshold equal to the floor leaves no band at all.
+        assert_eq!(pressure_reserve(10, 8, 8, 8), 0);
+    }
+
+    #[test]
+    fn the_limit_handles_a_small_cap_a_disabled_floor_and_a_cache_at_its_reserve() {
+        // Cap 4 (reserve 2) is smaller than the deficit: the cap bounds it.
+        assert_eq!(pressure_limit(4, 4, 8, 16, 8), 2);
+        // Admission disabled (floor 0) with a positive threshold still collects.
+        assert_eq!(pressure_limit(9, 10, 0, 16, 0), 5);
+        // Size exactly at the reserve is left alone.
+        assert_eq!(pressure_limit(5, 10, 8, 16, 10), 5);
+    }
+
+    #[test]
+    fn the_outcome_names_why_a_pass_removed_nothing() {
+        // (removed, size, limit, keep)
+        assert_eq!(pressure_outcome(4, 9, 5, 5), O::Collected);
+        assert_eq!(pressure_outcome(2, 12, 10, 0), O::Collected);
+        // Within the limit with no reserve involved (above the threshold).
+        assert_eq!(pressure_outcome(0, 9, 9, 0), O::WithinLimit);
+        assert_eq!(pressure_outcome(0, 0, 0, 0), O::WithinLimit);
+        // At or below the reserve the band keeps.
+        assert_eq!(pressure_outcome(0, 4, 4, 5), O::AtReserve);
+        assert_eq!(pressure_outcome(0, 5, 5, 5), O::AtReserve);
+        // Over the limit and everything is protected by the reserve (one 6 GiB
+        // artifact, reserve 5): nothing eligible, not "at reserve".
+        assert_eq!(pressure_outcome(0, 6, 5, 5), O::NothingEligible);
+        // Over the cap, above the collection threshold, nothing removable.
+        let limit = pressure_limit(12, 10, 8, 16, 20);
+        assert_eq!(limit, 10);
+        assert_eq!(pressure_outcome(0, 12, limit, 0), O::NothingEligible);
+    }
+
+    /// Write `size` bytes at `dir/name`, `age` seconds old.
+    fn put(dir: &Path, name: &str, size: usize, age: u64) {
+        let path = dir.join(name);
+        fs::write(&path, vec![b'x'; size]).expect("write");
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open")
+            .set_modified(SystemTime::now() - Duration::from_secs(age))
+            .expect("set mtime");
+    }
+
+    /// One pass the way the pressure paths run it: the limit and the reserve
+    /// from `free`, the reserve enforced where files are removed.
+    fn pass(dir: &Path, cap: u64, free: u64) -> Prune {
+        let size = dir_size(dir);
+        let limit = pressure_limit(size, cap, 8, 16, free);
+        prune_dir_keeping(dir, limit, pressure_reserve(cap, 8, 16, free)).expect("prune")
+    }
+
+    #[test]
+    fn an_artifact_larger_than_size_minus_reserve_is_kept_and_never_rebuilt_in_a_loop() {
+        // cap 10, reserve 5, one 6-byte artifact, free pinned at 10 (floor 8,
+        // threshold 16). The limit (5) alone would delete the whole artifact.
+        let t = tempfile::TempDir::new().expect("temp");
+        put(t.path(), "big", 6, 100);
+        assert_eq!(
+            prune_dir(t.path(), 5).expect("prune").files,
+            1,
+            "without the bound the limit empties the cache"
+        );
+        for _ in 0..3 {
+            // The simulated rebuild between passes.
+            put(t.path(), "big", 6, 100);
+            let out = pass(t.path(), 10, 10);
+            assert_eq!(out.files, 0, "{out:?}");
+            assert_eq!(out.remaining, 6);
+            assert!(t.path().join("big").exists());
+        }
+    }
+
+    #[test]
+    fn the_reserve_skips_a_file_that_would_cross_it_and_removes_only_small_ones() {
+        // total 10 (one 6-byte artifact, oldest, and four 1-byte files), cap 10,
+        // free 10: limit 5, reserve 5.
+        let t = tempfile::TempDir::new().expect("temp");
+        put(t.path(), "big", 6, 100);
+        for (i, name) in ["a", "b", "c", "d"].iter().enumerate() {
+            put(t.path(), name, 1, 50 - i as u64);
+        }
+        let out = pass(t.path(), 10, 10);
+        assert_eq!((out.files, out.freed, out.remaining), (4, 4, 6), "{out:?}");
+        assert!(t.path().join("big").exists());
+        assert!(out.remaining >= 5, "never below the reserve");
+        // A second pass with free space still pinned removes nothing.
+        assert_eq!(pass(t.path(), 10, 10).files, 0);
+    }
+
+    #[test]
+    fn the_reserve_stops_a_walk_that_would_cross_it_where_the_plain_limit_would_not() {
+        // Three 3-byte files, total 9, limit 5: the plain limit removes two
+        // (to 3); the reserve of 5 lets only the oldest go (to 6).
+        let t = tempfile::TempDir::new().expect("temp");
+        for (i, name) in ["a", "b", "c"].iter().enumerate() {
+            put(t.path(), name, 3, 90 - i as u64 * 10);
+        }
+        let out = pass(t.path(), 10, 10);
+        assert_eq!((out.files, out.remaining), (1, 6), "{out:?}");
+        assert!(!t.path().join("a").exists());
+        assert!(t.path().join("b").exists() && t.path().join("c").exists());
+
+        let plain = tempfile::TempDir::new().expect("temp");
+        for (i, name) in ["a", "b", "c"].iter().enumerate() {
+            put(plain.path(), name, 3, 90 - i as u64 * 10);
+        }
+        assert_eq!(prune_dir(plain.path(), 5).expect("prune").remaining, 3);
+    }
+
+    #[test]
+    fn below_the_floor_the_bound_is_off_and_the_cache_can_be_emptied() {
+        let t = tempfile::TempDir::new().expect("temp");
+        put(t.path(), "big", 6, 100);
+        // free 0 < floor 8: exactly the rule from before the threshold.
+        let out = pass(t.path(), 10, 0);
+        assert_eq!((out.files, out.remaining), (1, 0), "{out:?}");
     }
 }

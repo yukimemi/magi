@@ -4712,6 +4712,7 @@ fn retention_service_receipt_with(
         "version": env!("CARGO_PKG_VERSION"), "pid": std::process::id(),
         "operation": operation, "outcome": outcome, "detail": detail,
         "auto_fold": cfg.map(|c| c.disk.auto_fold),
+        "reclaim_free_bytes": cfg.map(|c| c.disk.reclaim_threshold()),
         "reclaim_bytes": cfg.map(|c| c.disk.worktree_reclaim_bytes)});
     if let (Some(receipt), serde_json::Value::Object(extra)) = (receipt.as_object_mut(), extra) {
         receipt.extend(extra);
@@ -9549,6 +9550,35 @@ mod tests {
             ),
             None,
             "comfortably above the floor is open"
+        );
+    }
+
+    /// The collection threshold is not an admission floor: free space just
+    /// above `min_free_bytes` but far below `reclaim_free_bytes` opens the gate
+    /// with no hold, whatever the threshold is.
+    #[test]
+    fn disk_gate_ignores_the_collection_threshold() {
+        let mut cfg = Config::default();
+        cfg.disk.reclaim_free_bytes = Some(cfg.disk.min_free_bytes * 100);
+        let repo = Path::new("/any/repo/path");
+        assert_eq!(
+            disk_gate_with(
+                repo,
+                &cfg,
+                PathBuf::new,
+                |_| Ok(cfg.disk.min_free_bytes + 1)
+            ),
+            None
+        );
+        assert!(
+            disk_gate_with(
+                repo,
+                &cfg,
+                PathBuf::new,
+                |_| Ok(cfg.disk.min_free_bytes - 1)
+            )
+            .is_some(),
+            "below the admission floor still holds"
         );
     }
 

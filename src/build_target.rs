@@ -363,9 +363,13 @@ pub(crate) fn prune_registered(
             }
         }
     }
+    // The collection threshold does not reach the isolated-build pool: it is
+    // collected to its cap and, below the admission floor, by the deficit
+    // against it. A threshold equal to the floor is exactly that rule.
     let limit = crate::disk::pressure_limit(
         result.remaining,
         disk.cache_limit_bytes,
+        disk.min_free_bytes,
         disk.min_free_bytes,
         crate::disk::managed_free_bytes(&root(home))?,
     );

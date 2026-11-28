@@ -729,6 +729,21 @@ pub fn maintenance_prune(
     cache_dir: &Path,
     limit: u64,
 ) -> Result<Option<crate::disk::Prune>> {
+    maintenance_prune_keeping(home, cache_dir, limit, 0)
+}
+
+/// [`maintenance_prune`] that never takes the cache below `keep` bytes
+/// ([`crate::disk::prune_dir_keeping`]): the reserve pressure collection keeps
+/// of a build cache while free space is at or above the admission floor and
+/// below the collection threshold. The
+/// inventory the bound is checked against is the one taken here, under the
+/// lease and the Cargo locks.
+pub fn maintenance_prune_keeping(
+    home: &Path,
+    cache_dir: &Path,
+    limit: u64,
+    keep: u64,
+) -> Result<Option<crate::disk::Prune>> {
     let owner = Owner {
         run: "maintenance".to_owned(),
         node: "prune".to_owned(),
@@ -741,7 +756,7 @@ pub fn maintenance_prune(
         AcquireOutcome::Busy(_) => Ok(None),
         AcquireOutcome::Acquired(guard) => {
             let _cargo = crate::retention::cargo_locks(cache_dir)?;
-            let result = crate::disk::prune_dir(cache_dir, limit)?;
+            let result = crate::disk::prune_dir_keeping(cache_dir, limit, keep)?;
             guard.release();
             Ok(Some(result))
         }

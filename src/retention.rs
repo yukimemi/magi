@@ -518,6 +518,9 @@ pub(crate) struct Report {
     pub checked_at: Option<Timestamp>,
     pub limit_bytes: u64,
     pub reclaim_budget_bytes: u64,
+    /// Free-space level the pass collected toward (`[disk] reclaim_free_bytes`,
+    /// resolved); `0` means free space did not drive collection.
+    pub reclaim_free_bytes: u64,
     /// Logical inventory, including protected and unproven data.
     pub measured_bytes: u64,
     /// Logical bytes unlinked, not a measurement of physical disk recovery.
@@ -1508,6 +1511,7 @@ async fn sweep_inner_on(
         checked_at: Some(now),
         limit_bytes: disk.worktree_limit_bytes,
         reclaim_budget_bytes: disk.worktree_reclaim_bytes,
+        reclaim_free_bytes: disk.reclaim_threshold(),
         ..Report::default()
     };
     if !unix_containment {
@@ -1590,7 +1594,7 @@ async fn sweep_inner_on(
             let target = path.join("target");
             observed.insert(target.clone());
             let pressure =
-                crate::disk::free_bytes(&path).map_or(true, |free| free < disk.min_free_bytes);
+                crate::disk::free_bytes(&path).map_or(true, |free| free < disk.reclaim_threshold());
             under_pressure |= pressure;
             let measurement = measurements.entry(target).or_default();
             if pressure
@@ -1634,7 +1638,7 @@ async fn sweep_inner_on(
     for (updated, id, path, _) in targets {
         if disk.worktree_limit_bytes == 0
             || remaining <= disk.worktree_limit_bytes
-                && crate::disk::free_bytes(&path).is_ok_and(|free| free >= disk.min_free_bytes)
+                && crate::disk::free_bytes(&path).is_ok_and(|free| free >= disk.reclaim_threshold())
         {
             report.retained.push(format!("{id}: output reclamation disabled or aggregate usage and free space are within policy"));
             continue;
@@ -1761,6 +1765,9 @@ async fn sweep_inner_on(
     report.protected_or_unproven_bytes = report
         .measured_bytes
         .saturating_sub(report.proven_reclaimable_bytes);
+    // The blocked-retention warning is about operating, not collecting: it
+    // stays on the admission floor so a volume merely below the collection
+    // threshold, with nothing eligible left to collect, raises nothing.
     let pressure_remaining = pressure_paths
         .iter()
         .any(|path| crate::disk::free_bytes(path).map_or(true, |free| free < disk.min_free_bytes));
@@ -3546,6 +3553,47 @@ mod tests {
         disk.worktree_limit_bytes = u64::MAX;
         let out = sweep(&f.home, &disk, Fx::now()).await;
         assert_eq!(out.freed_bytes, 1000, "{out:?}");
+        assert!(!output.exists());
+        assert!(
+            small.candidates[0]
+                .worktree
+                .join("target/debug/output")
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_collects_toward_the_threshold_not_the_admission_floor() {
+        let f = Fx::new().await;
+        let small = f.run("bb10", true).await;
+        let large = f.run("bb11", true).await;
+        for state in [&small, &large] {
+            Fx::target(&state.candidates[0].worktree);
+        }
+        let output = large.candidates[0].worktree.join("target/debug/output");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&output)
+            .unwrap()
+            .set_len(1000)
+            .unwrap();
+        let mut disk = Fx::disk();
+        disk.worktree_reclaim_bytes = 300;
+        // The floor is one byte, which every volume clears: the old rule sees
+        // no pressure and, with the aggregate cap out of reach, deletes nothing.
+        disk.min_free_bytes = 1;
+        disk.worktree_limit_bytes = u64::MAX;
+        let idle = sweep(&f.home, &disk, Fx::now()).await;
+        assert_eq!(idle.freed_bytes, 0, "{idle:?}");
+        assert_eq!(idle.reclaim_free_bytes, 2);
+        assert!(output.exists());
+
+        // A collection threshold no volume reaches turns the same state into
+        // pressure: the largest eligible output goes first, within the budget.
+        disk.reclaim_free_bytes = Some(u64::MAX);
+        let out = sweep(&f.home, &disk, Fx::now()).await;
+        assert_eq!(out.freed_bytes, 1000, "{out:?}");
+        assert_eq!(out.reclaim_free_bytes, u64::MAX);
         assert!(!output.exists());
         assert!(
             small.candidates[0]
