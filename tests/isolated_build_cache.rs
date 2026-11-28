@@ -27,6 +27,76 @@ fn git(repo: &Path, args: &[&str]) {
     );
 }
 
+#[tokio::test]
+async fn relative_worktree_migration_does_not_lock_checkout_hooks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    fs::create_dir(&repo).unwrap();
+    git(&repo, &["init", "-b", "main"]);
+    git(&repo, &["config", "user.name", "test"]);
+    git(&repo, &["config", "user.email", "test@example.invalid"]);
+    git(&repo, &["config", "core.autocrlf", "false"]);
+    fs::write(repo.join("file"), "content\n").unwrap();
+    git(&repo, &["add", "file"]);
+    git(&repo, &["commit", "-m", "initial"]);
+    git(&repo, &["config", "worktree.useRelativePaths", "true"]);
+    let hooks = tmp.path().join("hooks");
+    fs::create_dir(&hooks).unwrap();
+    git(
+        &repo,
+        &[
+            "config",
+            "core.hooksPath",
+            &hooks.to_string_lossy().replace('\\', "/"),
+        ],
+    );
+    let hook = hooks.join("post-checkout");
+    fs::write(
+        &hook,
+        "#!/bin/sh\ncase \"$PWD\" in */first) touch ../ready; while [ ! -f ../release ]; do sleep 0.1; done;; esac\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let first = tmp.path().join("first");
+    let second = tmp.path().join("second");
+    let other = async {
+        let ready = tokio::time::timeout(REVIEW_BUDGET, async {
+            while !tmp.path().join("ready").exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        let result = async {
+            ready?;
+            magi::git::enable_worktree_config(&repo).await?;
+            magi::git::worktree_add_detached(&repo, &second, "HEAD").await
+        }
+        .await;
+        // Release even on failure so the first Git process can exit.
+        fs::write(tmp.path().join("release"), "").unwrap();
+        result
+    };
+    let (first_result, second_result) = tokio::join!(
+        magi::git::worktree_add_detached(&repo, &first, "HEAD"),
+        other
+    );
+    first_result.unwrap();
+    second_result.unwrap();
+    assert!(
+        fs::read_to_string(first.join(".git"))
+            .unwrap()
+            .starts_with("gitdir: ../")
+    );
+    assert_eq!(
+        fs::read_to_string(second.join("file")).unwrap(),
+        "content\n"
+    );
+}
+
 common::e2e! {
 async fn isolated_reviews_build_their_own_sources_while_shared_cache_is_held() {
     let fx = common::fixture(common::home_lock().await, common::Judges::Unanimous, false);
@@ -56,12 +126,6 @@ fn build_child() {
     }
     git(&fx.repo, &["checkout", "main"]);
     git(&fx.repo, &["config", "worktree.useRelativePaths", "true"]);
-    // The reviews contend for build caches, not Git's one-time repository
-    // format migration. Initialize both shared config extensions before
-    // independent workers start creating worktrees concurrently.
-    git(&fx.repo, &["config", "core.repositoryformatversion", "1"]);
-    git(&fx.repo, &["config", "extensions.relativeWorktrees", "true"]);
-    git(&fx.repo, &["config", "extensions.worktreeConfig", "true"]);
 
     let reader = fx.tmp.path().join("reader.sh");
     fs::write(&reader, "[ -z \"${CARGO_TARGET_DIR+x}\" ] || exit 42\nexec sh \"$@\"\n").unwrap();

@@ -39,6 +39,112 @@ pub(crate) async fn git_raw_command(
     args: &[&str],
     kill_on_drop: bool,
 ) -> Result<GitOut> {
+    if args.starts_with(&["worktree", "add"]) {
+        return worktree_add_raw(cwd, args, kill_on_drop).await;
+    }
+    let _config_lock = if args == ["config", "extensions.worktreeConfig", "true"]
+        || args == ["config", "--unset", "extensions.worktreeConfig"]
+    {
+        Some(lock_worktree_config(cwd).await?)
+    } else {
+        None
+    };
+    git_raw_unlocked(cwd, args, kill_on_drop).await
+}
+
+async fn config_bool(repo: &Path, local: bool, key: &str) -> Result<bool> {
+    let scope = if local { "--local" } else { "--includes" };
+    let out = git_raw_unlocked(repo, &["config", scope, "--bool", "--get", key], false).await?;
+    match (out.code, out.stdout.as_str()) {
+        (Some(0), "true") => Ok(true),
+        (Some(0), "false") => Ok(false),
+        (Some(1), "") if out.stderr.is_empty() => Ok(false),
+        _ => bail!("read Git config {key}: {}", out.stderr),
+    }
+}
+
+async fn worktree_add_raw(cwd: &Path, args: &[&str], kill_on_drop: bool) -> Result<GitOut> {
+    let lock = lock_worktree_config(cwd).await?;
+    let relative = match args
+        .iter()
+        .rev()
+        .find(|arg| matches!(**arg, "--relative-paths" | "--no-relative-paths"))
+    {
+        Some(arg) => *arg == "--relative-paths",
+        None => config_bool(cwd, false, "worktree.useRelativePaths").await?,
+    };
+    if relative && !config_bool(cwd, true, "extensions.relativeWorktrees").await? {
+        // Older Git ignores worktree.useRelativePaths. Only a Git that
+        // implements relative worktrees can migrate the common config.
+        let help = git_raw_unlocked(cwd, &["worktree", "add", "-h"], false).await?;
+        if help.stdout.contains("relative-paths") || help.stderr.contains("relative-paths") {
+            // Git upgrades the repository format and sets the extension
+            // before writing the linking files, checking out any files, or
+            // running hooks. Once that monotonic extension is visible,
+            // subsequent adds won't write shared config. Let Git perform
+            // its own migration (including repository-format validation).
+            let add = git_raw_unlocked(cwd, args, kill_on_drop);
+            tokio::pin!(add);
+            loop {
+                tokio::select! {
+                    result = &mut add => return result,
+                    migrated = async {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        config_bool(cwd, true, "extensions.relativeWorktrees").await
+                    } => {
+                        if matches!(migrated, Ok(true)) {
+                            drop(lock);
+                            return add.await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    drop(lock);
+    git_raw_unlocked(cwd, args, kill_on_drop).await
+}
+
+async fn lock_worktree_config(repo: &Path) -> Result<std::fs::File> {
+    let common = git_raw_unlocked(
+        repo,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        false,
+    )
+    .await?;
+    ensure!(
+        common.ok(),
+        "resolve shared Git directory: {}",
+        common.stderr
+    );
+    let common = std::fs::canonicalize(&common.stdout)?;
+    let path = common.join("magi-worktree-config.lock");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)?;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        match crate::pr_head::try_lock_file(&file) {
+            Ok(()) => return Ok(file),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock || e.raw_os_error() == Some(33) =>
+            {
+                ensure!(
+                    tokio::time::Instant::now() < deadline,
+                    "waiting for shared Git config lock: {}",
+                    path.display()
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            Err(e) => return Err(e).context("acquire shared Git config lock"),
+        }
+    }
+}
+
+async fn git_raw_unlocked(cwd: &Path, args: &[&str], kill_on_drop: bool) -> Result<GitOut> {
     #[cfg(test)]
     crate::web::request_cost::git();
     let out = Command::new("git")
