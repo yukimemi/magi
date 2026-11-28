@@ -4666,6 +4666,8 @@ async fn run_fold(State(ui): State<Arc<Ui>>, Path(id): Path<String>) -> ApiResul
                     "run {id} is being worked on by a live daemon right now"
                 )));
             }
+            crate::clean::ensure_record_identity(&ui.runs, &id)
+                .map_err(|e| ApiError::internal(format!("{e:#}")))?;
             let state = match read_run(&ui.runs, &id) {
                 Ok(state) => {
                     state
@@ -23665,6 +23667,32 @@ mod tests {
             !runs.join(id).exists(),
             "an unreadable run has no candidate list to fold selectively, so \
              the whole record goes - same as `magi fold` on the CLI"
+        );
+    }
+
+    #[tokio::test]
+    async fn folding_a_record_of_another_run_in_a_refused_schema_is_an_identity_error() {
+        let fx = Fixture::start().await;
+        let runs = fx.runs();
+        let id = "20260901-000000-mism";
+        std::fs::create_dir_all(runs.join(id)).expect("run dir");
+        let record = br#"{"schema": 99999, "id": "20260901-000000-else"}"#.to_vec();
+        std::fs::write(runs.join(id).join("run.json"), &record).expect("record");
+
+        let res = fx.post(&format!("/api/runs/{id}/fold"), None).await;
+        assert_eq!(res.status, 500, "{}", res.body);
+        assert!(
+            res.json()["error"]
+                .as_str()
+                .unwrap()
+                .contains("records run 20260901-000000-else"),
+            "{}",
+            res.body
+        );
+        assert_eq!(
+            std::fs::read(runs.join(id).join("run.json")).unwrap(),
+            record,
+            "nothing is removed"
         );
     }
 

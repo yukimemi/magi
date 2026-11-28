@@ -1351,6 +1351,7 @@ fn busy_run(id: &str) -> impl Fn(anyhow::Error) -> anyhow::Error + '_ {
 /// operator's responsibility when the state file cannot identify them.
 pub async fn fold_unreadable(runs: &Path, worktrees_root: &Path, id: &str) -> Result<Vec<String>> {
     let resolved = resolve_id_path(runs, id)?;
+    ensure_record_identity(runs, &resolved)?;
     let mut removed = Vec::new();
     let run_dir = runs.join(&resolved);
     // The two locks every writer of the record takes, held until the directory
@@ -1692,9 +1693,11 @@ pub fn sweep_graveyard(home: &Path) -> usize {
         let path = entry.path();
         let gone = match std::fs::remove_dir_all(&path) {
             Ok(()) => true,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
             Err(e) => {
-                tracing::warn!("housekeep: remove leftover {}: {e}", path.display());
+                // Taken by a concurrent sweep or deletion: nothing left to do.
+                if !matches!(path.try_exists(), Ok(false)) {
+                    tracing::warn!("housekeep: remove leftover {}: {e}", path.display());
+                }
                 false
             }
         };
@@ -1725,12 +1728,7 @@ fn remove_run_dir(home: &Path, id: &str, dir: &Path) -> Result<()> {
         .and_then(|()| std::fs::rename(dir, &tombstone))
         .is_ok();
     if renamed {
-        return std::fs::remove_dir_all(&tombstone).with_context(|| {
-            format!(
-                "run {id} was deleted, but its leftovers remain in {}",
-                tombstone.display()
-            )
-        });
+        return remove_tombstone(id, &tombstone);
     }
     match std::fs::remove_file(dir.join("run.json")) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
@@ -1739,6 +1737,45 @@ fn remove_run_dir(home: &Path, id: &str, dir: &Path) -> Result<()> {
         _ => {}
     }
     std::fs::remove_dir_all(dir).with_context(|| format!("remove run directory {}", dir.display()))
+}
+
+/// Remove a tombstone that a deletion has just made. A tombstone that is
+/// already gone, or that a concurrent [`sweep_graveyard`] removes while this
+/// removal is under way, is a finished deletion: after a removal error only a
+/// tombstone that still exists is a failure.
+fn remove_tombstone(id: &str, tombstone: &Path) -> Result<()> {
+    match std::fs::remove_dir_all(tombstone) {
+        Err(e) if !matches!(tombstone.try_exists(), Ok(false)) => Err(e).with_context(|| {
+            format!(
+                "run {id} was deleted, but its leftovers remain in {}",
+                tombstone.display()
+            )
+        }),
+        _ => Ok(()),
+    }
+}
+
+/// The run record in `runs/<id>/run.json`, when it parses at all, names this
+/// run. Read before any schema migration, so that a record another run's, in a
+/// schema this build refuses, is an identity error rather than an "unreadable"
+/// run that is removed wholesale. A missing or unparseable record, or one with
+/// no id, says nothing about identity and passes.
+pub fn ensure_record_identity(runs: &Path, id: &str) -> Result<()> {
+    #[derive(Deserialize)]
+    struct Recorded {
+        #[serde(default)]
+        id: Option<String>,
+    }
+    let Ok(body) = std::fs::read_to_string(runs.join(id).join("run.json")) else {
+        return Ok(());
+    };
+    if let Ok(Recorded { id: Some(recorded) }) = serde_json::from_str(&body) {
+        anyhow::ensure!(
+            recorded == id,
+            "runs/{id}/run.json records run {recorded}, not run {id}"
+        );
+    }
+    Ok(())
 }
 
 /// Delete files from the shared build cache until it fits its cap — but only
@@ -4846,6 +4883,61 @@ pub(crate) mod tests {
         housekeep(&cfg, home, &home.join("wt"), &home.join("repo"), now).await;
         assert!(!second.exists(), "idle housekeeping removed the leftover");
         assert_eq!(sweep_graveyard(home), 0, "nothing is left to remove");
+    }
+
+    /// A record that parses, names another run and has a schema the migrating
+    /// loader refuses is an identity error, never an "unreadable" run removed
+    /// wholesale.
+    #[tokio::test]
+    async fn a_foreign_record_in_a_refused_schema_is_not_removed_as_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let runs = home.join("runs");
+        let id = "20260801-000000-z011";
+        std::fs::create_dir_all(runs.join(id)).unwrap();
+        let record = br#"{"schema": 99999, "id": "20260801-000000-z012"}"#.to_vec();
+        std::fs::write(runs.join(id).join("run.json"), &record).unwrap();
+
+        let error = ensure_record_identity(&runs, id).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("records run 20260801-000000-z012"),
+            "{error:#}"
+        );
+        let error = fold_unreadable(&runs, &home.join("wt"), id)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("records run 20260801-000000-z012"),
+            "{error:#}"
+        );
+        assert_eq!(
+            std::fs::read(runs.join(id).join("run.json")).unwrap(),
+            record
+        );
+        // A record that names this run, or none that parses, passes.
+        std::fs::write(
+            runs.join(id).join("run.json"),
+            format!(r#"{{"schema": 99999, "id": "{id}"}}"#),
+        )
+        .unwrap();
+        ensure_record_identity(&runs, id).unwrap();
+        std::fs::write(runs.join(id).join("run.json"), "not json").unwrap();
+        ensure_record_identity(&runs, id).unwrap();
+    }
+
+    /// A sweep that takes the tombstone between a deletion's rename and its
+    /// removal has finished that deletion; so has one that finds it gone.
+    #[test]
+    fn a_tombstone_taken_by_a_sweep_is_a_finished_deletion() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let tombstone = leftover_tombstone(home, "20260801-000000-z013-1");
+        assert_eq!(sweep_graveyard(home), 1);
+        assert!(!tombstone.exists());
+        remove_tombstone("20260801-000000-z013", &tombstone).unwrap();
+        let present = leftover_tombstone(home, "20260801-000000-z013-2");
+        remove_tombstone("20260801-000000-z013", &present).unwrap();
+        assert!(!present.exists());
     }
 
     /// An unreadable run's directory leaves through the same tombstone as a

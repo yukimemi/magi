@@ -2175,6 +2175,9 @@ async fn dispatch(command: Command) -> Result<()> {
             // so fold it wholesale instead. `--merged` has nothing to correct
             // in that case - there is no `status` or `merge` field to write -
             // so it refuses instead of silently skipping the correction.
+            // Before the migrating loader: a record that names another run is an
+            // identity error even when its schema is one this build refuses.
+            magi::clean::ensure_record_identity(&magi::run::runs_root(), &id)?;
             let removed = match RunState::load(&id) {
                 Ok(mut state) => {
                     // A record that is another run's is not folded on this one's say.
