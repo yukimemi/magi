@@ -947,6 +947,22 @@ pub struct Disk {
     /// competition triggers and small enough that a 1 TB disk with 100 GB free
     /// is nowhere near the threshold.
     pub min_free_bytes: u64,
+    /// Free space, in bytes, below which pressure collection runs, and the
+    /// level it aims to bring free space back up to: the shared build cache,
+    /// registered isolated builds and retained worktree outputs are collected
+    /// (within their own caps, locks and eligibility rules) until the volume
+    /// has this much free, or until nothing eligible is left. This is the
+    /// *collection* threshold; [`min_free_bytes`](Self::min_free_bytes) stays
+    /// the *admission* floor and nothing here moves a gate.
+    ///
+    /// Unset means twice `min_free_bytes`. A value below `min_free_bytes` is
+    /// treated as `min_free_bytes` (collection never aims below the admission
+    /// floor; loading such a config logs a warning). With the gate off
+    /// (`min_free_bytes = 0`) and this unset there is no pressure collection;
+    /// an explicit positive value still collects. Read it only through
+    /// [`reclaim_threshold`](Self::reclaim_threshold).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reclaim_free_bytes: Option<u64>,
     /// Fold finished runs without being asked. `Merged`, `Ready` and `Failed`
     /// runs older than [`fold_grace_secs`](Self::fold_grace_secs) have their
     /// worktrees removed. `0` turns the janitor off.
@@ -985,10 +1001,23 @@ pub struct Disk {
     pub retained_attempt_limit: usize,
 }
 
+impl Disk {
+    /// The free-space level pressure collection works toward: the one reader
+    /// of [`reclaim_free_bytes`](Self::reclaim_free_bytes). Never below
+    /// `min_free_bytes`; twice it when unset (saturating, so a test's
+    /// `u64::MAX` floor stays `u64::MAX`). `0` means no pressure collection.
+    pub fn reclaim_threshold(&self) -> u64 {
+        let floor = self.min_free_bytes;
+        self.reclaim_free_bytes
+            .map_or_else(|| floor.saturating_mul(2), |own| own.max(floor))
+    }
+}
+
 impl Default for Disk {
     fn default() -> Self {
         Self {
             min_free_bytes: 8 * 1024 * 1024 * 1024,
+            reclaim_free_bytes: None,
             auto_fold: true,
             fold_grace_secs: 6 * 60 * 60,
             cache_limit_bytes: 10 * 1024 * 1024 * 1024,
@@ -1894,6 +1923,14 @@ impl Config {
             );
         }
         crate::persona::validate(&cfg.talk.personas)?;
+        if let Some(own) = cfg.disk.reclaim_free_bytes
+            && own < cfg.disk.min_free_bytes
+        {
+            tracing::warn!(
+                "[disk] reclaim_free_bytes ({own}) is below min_free_bytes ({}); collection aims at min_free_bytes",
+                cfg.disk.min_free_bytes
+            );
+        }
         cfg.worktree.validate()?;
         cfg.release.validate()?;
         if let Some(name) = cfg.talk.operator_name() {
@@ -4952,6 +4989,72 @@ lock_file = "{{ vars.bad }}"
         std::fs::write(dir.path().join("magi.toml"), "[graph]\ncandidates = 1\n").unwrap();
         let cfg = Config::load(&dir.path().join("magi.toml")).expect("load");
         assert_eq!(cfg.disk, Disk::default());
+    }
+
+    #[test]
+    fn the_reclaim_threshold_defaults_to_twice_the_floor_and_never_undercuts_it() {
+        let disk = |min: u64, own: Option<u64>| Disk {
+            min_free_bytes: min,
+            reclaim_free_bytes: own,
+            ..Disk::default()
+        };
+        assert_eq!(disk(8, None).reclaim_threshold(), 16);
+        assert_eq!(Disk::default().reclaim_threshold(), 16 * 1024 * 1024 * 1024);
+        assert_eq!(disk(8, Some(30)).reclaim_threshold(), 30);
+        assert_eq!(
+            disk(8, Some(3)).reclaim_threshold(),
+            8,
+            "never below the floor"
+        );
+        assert_eq!(disk(8, Some(0)).reclaim_threshold(), 8);
+        assert_eq!(disk(8, Some(8)).reclaim_threshold(), 8);
+        assert_eq!(
+            disk(0, None).reclaim_threshold(),
+            0,
+            "gate off: no collection"
+        );
+        assert_eq!(
+            disk(0, Some(5)).reclaim_threshold(),
+            5,
+            "explicit still collects"
+        );
+        assert_eq!(disk(u64::MAX, None).reclaim_threshold(), u64::MAX);
+    }
+
+    #[test]
+    fn reclaim_free_bytes_loads_from_toml_and_older_configs_get_the_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("magi.toml");
+        std::fs::write(&path, "[disk]\nmin_free_bytes = 100\n").unwrap();
+        let cfg = Config::load(&path).expect("older config loads");
+        assert_eq!(cfg.disk.reclaim_free_bytes, None);
+        assert_eq!(cfg.disk.reclaim_threshold(), 200);
+
+        std::fs::write(
+            &path,
+            "[disk]\nmin_free_bytes = 100\nreclaim_free_bytes = 450\n",
+        )
+        .unwrap();
+        let cfg = Config::load(&path).expect("explicit value loads");
+        assert_eq!(cfg.disk.reclaim_threshold(), 450);
+    }
+
+    #[test]
+    fn a_saved_run_config_without_the_field_deserializes_to_the_default() {
+        // run.json records the effective config: records written before the
+        // field existed carry no key, and a default config writes none.
+        let disk = serde_json::to_value(Disk::default()).unwrap();
+        assert!(disk.get("reclaim_free_bytes").is_none());
+        let older: Disk = serde_json::from_value(disk).unwrap();
+        assert_eq!(older, Disk::default());
+        assert_eq!(older.reclaim_threshold(), 2 * older.min_free_bytes);
+
+        let own = Disk {
+            reclaim_free_bytes: Some(7),
+            ..Disk::default()
+        };
+        let back: Disk = serde_json::from_value(serde_json::to_value(&own).unwrap()).unwrap();
+        assert_eq!(back.reclaim_free_bytes, Some(7));
     }
 
     #[test]

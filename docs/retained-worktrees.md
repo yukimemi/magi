@@ -37,6 +37,20 @@ are remeasured and considered largest first, with oldest activity breaking ties;
 ineligible targets do not consume the first-deletion exception. Low free space
 permits reclamation below the cap, but does not override grace or ownership.
 
+Two free-space thresholds, two meanings. `[disk] min_free_bytes` (default 8 GiB)
+is the admission floor: below it no run starts or resumes, and a running writer
+below half of it is stopped. `[disk] reclaim_free_bytes` is the collection
+threshold: below it the shared cache, registered isolated builds and the
+retained-output sweep collect, aiming to bring free space back up to it.
+Unset, it is twice `min_free_bytes` (16 GiB by default); a value below
+`min_free_bytes` is raised to it (a warning is logged at load); with
+`min_free_bytes = 0` and the setting unset nothing collects for free space,
+while an explicit positive value still does. Collection stops at the threshold
+or when nothing eligible is left; the same caps, grace periods, leases and
+proofs apply, and a pass that cannot reach the threshold ends without error
+until the service's next period. The sweep report (`retention.json`) records
+the resolved threshold as `reclaim_free_bytes`.
+
 Only plain, canonical, registered worktrees are eligible. A legacy `target` must
 be ignored, contain no tracked files, carry Cargo's standard
 [cache directory tag signature](https://bford.info/cachedir/) and rustc identity,

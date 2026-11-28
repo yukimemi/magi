@@ -343,6 +343,19 @@ pub(crate) fn prune_registered(
     home: &Path,
     disk: &crate::config::Disk,
 ) -> Result<crate::disk::Prune> {
+    prune_registered_with(home, disk, crate::disk::managed_free_bytes)
+}
+
+/// [`prune_registered`] with the free-space measurement of the isolated-build
+/// volume supplied by the caller. Free space below
+/// [`Disk::reclaim_threshold`](crate::config::Disk::reclaim_threshold) - the
+/// collection threshold, not the admission floor - shrinks the pool's limit by
+/// the deficit; the same ownership, lease and proof checks decide what may go.
+pub(crate) fn prune_registered_with(
+    home: &Path,
+    disk: &crate::config::Disk,
+    free_bytes: impl Fn(&Path) -> Result<u64>,
+) -> Result<crate::disk::Prune> {
     let mut result = crate::disk::Prune::default();
     if disk.cache_limit_bytes == 0 || !root(home).is_dir() {
         return Ok(result);
@@ -363,11 +376,13 @@ pub(crate) fn prune_registered(
             }
         }
     }
+    let threshold = disk.reclaim_threshold();
+    let free_before = free_bytes(&root(home))?;
     let limit = crate::disk::pressure_limit(
         result.remaining,
         disk.cache_limit_bytes,
-        disk.min_free_bytes,
-        crate::disk::managed_free_bytes(&root(home))?,
+        threshold,
+        free_before,
     );
     targets.sort_unstable();
     for (_, target, size) in targets {
@@ -389,6 +404,16 @@ pub(crate) fn prune_registered(
                 tracing::warn!(%error, target = %target.display(), "isolated build prune refused")
             }
         }
+    }
+    if free_before < threshold && result.files > 0 {
+        tracing::info!(
+            threshold,
+            free_before,
+            free_after = free_bytes(&root(home)).ok(),
+            collected = result.freed,
+            files = result.files,
+            "isolated build pressure pass"
+        );
     }
     Ok(result)
 }
@@ -539,5 +564,127 @@ mod tests {
         ] {
             assert!(!admin_artifact(name), "{name}");
         }
+    }
+
+    fn git(cwd: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .current_dir(cwd)
+            .args(args)
+            .output()
+            .expect("spawn git");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// A registered, idle isolated target holding two 100-byte files (`old`
+    /// then `new`) under a private home and a real linked worktree.
+    fn registered_target() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let repo = root.join("repo");
+        fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        fs::write(repo.join("f"), "x").unwrap();
+        git(&repo, &["add", "f"]);
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example.com",
+                "commit",
+                "-q",
+                "-m",
+                "init",
+            ],
+        );
+        let worktree = root.join("wt");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                worktree.to_str().unwrap(),
+                "-b",
+                "feat",
+            ],
+        );
+        let home = root.join("home");
+        fs::create_dir(&home).unwrap();
+        let target = resolve(&home, &worktree).expect("register the isolated target");
+        let owner = cache::Owner::here("run", "node", "seat", &worktree, "head");
+        match cache::try_acquire(&home, &target, &owner).unwrap() {
+            cache::AcquireOutcome::Acquired(guard) => guard.release(),
+            cache::AcquireOutcome::Busy(_) => panic!("fresh target is busy"),
+        }
+        for (name, secs) in [("old", 1_000_000), ("new", 2_000_000)] {
+            let file = target.join(name);
+            fs::write(&file, vec![0u8; 100]).unwrap();
+            fs::File::options()
+                .write(true)
+                .open(&file)
+                .unwrap()
+                .set_times(
+                    fs::FileTimes::new().set_modified(
+                        std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(secs),
+                    ),
+                )
+                .unwrap();
+        }
+        (tmp, home, target)
+    }
+
+    #[test]
+    fn isolated_builds_are_collected_between_the_floor_and_the_collection_threshold() {
+        let disk = |reclaim_free_bytes| crate::config::Disk {
+            min_free_bytes: 10,
+            reclaim_free_bytes,
+            ..crate::config::Disk::default()
+        };
+
+        // Threshold equal to the floor is the old rule: free 11 is above the
+        // floor, so nothing is collected.
+        let (_keep, home, target) = registered_target();
+        let none = prune_registered_with(&home, &disk(Some(10)), |_| Ok(11)).unwrap();
+        assert_eq!(none.files, 0);
+        assert!(target.join("old").exists());
+
+        // Threshold 30: a 19-byte deficit. The oldest file covers it and the
+        // newer one stays; the ownership proof is never a candidate. On the
+        // old rule this input collects nothing, so this assertion would fail.
+        let some = prune_registered_with(&home, &disk(Some(30)), |_| Ok(11)).unwrap();
+        assert_eq!((some.files, some.freed), (1, 100));
+        assert!(!target.join("old").exists());
+        assert!(target.join("new").exists());
+        assert!(target.join(TARGET_PROOF).exists());
+
+        // Free at the threshold: left alone.
+        let at = prune_registered_with(&home, &disk(Some(30)), |_| Ok(30)).unwrap();
+        assert_eq!(at.files, 0);
+
+        // Unreachable threshold: everything eligible goes, then the pass ends
+        // without error and the next one finds nothing.
+        let all = prune_registered_with(&home, &disk(Some(1_000_000)), |_| Ok(11)).unwrap();
+        assert_eq!(all.files, 1);
+        let again = prune_registered_with(&home, &disk(Some(1_000_000)), |_| Ok(11)).unwrap();
+        assert_eq!(again.files, 0);
+        assert!(target.join(TARGET_PROOF).exists());
+
+        // A zero cap still turns pruning off.
+        let (_keep2, home2, target2) = registered_target();
+        let mut off = disk(Some(1_000_000));
+        off.cache_limit_bytes = 0;
+        assert_eq!(
+            prune_registered_with(&home2, &off, |_| Ok(0))
+                .unwrap()
+                .files,
+            0
+        );
+        assert!(target2.join("old").exists());
     }
 }

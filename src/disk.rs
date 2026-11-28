@@ -129,10 +129,15 @@ pub fn over_limit(size: u64, limit: u64) -> bool {
     size > limit
 }
 
-/// A cache's target size under its cap and the volume's free-space floor.
-/// Pressure can reclaim idle cache files below the ordinary size cap.
-pub fn pressure_limit(size: u64, cap: u64, min_free: u64, free: u64) -> u64 {
-    cap.min(size.saturating_sub(min_free.saturating_sub(free)))
+/// A cache's target size under its cap and the volume's collection threshold.
+/// Pressure can reclaim idle cache files below the ordinary size cap: the
+/// limit shrinks by the deficit of `free` against `target_free` (the
+/// [`Disk::reclaim_threshold`](crate::config::Disk::reclaim_threshold), never
+/// the admission floor), so reclaiming the whole deficit brings the volume
+/// back up to the threshold. A zero `cap` yields zero here; callers that treat
+/// a zero cap as "pruning off" check it before asking.
+pub fn pressure_limit(size: u64, cap: u64, target_free: u64, free: u64) -> u64 {
+    cap.min(size.saturating_sub(target_free.saturating_sub(free)))
 }
 
 /// The path a rendered command sets `CARGO_TARGET_DIR=` to, if any.
@@ -856,5 +861,23 @@ mod pressure_tests {
         assert_eq!(super::pressure_limit(100, 200, 80, 100), 100);
         assert_eq!(super::pressure_limit(100, 200, 800, 0), 0);
         assert_eq!(super::pressure_limit(100, 50, 0, 0), 50);
+    }
+
+    #[test]
+    fn free_space_between_the_floor_and_the_collection_threshold_shrinks_the_limit() {
+        // Admission floor 10, default collection threshold 20 (twice it).
+        // free 11 is above the floor: on the old rule (threshold = floor) the
+        // deficit is 0 and the limit stays at the size; now it is 9 short.
+        assert_eq!(super::pressure_limit(100, 200, 10, 11), 100);
+        assert_eq!(super::pressure_limit(100, 200, 20, 11), 91);
+        // At or above the threshold nothing shrinks.
+        assert_eq!(super::pressure_limit(100, 200, 20, 20), 100);
+        assert_eq!(super::pressure_limit(100, 200, 20, 500), 100);
+        // The configured cap still bounds from above.
+        assert_eq!(super::pressure_limit(100, 60, 20, 11), 60);
+        // A deficit larger than the cache empties it, never underflows.
+        assert_eq!(super::pressure_limit(5, 200, 20, 0), 0);
+        // A zero cap stays zero (callers treat it as "pruning off").
+        assert_eq!(super::pressure_limit(100, 0, 20, 11), 0);
     }
 }

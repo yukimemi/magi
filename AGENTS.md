@@ -3566,6 +3566,27 @@ the repaired tree and fast-forward delivery ancestry. `land_rebase_from` remains
 the recovery checkpoint until restoration and that ancestry join complete;
 resumes must perform the same join before clearing it.
 
+### Collection threshold versus admission floor
+
+`[disk] min_free_bytes` means admission only; `[disk] reclaim_free_bytes`
+(`Option<u64>`, skipped when unset so `run.json` and older records are
+unchanged) is where free space drives collection. **Read it only through
+`config::Disk::reclaim_threshold()`** (unset = `2 x min_free_bytes`, saturating;
+never below `min_free_bytes`; `0` = no free-space collection). Readers of the
+threshold: `clean::prune_cache_under_pressure` (shared cache, via
+`disk::pressure_limit`), `build_target::prune_registered_with` (isolated
+builds, same function) and the free-space tests in `retention::sweep_inner`
+(pressure flag and per-target skip), plus the `reclaim_free_bytes` field of
+`retention::Report` and the daemon's service receipt. Readers that stay on
+`min_free_bytes`: `daemon::disk_gate_with` / `disk::gate*` and `main::disk_precheck`
+(admission), `triage` floors and disk-hold recovery, `retention::emergency` and
+`OutputLease::admit*` (the half-floor writer stop and 1 GiB reservations), the
+`graph.rs` fix-round guard, `agent.rs`, `bump.rs`, `worktree_clean`/`worktree_setup`
+admission, and the "retention remains blocked" notice at the end of
+`sweep_inner` (about operating, so a volume merely below the threshold with
+nothing eligible raises nothing). `magi cache prune` prunes to the plain cap.
+A new reader of free space must pick one side on purpose and be listed here.
+
 ### Retained output sweep budget
 
 `src/retention.rs` normally visits targets by oldest activity; under free-space
