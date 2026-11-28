@@ -35,6 +35,7 @@ async fn relative_worktree_migration_does_not_lock_checkout_hooks() {
     git(&repo, &["init", "-b", "main"]);
     git(&repo, &["config", "user.name", "test"]);
     git(&repo, &["config", "user.email", "test@example.invalid"]);
+    git(&repo, &["config", "core.autocrlf", "false"]);
     fs::write(repo.join("file"), "content\n").unwrap();
     git(&repo, &["add", "file"]);
     git(&repo, &["commit", "-m", "initial"]);
