@@ -129,15 +129,130 @@ pub fn over_limit(size: u64, limit: u64) -> bool {
     size > limit
 }
 
-/// A cache's target size under its cap and the volume's collection threshold.
-/// Pressure can reclaim idle cache files below the ordinary size cap: the
-/// limit shrinks by the deficit of `free` against `target_free` (the
-/// [`Disk::reclaim_threshold`](crate::config::Disk::reclaim_threshold), never
-/// the admission floor), so reclaiming the whole deficit brings the volume
-/// back up to the threshold. A zero `cap` yields zero here; callers that treat
-/// a zero cap as "pruning off" check it before asking.
-pub fn pressure_limit(size: u64, cap: u64, target_free: u64, free: u64) -> u64 {
-    cap.min(size.saturating_sub(target_free.saturating_sub(free)))
+/// A cache's target size under its cap and the volume's free space: the one
+/// rule every caller of pressure collection goes through.
+///
+/// Three bands, by `free` against the admission floor `min_free` and the
+/// collection threshold `threshold`
+/// ([`Disk::reclaim_threshold`](crate::config::Disk::reclaim_threshold)):
+///
+/// * `free >= threshold`: nothing is short; the limit is the configured cap
+///   (never more than `size`, so nothing is asked to shrink).
+/// * `min_free <= free < threshold`: the limit shrinks by the deficit
+///   (`threshold - free`) but never below a **reserve**, half of `cap`
+///   (and never above the cache's own `size`, so a cache at or below its
+///   reserve is left alone). A build cache is only worth anything while some
+///   of it is left: on a disk whose free space other software controls, a
+///   rule without a reserve would empty every cache on every pass and start
+///   every build cold. The ratio is fixed on purpose, not a setting.
+/// * `free < min_free`: below the admission floor work is held anyway and
+///   getting space back outranks a warm cache, so this is exactly the rule
+///   from before the threshold existed: the limit shrinks by the deficit
+///   against `min_free`, down to zero if need be.
+///
+/// A zero `cap` yields zero here; callers that treat a zero cap as "pruning
+/// off" check it before asking. The limit is an *estimate*: the caller removes
+/// that many logical bytes oldest-first and does not re-measure within the
+/// pass (see [`PressureOutcome`]).
+pub fn pressure_limit(size: u64, cap: u64, min_free: u64, threshold: u64, free: u64) -> u64 {
+    if free >= threshold {
+        return cap.min(size);
+    }
+    if free < min_free {
+        return cap.min(size.saturating_sub(min_free - free));
+    }
+    let reserve = (cap / 2).min(size);
+    cap.min(reserve.max(size.saturating_sub(threshold - free)))
+}
+
+/// How one pressure-collection pass ended. None of them is an error: a pass
+/// that cannot make progress says so and the service's next period tries again.
+///
+/// A pass is *estimated-deficit collection*: it measures free space once,
+/// computes the deficit against the collection threshold, and removes that
+/// many *logical* bytes oldest-first, bounded by [`pressure_limit`]. It does
+/// not re-measure in a loop. Hard links and other writers mean the space
+/// actually freed can be less (or more); the next pass measures again and
+/// continues.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum PressureOutcome {
+    /// Free space was at or above the threshold and nothing needed removing.
+    #[serde(rename = "above threshold")]
+    AboveThreshold,
+    /// Files were removed.
+    #[serde(rename = "collected")]
+    Collected,
+    /// Below the threshold, but the cache is at or below its reserve.
+    #[serde(rename = "at reserve")]
+    AtReserve,
+    /// Below the threshold and nothing eligible was left to remove.
+    #[serde(rename = "nothing eligible")]
+    NothingEligible,
+    /// The cache was in use, so this pass left it alone.
+    #[serde(rename = "lease held")]
+    LeaseHeld,
+    /// The volume's free space could not be read; the plain cap applied.
+    #[serde(rename = "unmeasured")]
+    Unmeasured,
+}
+
+/// Classify a pass. `size` is the cache's size before it, `limit` what
+/// [`pressure_limit`] allowed, `removed` the logical bytes the pass removed
+/// and `blocked` whether any part of it was refused for a held lease.
+pub fn pressure_outcome(
+    free: Option<u64>,
+    min_free: u64,
+    threshold: u64,
+    size: u64,
+    limit: u64,
+    removed: u64,
+    blocked: bool,
+) -> PressureOutcome {
+    let Some(free) = free else {
+        return PressureOutcome::Unmeasured;
+    };
+    if removed > 0 {
+        PressureOutcome::Collected
+    } else if free >= threshold {
+        PressureOutcome::AboveThreshold
+    } else if blocked {
+        PressureOutcome::LeaseHeld
+    } else if free >= min_free && size > 0 && limit >= size {
+        PressureOutcome::AtReserve
+    } else {
+        PressureOutcome::NothingEligible
+    }
+}
+
+/// The service receipt of one pressure pass over a cache: written whether or
+/// not anything was removed. Free and size fields are `None` where the pass
+/// could not know them (an unreadable volume; a cache in use that the pass
+/// did not measure because free space was at or above the threshold).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PressureReport {
+    /// The cache directory (shared cache) or isolated-build root probed.
+    pub path: PathBuf,
+    /// The volume that path is on, where the platform names one.
+    pub volume: Option<String>,
+    /// Where free space drives collection (`reclaim_threshold()`).
+    pub threshold: u64,
+    /// The admission floor (`min_free_bytes`), unchanged by collection.
+    pub admission_floor: u64,
+    /// Free bytes on the volume when the pass started.
+    pub free_before: Option<u64>,
+    /// Free bytes on the volume when the pass ended; concurrent writers mean
+    /// the change is not attributable to the pass.
+    pub free_after: Option<u64>,
+    /// Logical size of the cache before the pass.
+    pub size_before: Option<u64>,
+    /// Logical size of the cache after the pass.
+    pub size_after: Option<u64>,
+    /// Logical bytes removed; not a measurement of physical recovery.
+    pub removed_bytes: u64,
+    /// Files removed.
+    pub files: usize,
+    /// How the pass ended; never an error.
+    pub outcome: PressureOutcome,
 }
 
 /// The path a rendered command sets `CARGO_TARGET_DIR=` to, if any.
@@ -855,29 +970,99 @@ mod tests {
 
 #[cfg(test)]
 mod pressure_tests {
+    use super::{PressureOutcome as O, pressure_limit, pressure_outcome};
+
     #[test]
-    fn pressure_reclaims_below_cap_without_underflow() {
-        assert_eq!(super::pressure_limit(100, 200, 80, 30), 50);
-        assert_eq!(super::pressure_limit(100, 200, 80, 100), 100);
-        assert_eq!(super::pressure_limit(100, 200, 800, 0), 0);
-        assert_eq!(super::pressure_limit(100, 50, 0, 0), 50);
+    fn a_threshold_equal_to_the_floor_is_the_rule_from_before_the_threshold() {
+        assert_eq!(pressure_limit(100, 200, 80, 80, 30), 50);
+        assert_eq!(pressure_limit(100, 200, 80, 80, 100), 100);
+        assert_eq!(pressure_limit(100, 200, 800, 800, 0), 0);
+        assert_eq!(pressure_limit(100, 50, 0, 0, 0), 50);
+        // Free at the floor with threshold == floor: no deficit, no reserve.
+        assert_eq!(pressure_limit(100, 200, 10, 10, 10), 100);
     }
 
     #[test]
-    fn free_space_between_the_floor_and_the_collection_threshold_shrinks_the_limit() {
-        // Admission floor 10, default collection threshold 20 (twice it).
-        // free 11 is above the floor: on the old rule (threshold = floor) the
-        // deficit is 0 and the limit stays at the size; now it is 9 short.
-        assert_eq!(super::pressure_limit(100, 200, 10, 11), 100);
-        assert_eq!(super::pressure_limit(100, 200, 20, 11), 91);
-        // At or above the threshold nothing shrinks.
-        assert_eq!(super::pressure_limit(100, 200, 20, 20), 100);
-        assert_eq!(super::pressure_limit(100, 200, 20, 500), 100);
-        // The configured cap still bounds from above.
-        assert_eq!(super::pressure_limit(100, 60, 20, 11), 60);
-        // A deficit larger than the cache empties it, never underflows.
-        assert_eq!(super::pressure_limit(5, 200, 20, 0), 0);
-        // A zero cap stays zero (callers treat it as "pruning off").
-        assert_eq!(super::pressure_limit(100, 0, 20, 11), 0);
+    fn above_the_threshold_the_limit_is_the_cap_or_the_size() {
+        // floor 8, threshold 16, cap 10 (units: GiB)
+        assert_eq!(pressure_limit(9, 10, 8, 16, 16), 9);
+        assert_eq!(pressure_limit(9, 10, 8, 16, 500), 9);
+        assert_eq!(
+            pressure_limit(12, 10, 8, 16, 16),
+            10,
+            "over the cap still shrinks"
+        );
+    }
+
+    #[test]
+    fn between_the_floor_and_the_threshold_a_cache_keeps_half_its_cap() {
+        // floor 8, threshold 16, cap 10, so the reserve is 5.
+        // A cache of 4 is below its reserve: untouched (limit == size).
+        assert_eq!(pressure_limit(4, 10, 8, 16, 10), 4);
+        // 9 with free 10: the deficit would leave 3, the reserve keeps 5.
+        assert_eq!(pressure_limit(9, 10, 8, 16, 10), 5);
+        // 9 with free 15: a deficit of 1 leaves 8, above the reserve.
+        assert_eq!(pressure_limit(9, 10, 8, 16, 15), 8);
+        // Exactly at the floor is still this band.
+        assert_eq!(pressure_limit(9, 10, 8, 16, 8), 5);
+        // The cap still bounds from above, and an odd cap rounds the reserve down.
+        assert_eq!(pressure_limit(100, 60, 10, 20, 11), 60);
+        assert_eq!(pressure_limit(9, 11, 8, 16, 8), 5);
+        // The reserve is a fixed ratio of the cap: it does not move with size.
+        assert_eq!(
+            pressure_limit(40, 10, 8, 16, 8),
+            10,
+            "cap bounds the shrink"
+        );
+    }
+
+    #[test]
+    fn below_the_floor_the_rule_is_the_one_from_before_the_threshold() {
+        // floor 8, threshold 16, cap 10: size 9, free 7 -> one short of the floor.
+        assert_eq!(pressure_limit(9, 10, 8, 16, 7), 8);
+        assert_eq!(pressure_limit(9, 10, 8, 16, 0), 1);
+        // No reserve here: a deficit larger than the cache empties it.
+        assert_eq!(pressure_limit(4, 10, 8, 16, 0), 0);
+        assert_eq!(pressure_limit(5, 200, 20, 20, 0), 0);
+    }
+
+    #[test]
+    fn a_zero_cap_stays_zero_in_every_band() {
+        for free in [0, 7, 8, 10, 15, 16, 500] {
+            assert_eq!(pressure_limit(100, 0, 8, 16, free), 0, "free {free}");
+        }
+    }
+
+    #[test]
+    fn repeated_passes_with_free_space_pinned_converge() {
+        // Free space stays at 10 whatever is removed (another program owns the
+        // disk). The first pass takes the cache to its reserve, the second
+        // removes nothing.
+        let mut size = 9;
+        let first = pressure_limit(size, 10, 8, 16, 10);
+        assert_eq!(first, 5);
+        size = size.min(first);
+        let second = pressure_limit(size, 10, 8, 16, 10);
+        assert_eq!(second, size, "nothing left to remove");
+    }
+
+    #[test]
+    fn the_outcome_names_why_a_pass_removed_nothing() {
+        // (free, floor, threshold, size, limit, removed, blocked)
+        let outcome = |free, size, limit, removed, blocked| {
+            pressure_outcome(free, 8, 16, size, limit, removed, blocked)
+        };
+        assert_eq!(outcome(Some(20), 9, 9, 0, false), O::AboveThreshold);
+        assert_eq!(outcome(Some(10), 9, 5, 4, false), O::Collected);
+        assert_eq!(outcome(Some(20), 12, 10, 2, false), O::Collected);
+        // At or below the reserve in the band.
+        assert_eq!(outcome(Some(10), 4, 4, 0, false), O::AtReserve);
+        // Below the floor there is no reserve: nothing left is "nothing eligible".
+        assert_eq!(outcome(Some(7), 4, 0, 0, false), O::NothingEligible);
+        assert_eq!(outcome(Some(10), 0, 0, 0, false), O::NothingEligible);
+        // Something should go, but none of it did.
+        assert_eq!(outcome(Some(10), 9, 5, 0, false), O::NothingEligible);
+        assert_eq!(outcome(Some(10), 9, 5, 0, true), O::LeaseHeld);
+        assert_eq!(outcome(None, 9, 9, 0, false), O::Unmeasured);
     }
 }

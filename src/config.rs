@@ -947,20 +947,32 @@ pub struct Disk {
     /// competition triggers and small enough that a 1 TB disk with 100 GB free
     /// is nowhere near the threshold.
     pub min_free_bytes: u64,
-    /// Free space, in bytes, below which pressure collection runs, and the
-    /// level it aims to bring free space back up to: the shared build cache,
-    /// registered isolated builds and retained worktree outputs are collected
-    /// (within their own caps, locks and eligibility rules) until the volume
-    /// has this much free, or until nothing eligible is left. This is the
-    /// *collection* threshold; [`min_free_bytes`](Self::min_free_bytes) stays
-    /// the *admission* floor and nothing here moves a gate.
+    /// Free space, in bytes, below which pressure collection runs: the shared
+    /// build cache, registered isolated builds and retained worktree outputs
+    /// are collected (within their own caps, locks and eligibility rules)
+    /// toward having this much free. This is the *collection* threshold;
+    /// [`min_free_bytes`](Self::min_free_bytes) stays the *admission* floor
+    /// and nothing here moves a gate.
+    ///
+    /// A pass is estimated-deficit collection: it measures free space once,
+    /// removes that many *logical* bytes oldest-first and does not re-measure
+    /// in a loop. Hard links and other writers mean the space actually freed
+    /// can differ; the next pass measures again and continues. A pass that
+    /// removes nothing ends without error. While free space is at or above
+    /// the admission floor, a build cache (shared or isolated) keeps a reserve
+    /// of half its configured cap, so a disk whose free space other software
+    /// controls does not empty it on every pass; below the floor there is no
+    /// reserve. Retained worktree outputs of finished runs get no reserve.
     ///
     /// Unset means twice `min_free_bytes`. A value below `min_free_bytes` is
     /// treated as `min_free_bytes` (collection never aims below the admission
-    /// floor; loading such a config logs a warning). With the gate off
-    /// (`min_free_bytes = 0`) and this unset there is no pressure collection;
-    /// an explicit positive value still collects. Read it only through
-    /// [`reclaim_threshold`](Self::reclaim_threshold).
+    /// floor; loading such a config logs a warning), so an explicit `0` is not
+    /// an off switch: the *resolved* value decides, and it is `0` (free space
+    /// never drives collection) only with `min_free_bytes = 0` and this unset
+    /// or `0`. An explicit positive value collects even with the gate off. The
+    /// retained-output sweep keeps its rule that a free-space measurement that
+    /// fails counts as pressure, whatever the resolved value. Read it only
+    /// through [`reclaim_threshold`](Self::reclaim_threshold).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reclaim_free_bytes: Option<u64>,
     /// Fold finished runs without being asked. `Merged`, `Ready` and `Failed`
@@ -1005,7 +1017,8 @@ impl Disk {
     /// The free-space level pressure collection works toward: the one reader
     /// of [`reclaim_free_bytes`](Self::reclaim_free_bytes). Never below
     /// `min_free_bytes`; twice it when unset (saturating, so a test's
-    /// `u64::MAX` floor stays `u64::MAX`). `0` means no pressure collection.
+    /// `u64::MAX` floor stays `u64::MAX`). `0` (only possible with
+    /// `min_free_bytes = 0`) means free space never drives collection.
     pub fn reclaim_threshold(&self) -> u64 {
         let floor = self.min_free_bytes;
         self.reclaim_free_bytes
@@ -5012,6 +5025,11 @@ lock_file = "{{ vars.bad }}"
             disk(0, None).reclaim_threshold(),
             0,
             "gate off: no collection"
+        );
+        assert_eq!(
+            disk(0, Some(0)).reclaim_threshold(),
+            0,
+            "explicit 0 resolves like unset: the resolved value decides"
         );
         assert_eq!(
             disk(0, Some(5)).reclaim_threshold(),

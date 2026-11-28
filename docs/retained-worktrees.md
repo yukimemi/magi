@@ -41,15 +41,46 @@ Two free-space thresholds, two meanings. `[disk] min_free_bytes` (default 8 GiB)
 is the admission floor: below it no run starts or resumes, and a running writer
 below half of it is stopped. `[disk] reclaim_free_bytes` is the collection
 threshold: below it the shared cache, registered isolated builds and the
-retained-output sweep collect, aiming to bring free space back up to it.
-Unset, it is twice `min_free_bytes` (16 GiB by default); a value below
-`min_free_bytes` is raised to it (a warning is logged at load); with
-`min_free_bytes = 0` and the setting unset nothing collects for free space,
-while an explicit positive value still does. Collection stops at the threshold
-or when nothing eligible is left; the same caps, grace periods, leases and
-proofs apply, and a pass that cannot reach the threshold ends without error
-until the service's next period. The sweep report (`retention.json`) records
-the resolved threshold as `reclaim_free_bytes`.
+retained-output sweep collect. Unset, it is twice `min_free_bytes` (16 GiB by
+default); a value below `min_free_bytes` is raised to it (a warning is logged at
+load), so an explicit `0` is not an off switch: the *resolved* value decides, and
+it is `0` (free space never drives collection) only with `min_free_bytes = 0` and
+the setting unset or `0`. An explicit positive value collects even with the gate
+off. The retained-output sweep keeps its older rule that a free-space measurement
+that fails counts as pressure, whatever the resolved value.
+
+A collection pass is *estimated-deficit collection*, not a promise to reach the
+threshold. The shared-cache and isolated-build passes measure free space once,
+compute the deficit against the threshold from that one number, and remove that
+many *logical* bytes oldest-first (`disk::pressure_limit`); they do not
+re-measure in a loop. Hard links and other writers mean the space actually freed
+can be less, so the next pass measures again and continues; a pass that removes
+nothing ends without error until the service's next period (30 s while work is
+running, the poll interval when idle, 5 minutes between runs).
+
+Build caches keep a reserve. While free space is at or above the admission floor
+a build cache - the shared one and the registered isolated-build pool, each
+against its configured cap - is never collected below half that cap: a cache is
+only useful while something is left in it, and on a disk whose free space other
+software controls a rule without a reserve would empty it on every pass and make
+every build start cold. The ratio is fixed, not a setting. Below the admission
+floor there is no reserve (work is held anyway and space outranks a warm cache):
+the limit shrinks by the deficit against `min_free_bytes`, as before the
+threshold existed. A zero cap still means pruning is off. Retained worktree
+outputs of finished runs get no reserve (nothing rebuilds from them); their
+per-pass byte budget and eligibility rules bound them instead.
+
+Every pass leaves a receipt, also when it removed nothing. The
+`source-eviction-disk-pressure-worker.json` service receipt records, per
+shared-cache and isolated-build pass, the threshold, the admission floor, the
+volume, free bytes before and after, cache size before and after, logical bytes
+removed and an outcome - `above threshold`, `collected`, `at reserve`,
+`nothing eligible`, `lease held` (or `unmeasured` when the volume's free space
+could not be read and the plain cap applied). None of them is an error. The
+sweep report (`retention.json`) records the resolved `reclaim_free_bytes`, the
+untouched `min_free_bytes` and, per volume holding retained outputs, absolute
+free bytes before and after (`volumes`; `observed_home_free_change_bytes` is the
+home volume only).
 
 Only plain, canonical, registered worktrees are eligible. A legacy `target` must
 be ignored, contain no tracked files, carry Cargo's standard

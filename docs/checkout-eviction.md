@@ -83,7 +83,9 @@ completion and global ownership/scan errors. Separate
 record scheduler/worker versions, configuration where available, cadence,
 active-worker/queue skips and configuration/launch errors. Idle housekeeping and
 active disk-pressure services share the same persistent scan. Their receipts do
-not assert that a still-running service has finished; use the scan observation
+not assert that a still-running service has finished (the disk-pressure worker
+receipt turns `completed` and carries its cache and output pass results only
+when its pass has ended); use the scan observation
 time and completion field. `magi fold <run-id> --show-seats` includes these receipts
 and both cycles' run/seat observations, even for runs with no evicted seats.
 A global validation error prevents inspection and is distinct from an observed

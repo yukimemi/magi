@@ -4028,6 +4028,20 @@ fn retention_service_receipt(
     detail: &str,
     cfg: Option<&Config>,
 ) {
+    retention_service_receipt_with(home, operation, phase, outcome, detail, cfg, None);
+}
+
+/// [`retention_service_receipt`] carrying what a pressure pass measured and
+/// removed (`passes`): written whether or not anything was removed.
+fn retention_service_receipt_with(
+    home: &Path,
+    operation: &str,
+    phase: &str,
+    outcome: &str,
+    detail: &str,
+    cfg: Option<&Config>,
+    passes: Option<serde_json::Value>,
+) {
     if !matches!(operation, "housekeeping" | "disk-pressure") {
         return;
     }
@@ -4035,14 +4049,23 @@ fn retention_service_receipt(
         "version": env!("CARGO_PKG_VERSION"), "pid": std::process::id(),
         "operation": operation, "outcome": outcome, "detail": detail,
         "auto_fold": cfg.map(|c| c.disk.auto_fold),
+        "admission_floor_bytes": cfg.map(|c| c.disk.min_free_bytes),
         "reclaim_free_bytes": cfg.map(|c| c.disk.reclaim_threshold()),
-        "reclaim_bytes": cfg.map(|c| c.disk.worktree_reclaim_bytes)});
+        "reclaim_bytes": cfg.map(|c| c.disk.worktree_reclaim_bytes),
+        "passes": passes});
     if let Err(error) = crate::fold_evidence::atomic_write(
         &home.join(format!("source-eviction-{operation}-{phase}.json")),
         &serde_json::to_vec(&receipt).expect("service receipt"),
     ) {
         tracing::warn!("retention service receipt failed: {error:#}");
     }
+}
+
+/// A receipt value for something serializable; a value that cannot be
+/// serialized (a non-UTF-8 path) is reported as such rather than dropped.
+fn receipt_value<T: serde::Serialize>(value: &T) -> serde_json::Value {
+    serde_json::to_value(value)
+        .unwrap_or_else(|error| serde_json::json!({"error": error.to_string()}))
 }
 
 async fn start_service(
@@ -4276,13 +4299,43 @@ pub async fn run_service_worker(home: &Path, payload: serde_json::Value) -> Resu
                     "retention sweep",
                     Some(&cfg),
                 );
-                crate::retention::sweep(home, &cfg.disk, Timestamp::now()).await;
-                if let Err(e) = clean::prune_cache_if_over_limit(&cfg, home) {
-                    tracing::warn!("disk pressure cache cleanup failed: {e:#}");
-                }
-                if let Err(e) = crate::build_target::prune_registered(home, &cfg.disk) {
-                    tracing::warn!("disk pressure isolated build cleanup failed: {e:#}");
-                }
+                let retained = crate::retention::sweep(home, &cfg.disk, Timestamp::now()).await;
+                let shared_cache = match clean::prune_cache_pass(&cfg, home) {
+                    Ok(pass) => pass.map(|pass| receipt_value(&pass.report)),
+                    Err(e) => {
+                        tracing::warn!("disk pressure cache cleanup failed: {e:#}");
+                        Some(serde_json::json!({"error": format!("{e:#}")}))
+                    }
+                };
+                let isolated_builds =
+                    match crate::build_target::prune_registered_pass(home, &cfg.disk) {
+                        Ok(pass) => pass.report.map(|report| receipt_value(&report)),
+                        Err(e) => {
+                            tracing::warn!("disk pressure isolated build cleanup failed: {e:#}");
+                            Some(serde_json::json!({"error": format!("{e:#}")}))
+                        }
+                    };
+                // Written whether or not anything was removed: a pass that
+                // could not reach the threshold is not an error, and this says
+                // how far it got until the service's next period.
+                retention_service_receipt_with(
+                    home,
+                    "disk-pressure",
+                    "worker",
+                    "completed",
+                    "pressure collection pass",
+                    Some(&cfg),
+                    Some(serde_json::json!({
+                        "shared_cache": shared_cache,
+                        "isolated_builds": isolated_builds,
+                        "retained_outputs": {
+                            "reclaim_free_bytes": retained.reclaim_free_bytes,
+                            "min_free_bytes": retained.min_free_bytes,
+                            "freed_bytes": retained.freed_bytes,
+                            "volumes": receipt_value(&retained.volumes),
+                        },
+                    })),
+                );
                 for current in current_work(home, Timestamp::now()) {
                     if let Ok(state) = RunState::load_under(&current.run, home)
                         && let Some(reason) = disk_gate(&state.repo, &state.config)

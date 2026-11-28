@@ -3572,20 +3572,54 @@ resumes must perform the same join before clearing it.
 (`Option<u64>`, skipped when unset so `run.json` and older records are
 unchanged) is where free space drives collection. **Read it only through
 `config::Disk::reclaim_threshold()`** (unset = `2 x min_free_bytes`, saturating;
-never below `min_free_bytes`; `0` = no free-space collection). Readers of the
-threshold: `clean::prune_cache_under_pressure` (shared cache, via
-`disk::pressure_limit`), `build_target::prune_registered_with` (isolated
-builds, same function) and the free-space tests in `retention::sweep_inner`
-(pressure flag and per-target skip), plus the `reclaim_free_bytes` field of
-`retention::Report` and the daemon's service receipt. Readers that stay on
+never below `min_free_bytes`, so an explicit `0` is not an off switch; the
+*resolved* `0` - only with `min_free_bytes = 0` - means no free-space
+collection, except that the retained-output sweep still treats a failed
+free-space measurement as pressure). Readers of the threshold:
+`clean::prune_cache_under_pressure` (shared cache) and
+`build_target::prune_registered_with` (isolated builds), both through
+`disk::pressure_limit` and `disk::pressure_outcome`, and the free-space tests
+in `retention::sweep_inner` (pressure flag and per-target skip), plus the
+`reclaim_free_bytes` / `min_free_bytes` / `volumes` fields of `retention::Report`
+and the daemon's `disk-pressure` worker receipt. Readers that stay on
 `min_free_bytes`: `daemon::disk_gate_with` / `disk::gate*` and `main::disk_precheck`
 (admission), `triage` floors and disk-hold recovery, `retention::emergency` and
 `OutputLease::admit*` (the half-floor writer stop and 1 GiB reservations), the
 `graph.rs` fix-round guard, `agent.rs`, `bump.rs`, `worktree_clean`/`worktree_setup`
-admission, and the "retention remains blocked" notice at the end of
-`sweep_inner` (about operating, so a volume merely below the threshold with
-nothing eligible raises nothing). `magi cache prune` prunes to the plain cap.
-A new reader of free space must pick one side on purpose and be listed here.
+admission, the isolated managed-operation admission in `build_target`, and the
+"retention remains blocked" notice at the end of `sweep_inner` (about operating,
+so a volume merely below the threshold with nothing eligible raises nothing).
+`magi cache prune` prunes to the plain cap. A new reader of free space must pick
+one side on purpose and be listed here.
+
+**A pass is estimated-deficit collection.** The shared-cache and isolated-build
+passes measure free space once, compute the deficit against the threshold from
+that one number and remove that many *logical* bytes oldest-first; they never
+re-measure in a loop (hard links and other writers mean the freed space can
+differ - the next pass, a service period later, measures again). Do not write
+"collects until the threshold is reached" anywhere.
+
+**Build caches keep a reserve while free space is at or above the admission
+floor.** `disk::pressure_limit` has three bands: free at or above the threshold
+(the cap), between the floor and the threshold (shrink by the deficit but never
+below half the cache's configured cap, and never touch a cache already at or
+below it) and below the floor (exactly the pre-threshold rule: shrink by the
+deficit against `min_free_bytes`, to zero if need be). The half-cap ratio is a
+constant on purpose, not a setting: a cache with nothing in it is no cache, and
+without it a disk whose free space other software controls would be emptied and
+rebuilt cold every pass. A zero cap still means pruning is off. Retained
+worktree outputs get no reserve (nothing rebuilds from them).
+
+**Every pass says how it went, also when it removed nothing.**
+`disk::PressureReport` / `PressureOutcome` (`above threshold`, `collected`,
+`at reserve`, `nothing eligible`, `lease held`, `unmeasured`) go into the
+`source-eviction-disk-pressure-worker.json` receipt; none is an error. The
+shared-cache pass measures the cache (`dir_size`) only below the threshold
+(origin/main measured it on every pass); the retained-output sweep remeasures
+targets on each sweep while a volume is below the threshold (before: below the
+floor), once per sweep, i.e. once per service period (30 s while work runs).
+The between-runs `cache` service and the idle janitor run the same passes and
+only log them.
 
 ### Retained output sweep budget
 

@@ -343,22 +343,50 @@ pub(crate) fn prune_registered(
     home: &Path,
     disk: &crate::config::Disk,
 ) -> Result<crate::disk::Prune> {
+    Ok(prune_registered_pass(home, disk)?.prune)
+}
+
+/// One pressure pass over the registered isolated builds: what was removed
+/// and, unless pruning is off or there is no isolated-build root, the receipt
+/// that says how it went.
+pub(crate) struct IsolatedPass {
+    pub prune: crate::disk::Prune,
+    pub report: Option<crate::disk::PressureReport>,
+}
+
+/// [`prune_registered`], keeping the pass's receipt.
+pub(crate) fn prune_registered_pass(
+    home: &Path,
+    disk: &crate::config::Disk,
+) -> Result<IsolatedPass> {
     prune_registered_with(home, disk, crate::disk::managed_free_bytes)
 }
 
-/// [`prune_registered`] with the free-space measurement of the isolated-build
-/// volume supplied by the caller. Free space below
+/// [`prune_registered_pass`] with the free-space measurement of the
+/// isolated-build volume supplied by the caller.
+///
+/// Free space below
 /// [`Disk::reclaim_threshold`](crate::config::Disk::reclaim_threshold) - the
 /// collection threshold, not the admission floor - shrinks the pool's limit by
-/// the deficit; the same ownership, lease and proof checks decide what may go.
+/// the deficit ([`crate::disk::pressure_limit`]: the pool keeps a reserve of
+/// half the cap while free space is at or above the admission floor); the same
+/// ownership, lease and proof checks decide what may go.
+///
+/// Like the shared cache this is estimated-deficit collection: one free-space
+/// measurement, that many *logical* bytes removed oldest-first, no re-measuring
+/// loop; the next pass continues. A pass that removes nothing is not an error
+/// and its receipt names why (a target whose lease is held is left alone).
 pub(crate) fn prune_registered_with(
     home: &Path,
     disk: &crate::config::Disk,
     free_bytes: impl Fn(&Path) -> Result<u64>,
-) -> Result<crate::disk::Prune> {
+) -> Result<IsolatedPass> {
     let mut result = crate::disk::Prune::default();
     if disk.cache_limit_bytes == 0 || !root(home).is_dir() {
-        return Ok(result);
+        return Ok(IsolatedPass {
+            prune: result,
+            report: None,
+        });
     }
     let mut targets = Vec::new();
     for entry in cache::inventory(home) {
@@ -376,14 +404,18 @@ pub(crate) fn prune_registered_with(
             }
         }
     }
+    let size_before = result.remaining;
+    let floor = disk.min_free_bytes;
     let threshold = disk.reclaim_threshold();
     let free_before = free_bytes(&root(home))?;
     let limit = crate::disk::pressure_limit(
-        result.remaining,
+        size_before,
         disk.cache_limit_bytes,
+        floor,
         threshold,
         free_before,
     );
+    let mut blocked = false;
     targets.sort_unstable();
     for (_, target, size) in targets {
         let excess = result.remaining.saturating_sub(limit);
@@ -399,23 +431,48 @@ pub(crate) fn prune_registered_with(
                 result.freed = result.freed.saturating_add(pruned.freed);
                 result.files = result.files.saturating_add(pruned.files);
             }
-            Ok(None) => {}
+            Ok(None) => blocked = true,
             Err(error) => {
                 tracing::warn!(%error, target = %target.display(), "isolated build prune refused")
             }
         }
     }
-    if free_before < threshold && result.files > 0 {
+    let report = crate::disk::PressureReport {
+        path: root(home),
+        volume: crate::disk::volume_root(&root(home)),
+        threshold,
+        admission_floor: floor,
+        free_before: Some(free_before),
+        free_after: free_bytes(&root(home)).ok(),
+        size_before: Some(size_before),
+        size_after: Some(result.remaining),
+        removed_bytes: result.freed,
+        files: result.files,
+        outcome: crate::disk::pressure_outcome(
+            Some(free_before),
+            floor,
+            threshold,
+            size_before,
+            limit,
+            result.freed,
+            blocked,
+        ),
+    };
+    if report.outcome != crate::disk::PressureOutcome::AboveThreshold {
         tracing::info!(
             threshold,
-            free_before,
-            free_after = free_bytes(&root(home)).ok(),
-            collected = result.freed,
-            files = result.files,
+            free_before = report.free_before,
+            free_after = report.free_after,
+            removed = report.removed_bytes,
+            files = report.files,
+            outcome = ?report.outcome,
             "isolated build pressure pass"
         );
     }
-    Ok(result)
+    Ok(IsolatedPass {
+        prune: result,
+        report: Some(report),
+    })
 }
 
 pub(crate) async fn acquire(
@@ -596,6 +653,8 @@ mod tests {
                 "user.name=t",
                 "-c",
                 "user.email=t@example.com",
+                "-c",
+                "commit.gpgsign=false",
                 "commit",
                 "-q",
                 "-m",
@@ -639,52 +698,115 @@ mod tests {
         (tmp, home, target)
     }
 
-    #[test]
-    fn isolated_builds_are_collected_between_the_floor_and_the_collection_threshold() {
-        let disk = |reclaim_free_bytes| crate::config::Disk {
-            min_free_bytes: 10,
+    /// The pool's cap in these tests is `2 * (size - 100)`: its reserve (half
+    /// the cap) is exactly what is left once the `old` file is gone.
+    fn pool(
+        size: u64,
+        min_free_bytes: u64,
+        reclaim_free_bytes: Option<u64>,
+    ) -> crate::config::Disk {
+        crate::config::Disk {
+            min_free_bytes,
             reclaim_free_bytes,
+            cache_limit_bytes: 2 * (size - 100),
             ..crate::config::Disk::default()
-        };
+        }
+    }
+
+    #[test]
+    fn a_pass_removes_the_estimated_deficit_between_the_floor_and_the_threshold() {
+        use crate::disk::PressureOutcome as O;
+        let (_keep, home, target) = registered_target();
+        let size = crate::disk::dir_size(&target);
 
         // Threshold equal to the floor is the old rule: free 11 is above the
         // floor, so nothing is collected.
-        let (_keep, home, target) = registered_target();
-        let none = prune_registered_with(&home, &disk(Some(10)), |_| Ok(11)).unwrap();
-        assert_eq!(none.files, 0);
+        let none = prune_registered_with(&home, &pool(size, 10, Some(10)), |_| Ok(11)).unwrap();
+        assert_eq!(none.prune.files, 0);
+        assert_eq!(none.report.unwrap().outcome, O::AboveThreshold);
         assert!(target.join("old").exists());
 
-        // Threshold 30: a 19-byte deficit. The oldest file covers it and the
-        // newer one stays; the ownership proof is never a candidate. On the
-        // old rule this input collects nothing, so this assertion would fail.
-        let some = prune_registered_with(&home, &disk(Some(30)), |_| Ok(11)).unwrap();
-        assert_eq!((some.files, some.freed), (1, 100));
+        // Threshold 30: a 19-byte deficit, taken from one free-space number
+        // (the injected 11 never changes). The pool is above its reserve, so
+        // the oldest file covers the deficit and the newer one stays; the
+        // ownership proof is never a candidate. On the old rule this input
+        // collects nothing, so this assertion would fail.
+        let some = prune_registered_with(&home, &pool(size, 10, Some(30)), |_| Ok(11)).unwrap();
+        assert_eq!((some.prune.files, some.prune.freed), (1, 100));
         assert!(!target.join("old").exists());
         assert!(target.join("new").exists());
         assert!(target.join(TARGET_PROOF).exists());
+        let report = some.report.unwrap();
+        assert_eq!(report.outcome, O::Collected);
+        assert_eq!((report.threshold, report.admission_floor), (30, 10));
+        assert_eq!(
+            (report.free_before, report.free_after),
+            (Some(11), Some(11))
+        );
+        assert_eq!(
+            (report.size_before, report.size_after),
+            (Some(size), Some(size - 100))
+        );
+        assert_eq!((report.removed_bytes, report.files), (100, 1));
 
         // Free at the threshold: left alone.
-        let at = prune_registered_with(&home, &disk(Some(30)), |_| Ok(30)).unwrap();
-        assert_eq!(at.files, 0);
+        let at = prune_registered_with(&home, &pool(size, 10, Some(30)), |_| Ok(30)).unwrap();
+        assert_eq!(at.prune.files, 0);
+        assert_eq!(at.report.unwrap().outcome, O::AboveThreshold);
 
-        // Unreachable threshold: everything eligible goes, then the pass ends
-        // without error and the next one finds nothing.
-        let all = prune_registered_with(&home, &disk(Some(1_000_000)), |_| Ok(11)).unwrap();
-        assert_eq!(all.files, 1);
-        let again = prune_registered_with(&home, &disk(Some(1_000_000)), |_| Ok(11)).unwrap();
-        assert_eq!(again.files, 0);
+        // Unreachable threshold with free space pinned at 11: the pool already
+        // sits at its reserve, so the pass removes nothing, however often it
+        // runs, and ends without error.
+        for _ in 0..2 {
+            let again =
+                prune_registered_with(&home, &pool(size, 10, Some(1_000_000)), |_| Ok(11)).unwrap();
+            assert_eq!(again.prune.files, 0);
+            assert_eq!(again.report.unwrap().outcome, O::AtReserve);
+        }
+        assert!(target.join("new").exists());
         assert!(target.join(TARGET_PROOF).exists());
 
         // A zero cap still turns pruning off.
         let (_keep2, home2, target2) = registered_target();
-        let mut off = disk(Some(1_000_000));
+        let mut off = pool(size, 10, Some(1_000_000));
         off.cache_limit_bytes = 0;
-        assert_eq!(
-            prune_registered_with(&home2, &off, |_| Ok(0))
-                .unwrap()
-                .files,
-            0
-        );
+        let pass = prune_registered_with(&home2, &off, |_| Ok(0)).unwrap();
+        assert_eq!(pass.prune.files, 0);
+        assert!(pass.report.is_none());
         assert!(target2.join("old").exists());
+    }
+
+    #[test]
+    fn below_the_admission_floor_the_pool_has_no_reserve() {
+        let (_keep, home, target) = registered_target();
+        let size = crate::disk::dir_size(&target);
+        // Floor 1000, threshold 2000, free 0: the old rule shrinks the limit by
+        // the whole 1000-byte deficit, past anything the pool holds.
+        let pass = prune_registered_with(&home, &pool(size, 1000, Some(2000)), |_| Ok(0)).unwrap();
+        assert_eq!((pass.prune.files, pass.prune.freed), (2, 200));
+        assert!(!target.join("old").exists() && !target.join("new").exists());
+        assert!(target.join(TARGET_PROOF).exists());
+        assert_eq!(
+            pass.report.unwrap().outcome,
+            crate::disk::PressureOutcome::Collected
+        );
+    }
+
+    #[test]
+    fn a_target_in_use_is_left_alone_and_the_receipt_says_so() {
+        let (_keep, home, target) = registered_target();
+        let size = crate::disk::dir_size(&target);
+        let owner = cache::Owner::here("run", "node", "seat", &target, "head");
+        let _held = match cache::try_acquire(&home, &target, &owner).unwrap() {
+            cache::AcquireOutcome::Acquired(guard) => guard,
+            cache::AcquireOutcome::Busy(_) => panic!("released target is busy"),
+        };
+        let pass =
+            prune_registered_with(&home, &pool(size, 10, Some(1_000_000)), |_| Ok(11)).unwrap();
+        assert_eq!(pass.prune.files, 0);
+        let report = pass.report.unwrap();
+        assert_eq!(report.outcome, crate::disk::PressureOutcome::LeaseHeld);
+        assert_eq!(report.removed_bytes, 0);
+        assert!(target.join("old").exists());
     }
 }
